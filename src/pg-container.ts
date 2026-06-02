@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 
 let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
@@ -20,15 +19,4 @@ export async function teardownTestPg(): Promise<void> {
     await c.stop();
     containerPromise = null;
   }
-}
-
-export interface TestSchemaHandle {
-  schema: string;
-  connectionUri: string;
-}
-
-export async function withTestSchema(): Promise<TestSchemaHandle> {
-  const connectionUri = await getTestPg();
-  const schema = `t_${randomBytes(6).toString('hex')}`;
-  return { schema, connectionUri };
 }
