@@ -10,6 +10,11 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./nest": {
+      "types": "./src/nest-test-app.ts",
+      "import": "./src/nest-test-app.ts",
+      "default": "./src/nest-test-app.ts"
     }
   },
   "scripts": {
@@ -17,15 +22,26 @@
     "test:integration": "vitest run --config vitest.integration.config.ts --passWithNoTests"
   },
   "dependencies": {
+    "@nestjs/testing": "^11.0.0",
     "@testcontainers/postgresql": "^11.0.0",
     "drizzle-orm": "^0.45.2",
     "msw": "^2.7.0",
+    "supertest": "^7.0.0",
     "testcontainers": "^11.0.0",
     "vite-tsconfig-paths": "^5.1.4",
     "vitest-fail-on-console": "^0.7.1"
   },
+  "devDependencies": {
+    "@types/supertest": "^6.0.0"
+  },
   "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
     "vitest": "^4.0.0"
   },
-  "description": "Shared Vitest config + testcontainers-PG + MSW + schema-driven fixtures. Framework-agnostic; zero domain coupling."
+  "peerDependenciesMeta": {
+    "@nestjs/common": { "optional": true },
+    "@nestjs/core": { "optional": true }
+  },
+  "description": "Shared Vitest config + testcontainers (PG/Redis/Typesense) + generic createFreshTestDb isolation + MSW + schema-driven fixtures + in-process Hono client; NestJS boot helper via the ./nest subpath."
 }

@@ -45,9 +45,9 @@ function swapDbName(adminUri: string, name: string): string {
   return u.toString();
 }
 
-async function createFreshDb(): Promise<{ url: string; name: string; adminUri: string }> {
+async function createFreshDb(prefix = 'it'): Promise<{ url: string; name: string; adminUri: string }> {
   const adminUri = await getTestPg();
-  const name = `it_${randomBytes(6).toString('hex')}`;
+  const name = `${prefix}_${randomBytes(6).toString('hex')}`;
   const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
   try {
     await admin.unsafe(`CREATE DATABASE "${name}"`);
@@ -98,19 +98,48 @@ async function applySqlFiles(url: string, paths: string[]): Promise<void> {
   }
 }
 
+export interface CreateFreshTestDbOptions {
+  /** Database-name prefix (default `it`). Useful to tag a suite, e.g. `eng`, `cart`. */
+  prefix?: string;
+  /**
+   * Materialize the schema into the fresh database. Receives the connection URL;
+   * open your own client / run your own migrations inside. On throw, the fresh
+   * database is dropped before the error propagates. Omit for an empty database.
+   */
+  provision?: (url: string) => Promise<void>;
+}
+
+/**
+ * THE generic isolation primitive: create a fresh, empty database on the shared
+ * testcontainers Postgres (`getTestPg`), optionally run a caller-supplied
+ * `provision(url)` to materialize its schema, and return a handle with `drop()`.
+ *
+ * This is transport/domain-agnostic — every higher-level helper is a thin wrapper:
+ *   - `createMigratedTestDb(sqlFiles)` → provision = apply ordered .sql files
+ *   - `provisionRestartTestDb()`       → provision = `drizzle-kit push` + post-migrate.sql
+ *   - Papercusp's `createFreshPgDb(prefix)` → provision = its baseline DDL
+ *
+ * Call once per test file in `beforeAll`; `drop()` in `afterAll`. Requires Docker.
+ */
+export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Promise<MigratedTestDb> {
+  const { url, name, adminUri } = await createFreshDb(opts.prefix);
+  if (opts.provision) {
+    try {
+      await opts.provision(url);
+    } catch (err) {
+      await makeDrop(adminUri, name)().catch(() => {});
+      throw new Error(`createFreshTestDb: provision failed for ${name}: ${(err as Error).message}`);
+    }
+  }
+  return { url, name, drop: makeDrop(adminUri, name) };
+}
+
 /**
  * Generic: create a fresh database and apply an ordered list of .sql file paths.
  * (Useful for arbitrary SQL packs; Restart's full schema uses `provisionRestartTestDb`.)
  */
 export async function createMigratedTestDb(sqlFilePaths: string[]): Promise<MigratedTestDb> {
-  const { url, name, adminUri } = await createFreshDb();
-  try {
-    await applySqlFiles(url, sqlFilePaths);
-  } catch (err) {
-    await makeDrop(adminUri, name)().catch(() => {});
-    throw new Error(`Failed applying SQL to ${name}: ${(err as Error).message}`);
-  }
-  return { url, name, drop: makeDrop(adminUri, name) };
+  return createFreshTestDb({ provision: (url) => applySqlFiles(url, sqlFilePaths) });
 }
 
 /** Walk up from `start` to find the Restart repo root (has `drizzle.config.ts` + `prisma/post-migrate.sql`). */
@@ -141,20 +170,21 @@ function findRepoRoot(start: string = process.cwd()): string {
  */
 export async function provisionRestartTestDb(): Promise<MigratedTestDb> {
   const root = findRepoRoot();
-  const { url, name, adminUri } = await createFreshDb();
   const drizzleKit = path.join(root, 'node_modules', '.bin', 'drizzle-kit');
-  try {
-    execFileSync(drizzleKit, ['push', '--force'], {
-      cwd: root,
-      env: { ...process.env, MIGRATION_DATABASE_URL: url, DATABASE_URL: url },
-      stdio: 'pipe',
-    });
-    await applySqlFiles(url, [path.join(root, 'prisma', 'post-migrate.sql')]);
-  } catch (err) {
-    await makeDrop(adminUri, name)().catch(() => {});
-    const e = err as { stderr?: Buffer; stdout?: Buffer; message?: string };
-    const detail = e.stderr?.toString() || e.stdout?.toString() || e.message || String(err);
-    throw new Error(`provisionRestartTestDb failed for ${name}: ${detail}`);
-  }
-  return { url, name, drop: makeDrop(adminUri, name) };
+  return createFreshTestDb({
+    provision: async (url) => {
+      try {
+        execFileSync(drizzleKit, ['push', '--force'], {
+          cwd: root,
+          env: { ...process.env, MIGRATION_DATABASE_URL: url, DATABASE_URL: url },
+          stdio: 'pipe',
+        });
+      } catch (err) {
+        const e = err as { stderr?: Buffer; stdout?: Buffer; message?: string };
+        const detail = e.stderr?.toString() || e.stdout?.toString() || e.message || String(err);
+        throw new Error(`drizzle-kit push failed: ${detail}`);
+      }
+      await applySqlFiles(url, [path.join(root, 'prisma', 'post-migrate.sql')]);
+    },
+  });
 }
