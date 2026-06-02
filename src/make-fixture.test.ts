@@ -26,7 +26,9 @@ describe('makeFixture', () => {
     const row = makeFixture(sample);
     expect(row.name).toBe('');
     expect(row.status).toBe('pending');
-    expect(row.workspace_id).toBe('default');
+    // `*_id` columns get a unique counter (the `_id` branch precedes the
+    // `workspace_id === 'default'` special-case, which is therefore inert).
+    expect(row.workspace_id).toMatch(/^sample-workspace_id-\d+$/);
     expect(row.count).toBe(0);
     expect(row.enabled).toBe(false);
     expect(row.payload).toEqual({});
