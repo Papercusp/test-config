@@ -12,6 +12,10 @@
       "default": "./src/index.ts"
     }
   },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:integration": "vitest run --config vitest.integration.config.ts --passWithNoTests"
+  },
   "dependencies": {
     "@testcontainers/postgresql": "^11.0.0",
     "drizzle-orm": "^0.45.2",
