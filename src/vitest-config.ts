@@ -56,8 +56,19 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // Integration tests share real PG schemas (e.g. harness_shared) — running
       // files in parallel races their `DROP SCHEMA CASCADE` teardown. Serialise.
       fileParallelism: layer === 'integration' ? false : undefined,
-      testTimeout: layer === 'unit' ? 5_000 : layer === 'integration' ? 30_000 : 60_000,
-      hookTimeout: layer === 'integration' ? 60_000 : 10_000,
+      // Unit timeout is 20s, not the vitest 5s default. Many unit tests
+      // `vi.resetModules()` + `await import('@/lib/...')` per test, which
+      // cold-imports the heavy operator module graph through the vite
+      // transform pipeline. With `pool: 'forks'` and no shared transform
+      // cache across forks, that first import legitimately costs several
+      // seconds — and on the shared dev box (≥6 concurrent agents + dev
+      // servers saturating CPU) it routinely exceeded 5s, producing
+      // "Test timed out in 5000ms" on ~38 operator files that pass in
+      // isolation. 20s gives cold-import headroom under load without
+      // masking a genuine hang (integration is already 30s). Assertions
+      // are unchanged — this is runner robustness, not test weakening.
+      testTimeout: layer === 'unit' ? 20_000 : layer === 'integration' ? 30_000 : 60_000,
+      hookTimeout: layer === 'integration' ? 60_000 : 20_000,
       setupFiles: finalSetup,
       globalSetup,
       reporters: process.env.CI
