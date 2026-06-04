@@ -20,8 +20,38 @@ const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**'];
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
 
+// A positional file filter naming an *.integration.test.* / *.browser.test.*
+// file. Under the unit layer these are *excluded* (see the exclude globs
+// below), so `vitest run path/to/foo.integration.test.ts` matches the unit
+// `include` then gets filtered back out — vitest prints the cryptic
+// "No test files found" + exits 1, with no hint that the file IS a test that
+// just needs the other config. Detect that exact case and fail with the cure.
+const LAYERED_TEST_FILE = /\.(integration|browser)\.test\.[cm]?[jt]sx?$/;
+
+function guardLayeredTestPathUnderUnit(): void {
+  // argv after the runner script: `vitest run <…filters/flags…>`. A filter is
+  // any non-flag token; we only care about ones that name a layered test file.
+  const misrouted = process.argv
+    .slice(2)
+    .filter((a) => !a.startsWith('-') && LAYERED_TEST_FILE.test(a));
+  if (misrouted.length === 0) return;
+  const layer = misrouted.some((a) => /\.browser\.test\./.test(a)) ? 'browser' : 'integration';
+  const config = layer === 'browser' ? 'vitest.browser.config.ts' : 'vitest.integration.config.ts';
+  const article = layer === 'integration' ? 'an' : 'a';
+  throw new Error(
+    `vitest: ${misrouted.join(', ')} is ${article} ${layer} test, which the default (unit) config excludes — ` +
+      `running it by path here matches "No test files found".\n` +
+      `Run it with the ${layer} config instead:\n` +
+      `  npx vitest run --config ${config} ${misrouted.join(' ')}\n` +
+      `(or \`npm run test:affected:integration\` to let the walker route it).`,
+  );
+}
+
 export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig {
   const { layer, setupFiles = [], globalSetup = [], include, exclude = [], allowConsoleNoise = false } = opts;
+  // Turn the silent "No test files found" footgun into an actionable error when
+  // an integration/browser test is run by path under the unit config.
+  if (layer === 'unit') guardLayeredTestPathUnderUnit();
   const finalSetup = allowConsoleNoise ? setupFiles : [FAIL_ON_CONSOLE_SETUP, ...setupFiles];
 
   const layerInclude =
