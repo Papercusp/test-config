@@ -94,11 +94,16 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // seconds — and on the shared dev box (≥6 concurrent agents + dev
       // servers saturating CPU) it routinely exceeded 5s, producing
       // "Test timed out in 5000ms" on ~38 operator files that pass in
-      // isolation. 20s gives cold-import headroom under load without
-      // masking a genuine hang (integration is already 30s). Assertions
-      // are unchanged — this is runner robustness, not test weakening.
-      testTimeout: layer === 'unit' ? 20_000 : layer === 'integration' ? 30_000 : 60_000,
-      hookTimeout: layer === 'integration' ? 60_000 : 20_000,
+      // isolation. 20s gave cold-import headroom — until 2026-06-07, when
+      // the green-checkpoint went red twice purely on 20_000ms timeouts
+      // (61 tests across 50 files, ALL ~20s, ALL passing in isolation) with
+      // the box at load ~135 (full fleet + Hetzner e2e churn). Same failure
+      // mode, next rung: 60s unit / 90s integration. A genuine hang still
+      // fails, just slower; the GATE must measure correctness, not box
+      // weather. Assertions are unchanged — runner robustness, not test
+      // weakening.
+      testTimeout: layer === 'unit' ? 60_000 : layer === 'integration' ? 90_000 : 120_000,
+      hookTimeout: layer === 'integration' ? 90_000 : 60_000,
       setupFiles: finalSetup,
       globalSetup,
       reporters: process.env.CI
