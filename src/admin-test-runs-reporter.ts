@@ -23,25 +23,34 @@
 
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { exec } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { dirname, join, posix, relative, resolve } from 'node:path';
 
-// ── inlined: inferWorkspaceRoot (was @papercusp/operator-core testing-domain-glob
-//    → @papercusp/testing-shell/glob). Walk up for pnpm-workspace.yaml, then .git. ──
+// ── inlined: inferWorkspaceRoot — find the true SUPERPROJECT root so recorded
+//    file paths are monorepo-relative (the tab's registry globs expect that). ──
 let _cachedRoot: string | null = null;
 function inferWorkspaceRoot(from = process.cwd()): string {
   if (_cachedRoot) return _cachedRoot;
-  for (const marker of ['pnpm-workspace.yaml', '.git']) {
-    let dir = resolve(from);
-    while (true) {
-      if (existsSync(join(dir, marker))) {
+  // Walk up to the first ancestor whose `.git` is a DIRECTORY — the superproject
+  // root. CRITICAL: a git SUBMODULE carries a `.git` FILE (a gitlink), which we
+  // must SKIP. The old `existsSync('.git')` check stopped at the submodule, so a
+  // submodule workspace recorded SUBMODULE-relative paths (e.g.
+  // `packages/orchestrator/…` or `grid-core/src/…`) instead of the monorepo-
+  // relative `libs/papercusp/packages/orchestrator/…` / `libs/generic/papergrid/
+  // grid-core/src/…` the tab globs match → those rows were invisible in the tab.
+  let dir = resolve(from);
+  while (true) {
+    try {
+      if (statSync(join(dir, '.git')).isDirectory()) {
         _cachedRoot = dir;
         return dir;
       }
-      const parent = dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
+    } catch {
+      /* no `.git` at this level — keep walking */
     }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
   _cachedRoot = from;
   return from;
