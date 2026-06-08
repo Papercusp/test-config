@@ -12,6 +12,19 @@ export const BASELINE_SCHEMA_GLOBAL_SETUP_PATH = fileURLToPath(
   new URL('./baseline-schema-global-setup.ts', import.meta.url),
 );
 
+/**
+ * Absolute path to the admin test-runs reporter (writes one row per test FILE to
+ * harness_shared.test_runs → the /admin/testing status chips). `defineVitestConfig`
+ * AUTO-WIRES this; workspaces whose vitest config is hand-rolled (plain
+ * `defineConfig`, not `defineVitestConfig`) opt in by appending it to their
+ * `reporters`: `reporters: ['default', ADMIN_TEST_RUNS_REPORTER_PATH]`. Fail-soft —
+ * a missing DB never changes a test outcome. Opt-out via
+ * PAPERCUSP_DISABLE_TEST_RUNS_REPORTER=1 (then just pass `['default']`).
+ */
+export const ADMIN_TEST_RUNS_REPORTER_PATH = fileURLToPath(
+  new URL('./admin-test-runs-reporter.ts', import.meta.url),
+);
+
 export { getTestPg, teardownTestPg, withTestSchema } from './pg-container.ts';
 export type { TestSchemaHandle } from './pg-container.ts';
 export { createFreshTestDb, createMigratedTestDb, provisionRestartTestDb } from './pg-migrate.ts';
