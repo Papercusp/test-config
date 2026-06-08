@@ -19,6 +19,14 @@ const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**'];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
+// Custom reporter that writes one row per test FILE to harness_shared.test_runs —
+// powers the /admin/testing status chips. AUTO-WIRED below so EVERY workspace using
+// defineVitestConfig records (not just apps/operator). Self-contained + fail-soft
+// (D-007): a missing DB / cold checkout never changes a test outcome. Opt-out via
+// PAPERCUSP_DISABLE_TEST_RUNS_REPORTER=1 (the reporter's own test sets it).
+const ADMIN_TEST_RUNS_REPORTER = resolve(__dirname, 'admin-test-runs-reporter.ts');
+const adminReporter: string[] =
+  process.env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' ? [] : [ADMIN_TEST_RUNS_REPORTER];
 
 // A positional file filter naming an *.integration.test.* / *.browser.test.*
 // file. Under the unit layer these are *excluded* (see the exclude globs
@@ -107,8 +115,8 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       setupFiles: finalSetup,
       globalSetup,
       reporters: process.env.CI
-        ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }]]
-        : ['default'],
+        ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }], ...adminReporter]
+        : ['default', ...adminReporter],
       // Per testing-spec §1.9: integration retry=0 (deterministic via testcontainers
       // per worker); unit retry=0; E2E (Playwright config) handles its own retries.
       retry: 0,
