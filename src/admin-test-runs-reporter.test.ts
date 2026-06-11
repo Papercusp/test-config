@@ -10,7 +10,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import AdminTestRunsReporter from './admin-test-runs-reporter';
+import AdminTestRunsReporter, { buildOutputTail } from './admin-test-runs-reporter';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -59,6 +59,56 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       errors: () => [],
     } as unknown as Parameters<typeof r.onTestModuleEnd>[0];
     expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
+  });
+
+  it('buildOutputTail captures failed TEST-CASE errors when the module has no top-level errors', () => {
+    const fakeModule = {
+      moduleId: '/tmp/fake.test.ts',
+      state: () => 'failed',
+      errors: () => [],
+      children: {
+        allTests: () => [
+          {
+            fullName: 'suite > passes',
+            result: () => ({ state: 'passed', errors: [] }),
+          },
+          {
+            fullName: 'suite > fails',
+            result: () => ({ state: 'failed', errors: [{ message: 'expected 1 to be 2' }] }),
+          },
+        ],
+      },
+    } as unknown as Parameters<typeof buildOutputTail>[0];
+    const tail = buildOutputTail(fakeModule, 'fail');
+    expect(tail).toBe('suite > fails: expected 1 to be 2');
+  });
+
+  it('buildOutputTail prefers module-level errors and stays null for passing modules', () => {
+    const withModuleErr = {
+      errors: () => [{ message: 'import boom' }],
+      children: { allTests: () => [] },
+    } as unknown as Parameters<typeof buildOutputTail>[0];
+    expect(buildOutputTail(withModuleErr, 'fail')).toBe('import boom');
+
+    const passing = {
+      errors: () => [],
+      children: {
+        allTests: () => [{ fullName: 'x', result: () => ({ state: 'passed', errors: [] }) }],
+      },
+    } as unknown as Parameters<typeof buildOutputTail>[0];
+    expect(buildOutputTail(passing, 'pass')).toBeNull();
+  });
+
+  it('buildOutputTail is fail-soft when the test walk throws', () => {
+    const explosive = {
+      errors: () => [],
+      children: {
+        allTests: () => {
+          throw new Error('walk-explodes');
+        },
+      },
+    } as unknown as Parameters<typeof buildOutputTail>[0];
+    expect(buildOutputTail(explosive, 'fail')).toBeNull();
   });
 
   it('onTestRunEnd resolves cleanly with no pending work', async () => {

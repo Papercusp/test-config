@@ -213,6 +213,54 @@ async function insertRow(row: TestRunRow): Promise<void> {
   }
 }
 
+/**
+ * Build the `output_tail` for a module's row: module-level errors (import /
+ * setup crashes) first, else — for a FAILED module — the failed test cases'
+ * error messages. Without the second leg every assertion-failure row landed
+ * with an EMPTY tail, so triaging a red chip on the Tests tab always required
+ * a local re-run (2026-06-11 overnight-loop forensics: four flake rows from a
+ * box-wide pkill incident were indistinguishable from real regressions).
+ * Structurally typed + fail-soft per D-007 — a reporter must never throw.
+ * Exported for tests.
+ */
+export function buildOutputTail(
+  testModule: TestModule,
+  status: TestRunRow['status'],
+): string | null {
+  let tail: string | null = null;
+  try {
+    const errs = testModule.errors?.() ?? [];
+    if (errs.length > 0) {
+      tail = errs
+        .map((e: unknown) => (e instanceof Error ? e.message : ((e as { message?: string })?.message ?? String(e))))
+        .join('\n')
+        .slice(-4000);
+    }
+  } catch { /* fail-soft */ }
+  if (tail || status !== 'fail') return tail;
+  try {
+    const lines: string[] = [];
+    const collection = (testModule as unknown as {
+      children?: { allTests?: () => Iterable<unknown> };
+    }).children;
+    for (const t of collection?.allTests?.() ?? []) {
+      const tc = t as {
+        fullName?: string;
+        result?: () => { state?: string; errors?: ReadonlyArray<{ message?: string } | undefined> };
+      };
+      const res = tc.result?.();
+      if (res?.state !== 'failed') continue;
+      for (const e of res.errors ?? []) {
+        lines.push(`${tc.fullName ?? '(test)'}: ${e?.message ?? String(e)}`);
+        if (lines.length >= 20) break;
+      }
+      if (lines.length >= 20) break;
+    }
+    if (lines.length > 0) tail = lines.join('\n').slice(-4000);
+  } catch { /* fail-soft */ }
+  return tail;
+}
+
 export default class AdminTestRunsReporter implements Reporter {
   private pending: Promise<void>[] = [];
 
@@ -233,13 +281,7 @@ export default class AdminTestRunsReporter implements Reporter {
       const durationMs = Math.round(durationMsRaw);
       const startedAt = new Date(finishedAt.getTime() - durationMs);
 
-      let outputTail: string | null = null;
-      try {
-        const errs = testModule.errors?.() ?? [];
-        if (errs.length > 0) {
-          outputTail = errs.map((e: unknown) => (e instanceof Error ? e.message : String(e))).join('\n').slice(-4000);
-        }
-      } catch { /* fail-soft */ }
+      const outputTail = buildOutputTail(testModule, status);
 
       this.pending.push(
         insertRow({ filePath, status, durationMs, startedAt, finishedAt, outputTail }),
