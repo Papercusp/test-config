@@ -12,6 +12,10 @@ let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
 // shared cluster's roles deterministic regardless of which test ran first.
 const FRAMEWORK_ROLES_DDL = `
   DO $$ BEGIN
+    -- The container is REUSED across vitest processes, so two runs can execute this
+    -- block concurrently; IF NOT EXISTS/CREATE then races to a unique_violation on
+    -- pg_authid_rolname_index. The xact-scoped advisory lock serializes them.
+    PERFORM pg_advisory_xact_lock(hashtext('papercusp-test-framework-roles'));
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='harness_app')   THEN CREATE ROLE harness_app   LOGIN PASSWORD 'harness_app_pwd';
     ELSE ALTER ROLE harness_app   LOGIN PASSWORD 'harness_app_pwd'; END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='harness_admin') THEN CREATE ROLE harness_admin LOGIN SUPERUSER PASSWORD 'harness_admin_pwd';
