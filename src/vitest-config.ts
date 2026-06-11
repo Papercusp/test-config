@@ -19,6 +19,14 @@ const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**'];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
+// The monorepo root (libs/test-config/src → up 3 = repo root). Whitelisted in
+// Vite's server.fs.allow below so a `vitest run --root <pkg>` invocation can
+// still serve this hoisted setup file + other workspace deps. Without it, a
+// jsdom/.tsx suite run with --root fails to LOAD with "Cannot find module
+// /@fs/.../libs/test-config/src/setup-fail-on-console.ts" — a recurring
+// invocation trap that records misleading red rows on the Tests tab even
+// though the tests pass when run workspace-locally (2026-06-11).
+const MONOREPO_ROOT = resolve(__dirname, '..', '..', '..');
 // Custom reporter that writes one row per test FILE to harness_shared.test_runs —
 // powers the /admin/testing status chips. AUTO-WIRED below so EVERY workspace using
 // defineVitestConfig records (not just apps/operator). Self-contained + fail-soft
@@ -72,6 +80,11 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
 
   return defineConfig({
     plugins: [tsconfigPaths({ ignoreConfigErrors: true })],
+    // fs.allow only WIDENS what the transform server may read — adding the
+    // monorepo root never breaks a workspace-local run, it just makes a
+    // `--root <pkg>` invocation able to serve the hoisted setup file + deps
+    // instead of dying on a /@fs/ allow-list miss (see MONOREPO_ROOT above).
+    server: { fs: { allow: [MONOREPO_ROOT] } },
     test: {
       include: layerInclude,
       exclude: [
