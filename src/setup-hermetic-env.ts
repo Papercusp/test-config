@@ -16,9 +16,20 @@
  *    (orchestrator invoke.ts gitConfigNoPushEnv). Real-git tests (run-git-sync)
  *    inherit it into their /tmp repos and every push is blocked.
  *
+ *  - PAPERCUSP_INTEGRATION_ROOT / RELEASE_ROOT / CHECKPOINT_ROOT /
+ *    INTEGRATION_BRANCH / RELEASE_REF — the release-gate workspace-map config
+ *    carried by gate/checkpoint runner envs. resolveWorkspaceMapConfig prefers
+ *    them over sibling derivation, so workspace-map tests asserting derivation
+ *    get the runner's real paths (third 2026-06-11 checkpoint red).
+ *
  * Keep this list to PROVEN leak classes — broad env wipes hide real bugs.
  */
 delete process.env.PAPERCUSP_WORKSPACE_ID;
+delete process.env.PAPERCUSP_INTEGRATION_ROOT;
+delete process.env.PAPERCUSP_RELEASE_ROOT;
+delete process.env.PAPERCUSP_CHECKPOINT_ROOT;
+delete process.env.PAPERCUSP_INTEGRATION_BRANCH;
+delete process.env.PAPERCUSP_RELEASE_REF;
 
 const gitConfigCount = Number.parseInt(process.env.GIT_CONFIG_COUNT ?? '', 10);
 if (Number.isFinite(gitConfigCount) && gitConfigCount > 0) {
