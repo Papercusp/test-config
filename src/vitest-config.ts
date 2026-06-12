@@ -19,6 +19,7 @@ const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**'];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
+const HERMETIC_ENV_SETUP = resolve(__dirname, 'setup-hermetic-env.ts');
 // The monorepo root (libs/test-config/src → up 3 = repo root). Whitelisted in
 // Vite's server.fs.allow below so a `vitest run --root <pkg>` invocation can
 // still serve this hoisted setup file + other workspace deps. Without it, a
@@ -68,7 +69,9 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   // Turn the silent "No test files found" footgun into an actionable error when
   // an integration/browser test is run by path under the unit config.
   if (layer === 'unit') guardLayeredTestPathUnderUnit();
-  const finalSetup = allowConsoleNoise ? setupFiles : [FAIL_ON_CONSOLE_SETUP, ...setupFiles];
+  const finalSetup = allowConsoleNoise
+    ? [HERMETIC_ENV_SETUP, ...setupFiles]
+    : [HERMETIC_ENV_SETUP, FAIL_ON_CONSOLE_SETUP, ...setupFiles];
 
   const layerInclude =
     include ??
