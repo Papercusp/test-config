@@ -126,7 +126,25 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // fails, just slower; the GATE must measure correctness, not box
       // weather. Assertions are unchanged — runner robustness, not test
       // weakening.
-      testTimeout: layer === 'unit' ? 60_000 : layer === 'integration' ? 90_000 : 120_000,
+      //
+      // 2026-06-22: SAME failure mode recurred — the green-checkpoint went red on
+      // ~9 operator-core files (create-*, hive/guard, coord-program-workflow.smoke,
+      // endpoint routes, generate-blueprint) ALL timing out at 60s, ALL passing in
+      // 3-5s in isolation. Root cause: those tests do `await import()` of the
+      // heaviest operator-core graphs (transpiled from SRC, no build), and under the
+      // gate's 8 concurrent vitest forks the shared transform serializes — a single
+      // cold heavy import measured 74-97s (coord-program-workflow's bare import = 80s)
+      // even with the box only ~15% loaded. Rather than bump the global unit timeout
+      // (dev wants fast-failing hangs), the unit timeout is env-overridable: the
+      // green-checkpoint sets VITEST_UNIT_TIMEOUT_MS=180000 (buildGreenCheckpointEnv),
+      // everything else keeps 60s. A genuine hang still fails (just slower) ONLY in
+      // the gate; correctness over box weather, as before.
+      testTimeout:
+        layer === 'unit'
+          ? Number(process.env.VITEST_UNIT_TIMEOUT_MS) || 60_000
+          : layer === 'integration'
+            ? 90_000
+            : 120_000,
       hookTimeout: layer === 'integration' ? 90_000 : 60_000,
       setupFiles: finalSetup,
       globalSetup,
