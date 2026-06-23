@@ -22,8 +22,19 @@
  *    them over sibling derivation, so workspace-map tests asserting derivation
  *    get the runner's real paths (third 2026-06-11 checkpoint red).
  *
+ *  - PAPERCUSP_PGBOUNCER (derived, not pinned) — `pgbouncerEnabled()` defaults ON for a
+ *    SERVER-class host (the dev box / a dedicated CI server) even when the env is unset, so
+ *    `getOrgPg()`'s `maybePgbouncer()` rewrites every org connection to 127.0.0.1:6432 — the
+ *    host's pooler. Integration tests point getOrgPg at a throwaway TESTCONTAINER with NO
+ *    bouncer, so the reroute hits the WRONG Postgres: a FATAL 08P01 under transaction pooling,
+ *    or "no such database: org_<rand>" against the host PG (and silently pollutes it). The
+ *    classic "green in CI (workstation-class), red on the dev box (server-class)" leak. Pin it
+ *    OFF as the test default; a test that genuinely exercises the bouncer path sets
+ *    PAPERCUSP_PGBOUNCER itself (the `??=` respects an explicit value).
+ *
  * Keep this list to PROVEN leak classes — broad env wipes hide real bugs.
  */
+process.env.PAPERCUSP_PGBOUNCER ??= '0';
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
 delete process.env.PAPERCUSP_RELEASE_ROOT;
