@@ -107,6 +107,81 @@ export interface CreateFreshTestDbOptions {
    * database is dropped before the error propagates. Omit for an empty database.
    */
   provision?: (url: string) => Promise<void>;
+  /**
+   * TEMPLATE-CLONE the schema instead of provisioning per-test. `provision` runs
+   * ONCE to build a template database keyed by `key` (cached on the shared,
+   * reused container + per-process), and every call `CREATE DATABASE … TEMPLATE`s
+   * it — a near-instant Postgres file clone vs replaying the provision (~280
+   * migrations) for every integration test file. `key` MUST change whenever the
+   * schema would (a content hash of the migration set), or a stale template
+   * silently serves the wrong schema. Mutually exclusive with `provision` at the
+   * top level (the template carries the schema). See `getOrBuildTemplate`.
+   */
+  template?: { key: string; provision: (url: string) => Promise<void> };
+}
+
+// Per-process cache: a template is built at most once per fork for a given key.
+// Across forks (the container is shared + REUSED), the advisory lock + a
+// pg_database existence check in `buildTemplate` make the FIRST fork build it and
+// the rest reuse — so the heavy provision runs once per container, not per file.
+const templateBuilds = new Map<string, Promise<string>>();
+
+async function buildTemplate(key: string, provision: (url: string) => Promise<void>): Promise<string> {
+  const adminUri = await getTestPg();
+  const name = `tmpl_${key}`;
+  const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
+  const lock = `pc-test-template-${key}`;
+  try {
+    // Serialize concurrent forks racing to build the SAME template on the shared
+    // container (mirrors the framework-roles advisory lock). Held across provision.
+    await admin.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
+    try {
+      const rows = (await admin.unsafe(`SELECT 1 FROM pg_database WHERE datname = '${name}'`)) as unknown[];
+      if (rows.length === 0) {
+        await admin.unsafe(`CREATE DATABASE "${name}"`);
+        try {
+          await provision(swapDbName(adminUri, name)); // opens + CLOSES its own client ⇒ no lingering conn ⇒ cloneable
+        } catch (err) {
+          await admin.unsafe(`DROP DATABASE IF EXISTS "${name}"`).catch(() => {});
+          throw err;
+        }
+      }
+    } finally {
+      await admin.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`);
+    }
+  } finally {
+    await admin.end({ timeout: 5 });
+  }
+  return name;
+}
+
+/**
+ * Get (build-once) a migrated TEMPLATE database keyed by `key`. The `provision`
+ * runs exactly once per (container, key); every later caller reuses the template.
+ * Clone it with `createFreshTestDb({ template: { key, provision } })`.
+ */
+export async function getOrBuildTemplate(key: string, provision: (url: string) => Promise<void>): Promise<string> {
+  let p = templateBuilds.get(key);
+  if (!p) {
+    p = buildTemplate(key, provision);
+    templateBuilds.set(key, p);
+  }
+  return p;
+}
+
+async function createDbFromTemplate(prefix: string, template: string): Promise<{ url: string; name: string; adminUri: string }> {
+  const adminUri = await getTestPg();
+  const name = `${prefix}_${randomBytes(6).toString('hex')}`;
+  const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
+  try {
+    // The clone needs NO active session on the source; the template's builder closed
+    // its connection, and nothing connects to a template directly. Serial integration
+    // runs never overlap clones; Postgres serializes them defensively regardless.
+    await admin.unsafe(`CREATE DATABASE "${name}" TEMPLATE "${template}"`);
+  } finally {
+    await admin.end({ timeout: 5 });
+  }
+  return { url: swapDbName(adminUri, name), name, adminUri };
 }
 
 /**
@@ -122,6 +197,12 @@ export interface CreateFreshTestDbOptions {
  * Call once per test file in `beforeAll`; `drop()` in `afterAll`. Requires Docker.
  */
 export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Promise<MigratedTestDb> {
+  // Template-clone path: build the schema ONCE into a cached template, then clone.
+  if (opts.template) {
+    const tmpl = await getOrBuildTemplate(opts.template.key, opts.template.provision);
+    const { url, name, adminUri } = await createDbFromTemplate(opts.prefix ?? 'it', tmpl);
+    return { url, name, drop: makeDrop(adminUri, name) };
+  }
   const { url, name, adminUri } = await createFreshDb(opts.prefix);
   if (opts.provision) {
     try {
