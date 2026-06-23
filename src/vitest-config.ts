@@ -110,6 +110,25 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // Integration tests share real PG schemas (e.g. harness_shared) — running
       // files in parallel races their `DROP SCHEMA CASCADE` teardown. Serialise.
       fileParallelism: layer === 'integration' ? false : undefined,
+      // EI-2590: ACTUALLY apply the worker cap the green-checkpoint sets. It
+      // exports VITEST_MAX_FORKS/THREADS=8 to bound concurrency when the gate
+      // shares the box with the live fleet (buildGreenCheckpointEnv) — but until
+      // now NOTHING read those vars, so the gate ran at vitest's DEFAULT pool size
+      // (≈ host cores − 1, ~127 on the 128-core dev box). ~127 forks all funnel
+      // their cold SRC transforms through the SINGLE main-process transform server,
+      // which serializes them — that, not raw CPU, is the real cause of the 74-97s
+      // "heavy await import()" timeouts the 180s VITEST_UNIT_TIMEOUT_MS band-aid
+      // masks (and a ~60GB peak-RSS OOM risk: 127 forks × ~500MB). Reading the env
+      // here realizes the checkpoint's documented intent. Vitest 4 dropped the old
+      // `poolOptions.forks.maxForks`; the unified knob is `maxWorkers`. The forks
+      // pool (unit/integration) reads VITEST_MAX_FORKS, the threads pool (browser)
+      // VITEST_MAX_THREADS. UNSET (dev/CI) ⇒ key omitted ⇒ vitest's default uncapped
+      // parallelism, so local runs are unchanged. Tunable per-run via the env vars.
+      ...(() => {
+        const cap =
+          Number(layer === 'browser' ? process.env.VITEST_MAX_THREADS : process.env.VITEST_MAX_FORKS) || 0;
+        return cap > 0 ? { maxWorkers: cap } : {};
+      })(),
       // Unit timeout is 20s, not the vitest 5s default. Many unit tests
       // `vi.resetModules()` + `await import('@/lib/...')` per test, which
       // cold-imports the heavy operator module graph through the vite
