@@ -194,15 +194,20 @@ async function insertRow(row: TestRunRow): Promise<void> {
 
   const source = resolveTestRunSource();
   const runGroupId = process.env.PAPERCUSP_TEST_RUN_GROUP ?? null;
+  // P-007: when the dogfood run is harness-scoped (env stamped by the operator),
+  // carry harness_slug/workspace_id so its rows stay consistent with the new
+  // per-hive ingestion columns. NULL for a plain operator self-test run.
+  const harnessSlug = process.env.PAPERCUSP_TEST_RUN_HARNESS || null;
+  const workspaceId = process.env.PAPERCUSP_WORKSPACE_ID || null;
 
   try {
     await Promise.race([
       pg.sql`
         INSERT INTO harness_shared.test_runs
-          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha)
+          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha, harness_slug, workspace_id)
         VALUES
           (${row.filePath}, 'vitest', ${row.status}, ${row.durationMs}, ${row.startedAt},
-           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit})
+           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit}, ${harnessSlug}, ${workspaceId})
       `,
       new Promise((_, reject) => setTimeout(() => reject(new Error('pg_insert_timeout')), 1000)),
     ]).catch(() => {
