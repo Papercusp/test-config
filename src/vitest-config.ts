@@ -2,6 +2,7 @@ import { defineConfig, type UserConfig } from 'vitest/config';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { mkdirSync, existsSync } from 'node:fs';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
@@ -28,6 +29,24 @@ const HERMETIC_ENV_SETUP = resolve(__dirname, 'setup-hermetic-env.ts');
 // invocation trap that records misleading red rows on the Tests tab even
 // though the tests pass when run workspace-locally (2026-06-11).
 const MONOREPO_ROOT = resolve(__dirname, '..', '..', '..');
+
+// Ensure Vitest's internal tmpDir (join(os.tmpdir(), nanoid())) lands in a
+// writable directory. On this dev box TMPDIR=/tmp/claude is set but /tmp is a
+// read-only filesystem — /tmp/claude does not exist and cannot be created —
+// so Vitest's ModuleFetcher fails to mkdir the 'ssr' subdirectory before any
+// test file loads (ENOENT). Override TMPDIR to a project-local writable path.
+// This runs when vitest.config.ts is evaluated, BEFORE the Vitest instance is
+// constructed (which is when the nanoid subdir is first computed), so the
+// override takes effect for every subsequent tmpdir() call in that process.
+{
+  const needsOverride = !process.env.TMPDIR || !existsSync(process.env.TMPDIR);
+  if (needsOverride) {
+    const localTmp = resolve(MONOREPO_ROOT, '.vitest-tmp');
+    mkdirSync(localTmp, { recursive: true });
+    process.env.TMPDIR = localTmp;
+  }
+}
+
 // Custom reporter that writes one row per test FILE to harness_shared.test_runs —
 // powers the /admin/testing status chips. AUTO-WIRED below so EVERY workspace using
 // defineVitestConfig records (not just apps/operator). Self-contained + fail-soft
