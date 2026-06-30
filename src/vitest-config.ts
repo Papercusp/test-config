@@ -127,7 +127,16 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       ...(() => {
         const cap =
           Number(layer === 'browser' ? process.env.VITEST_MAX_THREADS : process.env.VITEST_MAX_FORKS) || 0;
-        return cap > 0 ? { maxWorkers: cap } : {};
+        // MUST pair minWorkers with maxWorkers. The repo ROOT still runs vitest
+        // 2.1.9 (`npm test`), whose resolveConfig defaults minThreads/minForks to
+        // the HOST CORE COUNT when minWorkers is unset
+        // (`minThreads = poolOptions.minForks ?? config.minWorkers ?? threadsCount`).
+        // On the 128-core dev box that makes minThreads≈128 while maxWorkers=8, so
+        // Tinypool throws `options.minThreads and options.maxThreads must not
+        // conflict` at pool creation — the suite collects ZERO tests and the
+        // green-checkpoint gate goes permanently red. Pinning minWorkers:1 yields a
+        // valid 1..cap pool under BOTH v2.1.9 (root) and v4 (nested workspaces).
+        return cap > 0 ? { maxWorkers: cap, minWorkers: 1 } : {};
       })(),
       // Unit timeout is 20s, not the vitest 5s default. Many unit tests
       // `vi.resetModules()` + `await import('@/lib/...')` per test, which
