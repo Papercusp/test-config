@@ -3,6 +3,7 @@ import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { mkdirSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
@@ -31,19 +32,28 @@ const HERMETIC_ENV_SETUP = resolve(__dirname, 'setup-hermetic-env.ts');
 const MONOREPO_ROOT = resolve(__dirname, '..', '..', '..');
 
 // Ensure Vitest's internal tmpDir (join(os.tmpdir(), nanoid())) lands in a
-// writable directory. On this dev box TMPDIR=/tmp/claude is set but /tmp is a
-// read-only filesystem — /tmp/claude does not exist and cannot be created —
-// so Vitest's ModuleFetcher fails to mkdir the 'ssr' subdirectory before any
-// test file loads (ENOENT). Override TMPDIR to a project-local writable path.
+// writable directory. On this dev box TMPDIR=/tmp/claude is set but does not
+// exist / cannot be created (sandboxed /tmp), so Vitest's ModuleFetcher fails
+// to mkdir the 'ssr' subdir before any test file loads (ENOENT). Override
+// TMPDIR — but it MUST be SHORT and OUTSIDE the repo. The previous in-repo
+// <root>/.vitest-tmp broke two whole test classes and red-pinned the gate
+// (gate-greening 2026-06-30 / EI-5541):
+//   (1) Unix-domain socket paths under it exceeded the 108-char sun_path limit
+//       → `listen EINVAL` for the IPC e2e + wake-executor/wake-resume tests;
+//   (2) temp dirs created under it have a .git ancestor (the repo), so the
+//       "non-git dir" detection tests (detectPapercupRoot, lockDomainForProjectDir,
+//       readCloneDefaultBranch, realGitCommit) wrongly resolved the repo.
+// A short home-rooted dir (~/.pcv-tmp) is writable on this box, ~27 chars (socket
+// paths stay ~75 chars), and has no .git ancestor — fixing both classes at the source.
 // This runs when vitest.config.ts is evaluated, BEFORE the Vitest instance is
 // constructed (which is when the nanoid subdir is first computed), so the
 // override takes effect for every subsequent tmpdir() call in that process.
 {
   const needsOverride = !process.env.TMPDIR || !existsSync(process.env.TMPDIR);
   if (needsOverride) {
-    const localTmp = resolve(MONOREPO_ROOT, '.vitest-tmp');
-    mkdirSync(localTmp, { recursive: true });
-    process.env.TMPDIR = localTmp;
+    const shortTmp = resolve(homedir(), '.pcv-tmp');
+    mkdirSync(shortTmp, { recursive: true });
+    process.env.TMPDIR = shortTmp;
   }
 }
 
