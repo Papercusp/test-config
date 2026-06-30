@@ -1,0 +1,1 @@
+{"version":"4.1.8","results":[[":src/admin-test-runs-reporter.test.ts",{"duration":0,"failed":true}],[":src/vitest-config.test.ts",{"duration":0,"failed":true}],[":src/console-noise-filter.test.ts",{"duration":0,"failed":true}],[":src/make-fixture.test.ts",{"duration":0,"failed":true}]]}
