@@ -83,6 +83,12 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
 
   return defineConfig({
     plugins: [tsconfigPaths({ ignoreConfigErrors: true })],
+    // Use a project-local Vite cache dir instead of os.tmpdir() (which is
+    // TMPDIR=/tmp/claude on this dev box — a read-only path that doesn't
+    // exist, causing every vitest run to ENOENT on the ssr/ sub-directory
+    // before any test file can load). A local path is also faster (same FS)
+    // and survives TMPDIR being absent or readonly.
+    cacheDir: '.vitest-tmp',
     // fs.allow only WIDENS what the transform server may read — adding the
     // monorepo root never breaks a workspace-local run, it just makes a
     // `--root <pkg>` invocation able to serve the hoisted setup file + deps
