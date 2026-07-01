@@ -32,10 +32,23 @@
  *    OFF as the test default; a test that genuinely exercises the bouncer path sets
  *    PAPERCUSP_PGBOUNCER itself (the `??=` respects an explicit value).
  *
+ *  - PAPERCUSP_HIVE_HOME_SLUG — the operator-home harness pointer
+ *    (operatorHomeHarnessSlug() reads it LIVE, no cache). Tests asserting the UNSET
+ *    fallback ('no pointer → the legacy default "papercusp"') get a leaked value
+ *    instead. The leak is cross-FILE, not spawn-env: sibling tests (hive/*,
+ *    *-workspace-scope, overwatch/*) set it inside their tests and clean up only in
+ *    beforeEach (start of the NEXT test) — so after a file's LAST setting test it
+ *    stays set, and vitest's `forks` pool REUSES the worker for the next file,
+ *    leaking the value in (2026-06-30: green-checkpoint redded overwatch/loop +
+ *    fallback suites that pass in isolation, seeing 'ws-1'/'env-slug'). Scrubbing at
+ *    each file's start makes the UNSET default reliable; a test that needs a pin
+ *    sets it itself.
+ *
  * Keep this list to PROVEN leak classes — broad env wipes hide real bugs.
  */
 process.env.PAPERCUSP_PGBOUNCER ??= '0';
 delete process.env.PAPERCUSP_WORKSPACE_ID;
+delete process.env.PAPERCUSP_HIVE_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
 delete process.env.PAPERCUSP_RELEASE_ROOT;
 delete process.env.PAPERCUSP_CHECKPOINT_ROOT;
