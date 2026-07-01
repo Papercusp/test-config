@@ -113,6 +113,30 @@ function guardLayeredTestPathUnderUnit(): void {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Recurrence guard for the `.repro.test.ts` deploy-gate footgun (WI-1091 / WI-1053).
+//
+// A `*.repro.test.ts` reproduces an UNFIXED bug and fails BY DESIGN. Named as a
+// plain unit `*.test.ts` it lands in the unit suite the green-checkpoint gates
+// on, so those fail-by-design tests red-gated EVERY fleet deploy for ~73h
+// (WI-1053). `guardLayeredTestPathUnderUnit` above only catches the REVERSE
+// direction (a correctly-named integration test run by path under the unit
+// config). The naming contract for the direction that actually bit us: a repro
+// test MUST be `*.repro.integration.test.ts` (kept OUT of the deploy gate).
+//
+// `MISROUTED_REPRO_TEST` matches `.repro.test.<ext>` but NOT the correct
+// `.repro.integration.test.<ext>` (which has `.integration.` before `.test.`).
+// The operator-core meta-test `repro-test-naming-guard.test.ts` scans the repo
+// with `findMisroutedReproTests` and fails loudly if any misrouted repro test
+// reappears — turning a silent deploy-gate red into an actionable unit failure.
+export const MISROUTED_REPRO_TEST = /\.repro\.test\.[cm]?[jt]sx?$/;
+
+/** Return the subset of `files` that are repro tests misrouted into the unit
+ *  layer (`*.repro.test.ts` instead of `*.repro.integration.test.ts`), sorted. */
+export function findMisroutedReproTests(files: readonly string[]): string[] {
+  return files.filter((f) => MISROUTED_REPRO_TEST.test(f)).sort();
+}
+
 export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig {
   const { layer, setupFiles = [], globalSetup = [], include, exclude = [], allowConsoleNoise = false } = opts;
   // Turn the silent "No test files found" footgun into an actionable error when

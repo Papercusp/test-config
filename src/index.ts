@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 
-export { defineVitestConfig } from './vitest-config.ts';
+export { defineVitestConfig, findMisroutedReproTests, MISROUTED_REPRO_TEST } from './vitest-config.ts';
 export type { TestLayer, DefineVitestConfigOptions } from './vitest-config.ts';
 
 /**

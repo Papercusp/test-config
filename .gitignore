@@ -2,3 +2,7 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+# Vitest cacheDir (cacheDir: '.vitest-tmp' in vitest-config.ts) — a build
+# artifact that must never be tracked; a churning tracked results.json here
+# was stranding this submodule's source commits from git-sync.
+.vitest-tmp/
