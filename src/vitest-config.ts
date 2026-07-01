@@ -49,8 +49,27 @@ const MONOREPO_ROOT = resolve(__dirname, '..', '..', '..');
 // This runs when vitest.config.ts is evaluated, BEFORE the Vitest instance is
 // constructed (which is when the nanoid subdir is first computed), so the
 // override takes effect for every subsequent tmpdir() call in that process.
+/** True if `dir` (or any ancestor up to /) holds a repo-root marker (.git / package.json) — i.e.
+ *  TMPDIR points INSIDE a repo. This is the 2026-06-30 root cause of silent git-sync stranding:
+ *  when TMPDIR is in-repo, tests that `mkdtemp` a scratch git repo (lockdom-*, flg-repo-*,
+ *  realGitCommit, green-checkpoint) leave EMBEDDED repos (a nested .git) in the working tree; a
+ *  no-commit one makes `git add -A` FATAL (exit 128) → git-sync stages nothing → the WHOLE tree
+ *  strands uncommitted for hours. Forcing TMPDIR out to /tmp keeps those scratch repos out of the
+ *  tree entirely (and also fixes the sun_path-108 socket + non-git-detection classes noted above).
+ *  Previously the override only fired when TMPDIR was unset/missing — so anything that SET it to an
+ *  in-repo path that existed slipped through. */
+function tmpdirIsInsideRepo(dir: string): boolean {
+  let p = resolve(dir);
+  for (;;) {
+    if (existsSync(resolve(p, '.git')) || existsSync(resolve(p, 'package.json'))) return true;
+    const parent = dirname(p);
+    if (parent === p) return false; // reached the filesystem root
+    p = parent;
+  }
+}
 {
-  const needsOverride = !process.env.TMPDIR || !existsSync(process.env.TMPDIR);
+  const cur = process.env.TMPDIR;
+  const needsOverride = !cur || !existsSync(cur) || tmpdirIsInsideRepo(cur);
   if (needsOverride) {
     const shortTmp = '/tmp/pcv';
     mkdirSync(shortTmp, { recursive: true });
