@@ -252,6 +252,19 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
           : layer === 'integration'
             ? 90_000
             : 120_000,
+      // WI-1544 (2026-07-02): ignore ONE benign infra race, nothing else. Under a
+      // full parallel run (~2.4k files, forks pool) a worker whose tests ALL passed
+      // can emit a final console line while its rpc channel is closing; vitest
+      // surfaces that as an unhandled `EnvironmentTeardownError: Closing rpc while
+      // "onUserConsoleLog" was pending` attributed to whichever file the worker ran,
+      // and the whole run exits 1 with 25k tests green. Not reproducible in
+      // isolation (load-dependent), carries no assertion signal — a lost console
+      // line at worst. Every other unhandled error still fails the run.
+      onUnhandledError: (error) =>
+        error?.name === 'EnvironmentTeardownError' &&
+        /Closing rpc while "onUserConsoleLog" was pending/.test(String(error?.message))
+          ? false
+          : undefined,
       hookTimeout: layer === 'integration' ? 90_000 : 60_000,
       setupFiles: finalSetup,
       globalSetup,
