@@ -44,9 +44,25 @@
  *    each file's start makes the UNSET default reliable; a test that needs a pin
  *    sets it itself.
  *
+ *  - PAPERCUSP_VOICE_IPC_DIR (redirected, not scrubbed) — the voice-socket state root
+ *    (sockets/ + voice-ipc.json). Without a redirect, any test that (transitively)
+ *    starts the local voice socket reaps the REAL ~/.papercusp/sockets — an orphaned
+ *    socket on the host then emits a GC console.error that vitest-fail-on-console turns
+ *    into a red (2026-07-01: 3,889 orphaned sockets on the dev box redded
+ *    local-audio-socket in the green-checkpoint) — and overwrites the live
+ *    ~/.papercusp/voice-ipc.json discovery file out from under the running operator.
+ *    Redirect to a per-worker tmpdir. THE PATTERN: unit tests must never read/write the
+ *    real ~/.papercusp; any state-path env seam (PAPERCUSP_*_DIR) that keeps them out of
+ *    it belongs in this block, redirected to a tmpdir the same way.
+ *
  * Keep this list to PROVEN leak classes — broad env wipes hide real bugs.
  */
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 process.env.PAPERCUSP_PGBOUNCER ??= '0';
+process.env.PAPERCUSP_VOICE_IPC_DIR ??= mkdtempSync(join(tmpdir(), 'voice-ipc-hermetic-'));
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_HIVE_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
