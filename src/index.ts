@@ -34,6 +34,7 @@ export { getTestTypesense, teardownTestTypesense } from './typesense-container.t
 export type { TestTypesense } from './typesense-container.ts';
 export { setupMsw, msw } from './msw.ts';
 export { makeFixture, makeFixtures, _resetFixtureCounters } from './make-fixture.ts';
+export { resolveRepoFile, readRepoFile } from './repo-file.ts';
 export { honoTestClient } from './hono-test-client.ts';
 export type { HonoTestClient, HonoTestResponse, HonoTestClientOptions, RequestableApp } from './hono-test-client.ts';
 // NOTE: bootNestTestApp is intentionally NOT re-exported here — import it from
