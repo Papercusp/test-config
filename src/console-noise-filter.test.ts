@@ -45,6 +45,14 @@ describe('isSilencedConsoleMessage', () => {
     });
   });
 
+  it('silences the implement-worker-exit getPayload-failure deliberate warn (WI-1660 full-suite-only spy-timing flake)', () => {
+    expect(
+      isSilencedConsoleMessage(
+        format('[implement-worker-exit] getPayload failed for %s (treating prior deaths as 0):', 'EI-716', new Error('pg down')),
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(

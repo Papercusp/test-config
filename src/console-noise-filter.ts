@@ -31,5 +31,17 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // vitest-config.ts ("runner robustness, not test weakening").
   if (msg.includes('connection slots are reserved')) return true;
   if (msg.includes('too many clients already')) return true;
+  // implement-worker-exit.test.ts's "getPayload failure" test deliberately spies
+  // console.warn (vi.spyOn(...).mockImplementation) around the ONE intentional,
+  // best-effort warn recordImplementWorkerExit emits on a getPayload error
+  // (implement-worker-exit.ts's own doc: "never blocks the back-edge from
+  // recording"). Proven FULL-SUITE-ONLY flake (WI-1660): passes standalone and
+  // as a whole file every time, but under the full ~2.4k-file forks-pool run the
+  // spy occasionally loses the race against this setup's own beforeEach/afterEach
+  // console.warn wrapping, so the DELIBERATE warn is seen by the tracker instead
+  // of the spy. The message text is specific enough that silencing it can't hide
+  // a real defect elsewhere. Same philosophy as the PG connection-slot entries
+  // above: a proven full-suite-only timing artifact, not a code signal.
+  if (msg.includes('[implement-worker-exit] getPayload failed for')) return true;
   return false;
 }
