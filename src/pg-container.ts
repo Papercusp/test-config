@@ -84,6 +84,15 @@ export interface TestSchemaHandle {
   connectionUri: string;
 }
 
+/**
+ * EI-7207 — writing a LISTEN/NOTIFY integration test against this container?
+ * The first pg_notify after a fresh LISTEN is fast (~0.5-1.3s) in isolation,
+ * but can take 4-8+ SECONDS to arrive when this box is running many other
+ * PG-gated test files concurrently (10+ fleet agents' testcontainers/vitest
+ * workers competing for CPU/Docker at once) — not a logic bug in your code.
+ * Budget generous waitFor/test timeouts (15s+) for a LISTEN/NOTIFY assertion
+ * from the start rather than debugging apparent timeouts as a defect.
+ */
 export async function withTestSchema(): Promise<TestSchemaHandle> {
   const connectionUri = await getTestPg();
   const schema = `t_${randomBytes(6).toString('hex')}`;
