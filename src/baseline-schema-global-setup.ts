@@ -33,6 +33,7 @@ import postgres from 'postgres';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -74,11 +75,13 @@ const BOOT_PREREQS_DDL = `
 `;
 
 export default async function setup({ provide }: GlobalSetupContext) {
-  const container = await new PostgreSqlContainer('pgvector/pgvector:pg16')
-    .withDatabase('papercusp_it')
-    .withUsername('it_admin')
-    .withPassword('it_admin')
-    .start();
+  const container = await withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
+    new PostgreSqlContainer('pgvector/pgvector:pg16')
+      .withDatabase('papercusp_it')
+      .withUsername('it_admin')
+      .withPassword('it_admin')
+      .start(),
+  );
   const dsn = container.getConnectionUri();
 
   // Exercise the real boot-path migration runner (resolved from the discovered

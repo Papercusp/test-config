@@ -1,5 +1,6 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { randomBytes } from 'node:crypto';
+import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 
 let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
 
@@ -33,10 +34,12 @@ export async function getTestPg(): Promise<string> {
     // postgres:16-alpine offered is still present (same PG major), so existing
     // Restart integration tests are unaffected.
     containerPromise = (async () => {
-      const container = await new PostgreSqlContainer('pgvector/pgvector:pg16')
-        .withDatabase('papercusp_test')
-        .withReuse()
-        .start();
+      const container = await withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
+        new PostgreSqlContainer('pgvector/pgvector:pg16')
+          .withDatabase('papercusp_test')
+          .withReuse()
+          .start(),
+      );
       // Heal the cluster-global framework roles once per container (see above).
       const res = await container.exec([
         'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'test', '-d', 'papercusp_test', '-c', FRAMEWORK_ROLES_DDL,

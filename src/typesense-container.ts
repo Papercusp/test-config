@@ -1,4 +1,5 @@
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers';
+import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 
 export interface TestTypesense {
   /** Base URL, e.g. http://127.0.0.1:49xxx */
@@ -25,17 +26,19 @@ let typesensePromise: Promise<StartedTestContainer> | null = null;
 
 export async function getTestTypesense(): Promise<TestTypesense> {
   if (!typesensePromise) {
-    typesensePromise = new GenericContainer('typesense/typesense:29.0')
-      .withExposedPorts(8108)
-      .withEnvironment({
-        TYPESENSE_DATA_DIR: '/data',
-        TYPESENSE_API_KEY: TEST_TYPESENSE_API_KEY,
-        TYPESENSE_ENABLE_CORS: 'true',
-      })
-      .withTmpFs({ '/data': 'rw' })
-      .withWaitStrategy(Wait.forHttp('/health', 8108).forStatusCode(200))
-      .withReuse()
-      .start();
+    typesensePromise = withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
+      new GenericContainer('typesense/typesense:29.0')
+        .withExposedPorts(8108)
+        .withEnvironment({
+          TYPESENSE_DATA_DIR: '/data',
+          TYPESENSE_API_KEY: TEST_TYPESENSE_API_KEY,
+          TYPESENSE_ENABLE_CORS: 'true',
+        })
+        .withTmpFs({ '/data': 'rw' })
+        .withWaitStrategy(Wait.forHttp('/health', 8108).forStatusCode(200))
+        .withReuse()
+        .start(),
+    );
   }
   const container = await typesensePromise;
   const host = container.getHost();
