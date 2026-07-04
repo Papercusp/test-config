@@ -126,6 +126,20 @@ export interface CreateFreshTestDbOptions {
 // the rest reuse — so the heavy provision runs once per container, not per file.
 const templateBuilds = new Map<string, Promise<string>>();
 
+/** Comment stamped on a template database AFTER a successful build — the
+ *  readiness marker `buildTemplate` requires before serving a template. A
+ *  `tmpl_*` row WITHOUT it is a partial from a crashed/killed build and must
+ *  never be cloned (WI-1992: a mid-build death used to leave a half-migrated
+ *  template under the final name, and the bare `pg_database` existence check
+ *  then served it to EVERY later clone — a whole-section mass-fail). */
+const TEMPLATE_READY_MARK = 'pc-template-ready';
+
+async function terminateBackends(admin: postgres.Sql, dbName: string): Promise<void> {
+  await admin.unsafe(
+    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${dbName}' AND pid <> pg_backend_pid()`,
+  );
+}
+
 async function buildTemplate(key: string, provision: (url: string) => Promise<void>): Promise<string> {
   const adminUri = await getTestPg();
   const name = `tmpl_${key}`;
@@ -136,15 +150,51 @@ async function buildTemplate(key: string, provision: (url: string) => Promise<vo
     // container (mirrors the framework-roles advisory lock). Held across provision.
     await admin.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
     try {
-      const rows = (await admin.unsafe(`SELECT 1 FROM pg_database WHERE datname = '${name}'`)) as unknown[];
-      if (rows.length === 0) {
-        await admin.unsafe(`CREATE DATABASE "${name}"`);
+      // A template is only servable when it carries the readiness mark — stamped
+      // strictly AFTER provision + rename succeeded, so a partial build can never
+      // satisfy this check.
+      const ready = (await admin.unsafe(
+        `SELECT 1
+           FROM pg_database d
+           JOIN pg_shdescription c ON c.objoid = d.oid AND c.classoid = 'pg_database'::regclass
+          WHERE d.datname = '${name}' AND c.description = '${TEMPLATE_READY_MARK}'`,
+      )) as unknown[];
+      if (ready.length === 0) {
+        // A final-name row WITHOUT the mark is a partial from a crashed build (or a
+        // pre-hardening build) — drop it LOUDLY (terminate any leaked backends first;
+        // the old `.catch(() => {})` silent-drop is exactly how partials survived).
+        const exists = (await admin.unsafe(`SELECT 1 FROM pg_database WHERE datname = '${name}'`)) as unknown[];
+        if (exists.length > 0) {
+          await terminateBackends(admin, name);
+          await admin.unsafe(`DROP DATABASE IF EXISTS "${name}"`);
+        }
+        // Sweep leftovers of OUR key's crashed builds (safe: the advisory lock means
+        // no live fork is building this key right now). Other keys' builds are
+        // untouched — their names embed their own key.
+        const stale = (await admin.unsafe(
+          `SELECT datname FROM pg_database WHERE datname LIKE 'tmpl_bld_${key}_%'`,
+        )) as Array<{ datname: string }>;
+        for (const s of stale) {
+          await terminateBackends(admin, s.datname);
+          await admin.unsafe(`DROP DATABASE IF EXISTS "${s.datname}"`).catch(() => {});
+        }
+        // Build under a TEMP name and rename into place only on success — the
+        // final name is only ever a COMPLETE schema (rename is atomic in PG).
+        const bld = `tmpl_bld_${key}_${randomBytes(4).toString('hex')}`;
+        await admin.unsafe(`CREATE DATABASE "${bld}"`);
         try {
-          await provision(swapDbName(adminUri, name)); // opens + CLOSES its own client ⇒ no lingering conn ⇒ cloneable
+          await provision(swapDbName(adminUri, bld)); // opens + CLOSES its own client ⇒ no lingering conn ⇒ renameable
         } catch (err) {
-          await admin.unsafe(`DROP DATABASE IF EXISTS "${name}"`).catch(() => {});
+          // Best-effort drop; a survivor under tmpl_bld_* is HARMLESS (never looked
+          // up as a template) and the sweep above collects it next build.
+          await terminateBackends(admin, bld).catch(() => {});
+          await admin.unsafe(`DROP DATABASE IF EXISTS "${bld}"`).catch(() => {});
           throw err;
         }
+        // Paranoia: a backend the provision leaked would block the rename.
+        await terminateBackends(admin, bld);
+        await admin.unsafe(`ALTER DATABASE "${bld}" RENAME TO "${name}"`);
+        await admin.unsafe(`COMMENT ON DATABASE "${name}" IS '${TEMPLATE_READY_MARK}'`);
       }
     } finally {
       await admin.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`);
