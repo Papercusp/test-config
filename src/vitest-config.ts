@@ -142,6 +142,14 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   // Turn the silent "No test files found" footgun into an actionable error when
   // an integration/browser test is run by path under the unit config.
   if (layer === 'unit') guardLayeredTestPathUnderUnit();
+  // EI-6802: on the shared dev box, Docker can leave testcontainers-ryuk
+  // containers stuck in Created; subsequent testcontainers sessions then hang
+  // before setup reaches user code. Integration helpers use reusable containers
+  // and explicit per-test DB/schema cleanup, so default the integration layer to
+  // the proven no-Ryuk path while still honoring an explicit caller override.
+  if (layer === 'integration' && process.env.TESTCONTAINERS_RYUK_DISABLED == null) {
+    process.env.TESTCONTAINERS_RYUK_DISABLED = 'true';
+  }
   const finalSetup = allowConsoleNoise
     ? [HERMETIC_ENV_SETUP, ...setupFiles]
     : [HERMETIC_ENV_SETUP, FAIL_ON_CONSOLE_SETUP, ...setupFiles];
