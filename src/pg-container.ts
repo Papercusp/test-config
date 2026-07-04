@@ -51,7 +51,24 @@ export async function getTestPg(): Promise<string> {
   return container.getConnectionUri();
 }
 
+/**
+ * DELIBERATE NO-OP unless `FORCE_TEST_PG_TEARDOWN=1` (WI-1992).
+ *
+ * The container is `withReuse()` — ONE docker container shared by EVERY vitest
+ * process on the box (all forks of this run, other packages' concurrent runs,
+ * the green-checkpoint). `stop()` from any single test file's afterAll therefore
+ * killed the container out from under every OTHER in-flight suite: the first
+ * file to finish nuked the rest into a CONNECTION_CLOSED / ECONNREFUSED /
+ * "removal in progress" cascade (the operator-core 233-fail mass-fail class —
+ * ~12 apps/operator test files called this in afterAll, gated on a KEEP_TEST_PG
+ * env NOTHING ever set). A reused container is box-level infrastructure: its
+ * lifecycle belongs to docker/the operator, never to one test's teardown.
+ *
+ * The escape hatch is for a HUMAN/script deliberately reclaiming the container
+ * while nothing is running — never for a suite.
+ */
 export async function teardownTestPg(): Promise<void> {
+  if (process.env.FORCE_TEST_PG_TEARDOWN !== '1') return;
   if (containerPromise) {
     const c = await containerPromise;
     await c.stop();
