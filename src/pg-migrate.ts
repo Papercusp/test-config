@@ -215,6 +215,12 @@ export async function getOrBuildTemplate(key: string, provision: (url: string) =
   if (!p) {
     p = buildTemplate(key, provision);
     templateBuilds.set(key, p);
+    // Do NOT cache a rejection: a transient build failure (container hiccup, a
+    // killed sibling fork) would otherwise pin every later caller in this
+    // process to the same stale error even after the cause cleared (WI-1992).
+    p.catch(() => {
+      if (templateBuilds.get(key) === p) templateBuilds.delete(key);
+    });
   }
   return p;
 }
