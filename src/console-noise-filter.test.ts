@@ -65,6 +65,28 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the hive-directory best-effort publish-failure warn (WI-2994 full-suite attribution race)', () => {
+    // wireHiveDirectoryAtBoot (hive-directory-boot.ts) deliberately catches a
+    // per-hive publish failure and warns rather than breaking harness boot (its
+    // own header: "a directory failure must NEVER break harness boot"). The
+    // "device keychain not wired" state is a normal pre-boot-wiring condition,
+    // not a code defect — and per the WI-1660/seed:git precedent above, a
+    // deliberate best-effort warn like this one gets misattributed to whatever
+    // unrelated test is running in the same forks-pool worker when it fires
+    // during a full-suite run (it never fires in isolated/whole-file runs of
+    // hive-directory-boot.test.ts or hives.test.ts, which is why this only
+    // shows up under `npm run test:affected` on the full tree).
+    expect(
+      isSilencedConsoleMessage(
+        format(
+          '[hive-directory] failed to publish hive %s: %s',
+          'ash',
+          'hive-directory: device keychain not wired (call setHiveDirectoryTransport at boot)',
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(

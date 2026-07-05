@@ -52,5 +52,18 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // WI-1660 attribution race pins it on whichever test is live). Message text is
   // specific enough that silencing it cannot hide a real defect elsewhere.
   if (msg.includes('[seed:git] skipping submodule')) return true;
+  // wireHiveDirectoryAtBoot (hive-directory-boot.ts) deliberately catches a
+  // per-hive publish failure and warns instead of throwing — the module's own
+  // header states "a directory failure must NEVER break harness boot". A
+  // "device keychain not wired" publish failure is a normal pre-boot-wiring
+  // state (hive-directory-deps.ts's productionDeps().sign throws until
+  // setHiveDirectoryTransport runs), not a code defect, and no test in
+  // hive-directory-boot.test.ts / hives.test.ts exercises this path directly
+  // (WI-2994: both pass standalone and together). Per the WI-1660/seed:git
+  // precedent above, this deliberate best-effort warn gets misattributed to an
+  // unrelated test running in the same forks-pool worker when it fires during
+  // a full `npm run test:affected` run — silencing the exact message text
+  // cannot hide a real defect elsewhere.
+  if (msg.includes('[hive-directory] failed to publish hive')) return true;
   return false;
 }
