@@ -22,15 +22,22 @@
  *    them over sibling derivation, so workspace-map tests asserting derivation
  *    get the runner's real paths (third 2026-06-11 checkpoint red).
  *
- *  - PAPERCUSP_PGBOUNCER (derived, not pinned) — `pgbouncerEnabled()` defaults ON for a
- *    SERVER-class host (the dev box / a dedicated CI server) even when the env is unset, so
- *    `getOrgPg()`'s `maybePgbouncer()` rewrites every org connection to 127.0.0.1:6432 — the
- *    host's pooler. Integration tests point getOrgPg at a throwaway TESTCONTAINER with NO
- *    bouncer, so the reroute hits the WRONG Postgres: a FATAL 08P01 under transaction pooling,
- *    or "no such database: org_<rand>" against the host PG (and silently pollutes it). The
- *    classic "green in CI (workstation-class), red on the dev box (server-class)" leak. Pin it
- *    OFF as the test default; a test that genuinely exercises the bouncer path sets
- *    PAPERCUSP_PGBOUNCER itself (the `??=` respects an explicit value).
+ *  - PAPERCUSP_PGBOUNCER (unconditionally scrubbed, like every var above) — `pgbouncerEnabled()`
+ *    defaults ON for a SERVER-class host (the dev box / a dedicated CI server) even when the env
+ *    is unset, so `getOrgPg()`'s `maybePgbouncer()` rewrites every org connection to
+ *    127.0.0.1:6432 — the host's pooler. Integration tests point getOrgPg at a throwaway
+ *    TESTCONTAINER with NO bouncer, so the reroute hits the WRONG Postgres: a FATAL 08P01 under
+ *    transaction pooling, or "no such database: org_<rand>" (PgBouncer's own reject message for a
+ *    db name outside its pool list) against the host's real pooler (and silently pollutes the
+ *    host's real native PG). The classic "green in CI (workstation-class), red on the dev box
+ *    (server-class)" leak (WI-2839: seed-any-hive.integration.test.ts 13/13 red this way).
+ *    Originally used `??=` reasoning "a test that genuinely exercises the bouncer path sets it
+ *    itself" — but that's the SAME agent-spawn-pollution class as PAPERCUSP_WORKSPACE_ID above: an
+ *    orchestrator/spawn env can hand a running process an already-set '1' (server-class default)
+ *    before vitest ever starts, and `??=` can't see past that. Force it OFF unconditionally, same
+ *    as every other var in this file — a test that genuinely exercises the bouncer path still sets
+ *    PAPERCUSP_PGBOUNCER itself in its OWN beforeAll/test body, which runs AFTER this file's
+ *    module-level scrub and so still wins.
  *
  *  - PAPERCUSP_HIVE_HOME_SLUG — the operator-home harness pointer
  *    (operatorHomeHarnessSlug() reads it LIVE, no cache). Tests asserting the UNSET
@@ -61,7 +68,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-process.env.PAPERCUSP_PGBOUNCER ??= '0';
+process.env.PAPERCUSP_PGBOUNCER = '0';
 process.env.PAPERCUSP_VOICE_IPC_DIR ??= mkdtempSync(join(tmpdir(), 'voice-ipc-hermetic-'));
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_HIVE_HOME_SLUG;
