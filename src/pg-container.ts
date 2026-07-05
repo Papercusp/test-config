@@ -28,14 +28,21 @@ const FRAMEWORK_ROLES_DDL = `
 
 export async function getTestPg(): Promise<string> {
   if (!containerPromise) {
-    // pgvector/pgvector:pg16 — a PG16 superset that bundles the `vector`
+    // pgvector/pgvector:pg18 — a PG18 superset that bundles the `vector`
     // extension. Required because the squashed 000-baseline.sql schema (Papercusp)
-    // has vector(N) columns; a plain postgres:16-alpine can't build it. Everything
-    // postgres:16-alpine offered is still present (same PG major), so existing
-    // Restart integration tests are unaffected.
+    // has vector(N) columns; a plain postgres:18-alpine can't build it.
+    //
+    // WI-2942 (2026-07-05): bumped from pg16 -> pg18 to match the shipped/embedded
+    // operator, which runs PostgreSQL 18.3 (embedded-postgres 18.3.0-beta.17). PG16
+    // silently ALLOWED behavior PG18 REJECTS (e.g. a DELETE against a REPLICA
+    // IDENTITY FULL table with a generated column in a delete-publishing
+    // publication — WI-2914), so testing against PG16 let a PG18-only bug ship to
+    // the packaged desktop uncaught. pgvector/pgvector:pg18 exists on Docker Hub
+    // (verified via `docker manifest inspect` + a version pull: reports
+    // "PostgreSQL 18.4 (Debian 18.4-1.pgdg12+1)" — same major as the shipped 18.3).
     containerPromise = (async () => {
       const container = await withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
-        new PostgreSqlContainer('pgvector/pgvector:pg16')
+        new PostgreSqlContainer('pgvector/pgvector:pg18')
           .withDatabase('papercusp_test')
           .withReuse()
           .start(),
