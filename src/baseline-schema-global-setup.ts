@@ -75,8 +75,12 @@ const BOOT_PREREQS_DDL = `
 `;
 
 export default async function setup({ provide }: GlobalSetupContext) {
+  // WI-2942 (2026-07-05): pg16 -> pg18, to match the shipped/embedded operator
+  // (PostgreSQL 18.3) — see libs/test-config/src/pg-container.ts for the full
+  // rationale (PG16 silently allowed a DELETE PG18 rejects; WI-2914 shipped
+  // uncaught because CI tested the wrong major).
   const container = await withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
-    new PostgreSqlContainer('pgvector/pgvector:pg16')
+    new PostgreSqlContainer('pgvector/pgvector:pg18')
       .withDatabase('papercusp_it')
       .withUsername('it_admin')
       .withPassword('it_admin')

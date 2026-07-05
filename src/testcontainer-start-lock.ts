@@ -33,6 +33,37 @@ async function readOwner(lockDir: string): Promise<string> {
   }
 }
 
+/**
+ * True only when we can POSITIVELY confirm the lock's recorded owner process is
+ * dead: same host (a cross-host pid means nothing — never claim dead across
+ * hosts) AND `process.kill(pid, 0)` reports ESRCH (no such process). Any other
+ * outcome (different host, unparseable owner.json, EPERM/alive, or any other
+ * error) returns false — this must never produce a false "dead" that reclaims a
+ * live holder's lock.
+ */
+async function isOwnerProcessConfirmedDead(lockDir: string): Promise<boolean> {
+  let raw: string;
+  try {
+    raw = await readFile(join(lockDir, 'owner.json'), 'utf8');
+  } catch {
+    return false;
+  }
+  let owner: { pid?: unknown; host?: unknown };
+  try {
+    owner = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (typeof owner.pid !== 'number' || typeof owner.host !== 'string') return false;
+  if (owner.host !== hostname()) return false;
+  try {
+    process.kill(owner.pid, 0);
+    return false; // no throw ⇒ signal delivered ⇒ process exists (or we lack permission ⇒ assume alive)
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
 export interface TestcontainerStartLockOptions {
   timeoutMs?: number;
   staleMs?: number;
@@ -86,6 +117,22 @@ export async function withTestcontainerStartLock<T>(
         .then((s) => Date.now() - s.mtimeMs)
         .catch(() => 0);
       if (lockAgeMs > staleMs) {
+        await rm(lockDir, { recursive: true, force: true });
+        continue;
+      }
+
+      // EI-7818: age-based staleness (above) can NEVER fire under the DEFAULT
+      // config, because DEFAULT_TIMEOUT_MS (180s) is smaller than DEFAULT_STALE_MS
+      // (600s) — a caller always hits its own `elapsed > timeoutMs` throw below
+      // long before the lock is old enough to be judged stale, so a crashed
+      // holder's lock wedges EVERY subsequent caller for a full timeoutMs, FOREVER
+      // (reproduced live 2026-07-05: a dead pid's lock, ~9 min old, had already
+      // failed two separate 180s/400s-wrapped waits without ever reclaiming).
+      // Reclaim immediately, independent of age, the moment we can POSITIVELY
+      // confirm the recorded owner process no longer exists (same host + ESRCH) —
+      // this closes the gap the timing race leaves open without needing to guess
+      // at timeout/stale constant tuning.
+      if (await isOwnerProcessConfirmedDead(lockDir)) {
         await rm(lockDir, { recursive: true, force: true });
         continue;
       }
