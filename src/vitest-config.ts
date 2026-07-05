@@ -16,7 +16,15 @@ export interface DefineVitestConfigOptions {
   allowConsoleNoise?: boolean;
 }
 
-const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**'];
+// EI-7787: `.papercusp/**` is the agent scratch/tmp/log/state tree (canary reports,
+// worker logs, tmp-* vitest sandboxes, test-data-generator fixture droppings, …) —
+// never package source or a real test suite. A broad default-include vitest run
+// (`**/*.test.ts` with no narrower `include`) previously glob-matched stray fixture
+// files left under it (e.g. `.papercusp/scratch/**/tdg-*/…/__tests__/*.test.tsx`),
+// spamming hundreds of "No test suite found in file" false failures unrelated to the
+// package actually under test. Exclude the whole tree so ANY package's default run
+// is immune to whatever another tool drops there.
+const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.papercusp/**'];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
