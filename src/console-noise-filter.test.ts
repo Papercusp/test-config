@@ -53,6 +53,18 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the seed:git skipped-submodule deliberate warn (checkpoint-tree full-suite attribution race)', () => {
+    expect(
+      isSilencedConsoleMessage(
+        format(
+          "[seed:git] skipping submodule 'libs/retired' (%s) — not checked out in %s; a fresh member will cold-clone it.",
+          '/tmp/x/libs/retired',
+          '/tmp/x',
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(

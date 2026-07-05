@@ -43,5 +43,14 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // a real defect elsewhere. Same philosophy as the PG connection-slot entries
   // above: a proven full-suite-only timing artifact, not a code signal.
   if (msg.includes('[implement-worker-exit] getPayload failed for')) return true;
+  // seed-provider-git's readSubmodules emits ONE deliberate, informative warn when
+  // .gitmodules declares a submodule with no checked-out working tree — the exact
+  // skip behavior its own test exercises ("a fresh member will cold-clone it";
+  // seed-provider-git.ts). Passes standalone and as a whole file; red ONLY on the
+  // green gate's full forks-pool run in the CHECKPOINT tree (where real submodules
+  // are legitimately not checked out, so any real-tree cut path fires it and the
+  // WI-1660 attribution race pins it on whichever test is live). Message text is
+  // specific enough that silencing it cannot hide a real defect elsewhere.
+  if (msg.includes('[seed:git] skipping submodule')) return true;
   return false;
 }
