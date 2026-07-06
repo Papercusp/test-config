@@ -10,7 +10,11 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import AdminTestRunsReporter, { buildOutputTail, shouldRecordTestRunPath } from './admin-test-runs-reporter';
+import AdminTestRunsReporter, {
+  buildOutputTail,
+  captureReporterSaturationSnapshot,
+  shouldRecordTestRunPath,
+} from './admin-test-runs-reporter';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -59,6 +63,12 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       errors: () => [],
     } as unknown as Parameters<typeof r.onTestModuleEnd>[0];
     expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
+  });
+
+  it('captures the reporter saturation fields used by harness_shared.test_runs', () => {
+    const snap = captureReporterSaturationSnapshot();
+    expect(snap.rssMb).toEqual(expect.any(Number));
+    expect(snap.loopLagP95Ms === null || typeof snap.loopLagP95Ms === 'number').toBe(true);
   });
 
   it('does not record retired, scratch, or sibling-checkout test paths', () => {
