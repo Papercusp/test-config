@@ -10,7 +10,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import AdminTestRunsReporter, { buildOutputTail } from './admin-test-runs-reporter';
+import AdminTestRunsReporter, { buildOutputTail, shouldRecordTestRunPath } from './admin-test-runs-reporter';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -59,6 +59,17 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       errors: () => [],
     } as unknown as Parameters<typeof r.onTestModuleEnd>[0];
     expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
+  });
+
+  it('does not record retired, scratch, or sibling-checkout test paths', () => {
+    expect(shouldRecordTestRunPath('_retired/snapshot-system/x.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('libs/papercusp/_retired/orchestrator-run-loop/src/x.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('.papercusp/scratch/tdg-123/src/x.test.tsx')).toBe(false);
+    expect(shouldRecordTestRunPath('apps/operator/.papercusp/scratch/tdg-123/src/x.test.tsx')).toBe(false);
+    expect(shouldRecordTestRunPath('papercupai-workspace/papercup-checkpoint/apps/operator/x.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('papercupai-workspace/papercusp-checkpoint/apps/operator/x.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('papercupai-workspace/papercup-staging/apps/operator/x.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('packages/operator-core/lib/testing-orphan-runs.test.ts')).toBe(true);
   });
 
   it('buildOutputTail captures failed TEST-CASE errors when the module has no top-level errors', () => {

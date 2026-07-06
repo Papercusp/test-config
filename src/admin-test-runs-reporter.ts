@@ -111,6 +111,19 @@ function toWorkspaceRel(absPath: string): string {
   return relative(root, absPath).split(/[/\\]/).join(posix.sep);
 }
 
+const NON_SIGNAL_PREFIXES = [
+  'papercupai-workspace/papercup-checkpoint/',
+  'papercupai-workspace/papercusp-checkpoint/',
+  'papercupai-workspace/papercup-staging/',
+] as const;
+
+export function shouldRecordTestRunPath(filePath: string): boolean {
+  if (filePath.startsWith('_retired/') || filePath.includes('/_retired/')) return false;
+  if (filePath.startsWith('.papercusp/scratch/tdg-') || filePath.includes('/.papercusp/scratch/tdg-')) return false;
+  if (NON_SIGNAL_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return false;
+  return true;
+}
+
 function moduleStatus(m: TestModule): TestRunRow['status'] {
   let state: string;
   try {
@@ -277,6 +290,7 @@ export default class AdminTestRunsReporter implements Reporter {
   onTestModuleEnd(testModule: TestModule): void {
     try {
       const filePath = toWorkspaceRel(testModule.moduleId);
+      if (!shouldRecordTestRunPath(filePath)) return;
       const status = moduleStatus(testModule);
       let durationMsRaw = 0;
       try {
