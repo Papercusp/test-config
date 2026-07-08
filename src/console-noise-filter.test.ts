@@ -87,6 +87,25 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the hive-directory boot-join-skipped best-effort warn (WI-1660 full-suite spy-race flake)', () => {
+    // wireHiveDirectoryForWorkspace (hive-directory-boot.ts) deliberately catches an
+    // identity-resolution failure on the lazy boot-join and warns rather than throwing
+    // (its header: a gh-unauthenticated box SKIPS the directory and "must NEVER break
+    // harness boot"). hive-directory-ensure.test.ts exercises + asserts this warn via a
+    // console.warn spy; it only escapes the spy under the full forks-pool green-checkpoint
+    // (the WI-1660/WI-2994 attribution race), so silencing the exact text keeps the gate
+    // green without hiding a real defect.
+    expect(
+      isSilencedConsoleMessage(
+        format(
+          '[hive-directory] boot-join skipped for workspace %s: %s',
+          'ws',
+          'gh auth not ready',
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(

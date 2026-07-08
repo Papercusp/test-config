@@ -65,5 +65,20 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // a full `npm run test:affected` run — silencing the exact message text
   // cannot hide a real defect elsewhere.
   if (msg.includes('[hive-directory] failed to publish hive')) return true;
+  // ensureHiveDirectoryWired/wireHiveDirectoryForWorkspace (hive-directory-boot.ts)
+  // deliberately catches an identity-resolution failure on the lazy boot-join and
+  // warns instead of throwing — the module's own header: "a gh-unauthenticated box
+  // ... SKIPS the directory and returns null — it must NEVER break harness boot".
+  // hive-directory-ensure.test.ts EXERCISES this path on purpose (its "force retries
+  // after a failed unforced attempt" case spies console.warn and asserts this exact
+  // warn was emitted). Passes standalone and whole-file every time; red ONLY on the
+  // green gate's full forks-pool run, where — per the WI-1660/WI-2994 precedent above
+  // — the test's spy occasionally loses the race against this setup's beforeEach/
+  // afterEach console.warn wrapping, so the DELIBERATE warn reaches the tracker
+  // instead of the spy and misattributes to whichever test is live in the worker.
+  // The message text is specific enough that silencing it cannot hide a real defect
+  // elsewhere (a real regression on this path surfaces as a thrown error / a failed
+  // assertion, not this incidental best-effort log line).
+  if (msg.includes('[hive-directory] boot-join skipped for workspace')) return true;
   return false;
 }
