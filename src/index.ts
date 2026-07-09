@@ -25,7 +25,7 @@ export const ADMIN_TEST_RUNS_REPORTER_PATH = fileURLToPath(
   new URL('./admin-test-runs-reporter.ts', import.meta.url),
 );
 
-export { getTestPg, teardownTestPg, withTestSchema } from './pg-container.ts';
+export { getTestPg, teardownTestPg, withTestSchema, TEST_PG_IMAGE } from './pg-container.ts';
 export type { TestSchemaHandle } from './pg-container.ts';
 export { createFreshTestDb, createMigratedTestDb, provisionRestartTestDb, getOrBuildTemplate } from './pg-migrate.ts';
 export type { MigratedTestDb, CreateFreshTestDbOptions } from './pg-migrate.ts';

@@ -4,6 +4,17 @@ import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 
 let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
 
+/**
+ * The shared integration-test Postgres image. pgvector/pgvector:pg18 — a PG18
+ * superset bundling the `vector` extension the squashed 000-baseline.sql needs,
+ * matching the shipped/embedded operator (PostgreSQL 18.3, WI-2942). The gym
+ * cycle's own ephemeral provisioning image (`GYM_PROVISION_PG_IMAGE` in
+ * packages/operator-core/lib/gym/gym-db-init.ts) MUST equal this — a skew is
+ * what stranded the gym on pg16 while the test infra + operator moved to pg18
+ * (EI-8784); gym-provision-image.test.ts asserts they stay in lockstep.
+ */
+export const TEST_PG_IMAGE = 'pgvector/pgvector:pg18';
+
 // Framework roles, ensured CREATE-OR-FIX (login + correct password) once per container.
 // The container is shared + REUSED, and roles are cluster-global. Some tests historically
 // created harness_app password-less / NOLOGIN (voice-lease, substrate-outbox-trigger),
@@ -42,7 +53,7 @@ export async function getTestPg(): Promise<string> {
     // "PostgreSQL 18.4 (Debian 18.4-1.pgdg12+1)" — same major as the shipped 18.3).
     containerPromise = (async () => {
       const container = await withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
-        new PostgreSqlContainer('pgvector/pgvector:pg18')
+        new PostgreSqlContainer(TEST_PG_IMAGE)
           .withDatabase('papercusp_test')
           .withReuse()
           .start(),
