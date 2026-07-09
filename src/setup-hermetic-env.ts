@@ -39,7 +39,7 @@
  *    PAPERCUSP_PGBOUNCER itself in its OWN beforeAll/test body, which runs AFTER this file's
  *    module-level scrub and so still wins.
  *
- *  - PAPERCUSP_HIVE_HOME_SLUG — the operator-home harness pointer
+ *  - PAPERCUSP_POT_HOME_SLUG — the operator-home harness pointer
  *    (operatorHomeHarnessSlug() reads it LIVE, no cache). Tests asserting the UNSET
  *    fallback ('no pointer → the legacy default "papercusp"') get a leaked value
  *    instead. The leak is cross-FILE, not spawn-env: sibling tests (hive/*,
@@ -71,7 +71,7 @@ import { join } from 'node:path';
 process.env.PAPERCUSP_PGBOUNCER = '0';
 process.env.PAPERCUSP_VOICE_IPC_DIR ??= mkdtempSync(join(tmpdir(), 'voice-ipc-hermetic-'));
 delete process.env.PAPERCUSP_WORKSPACE_ID;
-delete process.env.PAPERCUSP_HIVE_HOME_SLUG;
+delete process.env.PAPERCUSP_POT_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
 delete process.env.PAPERCUSP_RELEASE_ROOT;
 delete process.env.PAPERCUSP_CHECKPOINT_ROOT;
