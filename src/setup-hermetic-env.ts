@@ -69,6 +69,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 process.env.PAPERCUSP_PGBOUNCER = '0';
+// Same rule as the voice-ipc redirect below — a unit test must never read the real
+// ~/.papercusp. embedded-pg.json is the discovery file for a LIVE Postgres, so once the
+// db resolver actually honors it (it silently did not: the writer emits `url`, the reader
+// demanded `host` — see _parseDiscoveryJson in libs/papercusp/libs/db/src/connection.ts),
+// an unguarded run on a machine with the desktop open would open pools against the
+// developer's REAL database and mutate it. Pin discovery off for every test process.
+// Against the pre-fix resolver this is a no-op: that reader never matched the file.
+process.env.PAPERCUSP_SKIP_PG_DISCOVERY = '1';
 if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
   const voiceIpcHermeticDir = mkdtempSync(join(tmpdir(), 'voice-ipc-hermetic-'));
   process.env.PAPERCUSP_VOICE_IPC_DIR = voiceIpcHermeticDir;
