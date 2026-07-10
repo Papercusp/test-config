@@ -64,12 +64,33 @@
  *
  * Keep this list to PROVEN leak classes — broad env wipes hide real bugs.
  */
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 process.env.PAPERCUSP_PGBOUNCER = '0';
-process.env.PAPERCUSP_VOICE_IPC_DIR ??= mkdtempSync(join(tmpdir(), 'voice-ipc-hermetic-'));
+if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
+  const voiceIpcHermeticDir = mkdtempSync(join(tmpdir(), 'voice-ipc-hermetic-'));
+  process.env.PAPERCUSP_VOICE_IPC_DIR = voiceIpcHermeticDir;
+  // This module runs at the START of every vitest FILE fleet-wide (it's the
+  // first entry in every defineVitestConfig's setupFiles) with no matching
+  // teardown hook of its own — so the tmpdir it mints here was never removed.
+  // At fleet scale that leaked 700k+ directories into the shared TMPDIR
+  // (/tmp/pcv), degrading every mkdir/readdir/stat that touches it (including
+  // the testcontainer start-lock under the same tree) and contributing to
+  // spurious integration-test timeouts + elevated host load fleet-wide
+  // (found + bulk-cleaned 2026-07-09, EI-8888-adjacent). `process.on('exit')`
+  // is the right hook here (not vitest's globalTeardown, which only fires for
+  // the pool's OWN root process, not each per-file worker that actually calls
+  // this) — `rmSync` is safe to use in an 'exit' handler (sync-only context).
+  process.on('exit', () => {
+    try {
+      rmSync(voiceIpcHermeticDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort — never let cleanup fail the process */
+    }
+  });
+}
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_POT_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;

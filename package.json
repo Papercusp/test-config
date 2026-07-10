@@ -15,6 +15,11 @@
       "types": "./src/nest-test-app.ts",
       "import": "./src/nest-test-app.ts",
       "default": "./src/nest-test-app.ts"
+    },
+    "./nuqs-mock": {
+      "types": "./src/nuqs-mock.ts",
+      "import": "./src/nuqs-mock.ts",
+      "default": "./src/nuqs-mock.ts"
     }
   },
   "scripts": {

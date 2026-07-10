@@ -1,5 +1,14 @@
 import { fileURLToPath } from 'node:url';
 
+// ⚠ This barrel statically re-exports heavy node-only test infra (testcontainers,
+// msw, @nestjs/testing, drizzle-orm). A Vite-side jsdom component test (e.g.
+// apps/operator-vite) that imports ANYTHING from '@papercusp/test-config' pulls
+// the WHOLE graph into esbuild's transform — which crashes outright with a
+// misleading "TextEncoder invariant violation" error that looks like a broken
+// Node/jsdom realm, not an import-weight problem (EI-8888). A new lightweight /
+// browser-safe export (like ./nuqs-mock, ./nest) belongs behind its OWN
+// package.json `exports` subpath, never added to this barrel's re-export list.
+
 export { defineVitestConfig, findMisroutedReproTests, MISROUTED_REPRO_TEST } from './vitest-config.ts';
 export type { TestLayer, DefineVitestConfigOptions } from './vitest-config.ts';
 
@@ -33,14 +42,18 @@ export { getTestRedis, teardownTestRedis } from './redis-container.ts';
 export { getTestTypesense, teardownTestTypesense } from './typesense-container.ts';
 export type { TestTypesense } from './typesense-container.ts';
 export { setupMsw, msw } from './msw.ts';
-export { nuqsParsers, createNuqsMock } from './nuqs-mock.ts';
-export type { NuqsMockOptions } from './nuqs-mock.ts';
 export { makeFixture, makeFixtures, _resetFixtureCounters } from './make-fixture.ts';
 export { resolveRepoFile, readRepoFile } from './repo-file.ts';
 export { honoTestClient } from './hono-test-client.ts';
 export type { HonoTestClient, HonoTestResponse, HonoTestClientOptions, RequestableApp } from './hono-test-client.ts';
 // NOTE: bootNestTestApp is intentionally NOT re-exported here — import it from
 // '@papercusp/test-config/nest' so projects without NestJS never load @nestjs/*.
+// NOTE: nuqsParsers/createNuqsMock are intentionally NOT re-exported here either —
+// import from '@papercusp/test-config/nuqs-mock'. This barrel statically re-exports
+// testcontainers/msw/@nestjs-testing/drizzle, which a Vite/jsdom component-test build
+// (apps/operator-vite) has no business transforming; importing the full barrel from
+// a component test crashed esbuild outright (EI-8821 follow-up) rather than merely
+// bloating the bundle.
 
 // Type the value provided by the baseline-schema globalSetup so every consumer
 // package (apps/operator, packages/operator-core, …) sees inject('baselineSchemaDsn')
