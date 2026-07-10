@@ -106,6 +106,21 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the docs-engine MDX-parse-fallback warn (WI-3842: an unrelated doc typo failed the docs-qa retrieval test)', () => {
+    // renderMdxToMarkdown (docs-engine/render-mdx.ts) deliberately degrades a single
+    // malformed doc to a raw-text fallback rather than throwing (EI-5860). The offending
+    // doc already has its own owned detection+repair (content-lint's mdxDetector +
+    // autoFixMdxAngles, wired into the git-sync content guard) that self-heals it on the
+    // next tick, so this warn is transient box weather for the corpus-wide retrieval
+    // test, not a code defect in the test's own subject.
+    expect(
+      isSilencedConsoleMessage(
+        '[docs-engine] MDX parse failed for /abs/path/agent-insights/some-doc.mdx; using raw-text fallback so search/outline still work. ' +
+          'Fix the doc (backtick raw <placeholders> / {expressions}). Cause: Unexpected character `5` (U+0035) before name, expected a character that can start a name, such as a letter, `$`, or `_`',
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(

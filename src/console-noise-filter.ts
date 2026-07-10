@@ -80,5 +80,22 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // elsewhere (a real regression on this path surfaces as a thrown error / a failed
   // assertion, not this incidental best-effort log line).
   if (msg.includes('[hive-directory] boot-join skipped for workspace')) return true;
+  // renderMdxToMarkdown (docs-engine/render-mdx.ts) deliberately catches a single
+  // doc's MDX compile failure (a raw un-backticked `<digit`/`<word>` placeholder or
+  // an unparseable `{expr}`) and degrades to a raw-text fallback so ONE malformed
+  // doc can't blind the whole corpus's search/outline (EI-5860) — the module's own
+  // header states this must NEVER throw. This exact content-error class already has
+  // its OWN owned detection+repair system (packages/operator-core/lib/content-lint's
+  // mdxDetector, wired into the git-sync content guard, with a deterministic
+  // autoFixMdxAngles pre-pass) that self-heals the offending doc on the next
+  // git-sync tick — so the doc gets fixed regardless of this warn. Without silencing,
+  // ANY doc anywhere in the ~600-page corpus with this common typo fails the
+  // UNRELATED full-corpus retrieveDocsContext test (docs-qa.test.ts) via
+  // vitest-fail-on-console (WI-3842), misattributing a content-lint matter to the
+  // wrong file. Message text is specific enough that silencing it cannot hide a
+  // real defect elsewhere (a real regression in renderMdxToMarkdown itself surfaces
+  // as a thrown error / failed assertion in render-mdx.test.ts, not this incidental
+  // best-effort log line).
+  if (msg.includes('[docs-engine] MDX parse failed for')) return true;
   return false;
 }
