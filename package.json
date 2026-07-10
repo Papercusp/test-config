@@ -32,7 +32,8 @@
     "vitest-fail-on-console": "^0.7.1"
   },
   "devDependencies": {
-    "@types/supertest": "^6.0.0"
+    "@types/supertest": "^6.0.0",
+    "nuqs": "^2.8.9"
   },
   "peerDependencies": {
     "@nestjs/common": "^11.0.0",

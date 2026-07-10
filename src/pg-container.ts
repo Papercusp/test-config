@@ -59,14 +59,51 @@ export async function getTestPg(): Promise<string> {
           .start(),
       );
       // Heal the cluster-global framework roles once per container (see above).
-      const res = await container.exec([
-        'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'test', '-d', 'papercusp_test', '-c', FRAMEWORK_ROLES_DDL,
-      ]);
-      if (res.exitCode !== 0) {
-        throw new Error(`getTestPg: framework-role ensure failed (exit ${res.exitCode}): ${res.output}`);
+      //
+      // RETRY ON "in recovery mode" — this container is `.withReuse()`d across
+      // EVERY concurrent vitest process on the box (all forks of this run, other
+      // packages' concurrent runs, the green-checkpoint, ~30+ fleet agents at
+      // once). Docker's reuse-hash matching isn't perfectly stable under that much
+      // concurrent churn, so a fresh `docker ps` regularly shows several
+      // short-lived pgvector/pgvector:pg18 containers being created/torn down
+      // side-by-side with the long-lived ones — and this process can attach to
+      // one that is mid-startup crash-recovery (WAL redo), a normal but BRIEF
+      // (sub-second to a few seconds) PG state, not a real outage (WI-3578 live
+      // finding, 2026-07-09: 3 consecutive integration-test runs on a healthy,
+      // unloaded box each hit `FATAL: the database system is in recovery mode`
+      // on the FIRST framework-role-ensure attempt, then succeeded once retried).
+      // A short bounded retry rides out the window instead of failing every
+      // concurrent suite that happens to touch the container during it.
+      let res: Awaited<ReturnType<typeof container.exec>> | undefined;
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= 6; attempt++) {
+        try {
+          res = await container.exec([
+            'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'test', '-d', 'papercusp_test', '-c', FRAMEWORK_ROLES_DDL,
+          ]);
+          if (res.exitCode === 0) break;
+          lastErr = new Error(`getTestPg: framework-role ensure failed (exit ${res.exitCode}): ${res.output}`);
+        } catch (e) {
+          lastErr = e;
+          res = undefined;
+        }
+        const msg = res ? res.output : lastErr instanceof Error ? lastErr.message : String(lastErr);
+        if (!/in recovery mode/i.test(msg) || attempt === 6) {
+          throw lastErr;
+        }
+        await new Promise((r) => setTimeout(r, attempt * 500));
+      }
+      if (!res || res.exitCode !== 0) {
+        throw lastErr ?? new Error('getTestPg: framework-role ensure failed (unknown error)');
       }
       return container;
-    })();
+    })().catch((e) => {
+      // Don't strand every later caller in this process on a permanently-rejected
+      // promise — a fresh call gets a clean shot at (possibly) a different
+      // container/state instead of replaying the same failure forever.
+      containerPromise = null;
+      throw e;
+    });
   }
   const container = await containerPromise;
   return container.getConnectionUri();

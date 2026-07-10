@@ -33,6 +33,8 @@ export { getTestRedis, teardownTestRedis } from './redis-container.ts';
 export { getTestTypesense, teardownTestTypesense } from './typesense-container.ts';
 export type { TestTypesense } from './typesense-container.ts';
 export { setupMsw, msw } from './msw.ts';
+export { nuqsParsers, createNuqsMock } from './nuqs-mock.ts';
+export type { NuqsMockOptions } from './nuqs-mock.ts';
 export { makeFixture, makeFixtures, _resetFixtureCounters } from './make-fixture.ts';
 export { resolveRepoFile, readRepoFile } from './repo-file.ts';
 export { honoTestClient } from './hono-test-client.ts';
