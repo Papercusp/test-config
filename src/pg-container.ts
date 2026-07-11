@@ -55,6 +55,21 @@ export async function getTestPg(): Promise<string> {
       const container = await withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
         new PostgreSqlContainer(TEST_PG_IMAGE)
           .withDatabase('papercusp_test')
+          // WI-4133: this ONE container is `.withReuse()`d by EVERY vitest
+          // process on the box (all forks, all packages, ~30+ fleet agents at
+          // once) — each opening its own client pool (createFreshPgDb: max 4;
+          // createFreshTestDb/migrated variants similar). The stock PG default
+          // `max_connections=100` (sized for a laptop, per the analogous fix
+          // for the operator's own DB — see agent-insights
+          // pg-connection-exhaustion-too-many-clients) is trivially blown past
+          // by fleet-wide concurrency, surfacing as "sorry, too many clients
+          // already" in heavy operator-boot integration suites (gym
+          // autoloop-cycle, etc.) even though WI-3821's CPU-load admission
+          // gate is healthy — that gate staggers *host load*, not *PG
+          // connection count*, so it does not prevent this. Raising the
+          // ceiling on this test-only container is free (no production data,
+          // no persistence to protect) and mirrors the native-PG fix exactly.
+          .withCommand(['postgres', '-c', 'max_connections=500'])
           .withReuse()
           .start(),
       );
