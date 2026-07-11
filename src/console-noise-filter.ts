@@ -97,5 +97,20 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // as a thrown error / failed assertion in render-mdx.test.ts, not this incidental
   // best-effort log line).
   if (msg.includes('[docs-engine] MDX parse failed for')) return true;
+  // notifyRegistryChanged (harness-registry.ts) fires a FIRE-AND-FORGET background
+  // promise after every registry mutation (dynamic-imports sync-sse, then calls
+  // notifySyncInvalidate) — the module's own header states "Fire-and-forget — a
+  // notify failure never blocks the write". Because it is never awaited by the
+  // caller, the promise can settle well after the triggering test has finished,
+  // landing its console.warn during whatever OTHER test is live in the same
+  // forks-pool worker (WI-4031: federation-all-content-types-sidecar.repro
+  // .integration.test.ts's MEMBER→OWNER case intermittently failed on this, having
+  // done nothing but run right after an earlier mutateHarnessRegistry call's
+  // notify settled late). Same misattribution class as the WI-1660/WI-2994/WI-3842
+  // entries above. Message text is specific enough that silencing it cannot hide a
+  // real defect elsewhere (a real regression in notifyRegistryChanged's write path
+  // surfaces as a thrown error / failed assertion, not this incidental best-effort
+  // log line).
+  if (msg.includes('[harness-registry] sync invalidate failed')) return true;
   return false;
 }

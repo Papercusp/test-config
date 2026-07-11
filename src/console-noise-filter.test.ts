@@ -121,6 +121,24 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the harness-registry fire-and-forget sync-invalidate-notify warn (WI-4031 unawaited-promise attribution race)', () => {
+    // notifyRegistryChanged (harness-registry.ts) is explicitly fire-and-forget — its
+    // own header: "Fire-and-forget — a notify failure never blocks the write" — so the
+    // background promise can settle after the triggering test has already finished,
+    // landing this warn during whatever OTHER test is live in the same forks-pool
+    // worker. Message text is specific enough that silencing it cannot hide a real
+    // defect in the registry write path itself (that surfaces as a thrown error /
+    // failed assertion, not this incidental best-effort log line).
+    expect(
+      isSilencedConsoleMessage(
+        format(
+          '[harness-registry] sync invalidate failed:',
+          new TypeError('notifySyncInvalidate is not a function'),
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(
