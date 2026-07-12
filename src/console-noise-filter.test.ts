@@ -139,6 +139,20 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the mem0 embedder-unavailable warn (warnOnce misattribution across the forks pool)', () => {
+    // Mem0Backend.available() → resolveEmbedder warns once per worker when no embedder is
+    // available — in CI ALWAYS an environment condition (no transformers, no OpenAI key),
+    // never a code defect. warnOnce fires once per process so it lands on whichever test
+    // first touches the memory backend. Silencing the exact prefix cannot hide a real
+    // embedder regression (that surfaces as a thrown error / failed assertion in the
+    // memory suite's dep-injected tests).
+    expect(
+      isSilencedConsoleMessage(
+        '[mem0] embedder unavailable: harrier_forced_but_transformers_not_installed (set memoryEmbedderMode in /settings/user).',
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(

@@ -112,5 +112,17 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // surfaces as a thrown error / failed assertion, not this incidental best-effort
   // log line).
   if (msg.includes('[harness-registry] sync invalidate failed')) return true;
+  // Mem0Backend.available() → resolveEmbedder() (mem0-client.ts warnOnce) emits ONE
+  // best-effort warn when no embedder is available — in the test env ALWAYS an
+  // ENVIRONMENT condition, never a code defect: CI has no @huggingface/transformers
+  // installed and no OpenAI key, so the default 'harrier'/'gemma'/'local' preference
+  // resolves to disabled with a `<mode>_forced_but_transformers_not_installed` /
+  // `..._no_key` reason. warnOnce fires ONCE per worker process, so under the full
+  // forks-pool run it lands on whichever test FIRST touches the memory backend
+  // (work-items-urgent, scheduler:get_next, … — none of which exercise the embedder),
+  // exactly the WI-1660 misattribution class as the entries above. A real embedder
+  // regression surfaces as a thrown error / failed assertion in the memory suite's own
+  // dep-injected tests (configure/resolveEmbedderWith), not this incidental degrade log.
+  if (msg.includes('[mem0] embedder unavailable:')) return true;
   return false;
 }
