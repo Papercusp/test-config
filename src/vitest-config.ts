@@ -146,6 +146,48 @@ export function findMisroutedReproTests(files: readonly string[]): string[] {
   return files.filter((f) => MISROUTED_REPRO_TEST.test(f)).sort();
 }
 
+/**
+ * The shared-host vitest worker cap (WI-4300) — the `{ maxWorkers, minWorkers }`
+ * fragment EVERY vitest config on this box must spread into its `test` block, whether
+ * or not it goes through {@link defineVitestConfig} (the reporter-only bypass configs
+ * spread it directly).
+ *
+ * Resolution (per pool: forks reads VITEST_MAX_FORKS, threads VITEST_MAX_THREADS):
+ *   • env set to a positive number → that cap (the green-checkpoint's 8 / the affected
+ *     gate's 32 keep working unchanged);
+ *   • env EXPLICITLY '0' → uncapped (the deliberate escape hatch for a dedicated host);
+ *   • env absent or garbage → min(32, max(8, cores/4)) — on a shared box, "unset" must
+ *     NEVER mean uncapped: vitest's default pool is ≈ host cores − 1 (~127 forks on the
+ *     128-core dev box), and with ~59 live agent sessions concurrent suites are routine
+ *     (observed: 5 overlapping uncapped runs ≈ 635 runnable tasks, load1 227; this class
+ *     melted the box to load 1000–3000 twice the week of 2026-07-06). Per EI-2590, ~127
+ *     forks also serialize on the single transform server, so the cap is typically
+ *     FASTER even for a solo run.
+ *
+ * minWorkers is pinned to 1 alongside any cap: the repo ROOT still runs vitest 2.1.9
+ * (`npm test`), whose resolveConfig defaults minForks to the HOST CORE COUNT when
+ * minWorkers is unset — 128 min vs a smaller max makes Tinypool throw
+ * `options.minThreads and options.maxThreads must not conflict` at pool creation, the
+ * suite collects ZERO tests, and the green-checkpoint gate goes permanently red.
+ * Pinning minWorkers:1 yields a valid 1..cap pool under BOTH v2.1.9 and v4.
+ */
+export function sharedHostWorkerCap(pool: 'forks' | 'threads' = 'forks'): {
+  maxWorkers?: number;
+  minWorkers?: number;
+} {
+  const raw = pool === 'threads' ? process.env.VITEST_MAX_THREADS : process.env.VITEST_MAX_FORKS;
+  const hostSaneCap = Math.min(32, Math.max(8, Math.floor(availableParallelism() / 4)));
+  const cap =
+    raw === undefined || raw.trim() === ''
+      ? hostSaneCap // absent ⇒ host-sane default (WI-4300)
+      : raw.trim() === '0'
+        ? 0 // explicit 0 ⇒ deliberate uncapped escape hatch
+        : Number(raw) > 0
+          ? Number(raw)
+          : hostSaneCap; // garbage ⇒ safe default, never uncapped
+  return cap > 0 ? { maxWorkers: cap, minWorkers: 1 } : {};
+}
+
 export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig {
   const { layer, setupFiles = [], globalSetup = [], include, exclude = [], allowConsoleNoise = false } = opts;
   // Turn the silent "No test files found" footgun into an actionable error when
@@ -206,57 +248,11 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // Integration tests share real PG schemas (e.g. harness_shared) — running
       // files in parallel races their `DROP SCHEMA CASCADE` teardown. Serialise.
       fileParallelism: layer === 'integration' ? false : undefined,
-      // EI-2590: ACTUALLY apply the worker cap the green-checkpoint sets. It
-      // exports VITEST_MAX_FORKS/THREADS=8 to bound concurrency when the gate
-      // shares the box with the live fleet (buildGreenCheckpointEnv) — but until
-      // now NOTHING read those vars, so the gate ran at vitest's DEFAULT pool size
-      // (≈ host cores − 1, ~127 on the 128-core dev box). ~127 forks all funnel
-      // their cold SRC transforms through the SINGLE main-process transform server,
-      // which serializes them — that, not raw CPU, is the real cause of the 74-97s
-      // "heavy await import()" timeouts the 180s VITEST_UNIT_TIMEOUT_MS band-aid
-      // masks (and a ~60GB peak-RSS OOM risk: 127 forks × ~500MB). Reading the env
-      // here realizes the checkpoint's documented intent. Vitest 4 dropped the old
-      // `poolOptions.forks.maxForks`; the unified knob is `maxWorkers`. The forks
-      // pool (unit/integration) reads VITEST_MAX_FORKS, the threads pool (browser)
-      // VITEST_MAX_THREADS.
-      //
-      // WI-4300 (owner directive 2026-07-12: "load should never be affecting us — if
-      // it is it's a bug"): UNSET no longer means UNCAPPED. The env-only cap left every
-      // entry point that isn't the two gate scripts (an agent's direct `npx vitest run`,
-      // a package `npm run test`, IDE runs) at vitest's default pool ≈ host cores − 1
-      // (~127 forks/run on the shared 128-core box). With ~59 live agent sessions,
-      // concurrent runs are ROUTINE — 5 overlapping uncapped suites ≈ 635 runnable
-      // tasks (observed load1 227; this class melted the box to load 1000–3000 twice
-      // the week of 2026-07-06). The cap must live HERE, at the one choke point all
-      // 23 workspace configs share, so EVERY invocation is bounded regardless of entry
-      // point. Default: min(32, max(8, cores/4)) — the affected-gate's own formula
-      // (and per EI-2590 below, ~127 forks SERIALIZE on the single transform server,
-      // so 32 is typically faster even for a solo run). A SET env still wins (the
-      // green-checkpoint's 8 / the affected gate's 32 are unchanged); an explicit '0'
-      // is the deliberate UNCAPPED escape hatch for a dedicated host; garbage values
-      // fall back to the safe default, never to uncapped.
-      ...(() => {
-        const raw = layer === 'browser' ? process.env.VITEST_MAX_THREADS : process.env.VITEST_MAX_FORKS;
-        const hostSaneCap = Math.min(32, Math.max(8, Math.floor(availableParallelism() / 4)));
-        const cap =
-          raw === undefined || raw.trim() === ''
-            ? hostSaneCap // absent ⇒ host-sane default (WI-4300)
-            : raw.trim() === '0'
-              ? 0 // explicit 0 ⇒ deliberate uncapped escape hatch
-              : Number(raw) > 0
-                ? Number(raw)
-                : hostSaneCap; // garbage ⇒ safe default, never uncapped
-        // MUST pair minWorkers with maxWorkers. The repo ROOT still runs vitest
-        // 2.1.9 (`npm test`), whose resolveConfig defaults minThreads/minForks to
-        // the HOST CORE COUNT when minWorkers is unset
-        // (`minThreads = poolOptions.minForks ?? config.minWorkers ?? threadsCount`).
-        // On the 128-core dev box that makes minThreads≈128 while maxWorkers=8, so
-        // Tinypool throws `options.minThreads and options.maxThreads must not
-        // conflict` at pool creation — the suite collects ZERO tests and the
-        // green-checkpoint gate goes permanently red. Pinning minWorkers:1 yields a
-        // valid 1..cap pool under BOTH v2.1.9 (root) and v4 (nested workspaces).
-        return cap > 0 ? { maxWorkers: cap, minWorkers: 1 } : {};
-      })(),
+      // EI-2590 + WI-4300: the shared-host worker cap — env wins (the checkpoint's 8
+      // / the affected gate's 32), explicit '0' = uncapped escape hatch, ABSENT ⇒ a
+      // host-sane default (unset must never mean ~127 forks on the shared box). Full
+      // history + semantics on {@link sharedHostWorkerCap} above.
+      ...sharedHostWorkerCap(layer === 'browser' ? 'threads' : 'forks'),
       // Unit timeout is 20s, not the vitest 5s default. Many unit tests
       // `vi.resetModules()` + `await import('@/lib/...')` per test, which
       // cold-imports the heavy operator module graph through the vite

@@ -9,7 +9,12 @@ import { fileURLToPath } from 'node:url';
 // browser-safe export (like ./nuqs-mock, ./nest) belongs behind its OWN
 // package.json `exports` subpath, never added to this barrel's re-export list.
 
-export { defineVitestConfig, findMisroutedReproTests, MISROUTED_REPRO_TEST } from './vitest-config.ts';
+export {
+  defineVitestConfig,
+  sharedHostWorkerCap,
+  findMisroutedReproTests,
+  MISROUTED_REPRO_TEST,
+} from './vitest-config.ts';
 export type { TestLayer, DefineVitestConfigOptions } from './vitest-config.ts';
 
 /**
