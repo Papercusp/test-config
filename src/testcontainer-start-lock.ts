@@ -1,4 +1,4 @@
-import { hostname } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 
@@ -17,8 +17,18 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
+// EI (2026-07-12): this used to hardcode '/tmp/pcv/testcontainers-locks',
+// duplicating (and drifting from) the writable-tmp choice vitest-config.ts
+// already makes via TMPDIR. On a box/sandbox where the writable scratch tmp
+// moved (e.g. a per-agent exec sandbox that mounts bare /tmp read-only and
+// carves out a DIFFERENT writable dir, such as /tmp/claude, as TMPDIR),
+// vitest-config.ts correctly follows TMPDIR — but this hardcoded fallback did
+// not, so `mkdir(root)` threw EROFS even though the process's own TMPDIR was
+// perfectly writable. Deriving from tmpdir() (which honors TMPDIR/TMP/TEMP)
+// keeps this in sync with whatever writable tmp the rest of the test harness
+// already resolved, instead of re-guessing a second time.
 function lockRoot(): string {
-  return resolve(process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR ?? '/tmp/pcv/testcontainers-locks');
+  return resolve(process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR ?? join(tmpdir(), 'pcv', 'testcontainers-locks'));
 }
 
 function safeName(name: string): string {
