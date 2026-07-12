@@ -30,6 +30,10 @@ const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.pap
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
 const HERMETIC_ENV_SETUP = resolve(__dirname, 'setup-hermetic-env.ts');
+// EI-9990: bumps @testing-library/dom's waitFor/findBy* internal poll timeout
+// for shared-box tolerance — a no-op for any package without
+// @testing-library/dom on its graph. See the file's own doc comment.
+const TESTING_LIBRARY_TIMEOUT_SETUP = resolve(__dirname, 'setup-testing-library-timeout.ts');
 // The monorepo root (libs/test-config/src → up 3 = repo root). Whitelisted in
 // Vite's server.fs.allow below so a `vitest run --root <pkg>` invocation can
 // still serve this hoisted setup file + other workspace deps. Without it, a
@@ -202,8 +206,8 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
     process.env.TESTCONTAINERS_RYUK_DISABLED = 'true';
   }
   const finalSetup = allowConsoleNoise
-    ? [HERMETIC_ENV_SETUP, ...setupFiles]
-    : [HERMETIC_ENV_SETUP, FAIL_ON_CONSOLE_SETUP, ...setupFiles];
+    ? [HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
+    : [HERMETIC_ENV_SETUP, FAIL_ON_CONSOLE_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles];
 
   const layerInclude =
     include ??
