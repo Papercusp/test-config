@@ -11,6 +11,7 @@
  * deterministically — independent of the ambient vitest invocation.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { availableParallelism } from 'node:os';
 import { defineVitestConfig } from './vitest-config.ts';
 
 let savedArgv: string[];
@@ -78,26 +79,34 @@ describe('defineVitestConfig worker cap wiring (EI-2590)', () => {
     expect(maxWorkersOf({ layer: 'unit' })).toBe(8);
   });
 
-  it('leaves maxWorkers UNSET when the env var is absent (dev/CI ⇒ vitest default, unchanged)', () => {
+  it('defaults maxWorkers to the host-sane cap when the env var is absent (WI-4300 — unset is NOT uncapped on a shared box)', () => {
     delete process.env.VITEST_MAX_FORKS;
     delete process.env.VITEST_MAX_THREADS;
-    expect(maxWorkersOf({ layer: 'unit' })).toBeUndefined();
+    const expected = Math.min(32, Math.max(8, Math.floor(availableParallelism() / 4)));
+    expect(maxWorkersOf({ layer: 'unit' })).toBe(expected);
+    expect(maxWorkersOf({ layer: 'browser' })).toBe(expected);
   });
 
   it('browser layer reads VITEST_MAX_THREADS (its pool is threads), not VITEST_MAX_FORKS', () => {
     delete process.env.VITEST_MAX_FORKS;
     process.env.VITEST_MAX_THREADS = '6';
     expect(maxWorkersOf({ layer: 'browser' })).toBe(6);
-    // And the forks var does NOT cap the threads pool.
-    process.env.VITEST_MAX_FORKS = '8';
+    // The forks var does NOT cap the threads pool — with THREADS absent the browser
+    // layer falls back to the host-sane default (WI-4300), never to the forks value.
+    process.env.VITEST_MAX_FORKS = '4';
     delete process.env.VITEST_MAX_THREADS;
-    expect(maxWorkersOf({ layer: 'browser' })).toBeUndefined();
+    expect(maxWorkersOf({ layer: 'browser' })).toBe(
+      Math.min(32, Math.max(8, Math.floor(availableParallelism() / 4))),
+    );
   });
 
-  it('ignores a non-numeric / zero cap (no maxWorkers key)', () => {
+  it("explicit '0' is the deliberate uncapped escape hatch; garbage falls back to the safe default (WI-4300)", () => {
     process.env.VITEST_MAX_FORKS = '0';
     expect(maxWorkersOf({ layer: 'unit' })).toBeUndefined();
+    // Garbage must NEVER mean uncapped on the shared box — it gets the default cap.
     process.env.VITEST_MAX_FORKS = 'not-a-number';
-    expect(maxWorkersOf({ layer: 'unit' })).toBeUndefined();
+    expect(maxWorkersOf({ layer: 'unit' })).toBe(
+      Math.min(32, Math.max(8, Math.floor(availableParallelism() / 4))),
+    );
   });
 });

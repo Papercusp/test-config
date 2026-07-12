@@ -3,6 +3,7 @@ import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { mkdirSync, existsSync } from 'node:fs';
+import { availableParallelism } from 'node:os';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
@@ -217,11 +218,34 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // here realizes the checkpoint's documented intent. Vitest 4 dropped the old
       // `poolOptions.forks.maxForks`; the unified knob is `maxWorkers`. The forks
       // pool (unit/integration) reads VITEST_MAX_FORKS, the threads pool (browser)
-      // VITEST_MAX_THREADS. UNSET (dev/CI) ⇒ key omitted ⇒ vitest's default uncapped
-      // parallelism, so local runs are unchanged. Tunable per-run via the env vars.
+      // VITEST_MAX_THREADS.
+      //
+      // WI-4300 (owner directive 2026-07-12: "load should never be affecting us — if
+      // it is it's a bug"): UNSET no longer means UNCAPPED. The env-only cap left every
+      // entry point that isn't the two gate scripts (an agent's direct `npx vitest run`,
+      // a package `npm run test`, IDE runs) at vitest's default pool ≈ host cores − 1
+      // (~127 forks/run on the shared 128-core box). With ~59 live agent sessions,
+      // concurrent runs are ROUTINE — 5 overlapping uncapped suites ≈ 635 runnable
+      // tasks (observed load1 227; this class melted the box to load 1000–3000 twice
+      // the week of 2026-07-06). The cap must live HERE, at the one choke point all
+      // 23 workspace configs share, so EVERY invocation is bounded regardless of entry
+      // point. Default: min(32, max(8, cores/4)) — the affected-gate's own formula
+      // (and per EI-2590 below, ~127 forks SERIALIZE on the single transform server,
+      // so 32 is typically faster even for a solo run). A SET env still wins (the
+      // green-checkpoint's 8 / the affected gate's 32 are unchanged); an explicit '0'
+      // is the deliberate UNCAPPED escape hatch for a dedicated host; garbage values
+      // fall back to the safe default, never to uncapped.
       ...(() => {
+        const raw = layer === 'browser' ? process.env.VITEST_MAX_THREADS : process.env.VITEST_MAX_FORKS;
+        const hostSaneCap = Math.min(32, Math.max(8, Math.floor(availableParallelism() / 4)));
         const cap =
-          Number(layer === 'browser' ? process.env.VITEST_MAX_THREADS : process.env.VITEST_MAX_FORKS) || 0;
+          raw === undefined || raw.trim() === ''
+            ? hostSaneCap // absent ⇒ host-sane default (WI-4300)
+            : raw.trim() === '0'
+              ? 0 // explicit 0 ⇒ deliberate uncapped escape hatch
+              : Number(raw) > 0
+                ? Number(raw)
+                : hostSaneCap; // garbage ⇒ safe default, never uncapped
         // MUST pair minWorkers with maxWorkers. The repo ROOT still runs vitest
         // 2.1.9 (`npm test`), whose resolveConfig defaults minThreads/minForks to
         // the HOST CORE COUNT when minWorkers is unset
