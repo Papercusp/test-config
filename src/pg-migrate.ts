@@ -61,10 +61,20 @@ function makeDrop(adminUri: string, name: string): () => Promise<void> {
   return async () => {
     const a = postgres(adminUri, { max: 1, onnotice: () => {} });
     try {
+      // WI-4311: pg_terminate_backend only SIGNALS other backends — it returns
+      // before they've actually disconnected. A plain DROP DATABASE issued right
+      // after can then find a not-yet-closed backend and either ERROR ("is being
+      // accessed by other users") or, under host I/O contention, sit blocked
+      // waiting on the connection to fully tear down before it can proceed with
+      // its own (I/O-heavy) file cleanup — observed on the shared dev box as
+      // backends parked in `DROP DATABASE` state for 6s-267s+ under heavy fleet
+      // load. `WITH (FORCE)` (PG13+) makes DROP DATABASE terminate remaining
+      // connections ITSELF as part of the same statement, closing this race
+      // instead of racing pg_terminate_backend's async signal against it.
       await a.unsafe(
         `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${name}' AND pid <> pg_backend_pid()`,
       );
-      await a.unsafe(`DROP DATABASE IF EXISTS "${name}"`);
+      await a.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
     } finally {
       await a.end({ timeout: 5 });
     }
@@ -166,7 +176,8 @@ async function buildTemplate(key: string, provision: (url: string) => Promise<vo
         const exists = (await admin.unsafe(`SELECT 1 FROM pg_database WHERE datname = '${name}'`)) as unknown[];
         if (exists.length > 0) {
           await terminateBackends(admin, name);
-          await admin.unsafe(`DROP DATABASE IF EXISTS "${name}"`);
+          // WI-4311: WITH (FORCE) closes the terminate-then-drop race (see makeDrop).
+          await admin.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
         }
         // Sweep leftovers of OUR key's crashed builds (safe: the advisory lock means
         // no live fork is building this key right now). Other keys' builds are
@@ -176,7 +187,7 @@ async function buildTemplate(key: string, provision: (url: string) => Promise<vo
         )) as Array<{ datname: string }>;
         for (const s of stale) {
           await terminateBackends(admin, s.datname);
-          await admin.unsafe(`DROP DATABASE IF EXISTS "${s.datname}"`).catch(() => {});
+          await admin.unsafe(`DROP DATABASE IF EXISTS "${s.datname}" WITH (FORCE)`).catch(() => {});
         }
         // Build under a TEMP name and rename into place only on success — the
         // final name is only ever a COMPLETE schema (rename is atomic in PG).
@@ -188,7 +199,7 @@ async function buildTemplate(key: string, provision: (url: string) => Promise<vo
           // Best-effort drop; a survivor under tmpl_bld_* is HARMLESS (never looked
           // up as a template) and the sweep above collects it next build.
           await terminateBackends(admin, bld).catch(() => {});
-          await admin.unsafe(`DROP DATABASE IF EXISTS "${bld}"`).catch(() => {});
+          await admin.unsafe(`DROP DATABASE IF EXISTS "${bld}" WITH (FORCE)`).catch(() => {});
           throw err;
         }
         // Paranoia: a backend the provision leaked would block the rename.
