@@ -83,6 +83,15 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     // intended REDs, never committed (EI-10761 — a red-test EI on a non-existent file).
     expect(shouldRecordTestRunPath('apps/operator-vite/src/components/left-sidebar/MugTab.flakeproof.test.tsx')).toBe(false);
     expect(shouldRecordTestRunPath('src/x.flakeproof.test.ts')).toBe(false);
+    // Cargo/Tauri BUILD-ARTIFACT copies of template checks — the sidecar build
+    // copies `templates/<id>/checks/*.test.ts` (which import
+    // `@papercusp/template-kit`) into a gitignored cargo target dir where
+    // node_modules are NOT linked, so every copy reds with "Cannot find package
+    // '@papercusp/template-kit'". Never a source regression (EI-11176).
+    expect(shouldRecordTestRunPath('.wi3388-cargo-target/debug/sidecar/templates/papercusp-webapp/checks/composition-integrity.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('papercusp-desktop/src-tauri/target/debug/sidecar/templates/papercusp-webapp/checks/composition-integrity.test.ts')).toBe(false);
+    // …but the real SOURCE copies of those same checks still record.
+    expect(shouldRecordTestRunPath('templates/papercusp-webapp/checks/composition-integrity.test.ts')).toBe(true);
     expect(shouldRecordTestRunPath('packages/operator-core/lib/testing-orphan-runs.test.ts')).toBe(true);
   });
 

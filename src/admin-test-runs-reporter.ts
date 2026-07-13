@@ -161,6 +161,15 @@ export function shouldRecordTestRunPath(filePath: string): boolean {
   // intended RED into a "test failing repeatedly" watchdog signal on a file that
   // does not exist in git (EI-10761). It is never a real regression signal.
   if (filePath.includes('.flakeproof.test.')) return false;
+  // Rust/Cargo BUILD-ARTIFACT trees. The desktop sidecar build copies the
+  // template `checks/*.test.ts` (which import `@papercusp/template-kit`) into
+  // the cargo target dir, where node_modules are NOT linked — so every copy
+  // reds with "Cannot find package '@papercusp/template-kit'". These dirs are
+  // gitignored build output, never a source regression (EI-11176). Covers the
+  // per-worktree `*-cargo-target/` dirs (WI-3388's CARGO_TARGET_DIR) and the
+  // standard `target/{debug,release}/` cargo output.
+  if (filePath.includes('cargo-target/')) return false;
+  if (/(?:^|\/)target\/(?:debug|release)\//.test(filePath)) return false;
   if (NON_SIGNAL_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return false;
   return true;
 }
