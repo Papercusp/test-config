@@ -155,6 +155,12 @@ const NON_SIGNAL_PREFIXES = [
 export function shouldRecordTestRunPath(filePath: string): boolean {
   if (filePath.startsWith('_retired/') || filePath.includes('/_retired/')) return false;
   if (filePath.startsWith('.papercusp/scratch/tdg-') || filePath.includes('/.papercusp/scratch/tdg-')) return false;
+  // `*.flakeproof.test.{ts,tsx}` is the reserved, gitignored scratch fixture for
+  // scripts/flake-soak.sh --self-test: it is DELIBERATELY reddened to prove the
+  // throttle discriminates, and never committed. Recording its runs turns an
+  // intended RED into a "test failing repeatedly" watchdog signal on a file that
+  // does not exist in git (EI-10761). It is never a real regression signal.
+  if (filePath.includes('.flakeproof.test.')) return false;
   if (NON_SIGNAL_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return false;
   return true;
 }
