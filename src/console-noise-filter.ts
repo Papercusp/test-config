@@ -124,5 +124,18 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // regression surfaces as a thrown error / failed assertion in the memory suite's own
   // dep-injected tests (configure/resolveEmbedderWith), not this incidental degrade log.
   if (msg.includes('[mem0] embedder unavailable:')) return true;
+  // notifyOperatorHindsight leg 2 (operator-hindsight.ts) deliberately catches a
+  // shared-conversation append failure and warns instead of throwing — the
+  // function's own doc: "fail-soft both ways: a thread-append failure never loses
+  // the coord notify". In a test env WITHOUT the operator-conversations substrate
+  // (delegated-tasks.integration.test.ts wires only the coord fixture; the
+  // conversations DB handle is undefined there) the append ALWAYS degrades — an
+  // ENVIRONMENT condition, not a code defect (operator-chat-sidebar-revival P-008,
+  // 2026-07-13). The leg-1 coord push those tests assert on is unaffected. Message
+  // text is specific enough that silencing it cannot hide a real defect elsewhere
+  // (a real regression in the append path surfaces as a failed assertion in
+  // operator-hindsight.test.ts's dep-mocked two-delivery tests, not this
+  // incidental best-effort log line).
+  if (msg.includes('[operator-hindsight] shared-thread append failed')) return true;
   return false;
 }
