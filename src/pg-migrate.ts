@@ -45,40 +45,90 @@ function swapDbName(adminUri: string, name: string): string {
   return u.toString();
 }
 
+/**
+ * True iff `e` is a postgres-js connect-phase timeout (`CONNECT_TIMEOUT`).
+ * Mirrors `isRetriablePgConnectError` (operator-core's pg-transient-retry.ts) /
+ * `isRetriableConnectionSetupError` (libs/db's connect-retry.ts) — this package
+ * can't import either (libs/papercusp/libs/db depends on @papercusp/test-config
+ * for its own integration tests, so the reverse import would cycle).
+ */
+function isConnectTimeout(e: unknown): boolean {
+  const x = e as { code?: string; message?: string } | null;
+  if (!x) return false;
+  return x.code === 'CONNECT_TIMEOUT' || /\bCONNECT_TIMEOUT\b/.test(x.message ?? '');
+}
+
+/**
+ * Bounded retry for a fresh postgres-js connect against `getTestPg()`'s shared,
+ * `.withReuse()`d container (EI-10571). That ONE container is hammered by every
+ * concurrent vitest process on the box (all forks, all packages, ~30+ fleet
+ * agents at once) — a brand-new client's very first query can transiently
+ * `CONNECT_TIMEOUT` purely from connect-queue/CPU pressure, not a real outage
+ * (the same class pg-container.ts already retries for "in recovery mode", and
+ * production code already retries via connect-retry.ts's
+ * `retryBeforeCallbackStarts` — this is the test-infra-side mirror of that
+ * same resilience, previously missing here). `attempt` recreates the client +
+ * re-runs `fn` from scratch each time: safe because CONNECT_TIMEOUT fires
+ * strictly BEFORE any statement reaches the server, so nothing can have
+ * partially applied.
+ */
+async function withConnectRetry<T>(fn: () => Promise<T>, attempts = 4): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (!isConnectTimeout(e) || attempt === attempts) throw e;
+      await new Promise((r) => setTimeout(r, attempt * 300));
+    }
+  }
+  throw lastErr;
+}
+
 async function createFreshDb(prefix = 'it'): Promise<{ url: string; name: string; adminUri: string }> {
   const adminUri = await getTestPg();
   const name = `${prefix}_${randomBytes(6).toString('hex')}`;
-  const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
-  try {
-    await admin.unsafe(`CREATE DATABASE "${name}"`);
-  } finally {
-    await admin.end({ timeout: 5 });
-  }
+  await withConnectRetry(async () => {
+    const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
+    try {
+      await admin.unsafe(`CREATE DATABASE "${name}"`);
+    } finally {
+      await admin.end({ timeout: 5 });
+    }
+  });
   return { url: swapDbName(adminUri, name), name, adminUri };
 }
 
 function makeDrop(adminUri: string, name: string): () => Promise<void> {
-  return async () => {
-    const a = postgres(adminUri, { max: 1, onnotice: () => {} });
-    try {
-      // WI-4311: pg_terminate_backend only SIGNALS other backends — it returns
-      // before they've actually disconnected. A plain DROP DATABASE issued right
-      // after can then find a not-yet-closed backend and either ERROR ("is being
-      // accessed by other users") or, under host I/O contention, sit blocked
-      // waiting on the connection to fully tear down before it can proceed with
-      // its own (I/O-heavy) file cleanup — observed on the shared dev box as
-      // backends parked in `DROP DATABASE` state for 6s-267s+ under heavy fleet
-      // load. `WITH (FORCE)` (PG13+) makes DROP DATABASE terminate remaining
-      // connections ITSELF as part of the same statement, closing this race
-      // instead of racing pg_terminate_backend's async signal against it.
-      await a.unsafe(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${name}' AND pid <> pg_backend_pid()`,
-      );
-      await a.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
-    } finally {
-      await a.end({ timeout: 5 });
-    }
-  };
+  return () =>
+    // EI-10571: this runs in every integration test file's `afterAll` teardown
+    // (default vitest hookTimeout 60_000ms) — a raw connect against the shared,
+    // fleet-hammered container with no retry turned a transient CONNECT_TIMEOUT
+    // into a hook-timeout failure. `pg_terminate_backend` (no-op if none match)
+    // + `DROP DATABASE IF EXISTS` are both idempotent, so retrying the whole
+    // block (fresh client each attempt) is safe.
+    withConnectRetry(async () => {
+      const a = postgres(adminUri, { max: 1, onnotice: () => {} });
+      try {
+        // WI-4311: pg_terminate_backend only SIGNALS other backends — it returns
+        // before they've actually disconnected. A plain DROP DATABASE issued right
+        // after can then find a not-yet-closed backend and either ERROR ("is being
+        // accessed by other users") or, under host I/O contention, sit blocked
+        // waiting on the connection to fully tear down before it can proceed with
+        // its own (I/O-heavy) file cleanup — observed on the shared dev box as
+        // backends parked in `DROP DATABASE` state for 6s-267s+ under heavy fleet
+        // load. `WITH (FORCE)` (PG13+) makes DROP DATABASE terminate remaining
+        // connections ITSELF as part of the same statement, closing this race
+        // instead of racing pg_terminate_backend's async signal against it.
+        await a.unsafe(
+          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${name}' AND pid <> pg_backend_pid()`,
+        );
+        await a.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+      } finally {
+        await a.end({ timeout: 5 });
+      }
+    });
 }
 
 /** Split a .sql file into individually-runnable statements on drizzle's breakpoint marker. */
@@ -153,12 +203,25 @@ async function terminateBackends(admin: postgres.Sql, dbName: string): Promise<v
 async function buildTemplate(key: string, provision: (url: string) => Promise<void>): Promise<string> {
   const adminUri = await getTestPg();
   const name = `tmpl_${key}`;
-  const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
   const lock = `pc-test-template-${key}`;
+  // EI-10571: connect + the first query (the advisory-lock acquire) with retry —
+  // this is where a fresh connect against the shared, fleet-hammered container
+  // can transiently CONNECT_TIMEOUT (see withConnectRetry). Once past it, the
+  // rest of this (possibly long-running) build reuses the same live connection,
+  // so nothing downstream needs its own retry.
+  const admin = await withConnectRetry(async () => {
+    const a = postgres(adminUri, { max: 1, onnotice: () => {} });
+    try {
+      // Serialize concurrent forks racing to build the SAME template on the shared
+      // container (mirrors the framework-roles advisory lock). Held across provision.
+      await a.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
+      return a;
+    } catch (e) {
+      await a.end({ timeout: 5 }).catch(() => {});
+      throw e;
+    }
+  });
   try {
-    // Serialize concurrent forks racing to build the SAME template on the shared
-    // container (mirrors the framework-roles advisory lock). Held across provision.
-    await admin.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
     try {
       // A template is only servable when it carries the readiness mark — stamped
       // strictly AFTER provision + rename succeeded, so a partial build can never
@@ -239,15 +302,19 @@ export async function getOrBuildTemplate(key: string, provision: (url: string) =
 async function createDbFromTemplate(prefix: string, template: string): Promise<{ url: string; name: string; adminUri: string }> {
   const adminUri = await getTestPg();
   const name = `${prefix}_${randomBytes(6).toString('hex')}`;
-  const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
-  try {
-    // The clone needs NO active session on the source; the template's builder closed
-    // its connection, and nothing connects to a template directly. Serial integration
-    // runs never overlap clones; Postgres serializes them defensively regardless.
-    await admin.unsafe(`CREATE DATABASE "${name}" TEMPLATE "${template}"`);
-  } finally {
-    await admin.end({ timeout: 5 });
-  }
+  // EI-10571: this is the HOT path every `createOrgTestDb`-style fixture takes
+  // on every integration test file's beforeAll — see withConnectRetry's docstring.
+  await withConnectRetry(async () => {
+    const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
+    try {
+      // The clone needs NO active session on the source; the template's builder closed
+      // its connection, and nothing connects to a template directly. Serial integration
+      // runs never overlap clones; Postgres serializes them defensively regardless.
+      await admin.unsafe(`CREATE DATABASE "${name}" TEMPLATE "${template}"`);
+    } finally {
+      await admin.end({ timeout: 5 });
+    }
+  });
   return { url: swapDbName(adminUri, name), name, adminUri };
 }
 
