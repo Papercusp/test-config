@@ -2,7 +2,7 @@ import { defineConfig, type UserConfig } from 'vitest/config';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { mkdirSync, existsSync } from 'node:fs';
+import { mkdirSync, existsSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
@@ -80,6 +80,35 @@ function tmpdirIsInsideRepo(dir: string): boolean {
     p = parent;
   }
 }
+
+// 2026-07-13 (green-checkpoint red, candidate 06368a3a): the "shortTmp has NO repo-root
+// marker up to /" premise above is asserted in a comment but was never VERIFIED at
+// runtime — `tmpdirIsInsideRepo` only ever checked the CURRENT TMPDIR value, never the
+// `/tmp/pcv` candidate this block is about to commit to. On this heavily shared,
+// multi-tenant box, some OTHER concurrent process mkdir'd a bare `.git` directly at
+// `/tmp` (not inside its own scratch subdir) and never cleaned it up — poisoning every
+// ancestor under it, INCLUDING `/tmp/pcv` itself, and silently defeating
+// hasGitAncestor/findRepoRoot for the whole box (the exact "non-git dir" detection
+// class EI-5541 already names, reintroduced from a new angle). Two confirmed-failing
+// gate tests (locks/non-repo-tmpdir.test.ts, locks/coordination-domain.test.ts) reproduced
+// this locally against the polluted box.
+// Self-heal it at the source: a `.git` entry directly at the well-known `/tmp` root that
+// is a completely EMPTY directory cannot be a real repo/worktree marker (a real one always
+// has at least a HEAD file / objects dir / config) — remove it before deciding whether an
+// override is needed, so the "marker-free up to /" premise this file depends on actually
+// holds instead of merely being documented.
+function scrubStrayEmptyGitMarker(dir: string): void {
+  const gitPath = resolve(dir, '.git');
+  try {
+    if (statSync(gitPath).isDirectory() && readdirSync(gitPath).length === 0) {
+      rmSync(gitPath, { recursive: true, force: true });
+    }
+  } catch {
+    // doesn't exist, isn't a directory, or isn't empty (a real repo) — never touch it.
+  }
+}
+scrubStrayEmptyGitMarker('/tmp');
+
 {
   const cur = process.env.TMPDIR;
   const needsOverride = !cur || !existsSync(cur) || tmpdirIsInsideRepo(cur);
