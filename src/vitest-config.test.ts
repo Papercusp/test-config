@@ -10,7 +10,7 @@
  * test, so each case overrides argv (then restores it) to drive it
  * deterministically — independent of the ambient vitest invocation.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { availableParallelism } from 'node:os';
 import { defineVitestConfig } from './vitest-config.ts';
 
@@ -108,5 +108,36 @@ describe('defineVitestConfig worker cap wiring (EI-2590)', () => {
     expect(maxWorkersOf({ layer: 'unit' })).toBe(
       Math.min(32, Math.max(8, Math.floor(availableParallelism() / 4))),
     );
+  });
+});
+
+describe('defineVitestConfig unhandled-error diagnostics (EI-10766)', () => {
+  type UnhandledErrorHandler = (error: Error & { code?: string }) => false | undefined;
+
+  function handler(): UnhandledErrorHandler {
+    return (defineVitestConfig({ layer: 'unit' }).test as {
+      onUnhandledError?: UnhandledErrorHandler;
+    }).onUnhandledError!;
+  }
+
+  it('still suppresses only the known benign rpc teardown race without printing the alarm', () => {
+    const error = new Error('Closing rpc while "onUserConsoleLog" was pending');
+    error.name = 'EnvironmentTeardownError';
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    expect(handler()(error)).toBe(false);
+    expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it('prints an actionable banner for every other unhandled error without suppressing it', () => {
+    const error = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    expect(handler()(error)).toBeUndefined();
+    expect(consoleError).toHaveBeenCalledOnce();
+    expect(consoleError.mock.calls[0]?.[0]).toContain('UNHANDLED ERROR failed this test file');
+    expect(consoleError.mock.calls[0]?.[0]).toContain('NOT an assertion');
+    expect(consoleError.mock.calls[0]?.[0]).toContain('code=EPIPE');
+    expect(consoleError.mock.calls[0]?.[0]).toContain('Every `expect` in this file may have PASSED');
   });
 });
