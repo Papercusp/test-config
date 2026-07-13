@@ -300,11 +300,31 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // and the whole run exits 1 with 25k tests green. Not reproducible in
       // isolation (load-dependent), carries no assertion signal — a lost console
       // line at worst. Every other unhandled error still fails the run.
-      onUnhandledError: (error) =>
-        error?.name === 'EnvironmentTeardownError' &&
-        /Closing rpc while "onUserConsoleLog" was pending/.test(String(error?.message))
-          ? false
-          : undefined,
+      onUnhandledError: (error) => {
+        if (
+          error?.name === 'EnvironmentTeardownError' &&
+          /Closing rpc while "onUserConsoleLog" was pending/.test(String(error?.message))
+        ) {
+          return false; // the one benign race above — swallow it, nothing else.
+        }
+        // EI-10766: every OTHER unhandled error still FAILS the run (return undefined below),
+        // but vitest attributes it to whichever test the worker was running — a test whose
+        // assertions all passed — so the reader hunts the bug in the wrong place. The WI-4499
+        // EPIPE cost ~a day exactly this way. Make the class loud AT THE POINT OF FAILURE.
+        // Purely additive: does not change the verdict, only prints a signpost. See fact
+        // a-failure-that-fails-no-assertion-2026-07-12.
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        // eslint-disable-next-line no-console
+        console.error(
+          '\n⚠⚠ UNHANDLED ERROR failed this test file — NOT an assertion.\n' +
+            `   name=${error?.name ?? '(unknown)'} code=${code ?? '(none)'}\n` +
+            `   message=${String(error?.message ?? error).slice(0, 300)}\n` +
+            '   Every `expect` in this file may have PASSED. Look for an unhandled async/stream\n' +
+            '   error (EPIPE/ECONNRESET/unhandledRejection/child stdin), not a bad assertion.\n' +
+            '   (test-config onUnhandledError · fact a-failure-that-fails-no-assertion-2026-07-12)\n',
+        );
+        return undefined; // still fail the run — diagnosability, not suppression.
+      },
       hookTimeout: layer === 'integration' ? 90_000 : 60_000,
       setupFiles: finalSetup,
       globalSetup,
