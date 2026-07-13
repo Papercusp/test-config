@@ -52,7 +52,7 @@ function swapDbName(adminUri: string, name: string): string {
  * can't import either (libs/papercusp/libs/db depends on @papercusp/test-config
  * for its own integration tests, so the reverse import would cycle).
  */
-function isConnectTimeout(e: unknown): boolean {
+export function isConnectTimeout(e: unknown): boolean {
   const x = e as { code?: string; message?: string } | null;
   if (!x) return false;
   return x.code === 'CONNECT_TIMEOUT' || /\bCONNECT_TIMEOUT\b/.test(x.message ?? '');
@@ -72,7 +72,12 @@ function isConnectTimeout(e: unknown): boolean {
  * strictly BEFORE any statement reaches the server, so nothing can have
  * partially applied.
  */
-async function withConnectRetry<T>(fn: () => Promise<T>, attempts = 4): Promise<T> {
+export async function withConnectRetry<T>(
+  fn: () => Promise<T>,
+  opts: { attempts?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<T> {
+  const attempts = opts.attempts ?? 4;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   let lastErr: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
@@ -80,7 +85,7 @@ async function withConnectRetry<T>(fn: () => Promise<T>, attempts = 4): Promise<
     } catch (e) {
       lastErr = e;
       if (!isConnectTimeout(e) || attempt === attempts) throw e;
-      await new Promise((r) => setTimeout(r, attempt * 300));
+      await sleep(attempt * 300);
     }
   }
   throw lastErr;
