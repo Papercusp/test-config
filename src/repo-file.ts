@@ -5,7 +5,7 @@
  * THE PROBLEM THIS KILLS: five integration suites (iq-battery corpus/collectors/
  * beekeeper-gen0, hive-eval store-pg/trend-read) each hand-rolled a
  * read-the-migration-DDL helper as a list of guessed `../../..` candidates with
- * a HARDCODED dev-box absolute path (`/home/marsh-office/papercupai-workspace/…`)
+ * a HARDCODED dev-box absolute path (`/home/dev/papercupai-workspace/…`)
  * as the last resort — one of them even pointing at a path that does not exist
  * on the dev box either. Any machine whose checkout lives elsewhere (the whole
  * point of the distributed test gate: run a shard from `(stagingSha, shard)`
