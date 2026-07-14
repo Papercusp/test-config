@@ -35,6 +35,14 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 
+/**
+ * The baseline schema owns a dedicated container, so its Docker handshake must
+ * not queue behind getTestPg's reused-container startup. Keep baseline runs
+ * serialized with one another, while leaving the shared test-PG lane free to
+ * start concurrently (EI-11788).
+ */
+export const BASELINE_SCHEMA_CONTAINER_START_LOCK = 'baseline-schema-container-start';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -79,7 +87,7 @@ export default async function setup({ provide }: GlobalSetupContext) {
   // (PostgreSQL 18.3) — see libs/test-config/src/pg-container.ts for the full
   // rationale (PG16 silently allowed a DELETE PG18 rejects; WI-2914 shipped
   // uncaught because CI tested the wrong major).
-  const container = await withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
+  const container = await withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, () =>
     new PostgreSqlContainer('pgvector/pgvector:pg18')
       .withDatabase('papercusp_it')
       .withUsername('it_admin')

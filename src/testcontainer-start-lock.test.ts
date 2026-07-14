@@ -42,6 +42,38 @@ describe('withTestcontainerStartLock', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it('keeps independent container startup lanes from blocking each other', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'pc-testcontainers-lock-'));
+    process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR = dir;
+
+    let active = 0;
+    let maxActive = 0;
+
+    async function lockedWork(name: string): Promise<string> {
+      return withTestcontainerStartLock(
+        name,
+        async () => {
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          active -= 1;
+          return name;
+        },
+        { timeoutMs: 2_000, retryMs: 5 },
+      );
+    }
+
+    await expect(
+      Promise.all([
+        lockedWork('shared-docker-testcontainers-start'),
+        lockedWork('baseline-schema-container-start'),
+      ]),
+    ).resolves.toHaveLength(2);
+
+    expect(maxActive).toBe(2);
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it('removes an abandoned stale lock before timing out', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'pc-testcontainers-lock-'));
     process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR = dir;
