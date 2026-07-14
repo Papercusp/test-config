@@ -8,14 +8,17 @@
  * operator-core but left the globalSetup behind, breaking their
  * `inject('baselineSchemaDsn')` (the DSN came back empty → "Invalid URL").
  *
- * Stands up the COMPLETE harness_shared schema ONCE per integration run by
- * applying the real migration set (000-baseline.sql + 107/108…) to a dedicated
- * pgvector container, then exposes its DSN via inject('baselineSchemaDsn').
+ * Stands up the COMPLETE harness_shared schema ONCE per reusable baseline
+ * container by applying the real migration set (000-baseline.sql + 107/108…)
+ * and exposes its DSN via inject('baselineSchemaDsn'). The container is isolated
+ * from getTestPg's shared test database, but reused across Vitest processes so a
+ * focused file does not replay hundreds of migrations while the checkpoint is
+ * active (EI-11788).
  *
- * Owns its OWN container (NOT the shared `getTestPg`): per-file tests call
- * `teardownTestPg()` in afterAll, which would stop/recreate the shared container
- * mid-run and invalidate this DSN. A dedicated container keeps this schema-DB
- * valid + isolated for the whole run.
+ * Owns its OWN reusable container (NOT the shared `getTestPg`): per-file tests
+ * call `teardownTestPg()` in afterAll, which would stop/recreate the shared
+ * container mid-run and invalidate this DSN. A dedicated container keeps this
+ * schema-DB valid + isolated from the shared test database for the whole run.
  *
  * Read the DSN in a test with:
  *   import { inject } from 'vitest';
@@ -92,6 +95,11 @@ export default async function setup({ provide }: GlobalSetupContext) {
       .withDatabase('papercusp_it')
       .withUsername('it_admin')
       .withPassword('it_admin')
+      // Reuse the baseline container across Vitest processes. The previous
+      // ephemeral container replayed ~476 migrations for every focused file;
+      // under checkpoint concurrency that startup alone could consume the test's
+      // entire 90s budget. The advisory lock below makes warm migrations safe.
+      .withReuse()
       .start(),
   );
   const dsn = container.getConnectionUri();
@@ -102,16 +110,25 @@ export default async function setup({ provide }: GlobalSetupContext) {
     applyPendingMigrations: (opts: {
       client: postgres.Sql;
       sqlDir: string;
-    }) => Promise<{ appliedCount: number; totalKnown: number }>;
+      }) => Promise<{ appliedCount: number; totalKnown: number; failed?: Array<unknown> }>;
   };
 
   // max:1 — the runner applies each migration in an explicit BEGIN/COMMIT block.
   const sql = postgres(dsn, { max: 1, onnotice: () => {} });
   try {
-    await sql.unsafe(BOOT_PREREQS_DDL);
-    const { appliedCount, totalKnown } = await applyPendingMigrations({ client: sql, sqlDir: SQL_DIR });
-    if (appliedCount !== totalKnown) {
-      throw new Error(`baseline globalSetup: applied ${appliedCount}/${totalKnown} (expected zero skips)`);
+    // Multiple Vitest processes can attach to the reusable baseline container at
+    // once. Serialize the migration runner itself, not just Docker startup:
+    // otherwise two fresh readers can both observe the same pending file and race
+    // on its DDL/ledger insert.
+    await sql.unsafe(`SELECT pg_advisory_lock(hashtext('papercusp-baseline-schema-migrations'))`);
+    try {
+      await sql.unsafe(BOOT_PREREQS_DDL);
+      const { appliedCount, totalKnown, failed = [] } = await applyPendingMigrations({ client: sql, sqlDir: SQL_DIR });
+      if (failed.length > 0) {
+        throw new Error(`baseline globalSetup: ${failed.length} migration(s) failed (${appliedCount}/${totalKnown} applied)`);
+      }
+    } finally {
+      await sql.unsafe(`SELECT pg_advisory_unlock(hashtext('papercusp-baseline-schema-migrations'))`).catch(() => {});
     }
   } finally {
     await sql.end({ timeout: 5 });
@@ -120,7 +137,8 @@ export default async function setup({ provide }: GlobalSetupContext) {
   provide('baselineSchemaDsn', dsn);
 
   return async () => {
-    await container.stop().catch(() => {});
+    // Reusable box-level infrastructure: stopping it from one Vitest process
+    // invalidates every other integration file attached to this baseline DB.
   };
 }
 
