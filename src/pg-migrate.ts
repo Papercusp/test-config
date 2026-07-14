@@ -182,7 +182,16 @@ export interface CreateFreshTestDbOptions {
    * silently serves the wrong schema. Mutually exclusive with `provision` at the
    * top level (the template carries the schema). See `getOrBuildTemplate`.
    */
-  template?: { key: string; provision: (url: string) => Promise<void> };
+  template?: {
+    key: string;
+    provision: (url: string) => Promise<void>;
+    /**
+     * Maximum time to wait for another process to finish building this template.
+     * The default stays below Vitest's common 120s beforeAll budget so callers get
+     * a stage-labelled infrastructure error instead of an opaque hook timeout.
+     */
+    lockTimeoutMs?: number;
+  };
 }
 
 // Per-process cache: a template is built at most once per fork for a given key.
@@ -198,6 +207,20 @@ const templateBuilds = new Map<string, Promise<string>>();
  *  template under the final name, and the bare `pg_database` existence check
  *  then served it to EVERY later clone — a whole-section mass-fail). */
 const TEMPLATE_READY_MARK = 'pc-template-ready';
+const DEFAULT_TEMPLATE_LOCK_TIMEOUT_MS = 75_000;
+
+function templateLockTimeoutMs(value?: number): number {
+  if (value === undefined) return DEFAULT_TEMPLATE_LOCK_TIMEOUT_MS;
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`getOrBuildTemplate: lockTimeoutMs must be a positive finite number (received ${value})`);
+  }
+  return Math.ceil(value);
+}
+
+function isLockTimeout(e: unknown): boolean {
+  const x = e as { code?: string; message?: string } | null;
+  return x?.code === '55P03' || /lock timeout/i.test(x?.message ?? '');
+}
 
 async function terminateBackends(admin: postgres.Sql, dbName: string): Promise<void> {
   await admin.unsafe(
@@ -205,10 +228,15 @@ async function terminateBackends(admin: postgres.Sql, dbName: string): Promise<v
   );
 }
 
-async function buildTemplate(key: string, provision: (url: string) => Promise<void>): Promise<string> {
+async function buildTemplate(
+  key: string,
+  provision: (url: string) => Promise<void>,
+  opts: { lockTimeoutMs?: number } = {},
+): Promise<string> {
   const adminUri = await getTestPg();
   const name = `tmpl_${key}`;
   const lock = `pc-test-template-${key}`;
+  const lockTimeoutMs = templateLockTimeoutMs(opts.lockTimeoutMs);
   // EI-10571: connect + the first query (the advisory-lock acquire) with retry —
   // this is where a fresh connect against the shared, fleet-hammered container
   // can transiently CONNECT_TIMEOUT (see withConnectRetry). Once past it, the
@@ -219,7 +247,24 @@ async function buildTemplate(key: string, provision: (url: string) => Promise<vo
     try {
       // Serialize concurrent forks racing to build the SAME template on the shared
       // container (mirrors the framework-roles advisory lock). Held across provision.
-      await a.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
+      // Bound ONLY the acquisition statement: an unbounded wait used to consume the
+      // caller's entire beforeAll budget and surface as a context-free Vitest hook
+      // timeout. Once acquired, restore the session default so real migration/DDL
+      // failures keep their own diagnostics instead of being mislabeled as lock waits.
+      await a.unsafe(`SET lock_timeout = '${lockTimeoutMs}ms'`);
+      try {
+        await a.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
+      } catch (e) {
+        if (isLockTimeout(e)) {
+          throw new Error(
+            `getOrBuildTemplate: stage=template-lock-acquire timed out after ${lockTimeoutMs}ms ` +
+              `(key=${key}, template=${name}, lock=${lock}); another test process is still building this migration set`,
+            { cause: e },
+          );
+        }
+        throw e;
+      }
+      await a.unsafe(`SET lock_timeout = '0'`);
       return a;
     } catch (e) {
       await a.end({ timeout: 5 }).catch(() => {});
@@ -289,10 +334,14 @@ async function buildTemplate(key: string, provision: (url: string) => Promise<vo
  * runs exactly once per (container, key); every later caller reuses the template.
  * Clone it with `createFreshTestDb({ template: { key, provision } })`.
  */
-export async function getOrBuildTemplate(key: string, provision: (url: string) => Promise<void>): Promise<string> {
+export async function getOrBuildTemplate(
+  key: string,
+  provision: (url: string) => Promise<void>,
+  opts: { lockTimeoutMs?: number } = {},
+): Promise<string> {
   let p = templateBuilds.get(key);
   if (!p) {
-    p = buildTemplate(key, provision);
+    p = buildTemplate(key, provision, opts);
     templateBuilds.set(key, p);
     // Do NOT cache a rejection: a transient build failure (container hiccup, a
     // killed sibling fork) would otherwise pin every later caller in this
@@ -338,7 +387,9 @@ async function createDbFromTemplate(prefix: string, template: string): Promise<{
 export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Promise<MigratedTestDb> {
   // Template-clone path: build the schema ONCE into a cached template, then clone.
   if (opts.template) {
-    const tmpl = await getOrBuildTemplate(opts.template.key, opts.template.provision);
+    const tmpl = await getOrBuildTemplate(opts.template.key, opts.template.provision, {
+      lockTimeoutMs: opts.template.lockTimeoutMs,
+    });
     const { url, name, adminUri } = await createDbFromTemplate(opts.prefix ?? 'it', tmpl);
     return { url, name, drop: makeDrop(adminUri, name) };
   }

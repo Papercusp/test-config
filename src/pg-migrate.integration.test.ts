@@ -131,6 +131,41 @@ describe('buildTemplate hardening (WI-1992)', () => {
     expect(await templateState(admin, name)).toBe('ready');
   });
 
+  it('bounds a contended template lock with stage-labelled diagnostics and retries cleanly', async () => {
+    const key = freshKey();
+    const name = `tmpl_${key}`;
+    const lock = `pc-test-template-${key}`;
+    cleanupDbs.push(name);
+    const holder = await adminClient();
+
+    await holder.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
+    const startedAt = Date.now();
+    try {
+      await expect(
+        getOrBuildTemplate(key, async () => {}, { lockTimeoutMs: 100 }),
+      ).rejects.toThrow(
+        `getOrBuildTemplate: stage=template-lock-acquire timed out after 100ms ` +
+          `(key=${key}, template=${name}, lock=${lock})`,
+      );
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+    } finally {
+      await holder.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`);
+    }
+
+    // A timed-out lock acquisition is not cached. Once the real builder releases
+    // the lock, the same process can build and serve the template normally.
+    const built = await getOrBuildTemplate(key, async (url) => {
+      const c = postgres(url, { max: 1, onnotice: () => {} });
+      try {
+        await c.unsafe(`CREATE TABLE after_lock_timeout_ok (id int)`);
+      } finally {
+        await c.end({ timeout: 5 });
+      }
+    });
+    expect(built).toBe(name);
+    expect(await templateState(holder, name)).toBe('ready');
+  });
+
   it('a pre-hardening PARTIAL template (final name, no mark) is dropped and rebuilt, not served', async () => {
     const key = freshKey();
     const name = `tmpl_${key}`;
