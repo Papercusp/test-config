@@ -58,6 +58,9 @@ const defaultBanner: BannerSink = (message) => {
 export class SubstrateCircuitBreaker {
   private consecutiveFailures = 0;
   private trippedError: Error | null = null;
+  private readonly threshold: number;
+  private readonly label: string;
+  private readonly banner: BannerSink;
 
   /**
    * @param threshold consecutive fully-exhausted failures before the breaker latches (>=1).
@@ -65,10 +68,13 @@ export class SubstrateCircuitBreaker {
    * @param banner    where to emit the one-time trip banner (default: process.stderr).
    */
   constructor(
-    private readonly threshold: number,
-    private readonly label: string,
-    private readonly banner: BannerSink = defaultBanner,
+    threshold: number,
+    label: string,
+    banner: BannerSink = defaultBanner,
   ) {
+    this.threshold = threshold;
+    this.label = label;
+    this.banner = banner;
     if (!Number.isInteger(threshold) || threshold < 1) {
       throw new Error(`SubstrateCircuitBreaker: threshold must be an integer >= 1, got ${threshold}`);
     }
