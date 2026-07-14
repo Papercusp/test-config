@@ -82,6 +82,10 @@ const FRAMEWORK_ROLES_DDL = `
 `;
 
 export async function getTestPg(): Promise<string> {
+  // Fail-fast: once the breaker has latched (substrate persistently down), throw
+  // the distinct TEST SUBSTRATE DOWN error immediately — no container start, no
+  // retry — so the rest of the run reports the outage instead of grinding.
+  substrateBreaker.check();
   if (!containerPromise) {
     // pgvector/pgvector:pg18 — a PG18 superset that bundles the `vector`
     // extension. Required because the squashed 000-baseline.sql schema (Papercusp)
@@ -141,7 +145,10 @@ export async function getTestPg(): Promise<string> {
             'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'test', '-d', 'papercusp_test', '-c', FRAMEWORK_ROLES_DDL,
           ]);
           if (res.exitCode === 0) break;
-          lastErr = new Error(`getTestPg: framework-role ensure failed (exit ${res.exitCode}): ${res.output}`);
+          lastErr = new Error(
+            `getTestPg: framework-role ensure failed ${describeContainer(container)} ` +
+              `(exit ${res.exitCode}): ${res.output}`,
+          );
         } catch (e) {
           lastErr = e;
           res = undefined;
@@ -156,13 +163,25 @@ export async function getTestPg(): Promise<string> {
         throw lastErr ?? new Error('getTestPg: framework-role ensure failed (unknown error)');
       }
       return container;
-    })().catch((e) => {
-      // Don't strand every later caller in this process on a permanently-rejected
-      // promise — a fresh call gets a clean shot at (possibly) a different
-      // container/state instead of replaying the same failure forever.
-      containerPromise = null;
-      throw e;
-    });
+    })()
+      .then((container) => {
+        // Substrate reachable — reset the fail-fast streak. Recorded here (once
+        // per acquisition), not per awaiter, so the breaker's count reflects
+        // distinct acquisition outcomes.
+        substrateBreaker.recordSuccess();
+        return container;
+      })
+      .catch((e) => {
+        // Don't strand every later caller in this process on a permanently-rejected
+        // promise — a fresh call gets a clean shot at (possibly) a different
+        // container/state instead of replaying the same failure forever.
+        containerPromise = null;
+        // Count this distinct acquisition failure toward the fail-fast breaker
+        // (EI-11530). Runs once per rejected promise — concurrent awaiters share
+        // this single outcome, so the streak isn't inflated by fan-out.
+        substrateBreaker.recordFailure(e);
+        throw e;
+      });
   }
   const container = await containerPromise;
   return container.getConnectionUri();
