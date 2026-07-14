@@ -1,8 +1,52 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { randomBytes } from 'node:crypto';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
+import { SubstrateCircuitBreaker } from './substrate-circuit-breaker.ts';
 
 let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
+
+/**
+ * Fail-fast breaker for a PERSISTENTLY-down shared substrate (EI-11530). The
+ * per-call retry below rides out a BRIEF recovery window; this breaker catches
+ * the OTHER case — the substrate down long enough that file after file exhausts
+ * its retries — and latches so the run reports a substrate outage instead of
+ * 455 junk test-failures. Threshold is env-tunable; 3 fully-exhausted failures
+ * (~30s+ continuous outage) is a strong true positive. Module-scoped, so it
+ * dies with the vitest worker and can never leave a stale "down" marker.
+ */
+function substrateFailfastThreshold(): number {
+  const raw = process.env.PAPERCUSP_TEST_SUBSTRATE_FAILFAST_THRESHOLD;
+  const n = raw ? Number(raw) : NaN;
+  return Number.isInteger(n) && n >= 1 ? n : 3;
+}
+const substrateBreaker = new SubstrateCircuitBreaker(
+  substrateFailfastThreshold(),
+  'getTestPg (shared test Postgres)',
+);
+
+/**
+ * A stable, human-readable descriptor of WHICH container an error came from
+ * (EI-11530 diagnosability). The confusable failure — psql `FATAL: the database
+ * system is in recovery mode` — names the CONTAINER'S internal socket
+ * `/var/run/postgresql/.s.PGSQL.5432`, byte-identical to the host's native PG
+ * socket, so it masqueraded as a live-DB crash and cost real diagnosis time.
+ * Naming the container id + mapped host:port makes it unambiguous. Every getter
+ * is guarded — a container mid-teardown can throw from these.
+ */
+function describeContainer(container: StartedPostgreSqlContainer): string {
+  const safe = (fn: () => unknown): string => {
+    try {
+      const v = fn();
+      return v == null ? '?' : String(v);
+    } catch {
+      return '?';
+    }
+  };
+  const id = safe(() => container.getId()).slice(0, 12);
+  const host = safe(() => container.getHost());
+  const port = safe(() => container.getMappedPort(5432));
+  return `[testcontainer ${id} @ ${host}:${port}]`;
+}
 
 /**
  * The shared integration-test Postgres image. pgvector/pgvector:pg18 — a PG18
