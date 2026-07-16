@@ -124,6 +124,21 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // regression surfaces as a thrown error / failed assertion in the memory suite's own
   // dep-injected tests (configure/resolveEmbedderWith), not this incidental degrade log.
   if (msg.includes('[mem0] embedder unavailable:')) return true;
+  // Mem0Backend.available() → getMemoryClient() → tryLoad() (mem0-client.ts) resolves
+  // the mem0 package via a `new Function('return import(specifier)')` dynamicImport trick
+  // (mem0-client.ts:310). Under vitest's module runner that eval'd function has NO import
+  // callback wired in, so Node throws "A dynamic import callback was not specified." — a
+  // DETERMINISTIC test-env-only condition, never a code defect (in production the real
+  // module context supplies the callback and the import succeeds; a genuine mem0-load
+  // failure surfaces as MODULE_NOT_FOUND via the poison-cache rung, a different message).
+  // tryLoad's catch reports it via the same best-effort warnOnce, and — like the embedder
+  // entry above — that warn fires from an ASYNC availability probe that can resolve during
+  // an UNRELATED test's window (seen red-ing scheduler/get_next.warning.test.ts in a full
+  // forks-pool `npm run test:affected` run; EI-11975). Same WI-1660 misattribution class:
+  // the memory suite's own tests drive the factories via dep injection and never run
+  // getMemoryClient() under vitest (mem0-client.test.ts's own header notes this), so
+  // silencing this exact mem0-scoped phrase cannot hide a real defect elsewhere.
+  if (msg.includes('[mem0] A dynamic import callback was not specified')) return true;
   // notifyOperatorHindsight leg 2 (operator-hindsight.ts) deliberately catches a
   // shared-conversation append failure and warns instead of throwing — the
   // function's own doc: "fail-soft both ways: a thread-append failure never loses

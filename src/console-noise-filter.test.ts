@@ -153,6 +153,22 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the mem0 dynamic-import-callback warn (EI-11975: tryLoad warnOnce leaks across the forks pool under vitest)', () => {
+    // Mem0Backend.available() → tryLoad() imports mem0 via a
+    // `new Function('return import(specifier)')` trick that has no import callback under
+    // vitest's module runner, so Node throws "A dynamic import callback was not specified.".
+    // tryLoad's catch reports it via best-effort warnOnce; the async availability probe can
+    // resolve during an UNRELATED test's window (it red-ed scheduler/get_next.warning.test.ts
+    // via vitest-fail-on-console). A deterministic test-env condition, never a code defect —
+    // same misattribution class as the embedder entry above; silencing the exact mem0-scoped
+    // phrase cannot hide a real defect (the memory suite drives factories via dep injection
+    // and never runs getMemoryClient() under vitest). warnOnce appends a '.', so the emitted
+    // line double-periods — the substring match is period-insensitive on purpose.
+    expect(
+      isSilencedConsoleMessage('[mem0] A dynamic import callback was not specified..'),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(
