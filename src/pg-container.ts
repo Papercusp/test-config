@@ -152,7 +152,16 @@ export async function getTestPg(): Promise<string> {
       // trips that after `threshold` fully-exhausted acquisitions; it just makes
       // each individual exhaustion a truer signal of "actually down" rather than
       // "recovery took longer than an arbitrary 10s".
+      //
+      // ALSO RETRY ON "not yet accepting connections" (WI-5263, 2026-07-17): an
+      // EARLIER point in the same PG startup sequence than "in recovery mode" —
+      // `FATAL: the database system is not yet accepting connections / DETAIL:
+      // Consistent recovery state has not been yet reached` — observed in
+      // engineer-issues-view-dml.integration.test.ts's quarantine history with
+      // the identical "attach mid-restart" mechanism as above. Same transient
+      // class, same budget.
       const RETRY_BUDGET_MS = 30_000;
+      const RETRYABLE_STARTUP_MSG = /in recovery mode|not yet accepting connections/i;
       const retryStartedAt = Date.now();
       let res: Awaited<ReturnType<typeof container.exec>> | undefined;
       let lastErr: unknown;
@@ -172,7 +181,7 @@ export async function getTestPg(): Promise<string> {
         }
         const msg = res ? res.output : lastErr instanceof Error ? lastErr.message : String(lastErr);
         const elapsedMs = Date.now() - retryStartedAt;
-        if (!/in recovery mode/i.test(msg) || elapsedMs >= RETRY_BUDGET_MS) {
+        if (!RETRYABLE_STARTUP_MSG.test(msg) || elapsedMs >= RETRY_BUDGET_MS) {
           throw lastErr;
         }
         await new Promise((r) => setTimeout(r, Math.min(attempt * 500, 3000)));
