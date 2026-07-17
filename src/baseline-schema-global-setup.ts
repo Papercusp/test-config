@@ -29,11 +29,34 @@
  * The path to this file is exported as `BASELINE_SCHEMA_GLOBAL_SETUP_PATH` from
  * the package index; integration configs pass it to `defineVitestConfig({
  * globalSetup: [...] })`.
+ *
+ * NO-DOCKER ESCAPE HATCH (EI-13104): a `capability:bash`-sandboxed cup (bwrap
+ * exec-sandbox, papercusp-capability-exec-sandbox flag) can never reach
+ * docker.sock — the sandbox's unprivileged user namespace intentionally does not
+ * carry the caller's supplementary groups (including `docker`) into the
+ * sandboxed process, and `sg`/`newgrp` group-switching is blocked outright
+ * (setgroups denied) inside that namespace. That is the sandbox correctly
+ * containing a real privilege-escalation vector — docker.sock access is
+ * effectively host-root, so re-granting it would undo the containment this
+ * exec-sandbox exists to provide (see exec-sandbox.ts). It is NOT a bug to
+ * "fix" on the sandbox side.
+ *
+ * The actionable fix lives here instead: when `PAPERCUSP_TEST_PG_ADMIN_URL` is
+ * set (a connection string for a role with CREATEDB on an ALREADY-RUNNING
+ * Postgres server the caller can reach — e.g. the box's native PG — reachable
+ * because the exec-sandbox does NOT `--unshare-net` by default), this globalSetup
+ * skips `PostgreSqlContainer`/testcontainers entirely: it provisions an isolated
+ * throwaway database on that server via `CREATE DATABASE`, applies the same real
+ * migration set to it, and `DROP DATABASE`s it on teardown. Nothing shared or
+ * persistent is touched — a fresh randomly-named DB per run, isolated exactly
+ * like the container path. Purely additive: the env var is unset by default, so
+ * every existing Docker-backed run is byte-identical to before this change.
  */
 import type { GlobalSetupContext } from 'vitest/node';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import postgres from 'postgres';
 import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
@@ -86,23 +109,56 @@ const BOOT_PREREQS_DDL = `
 `;
 
 export default async function setup({ provide }: GlobalSetupContext) {
-  // WI-2942 (2026-07-05): pg16 -> pg18, to match the shipped/embedded operator
-  // (PostgreSQL 18.3) — see libs/test-config/src/pg-container.ts for the full
-  // rationale (PG16 silently allowed a DELETE PG18 rejects; WI-2914 shipped
-  // uncaught because CI tested the wrong major).
-  const container = await withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, () =>
-    new PostgreSqlContainer('pgvector/pgvector:pg18')
-      .withDatabase('papercusp_it')
-      .withUsername('it_admin')
-      .withPassword('it_admin')
-      // Reuse the baseline container across Vitest processes. The previous
-      // ephemeral container replayed ~476 migrations for every focused file;
-      // under checkpoint concurrency that startup alone could consume the test's
-      // entire 90s budget. The advisory lock below makes warm migrations safe.
-      .withReuse()
-      .start(),
-  );
-  const dsn = container.getConnectionUri();
+  // NO-DOCKER ESCAPE HATCH (EI-13104) — see the module doc comment above. Checked
+  // first so a sandboxed caller with no docker.sock access never touches
+  // PostgreSqlContainer at all.
+  const existingAdminUrl = process.env.PAPERCUSP_TEST_PG_ADMIN_URL;
+  let dsn: string;
+  let dropDb: (() => Promise<void>) | null = null;
+
+  if (existingAdminUrl) {
+    const dbName = `papercusp_it_baseline_${randomBytes(6).toString('hex')}`;
+    const admin = postgres(existingAdminUrl, { max: 1, onnotice: () => {} });
+    try {
+      // No reuse/advisory-lock dance here (unlike the container path below):
+      // every setup() call under this escape hatch mints its OWN fresh database,
+      // so there is nothing to race with itself over.
+      await admin.unsafe(`CREATE DATABASE "${dbName}"`);
+    } finally {
+      await admin.end({ timeout: 5 });
+    }
+    const url = new URL(existingAdminUrl);
+    url.pathname = `/${dbName}`;
+    dsn = url.toString();
+    dropDb = async () => {
+      const cleanup = postgres(existingAdminUrl, { max: 1, onnotice: () => {} });
+      try {
+        // WITH (FORCE) (PG13+; this repo is on pg18) drops even if a lingering
+        // connection from a slow-to-close test client is still attached.
+        await cleanup.unsafe(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
+      } finally {
+        await cleanup.end({ timeout: 5 });
+      }
+    };
+  } else {
+    // WI-2942 (2026-07-05): pg16 -> pg18, to match the shipped/embedded operator
+    // (PostgreSQL 18.3) — see libs/test-config/src/pg-container.ts for the full
+    // rationale (PG16 silently allowed a DELETE PG18 rejects; WI-2914 shipped
+    // uncaught because CI tested the wrong major).
+    const container = await withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, () =>
+      new PostgreSqlContainer('pgvector/pgvector:pg18')
+        .withDatabase('papercusp_it')
+        .withUsername('it_admin')
+        .withPassword('it_admin')
+        // Reuse the baseline container across Vitest processes. The previous
+        // ephemeral container replayed ~476 migrations for every focused file;
+        // under checkpoint concurrency that startup alone could consume the test's
+        // entire 90s budget. The advisory lock below makes warm migrations safe.
+        .withReuse()
+        .start(),
+    );
+    dsn = container.getConnectionUri();
+  }
 
   // Exercise the real boot-path migration runner (resolved from the discovered
   // repo root rather than a brittle relative path so this file is location-agnostic).
@@ -137,8 +193,13 @@ export default async function setup({ provide }: GlobalSetupContext) {
   provide('baselineSchemaDsn', dsn);
 
   return async () => {
-    // Reusable box-level infrastructure: stopping it from one Vitest process
-    // invalidates every other integration file attached to this baseline DB.
+    // Container path: reusable box-level infrastructure — stopping it from one
+    // Vitest process invalidates every other integration file attached to this
+    // baseline DB, so it is deliberately left running.
+    //
+    // Escape-hatch path: this run minted its OWN throwaway database (not shared
+    // with any other process), so it is safe — and correct — to drop it here.
+    if (dropDb) await dropDb().catch(() => {});
   };
 }
 
