@@ -152,5 +152,20 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // operator-hindsight.test.ts's dep-mocked two-delivery tests, not this
   // incidental best-effort log line).
   if (msg.includes('[operator-hindsight] shared-thread append failed')) return true;
+  // recordBehaviorChange (change-ledger.ts) deliberately catches a ledger-insert
+  // failure and warns instead of throwing — the function's own doc: "Best-
+  // effort: ... or the write failed (warned loudly; the mutation it records
+  // proceeds regardless)". Any suite that exercises a write path wired to this
+  // hook (decideProposal's after-accept FB-02 call, the repo scanner, ablation
+  // recording, …) WITHOUT the real org PG available (most unit/integration
+  // suites don't need it) hits this warn as an ENVIRONMENT condition, not a
+  // code defect — getOrgPg() is unreachable, not a broken ledger (EI-380). The
+  // ledger's OWN correctness is covered by change-ledger.integration.test.ts,
+  // which runs against a real testcontainer PG and asserts on the write itself
+  // rather than spying this warn. Message text is specific enough that
+  // silencing it cannot hide a real defect elsewhere (a real regression in
+  // recordBehaviorChange surfaces as a failed assertion in that suite, not
+  // this incidental best-effort log line landing in an unrelated caller).
+  if (msg.includes('[change-ledger] FAILED to record')) return true;
   return false;
 }

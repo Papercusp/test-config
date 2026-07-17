@@ -169,6 +169,27 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the change-ledger best-effort record-failure warn (EI-380: an unrelated suite exercising a decideProposal-adjacent write path failed on this via vitest-fail-on-console)', () => {
+    // recordBehaviorChange (change-ledger.ts) deliberately catches a ledger-insert
+    // failure and warns instead of throwing — its own doc: "Best-effort: ... or the
+    // write failed (warned loudly; the mutation it records proceeds regardless)".
+    // Any suite exercising a write path wired to this hook (decideProposal's
+    // after-accept FB-02 call, the repo scanner, ablation recording, …) without the
+    // real org PG available hits this as an ENVIRONMENT condition (getOrgPg()
+    // unreachable), not a code defect — the ledger's own correctness is covered by
+    // change-ledger.integration.test.ts against a real testcontainer PG.
+    expect(
+      isSilencedConsoleMessage(
+        format(
+          '[change-ledger] FAILED to record %s change on %s — EKG attribution has a hole here:',
+          'proposal-accept',
+          'F-123',
+          'getOrgPg is not configured',
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(
