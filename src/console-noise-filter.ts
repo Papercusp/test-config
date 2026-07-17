@@ -80,6 +80,22 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // elsewhere (a real regression on this path surfaces as a thrown error / a failed
   // assertion, not this incidental best-effort log line).
   if (msg.includes('[hive-directory] boot-join skipped for workspace')) return true;
+  // wireHiveDirectoryForWorkspace (hive-directory-boot.ts, EI-9534/WI-953) fires a
+  // SEPARATE, DELIBERATELY LOUD warn (distinct from the lowercase "skipped" entry
+  // above, which covers a different catch — an identity-resolution failure) when
+  // requestOnlyHost() is true: a request-only host (PAPERCUSP_BACKGROUND_WORKERS=0,
+  // or the :3170 staging port) must never join the P2P hive-directory swarm, and
+  // this early-return is intentionally NOT gated behind !VITEST (the module's own
+  // comment: "a request-only host correctly skipping this is a real, useful fact to
+  // see once per process, not spam") so it bites in every process, tests included.
+  // bootAllHarnessesForActiveWorkspace's send-side wiring (boot-all.ts) calls this on
+  // every workspace it boots, so ANY boot-all test running under a request-only test
+  // env hits it (WI-5251: 6 subtests in boot-all.test.ts). Demoting the warn itself
+  // would undo the EI-9534 diagnosability fix; the message text is specific enough
+  // that silencing it here cannot hide a real defect elsewhere (a genuine directory-
+  // wiring regression on a background-workers host surfaces as a thrown error /
+  // failed assertion, not this incidental, intentional log line).
+  if (msg.includes('[hive-directory] boot-join SKIPPED for workspace')) return true;
   // renderMdxToMarkdown (docs-engine/render-mdx.ts) deliberately catches a single
   // doc's MDX compile failure (a raw un-backticked `<digit`/`<word>` placeholder or
   // an unparseable `{expr}`) and degrades to a raw-text fallback so ONE malformed

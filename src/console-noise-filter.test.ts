@@ -106,6 +106,25 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the hive-directory request-only boot-join-SKIPPED deliberate warn (WI-5251: boot-all.test.ts red under a request-only test env)', () => {
+    // wireHiveDirectoryForWorkspace (hive-directory-boot.ts, EI-9534/WI-953) fires a
+    // SEPARATE, deliberately loud warn — distinct from the lowercase "skipped" case
+    // above — when requestOnlyHost() is true (PAPERCUSP_BACKGROUND_WORKERS=0, or the
+    // :3170 staging port). It is intentionally NOT gated behind !VITEST, so any test
+    // that boots a harness under a request-only env (bootAllHarnessesForActiveWorkspace's
+    // send-side wiring) hits it. Silencing the exact text keeps the gate green without
+    // undoing the EI-9534 diagnosability fix or hiding a real defect.
+    expect(
+      isSilencedConsoleMessage(
+        format(
+          '[hive-directory] boot-join SKIPPED for workspace %s: requestOnlyHost()===true %s',
+          'ws',
+          '(PAPERCUSP_BACKGROUND_WORKERS=0, PAPERCUSP_HONO_PORT=<unset>)',
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it('silences the docs-engine MDX-parse-fallback warn (WI-3842: an unrelated doc typo failed the docs-qa retrieval test)', () => {
     // renderMdxToMarkdown (docs-engine/render-mdx.ts) deliberately degrades a single
     // malformed doc to a raw-text fallback rather than throwing (EI-5860). The offending
