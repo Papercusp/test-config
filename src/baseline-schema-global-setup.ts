@@ -199,7 +199,14 @@ export default async function setup({ provide }: GlobalSetupContext) {
     //
     // Escape-hatch path: this run minted its OWN throwaway database (not shared
     // with any other process), so it is safe — and correct — to drop it here.
-    if (dropDb) await dropDb().catch(() => {});
+    if (dropDb) {
+      // Best-effort: a leaked throwaway `papercusp_it_baseline_*` database (this
+      // run's own, uniquely-named) is a harmless cleanup miss, not a correctness
+      // issue — but log it so a leak is traceable instead of silently swallowed.
+      await dropDb().catch((err) => {
+        console.error('[baseline-schema-global-setup] failed to drop the escape-hatch throwaway database:', err);
+      });
+    }
   };
 }
 
