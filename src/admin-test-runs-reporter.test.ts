@@ -95,6 +95,15 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(shouldRecordTestRunPath('packages/operator-core/lib/testing-orphan-runs.test.ts')).toBe(true);
   });
 
+  it('does not record a path that resolves outside the workspace root (WI-5183)', () => {
+    // toWorkspaceRel('/tmp/fake.test.ts') → '../../../../tmp/fake.test.ts' — exactly
+    // the moduleId THIS test file's own fixtures above use ('/tmp/fake.test.ts').
+    // Never a real repo file; must not be recorded as a flakiness signal.
+    expect(shouldRecordTestRunPath('../../../../tmp/fake.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('../outside-repo.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('..\\windows-outside.test.ts')).toBe(false);
+  });
+
   it('buildOutputTail captures failed TEST-CASE errors when the module has no top-level errors', () => {
     const fakeModule = {
       moduleId: '/tmp/fake.test.ts',

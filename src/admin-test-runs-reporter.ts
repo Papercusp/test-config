@@ -153,6 +153,18 @@ const NON_SIGNAL_PREFIXES = [
 ] as const;
 
 export function shouldRecordTestRunPath(filePath: string): boolean {
+  // A `toWorkspaceRel`'d path that still starts with `../` resolved OUTSIDE the
+  // workspace root entirely (e.g. `/tmp/fake.test.ts` → `../../../../tmp/fake.test.ts`)
+  // — never a real repo file, so never a real regression signal. WI-5183: this
+  // reporter's OWN fail-soft self-tests (admin-test-runs-reporter.test.ts) construct
+  // fake TestModules with `moduleId: '/tmp/fake.test.ts'` and drive them through
+  // onTestModuleEnd for real (to prove it never throws) — on a dev box with a live
+  // PG reachable, that real call recorded real rows for a file that has never
+  // existed in git, which the flakiness scanner then flagged as a 100%-flip-rate
+  // "test" to quarantine (nonsensical: there is no real file/glob to quarantine).
+  // General fix (not a one-off path literal): reject ANY moduleId that normalizes
+  // outside the workspace root, not just this specific fixture path.
+  if (filePath.startsWith('../') || filePath.startsWith('..\\')) return false;
   if (filePath.startsWith('_retired/') || filePath.includes('/_retired/')) return false;
   if (filePath.startsWith('.papercusp/scratch/tdg-') || filePath.includes('/.papercusp/scratch/tdg-')) return false;
   // `*.flakeproof.test.{ts,tsx}` is the reserved, gitignored scratch fixture for

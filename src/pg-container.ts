@@ -135,11 +135,28 @@ export async function getTestPg(): Promise<string> {
       // finding, 2026-07-09: 3 consecutive integration-test runs on a healthy,
       // unloaded box each hit `FATAL: the database system is in recovery mode`
       // on the FIRST framework-role-ensure attempt, then succeeded once retried).
-      // A short bounded retry rides out the window instead of failing every
-      // concurrent suite that happens to touch the container during it.
+      // A bounded retry rides out the window instead of failing every concurrent
+      // suite that happens to touch the container during it.
+      //
+      // TIME-BOUNDED, not attempt-count-bounded (WI-5254/WI-5256, 2026-07-17):
+      // the original fixed 6-attempt/~10.5s budget (500ms*attempt backoff) was
+      // sized for the "healthy, unloaded box" case above — but under today's much
+      // heavier fleet load (50+ concurrent agents) the recovery window regularly
+      // outlasts it: harness_shared.test_runs shows curation-state.integration and
+      // render-templates.integration each failing on this exact "in recovery mode"
+      // message with durations of 8.2-10.0s, i.e. exhausting the full old budget
+      // and then failing anyway. Ride out a LONGER window (up to 30s total) with
+      // backoff capped at 3s/attempt, so a slower-but-still-transient recovery
+      // still resolves instead of flaking the whole suite. This does not weaken
+      // the SubstrateCircuitBreaker above it — a genuinely-down substrate still
+      // trips that after `threshold` fully-exhausted acquisitions; it just makes
+      // each individual exhaustion a truer signal of "actually down" rather than
+      // "recovery took longer than an arbitrary 10s".
+      const RETRY_BUDGET_MS = 30_000;
+      const retryStartedAt = Date.now();
       let res: Awaited<ReturnType<typeof container.exec>> | undefined;
       let lastErr: unknown;
-      for (let attempt = 1; attempt <= 6; attempt++) {
+      for (let attempt = 1; ; attempt++) {
         try {
           res = await container.exec([
             'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'test', '-d', 'papercusp_test', '-c', FRAMEWORK_ROLES_DDL,
@@ -154,10 +171,11 @@ export async function getTestPg(): Promise<string> {
           res = undefined;
         }
         const msg = res ? res.output : lastErr instanceof Error ? lastErr.message : String(lastErr);
-        if (!/in recovery mode/i.test(msg) || attempt === 6) {
+        const elapsedMs = Date.now() - retryStartedAt;
+        if (!/in recovery mode/i.test(msg) || elapsedMs >= RETRY_BUDGET_MS) {
           throw lastErr;
         }
-        await new Promise((r) => setTimeout(r, attempt * 500));
+        await new Promise((r) => setTimeout(r, Math.min(attempt * 500, 3000)));
       }
       if (!res || res.exitCode !== 0) {
         throw lastErr ?? new Error('getTestPg: framework-role ensure failed (unknown error)');
