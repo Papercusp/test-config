@@ -69,6 +69,27 @@ import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
  */
 export const BASELINE_SCHEMA_CONTAINER_START_LOCK = 'baseline-schema-container-start';
 
+/**
+ * EI-2433: testcontainers' `.withReuse()` matches an existing container purely by
+ * its CONFIG hash (image, env, ports, …) — it never validates that the database
+ * inside is actually usable. On this shared dev box a reused container can end up
+ * running but missing `papercusp_it` (dropped by an external actor, left over from
+ * a since-changed setup, …), which surfaced as every integration test failing with
+ * "no such database: papercusp_it" despite the container reporting healthy.
+ * Health-check a candidate container's actual DB before trusting its DSN.
+ */
+async function isBaselineContainerHealthy(dsn: string): Promise<boolean> {
+  const probe = postgres(dsn, { max: 1, onnotice: () => {}, connect_timeout: 5 });
+  try {
+    await probe.unsafe('SELECT 1');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await probe.end({ timeout: 5 }).catch(() => {});
+  }
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -145,7 +166,7 @@ export default async function setup({ provide }: GlobalSetupContext) {
     // (PostgreSQL 18.3) — see libs/test-config/src/pg-container.ts for the full
     // rationale (PG16 silently allowed a DELETE PG18 rejects; WI-2914 shipped
     // uncaught because CI tested the wrong major).
-    const container = await withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, () =>
+    const startBaselineContainer = () =>
       new PostgreSqlContainer('pgvector/pgvector:pg18')
         .withDatabase('papercusp_it')
         .withUsername('it_admin')
@@ -155,8 +176,22 @@ export default async function setup({ provide }: GlobalSetupContext) {
         // under checkpoint concurrency that startup alone could consume the test's
         // entire 90s budget. The advisory lock below makes warm migrations safe.
         .withReuse()
-        .start(),
-    );
+        .start();
+    const container = await withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, async () => {
+      let c = await startBaselineContainer();
+      // EI-2433: validate the (possibly reused) container's DB before trusting it.
+      // A reused-but-stale container matches on config alone; stopping it here
+      // means testcontainers' reuse lookup (which only matches RUNNING containers)
+      // can't find it again, so the retry below provisions a genuinely fresh one.
+      if (!(await isBaselineContainerHealthy(c.getConnectionUri()))) {
+        console.error(
+          '[baseline-schema-global-setup] reused container failed health-check (stale/missing papercusp_it) — stopping + reprovisioning fresh',
+        );
+        await c.stop().catch(() => {});
+        c = await startBaselineContainer();
+      }
+      return c;
+    });
     dsn = container.getConnectionUri();
   }
 
