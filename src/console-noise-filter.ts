@@ -31,6 +31,27 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // vitest-config.ts ("runner robustness, not test weakening").
   if (msg.includes('connection slots are reserved')) return true;
   if (msg.includes('too many clients already')) return true;
+  // PostgreSQL UNREACHABLE (ECONNREFUSED) — the DOWN twin of the exhaustion
+  // entries above. The exact same best-effort graceful-degradation paths log
+  // when the box's native PG isn't running/reachable at all (e.g. a unit-test
+  // box with no PG on :5432, or the checkpoint tree booting before PG is up)
+  // instead of when its pool is full — a raw socket `connect ECONNREFUSED …`
+  // where the exhaustion case carries SQLSTATE 53300. These paths are
+  // best-effort by construction (each catches+continues; gate-decisions'
+  // own doc: "a telemetry outage must never fail an orientation"; wire-outbox:
+  // "continuing — drain still starts"), so ANY failure they log — down OR
+  // exhausted — is environment weather, not a code signal (a real regression
+  // in one of these paths surfaces as a thrown error / failed assertion on the
+  // asserted path, never as this incidental best-effort log line). Keyed off
+  // each path's UNIQUE tag (not a generic ECONNREFUSED string) so the match
+  // stays exact and cannot silence an unrelated connection error. Without this
+  // the ECONNREFUSED variant tripped vitest-fail-on-console on orient.test.ts
+  // (gate-decisions capture) + boot-all.test.ts (wire-outbox / outbox-drain)
+  // whenever the run box had no reachable PG (EI-13946).
+  if (msg.includes('[gate-decisions] capture failed')) return true;
+  if (msg.includes('[wire-outbox] backfillLocalState failed for')) return true;
+  if (msg.includes('[outbox-drain] drain failed for')) return true;
+  if (msg.includes('[outbox-drain] LISTEN setup failed for')) return true;
   // implement-worker-exit.test.ts's "getPayload failure" test deliberately spies
   // console.warn (vi.spyOn(...).mockImplementation) around the ONE intentional,
   // best-effort warn recordImplementWorkerExit emits on a getPayload error

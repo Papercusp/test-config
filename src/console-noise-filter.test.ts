@@ -209,6 +209,43 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  describe('PostgreSQL UNREACHABLE (ECONNREFUSED) — the DOWN twin of the exhaustion entries (EI-13946)', () => {
+    // The exact console shapes that tripped vitest-fail-on-console on a run box
+    // with no reachable PG on :5432: orient.test.ts (gate-decisions fire-and-forget
+    // capture) + boot-all.test.ts (wire-outbox backfill / outbox-drain LISTEN+drain).
+    // Same best-effort catch-and-continue paths as the SQLSTATE-53300 exhaustion
+    // block above, but the payload is a raw socket `connect ECONNREFUSED …` instead
+    // of a PG resource-limit string, so the exhaustion entries never matched them.
+    const econnrefused = 'connect ECONNREFUSED 127.0.0.1:5432';
+    const downCalls: Array<[string, unknown[]]> = [
+      [
+        "[gate-decisions] capture failed (3 decision(s), first gate='orient.recall.queen-loop-withhold'); re-warns at most once/5min:",
+        [econnrefused],
+      ],
+      [
+        '[wire-outbox] backfillLocalState failed for ws-1::papercup (continuing — drain still starts):',
+        [econnrefused],
+      ],
+      [
+        '[outbox-drain] drain failed for ws-1::papercup:',
+        [econnrefused],
+      ],
+      [
+        '[outbox-drain] LISTEN setup failed for ws-1::papercup:',
+        [econnrefused],
+      ],
+    ];
+    it.each(downCalls)('silences %s', (first, rest) => {
+      expect(isSilencedConsoleMessage(format(first, ...rest))).toBe(true);
+    });
+
+    it('does NOT silence an ECONNREFUSED that lacks a known best-effort path tag (match is keyed off the tag, not a broad ECONNREFUSED string)', () => {
+      expect(
+        isSilencedConsoleMessage(format('[some-route] handler error:', econnrefused)),
+      ).toBe(false);
+    });
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(
