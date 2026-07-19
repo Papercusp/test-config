@@ -81,7 +81,47 @@ const FRAMEWORK_ROLES_DDL = `
   END $$;
 `;
 
+/**
+ * NO-DOCKER ESCAPE HATCH (EI-13104-class fix; WI-5415 found the gap): a
+ * `capability:bash`-sandboxed cup can never reach docker.sock (see the identical
+ * escape hatch's doc comment in baseline-schema-global-setup.ts for why that's the
+ * sandbox correctly containing a privilege-escalation vector, not a bug to route
+ * around). EI-13104 added the escape hatch to the BASELINE-SCHEMA globalSetup's own
+ * dedicated container, but this SEPARATE shared-container path (`getTestPg`, used by
+ * `createFreshTestDb`/`createFreshDb` — the fixture behind most `.integration.test.ts`
+ * files, including this repo's rubric/scorecard suites) still hard-required Docker —
+ * the same class of blocker recurring in a sibling code path. Mirrors that exact
+ * pattern here: `PAPERCUSP_TEST_PG_ADMIN_URL` (a CREATEDB-capable role on an
+ * ALREADY-RUNNING Postgres the sandbox can reach, e.g. the box's native PG) skips
+ * `PostgreSqlContainer` entirely and returns that URL directly (after ensuring the
+ * same framework roles the container path applies). Purely additive — the env var
+ * is unset by default, so every existing Docker-backed run is unaffected.
+ */
+let noDockerAdminUrlPromise: Promise<string> | null = null;
+
 export async function getTestPg(): Promise<string> {
+  const existingAdminUrl = process.env.PAPERCUSP_TEST_PG_ADMIN_URL;
+  if (existingAdminUrl) {
+    if (!noDockerAdminUrlPromise) {
+      noDockerAdminUrlPromise = (async () => {
+        const admin = postgres(existingAdminUrl, { max: 1, onnotice: () => {} });
+        try {
+          await admin.unsafe(FRAMEWORK_ROLES_DDL);
+        } finally {
+          await admin.end({ timeout: 5 });
+        }
+        return existingAdminUrl;
+      })().catch((e) => {
+        // Don't strand later callers in this process on a permanently-rejected
+        // promise — a fresh call gets a clean shot (e.g. the target PG was briefly
+        // unreachable at first use).
+        noDockerAdminUrlPromise = null;
+        throw e;
+      });
+    }
+    return noDockerAdminUrlPromise;
+  }
+
   // Fail-fast: once the breaker has latched (substrate persistently down), throw
   // the distinct TEST SUBSTRATE DOWN error immediately — no container start, no
   // retry — so the rest of the run reports the outage instead of grinding.
