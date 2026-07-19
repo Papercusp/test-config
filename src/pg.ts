@@ -19,3 +19,5 @@ export { getTestPg, teardownTestPg, withTestSchema, TEST_PG_IMAGE } from './pg-c
 export type { TestSchemaHandle } from './pg-container.ts';
 export { createFreshTestDb, createMigratedTestDb, provisionRestartTestDb, getOrBuildTemplate } from './pg-migrate.ts';
 export type { MigratedTestDb, CreateFreshTestDbOptions } from './pg-migrate.ts';
+export { probePgReachable, assertPgReachable } from './pg-reachability.ts';
+export type { PgReachabilityResult } from './pg-reachability.ts';
