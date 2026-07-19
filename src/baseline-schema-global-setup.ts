@@ -60,6 +60,7 @@ import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
+import { probePgReachable } from './pg-reachability.ts';
 
 /**
  * The baseline schema owns a dedicated container, so its Docker handshake must
@@ -77,17 +78,19 @@ export const BASELINE_SCHEMA_CONTAINER_START_LOCK = 'baseline-schema-container-s
  * a since-changed setup, …), which surfaced as every integration test failing with
  * "no such database: papercusp_it" despite the container reporting healthy.
  * Health-check a candidate container's actual DB before trusting its DSN.
+ *
+ * EI-2627: a single immediate probe conflated that genuine staleness with a
+ * brief, self-resolving startup/recovery race (the exact class getTestPg()
+ * already tolerates for the SHARED test-PG container via a bounded retry —
+ * WI-3578/WI-5254/WI-5256, see pg-container.ts) — under heavy fleet-wide
+ * concurrency this container hits that race often enough that reprovisioning
+ * on every blip adds MORE docker load, deepening the very churn it's meant to
+ * avoid. `probePgReachable` rides out ONLY the transient-looking failures
+ * (bounded budget) and still fails fast on a real "no such database"/auth
+ * error, so staleness is still caught immediately.
  */
 async function isBaselineContainerHealthy(dsn: string): Promise<boolean> {
-  const probe = postgres(dsn, { max: 1, onnotice: () => {}, connect_timeout: 5 });
-  try {
-    await probe.unsafe('SELECT 1');
-    return true;
-  } catch {
-    return false;
-  } finally {
-    await probe.end({ timeout: 5 }).catch(() => {});
-  }
+  return (await probePgReachable(dsn, 15_000)).ok;
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
