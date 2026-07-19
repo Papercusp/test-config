@@ -1,4 +1,5 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import postgres from 'postgres';
 import { randomBytes } from 'node:crypto';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 import { SubstrateCircuitBreaker } from './substrate-circuit-breaker.ts';
