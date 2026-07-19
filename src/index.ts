@@ -1,5 +1,3 @@
-import { fileURLToPath } from 'node:url';
-
 // ⚠ This barrel statically re-exports heavy node-only test infra (testcontainers,
 // msw, @nestjs/testing, drizzle-orm). A Vite-side jsdom component test (e.g.
 // apps/operator-vite) that imports ANYTHING from '@papercusp/test-config' pulls
@@ -8,36 +6,28 @@ import { fileURLToPath } from 'node:url';
 // Node/jsdom realm, not an import-weight problem (EI-8888). A new lightweight /
 // browser-safe export (like ./nuqs-mock, ./nest) belongs behind its OWN
 // package.json `exports` subpath, never added to this barrel's re-export list.
+//
+// `defineVitestConfig` + its path-constant siblings below are ALSO available
+// (identical values) from the lightweight `./vitest-config` subpath
+// (`@papercusp/test-config/vitest-config`), which does NOT statically import
+// msw/testcontainers/@nestjs-testing/drizzle. Every vitest.config.ts that only
+// needs config-building (the overwhelming majority) should import from THAT
+// subpath, not this barrel — importing the barrel just to call
+// `defineVitestConfig` was the root cause of EI-13226 (msw's cookieStore.mjs
+// touches `globalThis.localStorage` at module-scope import time, which fires
+// Node's spurious `--localstorage-file` warning on every such vitest run).
 
 export {
   defineVitestConfig,
   sharedHostWorkerCap,
   findMisroutedReproTests,
   MISROUTED_REPRO_TEST,
+  // Re-exported from vitest-config.ts (single source of truth) so the barrel
+  // stays backward-compatible for existing consumers of these two constants.
+  ADMIN_TEST_RUNS_REPORTER_PATH,
+  BASELINE_SCHEMA_GLOBAL_SETUP_PATH,
 } from './vitest-config.ts';
 export type { TestLayer, DefineVitestConfigOptions } from './vitest-config.ts';
-
-/**
- * Absolute path to the shared integration-tier baseline-schema globalSetup
- * (stands up the full harness_shared schema once + exposes inject('baselineSchemaDsn')).
- * Pass to defineVitestConfig({ globalSetup: [BASELINE_SCHEMA_GLOBAL_SETUP_PATH] }).
- */
-export const BASELINE_SCHEMA_GLOBAL_SETUP_PATH = fileURLToPath(
-  new URL('./baseline-schema-global-setup.ts', import.meta.url),
-);
-
-/**
- * Absolute path to the admin test-runs reporter (writes one row per test FILE to
- * harness_shared.test_runs → the /admin/testing status chips). `defineVitestConfig`
- * AUTO-WIRES this; workspaces whose vitest config is hand-rolled (plain
- * `defineConfig`, not `defineVitestConfig`) opt in by appending it to their
- * `reporters`: `reporters: ['default', ADMIN_TEST_RUNS_REPORTER_PATH]`. Fail-soft —
- * a missing DB never changes a test outcome. Opt-out via
- * PAPERCUSP_DISABLE_TEST_RUNS_REPORTER=1 (then just pass `['default']`).
- */
-export const ADMIN_TEST_RUNS_REPORTER_PATH = fileURLToPath(
-  new URL('./admin-test-runs-reporter.ts', import.meta.url),
-);
 
 export { getTestPg, teardownTestPg, withTestSchema, TEST_PG_IMAGE } from './pg-container.ts';
 export type { TestSchemaHandle } from './pg-container.ts';

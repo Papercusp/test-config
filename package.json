@@ -20,6 +20,11 @@
       "types": "./src/nuqs-mock.ts",
       "import": "./src/nuqs-mock.ts",
       "default": "./src/nuqs-mock.ts"
+    },
+    "./vitest-config": {
+      "types": "./src/vitest-config.ts",
+      "import": "./src/vitest-config.ts",
+      "default": "./src/vitest-config.ts"
     }
   },
   "scripts": {

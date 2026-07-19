@@ -128,6 +128,18 @@ const ADMIN_TEST_RUNS_REPORTER = resolve(__dirname, 'admin-test-runs-reporter.ts
 const adminReporter: string[] =
   process.env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' ? [] : [ADMIN_TEST_RUNS_REPORTER];
 
+// Public path constants, re-exported here (not just from the heavy `index.ts` barrel)
+// so a vitest.config.ts that only needs `defineVitestConfig` + these two path strings
+// can import from the LIGHTWEIGHT `@papercusp/test-config/vitest-config` subpath and
+// never load msw/testcontainers/@nestjs-testing/drizzle at config-resolution time
+// (EI-13226: that eager barrel import was the root cause of every vitest run in the
+// monorepo — including ones with zero use for msw — printing Node's spurious
+// `--localstorage-file` warning, because msw's cookieStore.mjs touches
+// `globalThis.localStorage` at MODULE-SCOPE import time; see comment on the barrel
+// re-export in index.ts). Kept in sync with index.ts's identically-named exports.
+export const ADMIN_TEST_RUNS_REPORTER_PATH = ADMIN_TEST_RUNS_REPORTER;
+export const BASELINE_SCHEMA_GLOBAL_SETUP_PATH = resolve(__dirname, 'baseline-schema-global-setup.ts');
+
 // A positional file filter naming an *.integration.test.* / *.browser.test.*
 // file. Under the unit layer these are *excluded* (see the exclude globs
 // below), so `vitest run path/to/foo.integration.test.ts` matches the unit
