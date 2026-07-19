@@ -25,6 +25,11 @@
       "types": "./src/vitest-config.ts",
       "import": "./src/vitest-config.ts",
       "default": "./src/vitest-config.ts"
+    },
+    "./pg": {
+      "types": "./src/pg.ts",
+      "import": "./src/pg.ts",
+      "default": "./src/pg.ts"
     }
   },
   "scripts": {

@@ -29,6 +29,11 @@ export {
 } from './vitest-config.ts';
 export type { TestLayer, DefineVitestConfigOptions } from './vitest-config.ts';
 
+// getTestPg/withTestSchema/createFreshTestDb/… (re-exported below, identical values) are
+// ALSO available from the lightweight `@papercusp/test-config/pg` subpath, which does NOT
+// statically import msw — a `.integration.test.ts` that only needs PG helpers should import
+// from THAT subpath, not this barrel, to avoid Node's spurious `--localstorage-file` warning
+// (EI-13226 follow-up; see the doc comment on `pg.ts`).
 export { getTestPg, teardownTestPg, withTestSchema, TEST_PG_IMAGE } from './pg-container.ts';
 export type { TestSchemaHandle } from './pg-container.ts';
 export { createFreshTestDb, createMigratedTestDb, provisionRestartTestDb, getOrBuildTemplate } from './pg-migrate.ts';
