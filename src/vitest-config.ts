@@ -109,13 +109,54 @@ function scrubStrayEmptyGitMarker(dir: string): void {
 }
 scrubStrayEmptyGitMarker('/tmp');
 
+/**
+ * True if `dir` exists AND is actually WRITABLE — existence alone is not enough
+ * (EI-6063). The implement-runner capability sandbox sets `TMPDIR=/tmp/claude`
+ * pointing at a READ-ONLY bind mount that DOES exist (`existsSync` → true), so the
+ * original `!cur || !existsSync(cur) || tmpdirIsInsideRepo(cur)` guard never fired
+ * and every `npx vitest run` in that sandbox died before any test loaded with
+ * `ENOENT: no such file or directory, mkdir '/tmp/claude/<id>/ssr'` (a read-only
+ * mount surfaces as ENOENT/EROFS/EACCES on write, never on a plain stat/existsSync
+ * check). Probe with a real mkdir+rm — the only way to tell "exists" from "writable".
+ */
+export function isWritableDir(dir: string): boolean {
+  const probe = resolve(dir, `.pcv-write-probe-${process.pid}-${Date.now()}`);
+  try {
+    mkdirSync(probe);
+    rmSync(probe, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 {
   const cur = process.env.TMPDIR;
-  const needsOverride = !cur || !existsSync(cur) || tmpdirIsInsideRepo(cur);
+  const needsOverride = !cur || !existsSync(cur) || tmpdirIsInsideRepo(cur) || !isWritableDir(cur);
   if (needsOverride) {
-    const shortTmp = '/tmp/pcv';
-    mkdirSync(shortTmp, { recursive: true });
-    process.env.TMPDIR = shortTmp;
+    // EI-6063: try /tmp first (short, keeps unix-socket sun_path paths well under the
+    // 108-char limit — see the block comment above), but some sandboxes mount ALL of
+    // /tmp read-only (not just a TMPDIR=/tmp/claude subpath) — fall back to /dev/shm,
+    // the one tmpfs the implement-runner sandbox confirms is always writable.
+    const candidates = ['/tmp/pcv', '/dev/shm/pcv'];
+    for (const shortTmp of candidates) {
+      try {
+        mkdirSync(shortTmp, { recursive: true });
+      } catch {
+        continue; // this candidate's parent is itself unwritable — try the next
+      }
+      if (isWritableDir(shortTmp)) {
+        process.env.TMPDIR = shortTmp;
+        break;
+      }
+      // exists but still not writable (e.g. mkdirSync silently no-op'd on a
+      // read-only mount that tolerates recursive:true on an already-existing
+      // dir) — fall through to the next candidate.
+    }
+    // If NEITHER candidate is writable, leave TMPDIR as whatever it was: every
+    // writable path this box offers has been exhausted, and failing loudly at the
+    // real mkdir call site is more diagnosable than silently pointing at a dir that
+    // will just fail the same way one level down.
   }
 }
 
