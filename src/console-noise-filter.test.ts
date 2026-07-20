@@ -209,6 +209,27 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the read-merge WI-2003 dead-letter quarantine console.error (EI-18140230738284514: boot.test.ts full-suite-only spy-race flake)', () => {
+    // mergeAdmittedLogsIncremental (read-merge.ts) deliberately logs a loud
+    // console.error when it dead-letters a persistently-unreadable op instead
+    // of wedging the rest of the peer's log forever. boot.test.ts's WI-5340
+    // case simulates exactly this and already spies+mocks console.error
+    // around it, but — per the WI-1660/WI-2994/WI-3842/WI-4031 misattribution
+    // class above — that spy occasionally loses the race against this
+    // setup's own console.error wrapping under the full forks-pool run, so
+    // the deliberate log escapes to vitest-fail-on-console (the test passed
+    // standalone/whole-file 52/52 every time; only the full-suite watchdog
+    // run saw this exact message in the failure tail).
+    expect(
+      isSilencedConsoleMessage(
+        "[read-merge] WI-2003 quarantine: unreadable op at a1a1a1a1a1a1#1 after 3 consecutive read failures — advancing past it so the rest of this peer's " +
+          'log can keep folding (this position itself never folds; if this is an identity-' +
+          'divergence signature-verify rejection, re-grant/re-emit the underlying wraps so the ' +
+          'sender re-publishes under a verifiable identity): WI-5340 test: simulated stuck zombie — block fetch never resolves',
+      ),
+    ).toBe(true);
+  });
+
   describe('PostgreSQL UNREACHABLE (ECONNREFUSED) — the DOWN twin of the exhaustion entries (EI-13946)', () => {
     // The exact console shapes that tripped vitest-fail-on-console on a run box
     // with no reachable PG on :5432: orient.test.ts (gate-decisions fire-and-forget

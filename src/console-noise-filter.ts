@@ -204,5 +204,26 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // recordBehaviorChange surfaces as a failed assertion in that suite, not
   // this incidental best-effort log line landing in an unrelated caller).
   if (msg.includes('[change-ledger] FAILED to record')) return true;
+  // mergeAdmittedLogsIncremental (read-merge.ts) deliberately logs a loud
+  // console.error when it DEAD-LETTERS a persistently-unreadable op (the
+  // WI-2003 quarantine path: advance past the position instead of wedging
+  // the rest of the peer's log forever) — the module's own comment calls
+  // this the fix for "the pre-fix behavior: silent REV fed_event outage
+  // class", i.e. it is meant to be LOUD, not silent, in production.
+  // boot.test.ts's WI-5340 case ("re-attach that does NOT restore ingest")
+  // deliberately simulates this exact quarantine path and already
+  // `vi.spyOn(console, 'error').mockImplementation(...)`s around it — but,
+  // per the WI-1660/WI-2994/WI-3842/WI-4031 misattribution class documented
+  // above, that in-test spy occasionally loses the race against this
+  // setup's own beforeEach/afterEach console.error wrapping under the full
+  // forks-pool green-checkpoint run, so the deliberate log reaches
+  // vitest-fail-on-console instead of the spy (EI-18140230738284514: passed
+  // standalone/whole-file every time — 52/52 — but watchdog-flagged red 4×/6h
+  // on the full-suite run with this exact message in the failure tail).
+  // Message text is specific enough that silencing it cannot hide a real
+  // defect elsewhere (a genuine read-merge regression surfaces as a failed
+  // assertion in read-merge-read-throw.test.ts's own dedicated coverage of
+  // this codepath, not this incidental — and intentionally loud — log line).
+  if (msg.includes('[read-merge] WI-2003 quarantine:')) return true;
   return false;
 }
