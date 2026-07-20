@@ -51,6 +51,25 @@
  *    each file's start makes the UNSET default reliable; a test that needs a pin
  *    sets it itself.
  *
+ *  - PAPERCUSP_BACKGROUND_WORKERS / PAPERCUSP_HONO_PORT — every su/psu agent shell on
+ *    this box carries `PAPERCUSP_BACKGROUND_WORKERS=0` in its ambient environment (the
+ *    launch env, mirroring the request-only service drop-ins), which silently changes
+ *    the ambient-env DEFAULT that `requestOnlyHost()` / `dbosLaunchesHere()`
+ *    (background-workers.ts) resolve to for any call that doesn't pass an explicit env
+ *    override — from "this process owns the substrate" to "request-only worker". Both
+ *    predicates are DELIBERATELY vitest-guard-free (a test must be able to flip them via
+ *    env, ambient or explicit), so unlike every var above there is no `VITEST` escape
+ *    hatch inside the predicates themselves — the leak has to be scrubbed at the env
+ *    layer, here. Found live 2026-07-19 (EI-2634 / this bug): 16/32
+ *    in-process-status.test.ts tests + the sibling integration-smoke.test.ts failed
+ *    DETERMINISTICALLY in every su/psu shell (bootedCount:0 / reachedSubstrateOwner:false
+ *    instead of the healthy-with-handles result the test names describe) — not a flake,
+ *    and invisible in CI (which never carries the var). Those two files had grown a local
+ *    save/scrub/restore workaround for exactly this; centralizing it here makes it hold
+ *    for every test file, not just the ones an agent happened to hand-patch. A test that
+ *    genuinely wants the request-only-host branch still sets the var itself, in its own
+ *    beforeEach/test body, which runs after this module-level scrub and so still wins.
+ *
  *  - PAPERCUSP_VOICE_IPC_DIR (redirected, not scrubbed) — the voice-socket state root
  *    (sockets/ + voice-ipc.json). Without a redirect, any test that (transitively)
  *    starts the local voice socket reaps the REAL ~/.papercusp/sockets — an orphaned
@@ -99,6 +118,8 @@ if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
     }
   });
 }
+delete process.env.PAPERCUSP_BACKGROUND_WORKERS;
+delete process.env.PAPERCUSP_HONO_PORT;
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_POT_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
