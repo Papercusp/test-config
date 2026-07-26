@@ -71,6 +71,63 @@ import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 export const BASELINE_SCHEMA_CONTAINER_START_LOCK = 'baseline-schema-container-start';
 
 /**
+ * EI-18748424931934157 — the schema this file seeds to stand in for a real per-harness
+ * schema (`harness_<slug>`), so that migrations are replayed against a schema graph that
+ * resembles a live operator instead of a bare `harness_shared`.
+ *
+ * THE HOLE THIS CLOSES. Every migration test in this repo builds a database containing
+ * ONLY `harness_shared`. Real operators additionally carry a per-harness schema per
+ * harness, each with a `harness_features` view defined as
+ * `SELECT * FROM harness_shared.harness_features_consolidated`. Postgres refuses to DROP
+ * a view that has dependents — so a migration that drops or incompatibly redefines a
+ * depended-on view is REJECTED on every real operator and ACCEPTED by every test we have.
+ * A fresh testcontainer was the one environment where such a migration was safe, and it
+ * was the only environment we tested in.
+ *
+ * That is not hypothetical: migration 678 passed the gate and then crash-looped the
+ * operator with "cannot drop view harness_shared.harness_features_consolidated because
+ * other objects depend on it". 678 itself was fixed (rewritten to append-only
+ * CREATE OR REPLACE); the trap that let it ship is what this closes. The reasoning slip
+ * behind it — "nothing has been built on the column yet", true of the COLUMN and
+ * irrelevant to the VIEW — is exactly the kind a human reviewer waves through, which is
+ * why the guard has to be mechanical rather than a review convention.
+ *
+ * WHY A VIEW AND NOT A LINT: this tests the actual property (a migration must survive a
+ * realistic dependency graph) rather than pattern-matching on SQL text, so it generalizes
+ * to dependency breakage nobody has thought of yet. A static "no bare DROP VIEW"
+ * assertion over the corpus is a reasonable cheap belt ALONGSIDE this, not instead of it.
+ *
+ * Deliberately ONE schema, not a replica of the real set: the property is binary — either
+ * a dependent exists or it does not — so a second copy would cost container time and
+ * catch nothing extra.
+ */
+export const DEPENDENT_VIEW_PROBE_SCHEMA = 'harness_migration_probe';
+
+/**
+ * Create the dependent-view probe, IF its base relation exists yet.
+ *
+ * Returns false (and writes nothing) on a brand-new database whose migrations have not
+ * been replayed yet — `harness_features_consolidated` is itself created by the corpus, so
+ * on a fresh container the probe cannot exist until after the first run. That is why the
+ * caller invokes this on BOTH sides of the runner: the pre-run call is the one that
+ * guards, and the post-run call is what makes the pre-run call effective on every
+ * subsequent run against this reused container.
+ *
+ * Existence is checked rather than catching the error, so a genuine failure to create the
+ * probe surfaces loudly instead of being swallowed as "base relation missing".
+ */
+async function seedDependentViewProbe(sql: postgres.Sql): Promise<boolean> {
+  const [row] = await sql<{ present: boolean }[]>`
+    SELECT to_regclass('harness_shared.harness_features_consolidated') IS NOT NULL AS present`;
+  if (!row?.present) return false;
+  await sql.unsafe(`
+    CREATE SCHEMA IF NOT EXISTS ${DEPENDENT_VIEW_PROBE_SCHEMA};
+    CREATE OR REPLACE VIEW ${DEPENDENT_VIEW_PROBE_SCHEMA}.harness_features AS
+      SELECT * FROM harness_shared.harness_features_consolidated;`);
+  return true;
+}
+
+/**
  * EI-2433: testcontainers' `.withReuse()` matches an existing container purely by
  * its CONFIG hash (image, env, ports, …) — it never validates that the database
  * inside is actually usable. On this shared dev box a reused container can end up
@@ -235,10 +292,26 @@ export default async function setup({ provide }: GlobalSetupContext) {
     await sql.unsafe(`SELECT pg_advisory_lock(hashtext('papercusp-baseline-schema-migrations'))`);
     try {
       await sql.unsafe(BOOT_PREREQS_DDL);
+      // EI-18748424931934157: seed the dependent-view probe BEFORE the runner, so pending
+      // migrations are applied against a REALISTIC schema graph rather than a bare
+      // harness_shared. See seedDependentViewProbe — this is the half that actually catches
+      // a 678-class regression.
+      await seedDependentViewProbe(sql);
       const { appliedCount, totalKnown, failed = [] } = await applyPendingMigrations({ client: sql, sqlDir: SQL_DIR });
       if (failed.length > 0) {
-        throw new Error(`baseline globalSetup: ${failed.length} migration(s) failed (${appliedCount}/${totalKnown} applied)`);
+        throw new Error(
+          `baseline globalSetup: ${failed.length} migration(s) failed (${appliedCount}/${totalKnown} applied). ` +
+            `If the failure is "cannot drop ... because other objects depend on it" naming ` +
+            `${DEPENDENT_VIEW_PROBE_SCHEMA}.harness_features, that is the EI-18748424931934157 probe doing its job: ` +
+            `your migration breaks per-harness dependent views that exist on every real operator. Use ` +
+            `CREATE OR REPLACE VIEW (append-only), or DROP ... CASCADE plus an explicit recreate of the dependents.`,
+        );
       }
+      // And again AFTER, for the fresh-container case: on a brand-new database the base
+      // relation did not exist yet above, so the probe could not be created. Seeding it
+      // here means the container is guarded from its NEXT run onward — which is when new
+      // migrations actually land, since this container is reused across runs.
+      await seedDependentViewProbe(sql);
     } finally {
       await sql.unsafe(`SELECT pg_advisory_unlock(hashtext('papercusp-baseline-schema-migrations'))`).catch(() => {});
     }
