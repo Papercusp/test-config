@@ -201,34 +201,53 @@ export async function getTestPg(): Promise<string> {
       // engineer-issues-view-dml.integration.test.ts's quarantine history with
       // the identical "attach mid-restart" mechanism as above. Same transient
       // class, same budget.
+      //
+      // HOST-SIDE CLIENT, NOT `container.exec(['psql', ...])` (EI-18680404964770187,
+      // 2026-07-26): the old implementation ran psql INSIDE the container, where it
+      // is reparented to PID 1 (the postmaster in this image). Postgres reaps
+      // UNKNOWN children in HandleChildCrash/CleanupBackend — an in-container psql
+      // that exits nonzero (e.g. the exact "in recovery mode" FATAL this loop is
+      // retrying) is treated as a crashed backend and makes the postmaster kill
+      // every active server process and force a full crash-recovery cycle
+      // (observed outage window ~3min, ~6x this loop's own 30s budget). Worse,
+      // EVERY retry attempt while recovering is itself another in-container exec
+      // that can exit nonzero and re-trigger the same crash — the retry loop was
+      // feeding the fault it was trying to ride out, and under fleet load N
+      // concurrent agents amplify each other. The container already publishes a
+      // host port (`getConnectionUri()`, used two lines below this block anyway),
+      // so run the DDL from a normal `postgres` client against that TCP port
+      // instead: a failed host-side connection is just a rejected promise — it can
+      // never be reaped by the postmaster and can never restart the cluster.
       const RETRY_BUDGET_MS = 30_000;
-      const RETRYABLE_STARTUP_MSG = /in recovery mode|not yet accepting connections/i;
+      const RETRYABLE_STARTUP_MSG =
+        /in recovery mode|not yet accepting connections|connection.*(refused|terminated|closed)|ECONNREFUSED|ECONNRESET|ETIMEDOUT/i;
       const retryStartedAt = Date.now();
-      let res: Awaited<ReturnType<typeof container.exec>> | undefined;
       let lastErr: unknown;
       for (let attempt = 1; ; attempt++) {
+        const admin = postgres(container.getConnectionUri(), {
+          max: 1,
+          onnotice: () => {},
+          connect_timeout: 10,
+        });
         try {
-          res = await container.exec([
-            'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'test', '-d', 'papercusp_test', '-c', FRAMEWORK_ROLES_DDL,
-          ]);
-          if (res.exitCode === 0) break;
-          lastErr = new Error(
-            `getTestPg: framework-role ensure failed ${describeContainer(container)} ` +
-              `(exit ${res.exitCode}): ${res.output}`,
-          );
+          await admin.unsafe(FRAMEWORK_ROLES_DDL);
+          lastErr = undefined;
+          break;
         } catch (e) {
-          lastErr = e;
-          res = undefined;
+          lastErr = new Error(
+            `getTestPg: framework-role ensure failed ${describeContainer(container)}: ` +
+              `${e instanceof Error ? e.message : String(e)}`,
+            { cause: e },
+          );
+        } finally {
+          await admin.end({ timeout: 5 }).catch(() => {});
         }
-        const msg = res ? res.output : lastErr instanceof Error ? lastErr.message : String(lastErr);
+        const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
         const elapsedMs = Date.now() - retryStartedAt;
         if (!RETRYABLE_STARTUP_MSG.test(msg) || elapsedMs >= RETRY_BUDGET_MS) {
           throw lastErr;
         }
         await new Promise((r) => setTimeout(r, Math.min(attempt * 500, 3000)));
-      }
-      if (!res || res.exitCode !== 0) {
-        throw lastErr ?? new Error('getTestPg: framework-role ensure failed (unknown error)');
       }
       return container;
     })()
