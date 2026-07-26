@@ -20,7 +20,7 @@ vi.mock('postgres', () => ({
   default: (url?: string, opts?: unknown) => postgresFactory(url, opts),
 }));
 
-import { assertPgReachable, probePgReachable } from './pg-reachability.ts';
+import { assertPgReachable, probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 
 describe('probePgReachable — EI-2627', () => {
   beforeEach(() => {
@@ -114,5 +114,69 @@ describe('assertPgReachable — EI-2627', () => {
     await expect(assertPgReachable('postgres://x', 'myFixture', 5000)).rejects.toThrow(
       /myFixture.*EI-2627.*docker ps/s,
     );
+  });
+});
+
+describe('withPgStartupRetry — EI-10533', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('returns the op result immediately on first-attempt success', async () => {
+    const op = vi.fn().mockResolvedValueOnce('ok');
+    await expect(withPgStartupRetry(op, 5000)).resolves.toBe('ok');
+    expect(op).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a transient "in recovery mode" failure, then succeeds', async () => {
+    const op = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('FATAL: the database system is in recovery mode'))
+      .mockResolvedValueOnce('ok');
+    const resultPromise = withPgStartupRetry(op, 5000);
+    await vi.runAllTimersAsync();
+    await expect(resultPromise).resolves.toBe('ok');
+    expect(op).toHaveBeenCalledTimes(2);
+  });
+
+  it('rethrows a non-retryable failure on the FIRST attempt (no retry)', async () => {
+    const op = vi.fn().mockRejectedValueOnce(new Error('password authentication failed for user "x"'));
+    await expect(withPgStartupRetry(op, 5000)).rejects.toThrow(/password authentication failed/);
+    expect(op).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up and rethrows the LAST error once the retry budget is exhausted', async () => {
+    const op = vi.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:5432'));
+    const resultPromise = withPgStartupRetry(op, 700);
+    // Attach a handler before advancing fake timers — otherwise the eventual
+    // rejection can fire (during runAllTimersAsync) before the `await expect`
+    // below attaches one, and vitest flags it as an unhandled rejection even
+    // though it IS handled a line later (same trap the pattern below avoids).
+    resultPromise.catch(() => {});
+    await vi.runAllTimersAsync();
+    await expect(resultPromise).rejects.toThrow(/ECONNREFUSED/);
+    expect(op.mock.calls.length).toBeGreaterThan(1);
+    expect(op.mock.calls.length).toBeLessThan(20);
+  });
+
+  it('surfaces a caller-wrapped error message (op re-throwing its own Error) through retry + final rejection', async () => {
+    // Mirrors the pg-container.ts / baseline-schema-global-setup.ts call sites,
+    // which catch the raw postgres error and re-throw a friendlier, cause-chained
+    // Error naming the infra class — the retryable substring must still be found
+    // inside THAT wrapped message for retry to keep working.
+    const op = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error('getTestPg (no-docker escape hatch): framework-role ensure failed: in recovery mode'),
+      )
+      .mockResolvedValueOnce('ok');
+    const resultPromise = withPgStartupRetry(op, 5000);
+    await vi.runAllTimersAsync();
+    await expect(resultPromise).resolves.toBe('ok');
+    expect(op).toHaveBeenCalledTimes(2);
   });
 });

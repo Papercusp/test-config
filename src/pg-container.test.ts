@@ -54,3 +54,37 @@ describe('getTestPg framework-role ensure (EI-18680404964770187)', () => {
     expect(SOURCE).toMatch(/not yet accepting connections/);
   });
 });
+
+/**
+ * Regression guard for EI-10533: the no-docker escape-hatch path
+ * (`PAPERCUSP_TEST_PG_ADMIN_URL` — a bare `postgres` admin client against the
+ * box's native PG, no Docker/testcontainers involved) previously had ZERO
+ * retry tolerance for a transient "in recovery mode" / "not yet accepting
+ * connections" FATAL, unlike the container path just above. A source-text
+ * guard (not a mocked-execution test) because the retry behavior itself is
+ * already covered by `withPgStartupRetry`'s own dedicated unit tests in
+ * pg-reachability.test.ts — this only asserts getTestPg's no-docker branch
+ * actually WIRES that shared helper in, so the two can't silently diverge
+ * again.
+ */
+describe('getTestPg no-docker escape hatch (EI-10533)', () => {
+  it('wraps the PAPERCUSP_TEST_PG_ADMIN_URL role-ensure in the shared startup-retry helper', () => {
+    expect(SOURCE).toMatch(/import\s*\{\s*withPgStartupRetry\s*\}\s*from\s*'\.\/pg-reachability\.ts'/);
+    // The withPgStartupRetry(...) call must appear strictly BEFORE the
+    // container-path's own retry loop comment block, i.e. inside the
+    // `existingAdminUrl` branch — not just imported and unused there.
+    const noDockerBranchStart = SOURCE.indexOf('if (existingAdminUrl) {');
+    const containerRetryLoopStart = SOURCE.indexOf('RETRY_BUDGET_MS');
+    const withRetryCallIdx = SOURCE.indexOf('await withPgStartupRetry(');
+    expect(noDockerBranchStart).toBeGreaterThan(-1);
+    expect(containerRetryLoopStart).toBeGreaterThan(-1);
+    expect(withRetryCallIdx).toBeGreaterThan(noDockerBranchStart);
+    expect(withRetryCallIdx).toBeLessThan(containerRetryLoopStart);
+  });
+
+  it('names EI-10533 / shared-infra-churn in the wrapped error so the next agent debugs the right layer', () => {
+    expect(SOURCE).toMatch(/no-docker escape hatch.*framework-role ensure/s);
+    expect(SOURCE).toMatch(/shared-infra churn/);
+    expect(SOURCE).toMatch(/EI-10533/);
+  });
+});
