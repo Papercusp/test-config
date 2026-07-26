@@ -37,7 +37,7 @@ function withPristineDeadline<T>(p: Promise<T>, ms: number, onTimeout: T): Promi
   return Promise.race([
     p,
     new Promise<T>((resolve) => {
-      globalThis.setTimeout(() => resolve(onTimeout), ms); // MUTATION: lazy capture
+      PRISTINE_SET_TIMEOUT(() => resolve(onTimeout), ms);
     }),
   ]);
 }
