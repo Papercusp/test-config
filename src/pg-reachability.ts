@@ -22,7 +22,18 @@
  */
 import postgres from 'postgres';
 
-const RETRYABLE_MSG = /in recovery mode|not yet accepting connections|ECONNREFUSED|connect_timeout|timeout/i;
+/**
+ * Superset retryable-startup-error signature (EI-10533): recovery-mode /
+ * not-yet-accepting-connections, plus the generic connection-drop shapes
+ * (ECONNREFUSED/ECONNRESET/ETIMEDOUT/"connection … refused|terminated|closed")
+ * that pg-container.ts's shared-test-container retry loop already tolerates.
+ * Exported so every bounded-retry call site (this probe, and
+ * `withPgStartupRetry` below) shares ONE definition instead of drifting.
+ */
+export const RETRYABLE_PG_STARTUP_MSG =
+  /in recovery mode|not yet accepting connections|connection.*(refused|terminated|closed)|ECONNREFUSED|ECONNRESET|ETIMEDOUT|connect_timeout|timeout/i;
+
+const RETRYABLE_MSG = RETRYABLE_PG_STARTUP_MSG;
 
 export interface PgReachabilityResult {
   ok: boolean;
@@ -75,4 +86,39 @@ export async function assertPgReachable(dsn: string, label: string, budgetMs = 1
       `recycled the shared baseline-schema container (pgvector/pgvector:pg18, db "papercusp_it") — NOT a ` +
       `code regression. Check \`docker ps\` for a live papercusp_it container and re-run; CI is unaffected.`,
   );
+}
+
+/**
+ * Retry `op` while it fails with a transient Postgres startup/recovery error
+ * (see `RETRYABLE_PG_STARTUP_MSG`), capped backoff 500ms*attempt up to 3s,
+ * for up to `budgetMs` total. Any non-retryable failure, or exhausting the
+ * budget, rethrows the LAST error unchanged — `op` owns its own client
+ * lifecycle per attempt (open + close), this only decides retry-vs-rethrow.
+ *
+ * EI-10533: the shared test-PG container path (`getTestPg` in
+ * pg-container.ts) already tolerates this class via its own inline retry
+ * loop. This helper generalizes it for the NO-DOCKER escape-hatch call sites
+ * (a bare `postgres` admin client against the box's native PG, used when a
+ * `capability:bash`-sandboxed cup can't reach docker.sock — EI-13104), which
+ * previously had ZERO tolerance: a single transient recovery-mode blip on
+ * the shared native cluster (this box's :5432, coordinated through by the
+ * whole fleet — a concurrent test's CREATE/DROP DATABASE can trigger it)
+ * failed the whole beforeAll/globalSetup outright, and — because the raw
+ * postgres error gives no hint the cause is shared-infra churn rather than a
+ * real bug — a test file whose afterAll assumes `db` was assigned throws a
+ * masking TypeError on top, hiding the actual (transient, self-resolving)
+ * cause entirely.
+ */
+export async function withPgStartupRetry<T>(op: () => Promise<T>, budgetMs = 30_000): Promise<T> {
+  const startedAt = Date.now();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await op();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const elapsedMs = Date.now() - startedAt;
+      if (!RETRYABLE_PG_STARTUP_MSG.test(msg) || elapsedMs >= budgetMs) throw e;
+      await new Promise((r) => setTimeout(r, Math.min(attempt * 500, 3000)));
+    }
+  }
 }

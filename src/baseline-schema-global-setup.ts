@@ -60,7 +60,7 @@ import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
-import { probePgReachable } from './pg-reachability.ts';
+import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 
 /**
  * The baseline schema owns a dedicated container, so its Docker handshake must
@@ -142,15 +142,33 @@ export default async function setup({ provide }: GlobalSetupContext) {
 
   if (existingAdminUrl) {
     const dbName = `papercusp_it_baseline_${randomBytes(6).toString('hex')}`;
-    const admin = postgres(existingAdminUrl, { max: 1, onnotice: () => {} });
-    try {
-      // No reuse/advisory-lock dance here (unlike the container path below):
-      // every setup() call under this escape hatch mints its OWN fresh database,
-      // so there is nothing to race with itself over.
-      await admin.unsafe(`CREATE DATABASE "${dbName}"`);
-    } finally {
-      await admin.end({ timeout: 5 });
-    }
+    // EI-10533: previously zero retry tolerance here — a single transient
+    // "in recovery mode" / "not yet accepting connections" FATAL on the
+    // box's shared native PG cluster (fleet-wide concurrent test-DB churn)
+    // failed globalSetup outright, with the raw postgres error giving no
+    // hint the real cause was shared-infra churn, not a code bug. Ride out
+    // the same bounded window the reused-container health-check below (and
+    // getTestPg's own container path in pg-container.ts) already tolerates.
+    await withPgStartupRetry(async () => {
+      const admin = postgres(existingAdminUrl, { max: 1, onnotice: () => {} });
+      try {
+        // No reuse/advisory-lock dance here (unlike the container path below):
+        // every setup() call under this escape hatch mints its OWN fresh database,
+        // so there is nothing to race with itself over.
+        await admin.unsafe(`CREATE DATABASE "${dbName}"`);
+      } catch (e) {
+        throw new Error(
+          `baseline-schema-global-setup (no-docker escape hatch): CREATE DATABASE against ` +
+            `PAPERCUSP_TEST_PG_ADMIN_URL failed: ${e instanceof Error ? e.message : String(e)}. If this names ` +
+            `a transient recovery-mode / not-yet-accepting-connections FATAL, this is very likely shared-infra ` +
+            `churn on the box's native PG cluster (concurrent test-DB creates/drops from other fleet agents) — ` +
+            `NOT a real test or code bug. See EI-10533.`,
+          { cause: e },
+        );
+      } finally {
+        await admin.end({ timeout: 5 }).catch(() => {});
+      }
+    });
     const url = new URL(existingAdminUrl);
     url.pathname = `/${dbName}`;
     dsn = url.toString();

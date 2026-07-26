@@ -3,6 +3,7 @@ import postgres from 'postgres';
 import { randomBytes } from 'node:crypto';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 import { SubstrateCircuitBreaker } from './substrate-circuit-breaker.ts';
+import { withPgStartupRetry } from './pg-reachability.ts';
 
 let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
 
@@ -105,12 +106,30 @@ export async function getTestPg(): Promise<string> {
   if (existingAdminUrl) {
     if (!noDockerAdminUrlPromise) {
       noDockerAdminUrlPromise = (async () => {
-        const admin = postgres(existingAdminUrl, { max: 1, onnotice: () => {} });
-        try {
-          await admin.unsafe(FRAMEWORK_ROLES_DDL);
-        } finally {
-          await admin.end({ timeout: 5 });
-        }
+        // EI-10533: this native-PG path previously had ZERO retry tolerance —
+        // unlike the container path below, a single transient "in recovery
+        // mode" / "not yet accepting connections" FATAL on the box's shared
+        // native PG cluster (fleet-wide concurrent test-DB churn) failed
+        // outright, with the raw postgres error giving no hint the real
+        // cause was shared-infra churn rather than a test/code bug. Ride out
+        // the same bounded window the container path already tolerates.
+        await withPgStartupRetry(async () => {
+          const admin = postgres(existingAdminUrl, { max: 1, onnotice: () => {} });
+          try {
+            await admin.unsafe(FRAMEWORK_ROLES_DDL);
+          } catch (e) {
+            throw new Error(
+              `getTestPg (no-docker escape hatch): framework-role ensure against ` +
+                `PAPERCUSP_TEST_PG_ADMIN_URL failed: ${e instanceof Error ? e.message : String(e)}. If this ` +
+                `names a transient recovery-mode / not-yet-accepting-connections FATAL, this is very likely ` +
+                `shared-infra churn on the box's native PG cluster (concurrent test-DB creates/drops from ` +
+                `other fleet agents) — NOT a real test or code bug. See EI-10533.`,
+              { cause: e },
+            );
+          } finally {
+            await admin.end({ timeout: 5 }).catch(() => {});
+          }
+        });
         return existingAdminUrl;
       })().catch((e) => {
         // Don't strand later callers in this process on a permanently-rejected
