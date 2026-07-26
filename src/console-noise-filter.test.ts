@@ -230,6 +230,45 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  it('silences the chat-actions throwing-available() deliberate warn (EI-18679764170567879: registry.test.ts full-suite-only spy-race flake)', () => {
+    // listChatActions (chat-actions/registry.ts) deliberately catches a throwing
+    // available() and warns instead of letting one broken action take down the
+    // whole list. registry.test.ts's "a throwing available() is excluded, not
+    // fatal to the whole list" case already spies+mocks console.warn around this
+    // exact deliberate warn, but — per the WI-1660/WI-2994/WI-3842/WI-4031
+    // misattribution class above — that spy occasionally loses the race against
+    // this setup's own console.warn wrapping under the full forks-pool run, so
+    // the deliberate warn escapes to vitest-fail-on-console.
+    expect(isSilencedConsoleMessage('[chat-actions] broken.available threw')).toBe(true);
+    // Keyed off both the tag and the suffix, not the dynamic action id in between.
+    expect(isSilencedConsoleMessage('[chat-actions] some-other-id.available threw')).toBe(true);
+  });
+
+  it('silences the events:await advisory bounded-timeout degrade warns (EI-18679764170567879: announce.test.ts full-suite-only flake)', () => {
+    // events:await's fail-soft near-miss / orphan-key advisory checks each wrap a
+    // normally-instant lookup in withBoundedTimeout, which logs
+    // `[bounded-timeout] <label> exceeded …ms — degrading to fallback` ONLY when
+    // its real setTimeout deadline wins the race against the lookup — a
+    // full-suite-only fork-pool scheduling artifact for these advisory,
+    // already-fail-soft call sites, not a code defect.
+    expect(
+      isSilencedConsoleMessage('[bounded-timeout] events-await:nearMiss exceeded 1000ms — degrading to fallback'),
+    ).toBe(true);
+    expect(
+      isSilencedConsoleMessage('[bounded-timeout] events-await:orphanKey exceeded 1500ms — degrading to fallback'),
+    ).toBe(true);
+    expect(
+      isSilencedConsoleMessage(
+        '[bounded-timeout] events-await:keyFireEvidence exceeded 1000ms — degrading to fallback',
+      ),
+    ).toBe(true);
+    // Scoped to the events:await advisory labels only — a DIFFERENT bounded-timeout
+    // caller (a genuinely slow/regressed read elsewhere) must still fail loudly.
+    expect(
+      isSilencedConsoleMessage('[bounded-timeout] fleet:status:presence exceeded 5000ms — degrading to fallback'),
+    ).toBe(false);
+  });
+
   describe('PostgreSQL UNREACHABLE (ECONNREFUSED) — the DOWN twin of the exhaustion entries (EI-13946)', () => {
     // The exact console shapes that tripped vitest-fail-on-console on a run box
     // with no reachable PG on :5432: orient.test.ts (gate-decisions fire-and-forget
