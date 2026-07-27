@@ -24,7 +24,7 @@
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { exec } from 'node:child_process';
 import { statSync } from 'node:fs';
-import { dirname, join, posix, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 
 // ── inlined: inferWorkspaceRoot — find the true SUPERPROJECT root so recorded
