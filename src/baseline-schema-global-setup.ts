@@ -381,7 +381,7 @@ const BOOT_PREREQS_DDL = `
   CREATE EXTENSION IF NOT EXISTS vector;
 `;
 
-export default async function setup({ provide }: GlobalSetupContext) {
+export default async function setup({ provide }: TestProject) {
   // NO-DOCKER ESCAPE HATCH (EI-13104) — see the module doc comment above. Checked
   // first so a sandboxed caller with no docker.sock access never touches
   // PostgreSqlContainer at all.

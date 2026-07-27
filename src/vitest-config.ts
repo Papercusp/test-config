@@ -1,4 +1,7 @@
-import { defineConfig, type UserConfig } from 'vitest/config';
+// Vitest 4 no longer re-exports a plain `UserConfig` symbol from 'vitest/config' (TS2305) —
+// it re-exports vite's own `UserConfig` (augmented in-module with the `test` field) under the
+// alias `ViteUserConfig`. Import that under our existing local name so nothing else here changes.
+import { defineConfig, type ViteUserConfig as UserConfig } from 'vitest/config';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
