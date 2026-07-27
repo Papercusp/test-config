@@ -24,7 +24,7 @@
  * test file in `beforeAll` and `drop()` in `afterAll`.
  */
 import { randomBytes } from 'node:crypto';
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import postgres from 'postgres';

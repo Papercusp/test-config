@@ -30,6 +30,8 @@
  * unit-layer setup (every `defineVitestConfig` caller) is harmless even for
  * packages that never render a component.
  */
+export {}; // mark this a module (not a script) so top-level `await` below typechecks (TS1375)
+
 try {
   const { configure } = await import('@testing-library/dom');
   configure({ asyncUtilTimeout: 5_000 });
