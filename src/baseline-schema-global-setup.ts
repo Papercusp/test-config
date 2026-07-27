@@ -55,7 +55,7 @@
 import type { GlobalSetupContext } from 'vitest/node';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import postgres from 'postgres';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -148,6 +148,128 @@ async function seedDependentViewProbe(sql: postgres.Sql): Promise<boolean> {
  */
 async function isBaselineContainerHealthy(dsn: string): Promise<boolean> {
   return (await probePgReachable(dsn, 15_000)).ok;
+}
+
+/**
+ * EI-18779962385972529 — the LEDGER-vs-REALITY probe.
+ *
+ * Reachability (above) proves the container ANSWERS. It does not prove the schema
+ * inside matches what that container's own `harness_shared.schema_migrations`
+ * ledger CLAIMS is applied. Those can diverge — a schema dropped by an external
+ * actor on this shared dev box, a container carried over from a since-changed
+ * setup — and the divergence is PERMANENT and SILENT:
+ * `applyPendingMigrations` skips any file already in the ledger
+ * (`if (applied.has(f)) continue`), so a migration recorded-but-missing is never
+ * re-applied, and every LATER migration that depends on it fails on every run,
+ * for ever, with no self-heal.
+ *
+ * Worse, it does not fail where the fault is. It surfaces as an unrelated
+ * downstream `ALTER TABLE ... schema "x" does not exist` during COLLECT of some
+ * innocent test, which reads as "my own change broke the suite" — that
+ * mis-attribution was most of the cost when this took out the whole
+ * operator-core integration tier on 2026-07-27.
+ *
+ * The probe is CLASS-level, not a hardcoded schema name: for every migration the
+ * ledger claims is applied, assert the schemas that file DECLARES it creates
+ * actually exist. So it catches the next instance of this class, not just the one
+ * that bit us.
+ *
+ * NO FALSE POSITIVES BY CONSTRUCTION: the migration runner applies a file's DDL
+ * and its ledger INSERT inside ONE transaction (see migration-runner.js — "Apply +
+ * record in one transaction so a partial apply doesn't leave schema_migrations
+ * claiming success"), so a concurrently-running migration can never be OBSERVED as
+ * recorded-but-missing. A hit therefore means genuine divergence, never a race —
+ * which is what makes reprovisioning on it safe rather than churn-inducing.
+ */
+const CREATE_SCHEMA_RE = /^[^\S\r\n]*CREATE\s+SCHEMA\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([A-Za-z_][A-Za-z0-9_$]*)"?/gim;
+
+/**
+ * Schemas a migration file declares it creates. Pure + exported for unit test.
+ * Deliberately conservative: only unconditional top-level `CREATE SCHEMA` counts.
+ * A schema created inside a DO/plpgsql block is NOT matched, because we cannot
+ * know whether its guard was meant to fire — and a probe that guesses would
+ * reprovision healthy containers, which is worse than missing a case.
+ */
+export function schemasDeclaredByMigrationSql(sqlText: string): string[] {
+  const found = new Set<string>();
+  // Strip line comments so a commented-out CREATE SCHEMA is not counted.
+  const withoutLineComments = sqlText.replace(/--[^\r\n]*/g, '');
+  for (const m of withoutLineComments.matchAll(CREATE_SCHEMA_RE)) {
+    if (m[1]) found.add(m[1].toLowerCase());
+  }
+  return [...found];
+}
+
+/** One recorded-but-missing pair. Pure shape, exported for unit test. */
+export interface LedgerSchemaDivergence {
+  migration: string;
+  schema: string;
+}
+
+/**
+ * Pure diff: which (migration, schema) pairs does the ledger claim that reality
+ * does not have? Split out from the IO so it is unit-testable without a database.
+ */
+export function diffLedgerAgainstSchemas(input: {
+  recorded: string[];
+  declaredBy: (migration: string) => string[];
+  existing: Set<string>;
+}): LedgerSchemaDivergence[] {
+  const out: LedgerSchemaDivergence[] = [];
+  for (const migration of input.recorded) {
+    for (const schema of input.declaredBy(migration)) {
+      if (!input.existing.has(schema)) out.push({ migration, schema });
+    }
+  }
+  return out;
+}
+
+/**
+ * Run the probe against a live DSN. Returns [] when the ledger and the schema
+ * agree — including on a brand-new container, where the ledger table does not
+ * exist yet and there is by definition nothing to diverge from.
+ */
+async function findLedgerSchemaDivergence(
+  dsn: string,
+  sqlDir: string,
+): Promise<LedgerSchemaDivergence[]> {
+  const sql = postgres(dsn, { max: 1, onnotice: () => {} });
+  try {
+    const [ledger] = await sql<{ present: boolean }[]>`
+      SELECT to_regclass('harness_shared.schema_migrations') IS NOT NULL AS present`;
+    if (!ledger?.present) return []; // fresh container — nothing recorded yet
+    const rows = await sql<{ filename: string }[]>`
+      SELECT filename FROM harness_shared.schema_migrations`;
+    if (rows.length === 0) return [];
+
+    const onDisk = new Set(readdirSync(sqlDir).filter((f) => f.endsWith('.sql')));
+    const declaredCache = new Map<string, string[]>();
+    const declaredBy = (migration: string): string[] => {
+      // A ledger row whose FILE is gone cannot be checked — skip rather than
+      // guess. (Deleting an applied migration is its own problem, not this one.)
+      if (!onDisk.has(migration)) return [];
+      let d = declaredCache.get(migration);
+      if (!d) {
+        d = schemasDeclaredByMigrationSql(readFileSync(resolve(sqlDir, migration), 'utf8'));
+        declaredCache.set(migration, d);
+      }
+      return d;
+    };
+
+    const wanted = new Set<string>();
+    for (const r of rows) for (const s of declaredBy(r.filename)) wanted.add(s);
+    if (wanted.size === 0) return [];
+
+    const present = await sql<{ nspname: string }[]>`
+      SELECT nspname FROM pg_namespace WHERE nspname = ANY(${[...wanted]})`;
+    return diffLedgerAgainstSchemas({
+      recorded: rows.map((r) => r.filename),
+      declaredBy,
+      existing: new Set(present.map((p) => p.nspname.toLowerCase())),
+    });
+  } finally {
+    await sql.end({ timeout: 5 }).catch(() => {});
+  }
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -267,6 +389,38 @@ export default async function setup({ provide }: GlobalSetupContext) {
         );
         await c.stop().catch(() => {});
         c = await startBaselineContainer();
+      }
+      // EI-18779962385972529: reachable is not the same as CORRECT. A reused
+      // container whose ledger claims a migration whose objects are absent will
+      // skip that file for ever and fail every dependent migration on every run,
+      // with no self-heal — so treat divergence exactly like the staleness above:
+      // stop it (which un-registers it from testcontainers' reuse lookup, since
+      // that only matches RUNNING containers) and provision a genuinely fresh one.
+      // Fail-soft: a probe that cannot run must never block the tier it protects.
+      try {
+        const divergence = await findLedgerSchemaDivergence(c.getConnectionUri(), SQL_DIR);
+        if (divergence.length > 0) {
+          const detail = divergence
+            .slice(0, 5)
+            .map((d) => `${d.migration} → schema "${d.schema}"`)
+            .join(', ');
+          console.error(
+            `[baseline-schema-global-setup] reused container is DIVERGED: schema_migrations records ` +
+              `${divergence.length} migration/schema pair(s) whose schema does NOT exist (${detail}` +
+              `${divergence.length > 5 ? ', …' : ''}). The runner skips any migration already in the ` +
+              `ledger, so this never self-heals and would surface as an unrelated "schema does not ` +
+              `exist" error during COLLECT of some innocent test — stopping + reprovisioning fresh ` +
+              `(EI-18779962385972529).`,
+          );
+          await c.stop().catch(() => {});
+          c = await startBaselineContainer();
+        }
+      } catch (e) {
+        console.error(
+          '[baseline-schema-global-setup] ledger/schema divergence probe failed (continuing — the ' +
+            'probe is a guard, never a gate):',
+          e,
+        );
       }
       return c;
     });
