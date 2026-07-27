@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import AdminTestRunsReporter, {
   buildOutputTail,
   captureReporterSaturationSnapshot,
+  computeIsScratchConfig,
   isScratchConfigFile,
   shouldRecordTestRunPath,
 } from './admin-test-runs-reporter';
@@ -180,13 +181,26 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(isScratchConfigFile('/home/dev/papercup-release/vitest.config.ts', '/home/dev/papercup')).toBe(true);
   });
 
-  it('onInit (EI-18767688096795873): computes isScratchConfig from ctx.vite.config.configFile without throwing', () => {
-    const r = new AdminTestRunsReporter();
+  it('computeIsScratchConfig (EI-18767688096795873): reads ctx.vite.config.configFile, not ctx.config', () => {
     // The resolved config path lives on the underlying Vite dev server's config,
-    // not Vitest's own ctx.config (which deliberately omits configFile) — see the
-    // onInit implementation's comment.
+    // not Vitest's own ctx.config (which deliberately omits configFile).
+    const scratch = { vite: { config: { configFile: '/tmp/mutant-xyz/vitest.mutant.config.ts' } } } as unknown as Parameters<typeof computeIsScratchConfig>[0];
+    expect(computeIsScratchConfig(scratch)).toBe(true);
+
+    const canonical = { vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as unknown as Parameters<typeof computeIsScratchConfig>[0];
+    expect(computeIsScratchConfig(canonical)).toBe(false);
+  });
+
+  it('computeIsScratchConfig defaults to false (never throws) on a bogus/missing ctx.vite', () => {
+    expect(computeIsScratchConfig({} as unknown as Parameters<typeof computeIsScratchConfig>[0])).toBe(false);
+    expect(computeIsScratchConfig(null as unknown as Parameters<typeof computeIsScratchConfig>[0])).toBe(false);
+  });
+
+  it('onInit (EI-18767688096795873): wires computeIsScratchConfig without throwing, even on a bogus ctx', () => {
+    const r = new AdminTestRunsReporter();
     const fakeCtx = { vite: { config: { configFile: '/tmp/mutant-xyz/vitest.mutant.config.ts' } } } as unknown as Parameters<typeof r.onInit>[0];
     expect(() => r.onInit(fakeCtx)).not.toThrow();
+    expect(() => r.onInit(null as never)).not.toThrow();
   });
 
   it('onTestRunEnd resolves cleanly with no pending work', async () => {
