@@ -182,22 +182,74 @@ async function isBaselineContainerHealthy(dsn: string): Promise<boolean> {
  * which is what makes reprovisioning on it safe rather than churn-inducing.
  */
 const CREATE_SCHEMA_RE = /^[^\S\r\n]*CREATE\s+SCHEMA\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([A-Za-z_][A-Za-z0-9_$]*)"?/gim;
+const DROP_SCHEMA_RE = /^[^\S\r\n]*DROP\s+SCHEMA\s+(?:IF\s+EXISTS\s+)?"?([A-Za-z_][A-Za-z0-9_$]*)"?/gim;
+const RENAME_SCHEMA_RE =
+  /^[^\S\r\n]*ALTER\s+SCHEMA\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?\s+RENAME\s+TO\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?/gim;
+
+/** A schema-level effect declared by one migration file. */
+export type SchemaMutation =
+  | { kind: 'create'; name: string }
+  | { kind: 'drop'; name: string }
+  | { kind: 'rename'; name: string; to: string };
 
 /**
- * Schemas a migration file declares it creates. Pure + exported for unit test.
- * Deliberately conservative: only unconditional top-level `CREATE SCHEMA` counts.
- * A schema created inside a DO/plpgsql block is NOT matched, because we cannot
- * know whether its guard was meant to fire — and a probe that guesses would
- * reprovision healthy containers, which is worse than missing a case.
+ * The schema-level effects a migration file declares. Pure + exported for unit test.
+ *
+ * CREATE ALONE IS NOT ENOUGH, and getting this wrong is expensive in the SAFE
+ * direction. The first cut of this probe looked only at `CREATE SCHEMA` and
+ * immediately fired on a healthy container: `000-baseline.sql` creates
+ * `papercup_shared`, and `332-rename-papercup-shared-to-papercusp-shared.sql`
+ * RENAMES it away — so its absence is CORRECT, not divergence. A create-only
+ * probe would have reprovisioned a perfectly good container (replaying ~476
+ * migrations) on every single run. So we track drops and renames too and fold
+ * them in apply order, and only the NET-expected set is asserted.
+ *
+ * Deliberately conservative: only unconditional, line-leading statements count. A
+ * schema created inside a DO/plpgsql block is NOT matched, because we cannot know
+ * whether its guard fired — and a probe that guesses reprovisions healthy
+ * containers, which is worse than missing a case.
  */
-export function schemasDeclaredByMigrationSql(sqlText: string): string[] {
-  const found = new Set<string>();
-  // Strip line comments so a commented-out CREATE SCHEMA is not counted.
-  const withoutLineComments = sqlText.replace(/--[^\r\n]*/g, '');
-  for (const m of withoutLineComments.matchAll(CREATE_SCHEMA_RE)) {
-    if (m[1]) found.add(m[1].toLowerCase());
+export function schemaMutationsInMigrationSql(sqlText: string): SchemaMutation[] {
+  // Strip line comments so a commented-out statement is never counted.
+  const src = sqlText.replace(/--[^\r\n]*/g, '');
+  const out: Array<SchemaMutation & { at: number }> = [];
+  for (const m of src.matchAll(CREATE_SCHEMA_RE)) {
+    if (m[1]) out.push({ kind: 'create', name: m[1].toLowerCase(), at: m.index ?? 0 });
   }
-  return [...found];
+  for (const m of src.matchAll(DROP_SCHEMA_RE)) {
+    if (m[1]) out.push({ kind: 'drop', name: m[1].toLowerCase(), at: m.index ?? 0 });
+  }
+  for (const m of src.matchAll(RENAME_SCHEMA_RE)) {
+    if (m[1] && m[2]) {
+      out.push({ kind: 'rename', name: m[1].toLowerCase(), to: m[2].toLowerCase(), at: m.index ?? 0 });
+    }
+  }
+  // Within one file, statement ORDER decides the net effect (create-then-drop is
+  // not the same as drop-then-create), so restore source order.
+  return out.sort((a, b) => a.at - b.at).map(({ at: _at, ...mut }) => mut);
+}
+
+/**
+ * Fold every recorded migration's mutations, IN APPLY ORDER, into the set of
+ * schemas that should exist now. Apply order is filename sort — the same order
+ * `applyPendingMigrations` uses (`readdir().filter(.sql).sort()`).
+ */
+export function expectedSchemasAfter(
+  migrationsInApplyOrder: Array<{ migration: string; mutations: SchemaMutation[] }>,
+): Map<string, string> {
+  // schema -> the migration that last established it (for a nameable message)
+  const present = new Map<string, string>();
+  for (const { migration, mutations } of migrationsInApplyOrder) {
+    for (const mut of mutations) {
+      if (mut.kind === 'create') present.set(mut.name, migration);
+      else if (mut.kind === 'drop') present.delete(mut.name);
+      else {
+        present.delete(mut.name);
+        present.set(mut.to, migration);
+      }
+    }
+  }
+  return present;
 }
 
 /** One recorded-but-missing pair. Pure shape, exported for unit test. */
@@ -207,19 +259,21 @@ export interface LedgerSchemaDivergence {
 }
 
 /**
- * Pure diff: which (migration, schema) pairs does the ledger claim that reality
- * does not have? Split out from the IO so it is unit-testable without a database.
+ * Pure diff: which schemas does the recorded migration set say should exist that
+ * reality does not have? Split out from the IO so it is unit-testable without a
+ * database. `recorded` MUST be in apply order (filename sort).
  */
 export function diffLedgerAgainstSchemas(input: {
   recorded: string[];
-  declaredBy: (migration: string) => string[];
+  mutationsOf: (migration: string) => SchemaMutation[];
   existing: Set<string>;
 }): LedgerSchemaDivergence[] {
+  const expected = expectedSchemasAfter(
+    input.recorded.map((migration) => ({ migration, mutations: input.mutationsOf(migration) })),
+  );
   const out: LedgerSchemaDivergence[] = [];
-  for (const migration of input.recorded) {
-    for (const schema of input.declaredBy(migration)) {
-      if (!input.existing.has(schema)) out.push({ migration, schema });
-    }
+  for (const [schema, migration] of expected) {
+    if (!input.existing.has(schema)) out.push({ migration, schema });
   }
   return out;
 }
@@ -243,28 +297,32 @@ async function findLedgerSchemaDivergence(
     if (rows.length === 0) return [];
 
     const onDisk = new Set(readdirSync(sqlDir).filter((f) => f.endsWith('.sql')));
-    const declaredCache = new Map<string, string[]>();
-    const declaredBy = (migration: string): string[] => {
+    const cache = new Map<string, SchemaMutation[]>();
+    const mutationsOf = (migration: string): SchemaMutation[] => {
       // A ledger row whose FILE is gone cannot be checked — skip rather than
       // guess. (Deleting an applied migration is its own problem, not this one.)
       if (!onDisk.has(migration)) return [];
-      let d = declaredCache.get(migration);
+      let d = cache.get(migration);
       if (!d) {
-        d = schemasDeclaredByMigrationSql(readFileSync(resolve(sqlDir, migration), 'utf8'));
-        declaredCache.set(migration, d);
+        d = schemaMutationsInMigrationSql(readFileSync(resolve(sqlDir, migration), 'utf8'));
+        cache.set(migration, d);
       }
       return d;
     };
 
-    const wanted = new Set<string>();
-    for (const r of rows) for (const s of declaredBy(r.filename)) wanted.add(s);
+    // Apply order, matching the runner's own `readdir().filter(.sql).sort()` — a
+    // rename/drop only cancels an earlier create if we fold them in that order.
+    const recorded = rows.map((r) => r.filename).sort();
+    const wanted = expectedSchemasAfter(
+      recorded.map((migration) => ({ migration, mutations: mutationsOf(migration) })),
+    );
     if (wanted.size === 0) return [];
 
     const present = await sql<{ nspname: string }[]>`
-      SELECT nspname FROM pg_namespace WHERE nspname = ANY(${[...wanted]})`;
+      SELECT nspname FROM pg_namespace WHERE nspname = ANY(${[...wanted.keys()]})`;
     return diffLedgerAgainstSchemas({
-      recorded: rows.map((r) => r.filename),
-      declaredBy,
+      recorded,
+      mutationsOf,
       existing: new Set(present.map((p) => p.nspname.toLowerCase())),
     });
   } finally {
