@@ -364,21 +364,33 @@ export function buildOutputTail(
   return tail;
 }
 
+/**
+ * EI-18767688096795873: the onInit glue, pulled out pure/exported so the
+ * try/catch + defaulting is directly unit-testable without touching the
+ * reporter's private field. Vitest's OWN `ctx.config` (ResolvedConfig)
+ * deliberately omits `config`/`configFile` (see its `Omit<...>` in vitest's
+ * types) — the resolved path to the config file actually used lives on the
+ * underlying Vite dev server's resolved config instead. Defaults to `false`
+ * (trust the run) on ANY read failure, matching the "only ever suppress a
+ * false positive" contract.
+ */
+export function computeIsScratchConfig(ctx: Pick<Vitest, 'vite'>): boolean {
+  try {
+    return isScratchConfigFile(ctx.vite.config.configFile, inferWorkspaceRoot());
+  } catch {
+    return false;
+  }
+}
+
 export default class AdminTestRunsReporter implements Reporter {
   private pending: Promise<void>[] = [];
   /** EI-18767688096795873: computed once in onInit from the run's resolved
-   *  config file — see isScratchConfigFile. Defaults to false (trust the run)
-   *  if onInit's config read ever fails, matching the "only ever suppress a
-   *  false positive" contract. */
+   *  config file — see computeIsScratchConfig / isScratchConfigFile. */
   private isScratchConfig = false;
 
   onInit(ctx: Vitest): void {
     ensureLoopLagMonitor();
-    try {
-      this.isScratchConfig = isScratchConfigFile(ctx.config.configFile, inferWorkspaceRoot());
-    } catch {
-      /* fail-soft — leave the false default */
-    }
+    this.isScratchConfig = computeIsScratchConfig(ctx);
   }
 
   /** Per-module hook — fire-and-forget the insert; onTestRunEnd awaits them. */

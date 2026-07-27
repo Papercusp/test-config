@@ -180,9 +180,12 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(isScratchConfigFile('/home/dev/papercup-release/vitest.config.ts', '/home/dev/papercup')).toBe(true);
   });
 
-  it('onInit (EI-18767688096795873): computes isScratchConfig from ctx.config.configFile without throwing', () => {
+  it('onInit (EI-18767688096795873): computes isScratchConfig from ctx.vite.config.configFile without throwing', () => {
     const r = new AdminTestRunsReporter();
-    const fakeCtx = { config: { configFile: '/tmp/mutant-xyz/vitest.mutant.config.ts' } } as unknown as Parameters<typeof r.onInit>[0];
+    // The resolved config path lives on the underlying Vite dev server's config,
+    // not Vitest's own ctx.config (which deliberately omits configFile) — see the
+    // onInit implementation's comment.
+    const fakeCtx = { vite: { config: { configFile: '/tmp/mutant-xyz/vitest.mutant.config.ts' } } } as unknown as Parameters<typeof r.onInit>[0];
     expect(() => r.onInit(fakeCtx)).not.toThrow();
   });
 
