@@ -261,7 +261,12 @@ export interface LedgerSchemaDivergence {
 /**
  * Pure diff: which schemas does the recorded migration set say should exist that
  * reality does not have? Split out from the IO so it is unit-testable without a
- * database. `recorded` MUST be in apply order (filename sort).
+ * database.
+ *
+ * Sorts `recorded` itself rather than trusting the caller to. PG returns ledger
+ * rows in no guaranteed order, and folding a rename BEFORE the create it cancels
+ * resurrects exactly the false positive this probe exists to avoid — so the
+ * ordering guarantee belongs here, not in a comment on the call site.
  */
 export function diffLedgerAgainstSchemas(input: {
   recorded: string[];
@@ -269,7 +274,9 @@ export function diffLedgerAgainstSchemas(input: {
   existing: Set<string>;
 }): LedgerSchemaDivergence[] {
   const expected = expectedSchemasAfter(
-    input.recorded.map((migration) => ({ migration, mutations: input.mutationsOf(migration) })),
+    [...input.recorded]
+      .sort()
+      .map((migration) => ({ migration, mutations: input.mutationsOf(migration) })),
   );
   const out: LedgerSchemaDivergence[] = [];
   for (const [schema, migration] of expected) {
