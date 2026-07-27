@@ -155,6 +155,37 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(buildOutputTail(explosive, 'fail')).toBeNull();
   });
 
+  it('isScratchConfigFile (EI-18767688096795873): flags a config resolved OUTSIDE the repo tree', () => {
+    // Exactly the reported shape: a mutation-testing harness's throwaway config
+    // under /tmp, unrelated to the real in-tree repo root.
+    expect(isScratchConfigFile('/tmp/mutant-abc123/vitest.mutant.config.ts', '/home/dev/papercup')).toBe(true);
+  });
+
+  it('isScratchConfigFile: does NOT flag a canonical in-tree config', () => {
+    expect(isScratchConfigFile('/home/dev/papercup/packages/operator-core/vitest.config.ts', '/home/dev/papercup')).toBe(false);
+    expect(isScratchConfigFile('/home/dev/papercup/vitest.config.ts', '/home/dev/papercup')).toBe(false);
+  });
+
+  it('isScratchConfigFile: defaults to false (trust the run) when there is no configFile at all', () => {
+    // A config-less `vitest run` (libs/generic/* shape) resolves configFile to
+    // `false` — must never be treated as scratch (that would suppress a real signal).
+    expect(isScratchConfigFile(false, '/home/dev/papercup')).toBe(false);
+    expect(isScratchConfigFile(undefined, '/home/dev/papercup')).toBe(false);
+    expect(isScratchConfigFile('', '/home/dev/papercup')).toBe(false);
+  });
+
+  it('isScratchConfigFile: a sibling directory that merely SHARES the repo-root prefix is still outside the tree', () => {
+    // '/home/dev/papercup-release' starts with the string '/home/dev/papercup' but
+    // is a DIFFERENT directory — relative() must be used, not a string prefix check.
+    expect(isScratchConfigFile('/home/dev/papercup-release/vitest.config.ts', '/home/dev/papercup')).toBe(true);
+  });
+
+  it('onInit (EI-18767688096795873): computes isScratchConfig from ctx.config.configFile without throwing', () => {
+    const r = new AdminTestRunsReporter();
+    const fakeCtx = { config: { configFile: '/tmp/mutant-xyz/vitest.mutant.config.ts' } } as unknown as Parameters<typeof r.onInit>[0];
+    expect(() => r.onInit(fakeCtx)).not.toThrow();
+  });
+
   it('onTestRunEnd resolves cleanly with no pending work', async () => {
     const r = new AdminTestRunsReporter();
     await expect(r.onTestRunEnd()).resolves.toBeUndefined();
