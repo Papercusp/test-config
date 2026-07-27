@@ -52,7 +52,12 @@
  * like the container path. Purely additive: the env var is unset by default, so
  * every existing Docker-backed run is byte-identical to before this change.
  */
-import type { GlobalSetupContext } from 'vitest/node';
+// Vitest 4 dropped the `GlobalSetupContext` type export this used to import (removed from
+// 'vitest/node'; TS2305). A globalSetup's `setup(ctx)` is actually invoked with the running
+// `TestProject` instance as `ctx` (see vitest's cli-api TestProject#setupGlobalSetupFiles:
+// `await globalSetupFile.setup?.(this)`), which IS still exported from 'vitest/node' and
+// carries the same `provide` member this file destructures.
+import type { TestProject } from 'vitest/node';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import postgres from 'postgres';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
