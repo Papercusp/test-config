@@ -57,6 +57,24 @@ function inferWorkspaceRoot(from = process.cwd()): string {
   return from;
 }
 
+/**
+ * EI-18767688096795873: does `configFile` (Vitest's RESOLVED config path for this
+ * run) live OUTSIDE the repo working tree entirely? A canonical `vitest.config.ts`
+ * always resolves inside `repoRoot`; a throwaway config (e.g. a mutation-testing
+ * harness's `--config /tmp/<...>/vitest.mutant.config.ts`, built to alias in a
+ * deliberately-broken module and assert the suite goes red) never does — by
+ * construction, NOT by convention, so this needs no cooperation from whatever
+ * produced the config. `false`/no configFile at all is NOT flagged: we can only ever
+ * use this to SUPPRESS a false positive, never to manufacture one, so an unknown
+ * case must default to "trust it" (the pre-existing behavior). Pure + exported for
+ * unit testing.
+ */
+export function isScratchConfigFile(configFile: string | false | undefined, repoRoot: string): boolean {
+  if (!configFile) return false;
+  const rel = relative(repoRoot, configFile);
+  return rel.startsWith('..') || isAbsolute(rel);
+}
+
 // ── inlined: resolveTestRunSource (was testing-run-source.ts). ──
 type TestRunSource = 'ci' | 'local' | 'admin-ui';
 const VALID_SOURCES: ReadonlySet<TestRunSource> = new Set(['ci', 'local', 'admin-ui']);
@@ -105,6 +123,10 @@ interface TestRunRow {
   startedAt: Date;
   finishedAt: Date;
   outputTail: string | null;
+  /** EI-18767688096795873: true when this run's resolved vitest config lives
+   *  outside the repo tree (a throwaway/mutation-testing config) — see
+   *  `isScratchConfigFile`. */
+  isScratchConfig: boolean;
 }
 
 let _loopLagMonitor: ReturnType<typeof monitorEventLoopDelay> | null = null;
@@ -280,10 +302,10 @@ async function insertRow(row: TestRunRow): Promise<void> {
     await Promise.race([
       pg.sql`
         INSERT INTO harness_shared.test_runs
-          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha, harness_slug, workspace_id, loop_lag_p95_ms, rss_mb)
+          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha, harness_slug, workspace_id, loop_lag_p95_ms, rss_mb, is_scratch_config)
         VALUES
           (${row.filePath}, 'vitest', ${row.status}, ${row.durationMs}, ${row.startedAt},
-           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit}, ${harnessSlug}, ${workspaceId}, ${loopLagP95Ms}, ${rssMb})
+           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit}, ${harnessSlug}, ${workspaceId}, ${loopLagP95Ms}, ${rssMb}, ${row.isScratchConfig})
       `,
       new Promise((_, reject) => setTimeout(() => reject(new Error('pg_insert_timeout')), 1000)),
     ]).catch(() => {
@@ -344,10 +366,19 @@ export function buildOutputTail(
 
 export default class AdminTestRunsReporter implements Reporter {
   private pending: Promise<void>[] = [];
+  /** EI-18767688096795873: computed once in onInit from the run's resolved
+   *  config file — see isScratchConfigFile. Defaults to false (trust the run)
+   *  if onInit's config read ever fails, matching the "only ever suppress a
+   *  false positive" contract. */
+  private isScratchConfig = false;
 
-  onInit(_ctx: Vitest): void {
-    void _ctx;
+  onInit(ctx: Vitest): void {
     ensureLoopLagMonitor();
+    try {
+      this.isScratchConfig = isScratchConfigFile(ctx.config.configFile, inferWorkspaceRoot());
+    } catch {
+      /* fail-soft — leave the false default */
+    }
   }
 
   /** Per-module hook — fire-and-forget the insert; onTestRunEnd awaits them. */
@@ -367,7 +398,7 @@ export default class AdminTestRunsReporter implements Reporter {
       const outputTail = buildOutputTail(testModule, status);
 
       this.pending.push(
-        insertRow({ filePath, status, durationMs, startedAt, finishedAt, outputTail }),
+        insertRow({ filePath, status, durationMs, startedAt, finishedAt, outputTail, isScratchConfig: this.isScratchConfig }),
       );
     } catch {
       /* swallow — D-007 */

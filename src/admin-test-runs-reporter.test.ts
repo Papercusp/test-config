@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import AdminTestRunsReporter, {
   buildOutputTail,
   captureReporterSaturationSnapshot,
+  isScratchConfigFile,
   shouldRecordTestRunPath,
 } from './admin-test-runs-reporter';
 
