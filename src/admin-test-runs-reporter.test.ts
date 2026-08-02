@@ -9,7 +9,7 @@
  * onExit.
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +19,8 @@ import AdminTestRunsReporter, {
   classifyGitEntry,
   computeIsScratchConfig,
   isScratchConfigFile,
+  resolveTestRunHarnessSlug,
+  resolveTestRunWorkspaceId,
   shouldRecordTestRunPath,
 } from './admin-test-runs-reporter';
 
@@ -301,5 +303,75 @@ describe('classifyGitEntry (worktree vs submodule vs plain repo root)', () => {
     expect(
       shouldRecordTestRunPath('papercupai-workspace/papercusp-checkpoint/packages/operator-core/lib/foo.test.ts'),
     ).toBe(false);
+  });
+});
+
+// WI-6583: harness_slug/workspace_id were populated on effectively none of
+// 647,266 rows because only ONE naming convention was ever checked. These pin
+// the broadened precedence so a future edit can't quietly narrow it back down.
+describe('resolveTestRunHarnessSlug / resolveTestRunWorkspaceId (WI-6583)', () => {
+  const ATTRIBUTION_KEYS = [
+    'PAPERCUSP_TEST_RUN_HARNESS',
+    'HARNESS_SLUG',
+    'PAPERCUSP_HARNESS_SLUG',
+    'PAPERCUSP_WORKSPACE_ID',
+    'PAPERCUSP_WORKSPACE',
+  ] as const;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = {};
+    for (const k of ATTRIBUTION_KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+  afterEach(() => {
+    for (const k of ATTRIBUTION_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  it('resolveTestRunHarnessSlug: returns null when nothing is set', () => {
+    expect(resolveTestRunHarnessSlug()).toBeNull();
+  });
+
+  it('resolveTestRunHarnessSlug: falls back to HARNESS_SLUG (a harness-spawned agent role)', () => {
+    process.env.HARNESS_SLUG = 'my-harness';
+    expect(resolveTestRunHarnessSlug()).toBe('my-harness');
+  });
+
+  it('resolveTestRunHarnessSlug: falls back to PAPERCUSP_HARNESS_SLUG (an interactive su/psu shell)', () => {
+    process.env.PAPERCUSP_HARNESS_SLUG = 'papercusp';
+    expect(resolveTestRunHarnessSlug()).toBe('papercusp');
+  });
+
+  it('resolveTestRunHarnessSlug: PAPERCUSP_TEST_RUN_HARNESS (explicit dogfood override) wins over the others', () => {
+    process.env.PAPERCUSP_TEST_RUN_HARNESS = 'explicit';
+    process.env.HARNESS_SLUG = 'from-spawn';
+    process.env.PAPERCUSP_HARNESS_SLUG = 'from-shell';
+    expect(resolveTestRunHarnessSlug()).toBe('explicit');
+  });
+
+  it('resolveTestRunHarnessSlug: HARNESS_SLUG wins over PAPERCUSP_HARNESS_SLUG', () => {
+    process.env.HARNESS_SLUG = 'from-spawn';
+    process.env.PAPERCUSP_HARNESS_SLUG = 'from-shell';
+    expect(resolveTestRunHarnessSlug()).toBe('from-spawn');
+  });
+
+  it('resolveTestRunWorkspaceId: returns null when nothing is set', () => {
+    expect(resolveTestRunWorkspaceId()).toBeNull();
+  });
+
+  it('resolveTestRunWorkspaceId: falls back to PAPERCUSP_WORKSPACE (an interactive su/psu shell)', () => {
+    process.env.PAPERCUSP_WORKSPACE = 'papercusp-workspace';
+    expect(resolveTestRunWorkspaceId()).toBe('papercusp-workspace');
+  });
+
+  it('resolveTestRunWorkspaceId: PAPERCUSP_WORKSPACE_ID wins over PAPERCUSP_WORKSPACE', () => {
+    process.env.PAPERCUSP_WORKSPACE_ID = 'ws-id';
+    process.env.PAPERCUSP_WORKSPACE = 'ws-legacy';
+    expect(resolveTestRunWorkspaceId()).toBe('ws-id');
   });
 });
