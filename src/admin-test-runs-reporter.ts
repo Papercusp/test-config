@@ -326,6 +326,44 @@ async function closeSharedPg(): Promise<void> {
   }
 }
 
+/**
+ * WI-6583 — harness_slug was populated on 2 of 647,266 rows, workspace_id on
+ * 1,592, because this only ever checked ONE naming convention
+ * (PAPERCUSP_TEST_RUN_HARNESS / PAPERCUSP_WORKSPACE_ID — a pair stamped only
+ * by a deliberately harness-scoped "dogfood" run, P-007). That is not the
+ * only place a test run's harness/workspace identity is knowable at write
+ * time — it is simply the narrowest. Two OTHER naming conventions already
+ * carry the same information on the vast majority of REAL runs and were
+ * never checked here:
+ *   - `HARNESS_SLUG` (+ `PAPERCUSP_WORKSPACE_ID`) — stamped on every
+ *     harness-spawned agent-role process
+ *     (endpoint-route/routes/harness/spawn.ts).
+ *   - `PAPERCUSP_HARNESS_SLUG` (+ `PAPERCUSP_WORKSPACE`) — stamped on an
+ *     interactive su/psu shell session (the dev box this reporter itself
+ *     runs on most often).
+ * Checked in that order (most explicit override first). Exported so the
+ * precedence is unit-testable without touching this function's PG/git IO.
+ *
+ * This does NOT undo the release gate's deliberate exclusion: green-checkpoint
+ * strips every `PAPERCUSP_*` var (see its own `buildGateChildEnv` comment) —
+ * and, since this fix landed, `HARNESS_SLUG` too — from its children's env
+ * before setting only what IT wants, specifically so its rows stay unattributed
+ * (`source='ci'` rows are about the checkpoint tree, not one hive's own suite).
+ */
+export function resolveTestRunHarnessSlug(): string | null {
+  return (
+    process.env.PAPERCUSP_TEST_RUN_HARNESS ||
+    process.env.HARNESS_SLUG ||
+    process.env.PAPERCUSP_HARNESS_SLUG ||
+    null
+  );
+}
+
+/** Sibling of {@link resolveTestRunHarnessSlug} — see its doc comment. */
+export function resolveTestRunWorkspaceId(): string | null {
+  return process.env.PAPERCUSP_WORKSPACE_ID || process.env.PAPERCUSP_WORKSPACE || null;
+}
+
 async function insertRow(row: TestRunRow): Promise<void> {
   let branch: string | null = null;
   let commit: string | null = null;
@@ -340,11 +378,8 @@ async function insertRow(row: TestRunRow): Promise<void> {
 
   const source = resolveTestRunSource();
   const runGroupId = process.env.PAPERCUSP_TEST_RUN_GROUP ?? null;
-  // P-007: when the dogfood run is harness-scoped (env stamped by the operator),
-  // carry harness_slug/workspace_id so its rows stay consistent with the new
-  // per-hive ingestion columns. NULL for a plain operator self-test run.
-  const harnessSlug = process.env.PAPERCUSP_TEST_RUN_HARNESS || null;
-  const workspaceId = process.env.PAPERCUSP_WORKSPACE_ID || null;
+  const harnessSlug = resolveTestRunHarnessSlug();
+  const workspaceId = resolveTestRunWorkspaceId();
   const { loopLagP95Ms, rssMb } = captureReporterSaturationSnapshot();
 
   try {
