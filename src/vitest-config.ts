@@ -33,6 +33,10 @@ const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.pap
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
 const HERMETIC_ENV_SETUP = resolve(__dirname, 'setup-hermetic-env.ts');
+// EI-19311807188719573: unit-layer-only rail forbidding a real Postgres connection.
+// See the file's own doc comment for why it guards the consequence (a live pool) rather
+// than the cause (an un-memoized dynamic import under concurrency).
+const NO_REAL_PG_SETUP = resolve(__dirname, 'setup-no-real-pg.ts');
 // EI-9990: bumps @testing-library/dom's waitFor/findBy* internal poll timeout
 // for shared-box tolerance — a no-op for any package without
 // @testing-library/dom on its graph. See the file's own doc comment.
@@ -290,9 +294,14 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   if (layer === 'integration' && process.env.TESTCONTAINERS_RYUK_DISABLED == null) {
     process.env.TESTCONTAINERS_RYUK_DISABLED = 'true';
   }
+  // EI-19311807188719573: the UNIT layer additionally forbids a real Postgres
+  // connection. Unit-only — the integration layer legitimately builds real clients
+  // against a testcontainer. Ordered FIRST so the rail is armed before any other
+  // setup file can touch the db layer.
+  const layerSetup = layer === 'unit' ? [NO_REAL_PG_SETUP] : [];
   const finalSetup = allowConsoleNoise
-    ? [HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
-    : [HERMETIC_ENV_SETUP, FAIL_ON_CONSOLE_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles];
+    ? [...layerSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
+    : [...layerSetup, HERMETIC_ENV_SETUP, FAIL_ON_CONSOLE_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles];
 
   const layerInclude =
     include ??
