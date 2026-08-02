@@ -306,6 +306,63 @@ describe('isSilencedConsoleMessage', () => {
     });
   });
 
+  describe('PostgreSQL FORBIDDEN — the unit-layer rail (WI-6869 / EI-19311807188719573)', () => {
+    // The rail in setup-no-real-pg.ts makes assertRealPgAllowed throw instead of opening
+    // a pool. At the SAME best-effort catch-and-continue call sites the exhaustion and
+    // ECONNREFUSED blocks above already cover, that throw is caught and logged, and
+    // vitest-fail-on-console then turns the log line into a failure. Verbatim message
+    // text from libs/papercusp/libs/db/src/connection.ts, credentials pre-redacted by
+    // the guard itself.
+    const railError =
+      'A UNIT test tried to open a REAL Postgres connection (pool "org-admin" → ' +
+      'postgresql://<redacted>@localhost:5432/papercusp). Unit tests must not touch a live ' +
+      "database — inject the module's own seam double, or rename the file " +
+      '*.integration.test.ts to run it against a testcontainer. [EI-19311807188719573]';
+
+    it('silences the rail message logged bare by a fail-open call site', () => {
+      expect(isSilencedConsoleMessage(railError)).toBe(true);
+    });
+
+    it('silences it as a trailing console argument (the sync-sse onError shape that broke discord.test.ts)', () => {
+      expect(isSilencedConsoleMessage(format('[sync-sse] notify failed:', railError))).toBe(true);
+    });
+
+    it('silences it when the pool label differs (match is keyed off the rail sentence, not one pool name)', () => {
+      expect(
+        isSilencedConsoleMessage(
+          format('[adv-sessions] recordedLiveOwnerIds failed:', railError.replace('org-admin', 'harness-app')),
+        ),
+      ).toBe(true);
+    });
+
+    // WHY SILENCING THIS CANNOT HIDE THE HAZARD THE RAIL EXISTS TO CATCH, stated here
+    // because it is the whole safety argument and it is NOT expressible as a case below.
+    // A test whose ASSERTIONS depend on live DB rows still fails once its connection is
+    // blocked — but it fails by THROWING an AssertionError, and a thrown error never
+    // reaches this predicate at all. This filter is consulted only by
+    // vitest-fail-on-console, i.e. only for console.error/console.warn arguments. So the
+    // hazard class reds on its asserted path regardless of anything decided here; that is
+    // observable in the WI-6869 split, where 14 of the 47 files fail exactly that way and
+    // are deliberately left failing by this change.
+    //
+    // What the two cases below DO pin down is the blast radius: the match is keyed on the
+    // rail's own sentence, so an unrelated failure logged by the very same best-effort
+    // call site still fails loudly.
+    it('does NOT silence a different error from the same best-effort call site', () => {
+      expect(
+        isSilencedConsoleMessage(
+          format('[sync-sse] notify failed:', 'duplicate key value violates unique constraint "foo_pkey"'),
+        ),
+      ).toBe(false);
+    });
+
+    it('does NOT silence an unrelated error that merely mentions Postgres', () => {
+      expect(
+        isSilencedConsoleMessage(format('[some-route] handler error:', 'Postgres connection lost mid-query')),
+      ).toBe(false);
+    });
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(

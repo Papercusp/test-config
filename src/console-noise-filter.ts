@@ -52,6 +52,27 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   if (msg.includes('[wire-outbox] backfillLocalState failed for')) return true;
   if (msg.includes('[outbox-drain] drain failed for')) return true;
   if (msg.includes('[outbox-drain] LISTEN setup failed for')) return true;
+  // PostgreSQL FORBIDDEN — the third variant of the same condition as the two blocks
+  // above (pool exhausted / server unreachable), and the only one that is deliberate:
+  // the unit-layer rail in setup-no-real-pg.ts pins PAPERCUSP_FORBID_REAL_PG=1, so
+  // assertRealPgAllowed (libs/papercusp/libs/db/src/connection.ts) THROWS at buildClient
+  // rather than opening a real pool. The rail is correct and stays — this entry does not
+  // weaken it, because the throw still happens and the connection is still never opened.
+  // What this silences is only the DOWNSTREAM LOG at the same best-effort call sites the
+  // entries above already cover: each catches+continues, so the rail's own message lands
+  // as an incidental console.error/warn, and vitest-fail-on-console then converts that log
+  // line into a test failure. That is what red-pinned the green-checkpoint on 2026-08-02
+  // (WI-6869): 47 unit files failed within 18 minutes of the rail landing, 33 of them via
+  // this exact path, every one of which had passed on the run 24 minutes earlier.
+  // CRITICALLY, this cannot hide the hazard the rail exists to catch. A test whose
+  // ASSERTIONS depend on live DB rows still fails — blocking its connection turns its
+  // assertion red on the asserted path (the remaining 14 files of that 47 fail exactly
+  // this way, and are deliberately left failing). Only a test that never needed the pool
+  // in the first place goes quiet, which is the correct verdict for it. Same philosophy,
+  // and the same wording, as the exhaustion/unreachable entries: a real regression on a
+  // best-effort path surfaces as a thrown error or a failed assertion, never as this
+  // incidental log line.
+  if (msg.includes('A UNIT test tried to open a REAL Postgres connection')) return true;
   // implement-worker-exit.test.ts's "getPayload failure" test deliberately spies
   // console.warn (vi.spyOn(...).mockImplementation) around the ONE intentional,
   // best-effort warn recordImplementWorkerExit emits on a getPayload error
