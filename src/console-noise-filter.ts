@@ -290,5 +290,23 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   ) {
     return true;
   }
+  // sweepStalledLoops (stalled-loops-guard.ts, WI-6639/EI-19362678179163398) deliberately
+  // warns on its second-source veto path — the module's own comment: "a non-zero veto
+  // count is the live tell that last_turn_at is under-reporting again, and it must reach
+  // the operator log rather than vanish". stalled-loops-guard.test.ts's own "REFUSES to
+  // disarm a turnsStalled owner that produced a real turn inside the floor" and "sizes the
+  // veto window from turnsStalledFloorMs" cases deliberately exercise this path and already
+  // `vi.spyOn(console, 'warn').mockImplementation(...)` around it — the SAME WI-1660/
+  // WI-2994/WI-3842/WI-4031/EI-18140230738284514/EI-18679764170567879 misattribution class
+  // documented above: under the full forks-pool run the in-test spy occasionally loses the
+  // race against this setup's own beforeEach/afterEach console.warn wrapping, so the
+  // deliberate warn reaches vitest-fail-on-console instead of the spy (observed 2026-08-02:
+  // passes standalone and as a whole file every time — 10/10 — but 2/10 failed exactly this
+  // way inside a full `npm run test:affected` run, verdict unchanged on a fresh-process
+  // HARDEN-GATE retry). Message text is specific enough that silencing it cannot hide a
+  // real defect elsewhere (a genuine veto-logic regression surfaces as a failed assertion
+  // on `res.vetoedByRecentTurn` / `autoPause` in this file's own dedicated coverage, not
+  // this incidental — intentionally loud — log line).
+  if (msg.includes('[stalled-loops-guard] VETO')) return true;
   return false;
 }

@@ -269,6 +269,29 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(false);
   });
 
+  it('silences the stalled-loops-guard second-source-veto deliberate warn (WI-6639/EI-19362678179163398: full-suite-only spy-race flake)', () => {
+    // sweepStalledLoops (stalled-loops-guard.ts) deliberately warns when its
+    // second-source veto refuses to disarm a turnsStalled owner that produced a
+    // REAL turn inside the floor — the module's own comment: "a non-zero veto
+    // count is the live tell that last_turn_at is under-reporting again". Its
+    // own test file spies console.warn around the two cases that exercise this
+    // path, but under the full forks-pool run the in-test spy occasionally loses
+    // the race against this setup's own beforeEach/afterEach wrapping (the same
+    // misattribution class as every entry above), so the deliberate warn escapes
+    // to vitest-fail-on-console. Observed 2026-08-02: 10/10 standalone, 2/10 red
+    // inside a full `npm run test:affected` run, unchanged on a fresh-process retry.
+    expect(
+      isSilencedConsoleMessage(
+        '[stalled-loops-guard] VETO su-live: turnsStalled:true but a real turn landed 120s ago ' +
+          '(lastTurnAt=2026-08-02T13:29:47.897Z, lastRealTurnAt=2026-08-02T17:27:47.897Z) — refusing to disarm. ' +
+          'A non-zero veto count means last_turn_at is under-reporting (EI-19362678179163398).',
+      ),
+    ).toBe(true);
+    // Message text is specific enough not to swallow an unrelated stalled-loops-guard
+    // line that never made it into the exact "VETO" tag.
+    expect(isSilencedConsoleMessage('[stalled-loops-guard] disarmed su-dead: no recent activity')).toBe(false);
+  });
+
   describe('PostgreSQL UNREACHABLE (ECONNREFUSED) — the DOWN twin of the exhaustion entries (EI-13946)', () => {
     // The exact console shapes that tripped vitest-fail-on-console on a run box
     // with no reachable PG on :5432: orient.test.ts (gate-decisions fire-and-forget
