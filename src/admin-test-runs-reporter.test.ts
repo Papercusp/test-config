@@ -10,9 +10,13 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import AdminTestRunsReporter, {
   buildOutputTail,
   captureReporterSaturationSnapshot,
+  classifyGitEntry,
   computeIsScratchConfig,
   isScratchConfigFile,
   shouldRecordTestRunPath,
@@ -211,5 +215,91 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
   it('onExit resolves cleanly with no pending work', async () => {
     const r = new AdminTestRunsReporter();
     await expect(r.onExit()).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * EI-19307211919650123 — the root walk must tell a linked WORKTREE apart from a
+ * SUBMODULE. Both carry a `.git` FILE, and they need opposite answers:
+ *   - worktree  → this dir IS the repo root; stop (paths are relative to it)
+ *   - submodule → the superproject above is the root; keep walking
+ *
+ * The regression this guards is not hypothetical. Treating every `.git` file as
+ * "keep walking" made the green gate's checkout (`papercusp-checkpoint`, a linked
+ * worktree) resolve its root to a stray `/home/<user>/.git`, so every gate row was
+ * stamped `papercupai-workspace/papercusp-checkpoint/…` and then dropped by
+ * `shouldRecordTestRunPath` — the release gate recorded nothing at all.
+ *
+ * Uses a real temp fs rather than mocking `node:fs`, so it exercises the same
+ * statSync/readFileSync path production takes.
+ */
+describe('classifyGitEntry (worktree vs submodule vs plain repo root)', () => {
+  const made: string[] = [];
+  function tree(): string {
+    const d = mkdtempSync(join(tmpdir(), 'pc-gitentry-'));
+    made.push(d);
+    return d;
+  }
+  afterEach(() => {
+    while (made.length) {
+      try { rmSync(made.pop() as string, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
+  it('a `.git` DIRECTORY is a repo root', () => {
+    const d = tree();
+    mkdirSync(join(d, '.git'));
+    expect(classifyGitEntry(d)).toBe('root');
+  });
+
+  it('THE REGRESSION: a linked-worktree gitlink is a repo root, not a thing to walk past', () => {
+    const d = tree();
+    writeFileSync(join(d, '.git'), 'gitdir: /repo/.git/worktrees/papercusp-checkpoint\n');
+    expect(classifyGitEntry(d)).toBe('root');
+  });
+
+  it('a SUBMODULE gitlink is still skipped — the superproject stays the root', () => {
+    const d = tree();
+    writeFileSync(join(d, '.git'), 'gitdir: /repo/.git/modules/libs/generic/cache\n');
+    expect(classifyGitEntry(d)).toBe('skip');
+  });
+
+  it('no `.git` entry at all reports none', () => {
+    expect(classifyGitEntry(tree())).toBe('none');
+  });
+
+  it('an unrecognised gitlink keeps the previous behaviour (skip), never an invented root', () => {
+    const d = tree();
+    writeFileSync(join(d, '.git'), 'this is not a gitlink\n');
+    expect(classifyGitEntry(d)).toBe('skip');
+    const d2 = tree();
+    writeFileSync(join(d2, '.git'), 'gitdir: /repo/.git/something-else/x\n');
+    expect(classifyGitEntry(d2)).toBe('skip');
+  });
+
+  it('tolerates windows-style separators in the gitdir target', () => {
+    const d = tree();
+    writeFileSync(join(d, '.git'), 'gitdir: C:\\repo\\.git\\worktrees\\wt\n');
+    expect(classifyGitEntry(d)).toBe('root');
+  });
+
+  it('COMPOSED: the walk stops at a worktree, and its paths survive shouldRecordTestRunPath', () => {
+    // Mirrors the real shape: a superproject with a linked worktree beside it.
+    const repo = tree();
+    mkdirSync(join(repo, '.git'));
+    const wt = join(repo, 'checkout');
+    mkdirSync(wt);
+    writeFileSync(join(wt, '.git'), `gitdir: ${join(repo, '.git', 'worktrees', 'checkout')}\n`);
+
+    expect(classifyGitEntry(wt)).toBe('root');
+    // Because the walk stops AT the worktree, a test file inside it records as
+    // repo-relative (`packages/...`) — the same key a local run in the main tree
+    // produces, which is what makes gate-vs-local comparison possible at all.
+    expect(shouldRecordTestRunPath('packages/operator-core/lib/foo.test.ts')).toBe(true);
+    // Had the walk continued past it, the path would have carried the checkout
+    // prefix — the exact shape NON_SIGNAL_PREFIXES drops.
+    expect(
+      shouldRecordTestRunPath('papercupai-workspace/papercusp-checkpoint/packages/operator-core/lib/foo.test.ts'),
+    ).toBe(false);
   });
 });
