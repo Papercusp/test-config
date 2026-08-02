@@ -23,31 +23,80 @@
 
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { exec } from 'node:child_process';
-import { statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+/**
+ * EI-19307211919650123: classify the `.git` entry at `dir` for the root walk.
+ * Three outcomes, because `.git` being a FILE is ambiguous and the two cases
+ * need OPPOSITE answers:
+ *
+ *  - `'root'` — a real repo root. Either `.git` is a DIRECTORY, or it is a
+ *    LINKED-WORKTREE gitlink (`gitdir: …/.git/worktrees/<name>`). A worktree's
+ *    checkout IS the repo root: paths must be relative to it.
+ *  - `'skip'` — a SUBMODULE gitlink (`gitdir: …/.git/modules/<name>`). The
+ *    SUPERPROJECT above is the root the tab's registry globs are relative to,
+ *    so the walk must continue past it. Also the default for any gitlink shape
+ *    we don't recognise — this classifier may only ever ADD a stopping point it
+ *    can prove, never invent one, so an unknown gitlink keeps today's behaviour.
+ *  - `'none'` — no `.git` here at all.
+ *
+ * Why this exists: the walk used to stop ONLY at a `.git` directory, so it sailed
+ * straight past `papercusp-checkpoint` (the green gate's checkout — a linked
+ * worktree, hence a `.git` FILE) and landed on a stray `/home/<user>/.git` that
+ * contains only `info/` and is not a repo at all. Every gate row was then stamped
+ * `papercupai-workspace/papercusp-checkpoint/…`, which {@link shouldRecordTestRunPath}
+ * DROPS via NON_SIGNAL_PREFIXES — so the release gate, the one suite whose verdict
+ * gates the whole fleet, recorded nothing. Same bug hit `papercusp-staging` and any
+ * `.papercusp/worktrees/` isolation tree.
+ *
+ * Pure (modulo fs) + exported for unit testing.
+ */
+export function classifyGitEntry(dir: string): 'root' | 'skip' | 'none' {
+  let isFile: boolean;
+  try {
+    const st = statSync(join(dir, '.git'));
+    if (st.isDirectory()) return 'root';
+    isFile = st.isFile();
+  } catch {
+    return 'none';
+  }
+  if (!isFile) return 'none';
+  try {
+    // A gitlink is a one-liner: `gitdir: <absolute-or-relative path>`.
+    const target = readFileSync(join(dir, '.git'), 'utf8').trim();
+    const m = /^gitdir:\s*(.+)$/.exec(target);
+    if (!m) return 'skip';
+    // Normalise separators so the marker test is platform-agnostic.
+    const gitdir = m[1].trim().split('\\').join('/');
+    if (gitdir.includes('/worktrees/')) return 'root';
+    return 'skip'; // `/modules/` (submodule) and every unrecognised shape
+  } catch {
+    return 'skip';
+  }
+}
 
 // ── inlined: inferWorkspaceRoot — find the true SUPERPROJECT root so recorded
 //    file paths are monorepo-relative (the tab's registry globs expect that). ──
 let _cachedRoot: string | null = null;
 function inferWorkspaceRoot(from = process.cwd()): string {
   if (_cachedRoot) return _cachedRoot;
-  // Walk up to the first ancestor whose `.git` is a DIRECTORY — the superproject
-  // root. CRITICAL: a git SUBMODULE carries a `.git` FILE (a gitlink), which we
-  // must SKIP. The old `existsSync('.git')` check stopped at the submodule, so a
-  // submodule workspace recorded SUBMODULE-relative paths (e.g.
-  // `packages/orchestrator/…` or `grid-core/src/…`) instead of the monorepo-
-  // relative `libs/papercusp/packages/orchestrator/…` / `libs/generic/papergrid/
-  // grid-core/src/…` the tab globs match → those rows were invisible in the tab.
+  // Walk up to the first ancestor that {@link classifyGitEntry} calls a repo
+  // root — a `.git` DIRECTORY, or a linked-WORKTREE gitlink. CRITICAL: a git
+  // SUBMODULE also carries a `.git` FILE (a gitlink) and must be SKIPPED. The
+  // original `existsSync('.git')` check stopped at the submodule, so a submodule
+  // workspace recorded SUBMODULE-relative paths (e.g. `packages/orchestrator/…`
+  // or `grid-core/src/…`) instead of the monorepo-relative
+  // `libs/papercusp/packages/orchestrator/…` / `libs/generic/papergrid/grid-core/src/…`
+  // the tab globs match → those rows were invisible in the tab. The fix for THAT
+  // (skip every `.git` file) then over-corrected into the worktree bug described
+  // on classifyGitEntry, which is why the two cases are now told apart explicitly.
   let dir = resolve(from);
   while (true) {
-    try {
-      if (statSync(join(dir, '.git')).isDirectory()) {
-        _cachedRoot = dir;
-        return dir;
-      }
-    } catch {
-      /* no `.git` at this level — keep walking */
+    if (classifyGitEntry(dir) === 'root') {
+      _cachedRoot = dir;
+      return dir;
     }
     const parent = dirname(dir);
     if (parent === dir) break;
