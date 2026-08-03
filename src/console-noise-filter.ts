@@ -246,6 +246,19 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // assertion in read-merge-read-throw.test.ts's own dedicated coverage of
   // this codepath, not this incidental — and intentionally loud — log line).
   if (msg.includes('[read-merge] WI-2003 quarantine:')) return true;
+  // embed-backfill's WI-7327 stale-latch takeover is deliberately LOUD: a sweep
+  // that hangs pins the `running` latch and silently disables ALL future backfill
+  // (measured 2026-08-03 — 451k rows unembedded, zero log output for ~9.5h), so
+  // recovering from it quietly would recreate the invisibility that caused the
+  // outage. embed-backfill.test.ts's "takes over a STALE latch" case exercises this
+  // exact path; per the WI-1660/WI-2994/WI-3842/WI-4031/EI-18140230738284514
+  // misattribution class documented above, an in-test spy does NOT reliably catch
+  // it (observed here: the spy recorded '' while the takeover provably ran), so the
+  // test asserts the BEHAVIOUR — that the latch is seized and released — and the
+  // log is silenced here instead. Message text is specific enough that silencing it
+  // cannot mask a real defect: a takeover regression fails that test's own
+  // assertions, not this line.
+  if (msg.includes('[embed-backfill] STALE LATCH:')) return true;
   // chat-actions registry.ts's listChatActions() deliberately catches a throwing
   // available() and warns instead of letting one broken action take down the
   // whole list — the module's own comment: "logged, not fatal". registry.test.ts's
