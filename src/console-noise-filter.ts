@@ -321,5 +321,13 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // on `res.vetoedByRecentTurn` / `autoPause` in this file's own dedicated coverage, not
   // this incidental — intentionally loud — log line).
   if (msg.includes('[stalled-loops-guard] VETO')) return true;
+  // Same module, same reasoning, second deliberate warn path (EI-19406534159939583): the
+  // FIRE-STARVED branch re-arms rather than disarms a loop whose owner answered its last fire
+  // and is still reachable, and that finding MUST reach the operator log — it means the
+  // loop-firing path stopped serving live agents, which is an infrastructure fault no agent
+  // will report on its own. Its dedicated tests spy on console.warn, so this entry covers only
+  // the same spy-vs-setup race documented for the VETO line above; a real regression still
+  // surfaces as a failed assertion on `res.reArmedFireStarved` / `rearm` / `autoPause`.
+  if (msg.includes('[stalled-loops-guard] FIRE-STARVED')) return true;
   return false;
 }
