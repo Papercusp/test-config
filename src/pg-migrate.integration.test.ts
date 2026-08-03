@@ -50,7 +50,10 @@ afterAll(async () => {
           `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${name}' AND pid <> pg_backend_pid()`,
         )
         .catch(() => {});
-      await admin.unsafe(`DROP DATABASE IF EXISTS "${name}"`).catch(() => {});
+      // WI-4311: WITH (FORCE) — pg_terminate_backend above only SIGNALS; a plain
+      // DROP can still block on a not-yet-closed backend (parked 6s-267s+ under
+      // fleet load). Mirrors makeDrop() in ./pg-migrate.ts.
+      await admin.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => {});
     }
   } finally {
     await admin.end({ timeout: 5 });
