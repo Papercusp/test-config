@@ -35,6 +35,8 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+import { pinModuleState } from '@papercusp/module-singleton';
 import { afterAll, beforeAll, expect } from 'vitest';
 
 import {
@@ -69,13 +71,25 @@ let timers: TimerLedger | null = null;
 /**
  * POST-MORTEM FIRES seen in this worker since the last record was written.
  *
+ * PINNED TO THE REALM, not module scope — and this was measured, not assumed. A
+ * setup file is re-evaluated for EACH test file even when the worker is reused,
+ * so a plain module-level Map gives every file its own sink: the armer's timer
+ * callback writes into the module instance that armed it, while the LANDING
+ * file's afterAll drains a different, empty one. The probe showed exactly that —
+ * the stray timer demonstrably fired (its callback ran) and the report still came
+ * back empty. Cross-file state is the whole subject here, so the sink has to
+ * outlive a single file's module instance.
+ *
  * COLLAPSED BY (armer, landing, kind) rather than kept as an event list, because
  * the volume is unbounded by construction: a leaked interval fires forever, and a
  * single one at 10ms would append ~6,000 events a minute for the rest of the run.
  * A count is the whole signal anyway — "cell-read poisons sse-prime 300 times" and
  * "…once" are the same finding with different loudness.
  */
-const postMortem = new Map<string, PostMortemFireRecord>();
+const postMortem = pinModuleState(
+  '@papercusp/test-config.leak-detector.post-mortem-fires',
+  () => new Map<string, PostMortemFireRecord>(),
+);
 
 /**
  * The file running at the moment a stray timer fires — the file being POISONED.

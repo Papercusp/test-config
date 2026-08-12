@@ -38,6 +38,7 @@
   },
   "dependencies": {
     "@nestjs/testing": "^11.0.0",
+    "@papercusp/module-singleton": "*",
     "@testcontainers/postgresql": "^11.0.0",
     "drizzle-orm": "^0.45.2",
     "msw": "^2.7.0",
