@@ -216,8 +216,8 @@ function guardLayeredTestPathUnderUnit(): void {
   throw new Error(
     `vitest: ${misrouted.join(', ')} is ${article} ${layer} test, which the default (unit) config excludes — ` +
       `running it by path here matches "No test files found".\n` +
-      `Run it with the ${layer} config instead:\n` +
-      `  npx vitest run --config ${config} ${misrouted.join(' ')}\n` +
+      `The owning package's ${layer} config is ${config}; run it through the repository test router:\n` +
+      `  npm run test:file -- ${misrouted.join(' ')}\n` +
       `(or \`npm run test:affected:integration\` to let the walker route it).`,
   );
 }

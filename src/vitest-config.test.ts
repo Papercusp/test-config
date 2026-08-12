@@ -31,16 +31,28 @@ function withArgv(...tokens: string[]): void {
 }
 
 describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
-  it('throws an actionable error (naming the integration config) for an *.integration.test.ts run by path under the unit config', () => {
+  it('routes an *.integration.test.ts remediation through the repository test router', () => {
     withArgv('lib/foo.integration.test.ts');
     expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(/integration test/i);
     withArgv('lib/foo.integration.test.ts');
-    expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(/--config vitest\.integration\.config\.ts/);
+    expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
+      /owning package's integration config is vitest\.integration\.config\.ts/,
+    );
+    withArgv('lib/foo.integration.test.ts');
+    expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
+      /npm run test:file -- lib\/foo\.integration\.test\.ts/,
+    );
   });
 
-  it('points an *.browser.test.ts at the browser config', () => {
+  it('routes an *.browser.test.ts remediation through the repository test router', () => {
     withArgv('lib/foo.browser.test.ts');
-    expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(/--config vitest\.browser\.config\.ts/);
+    expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
+      /owning package's browser config is vitest\.browser\.config\.ts/,
+    );
+    withArgv('lib/foo.browser.test.ts');
+    expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
+      /npm run test:file -- lib\/foo\.browser\.test\.ts/,
+    );
   });
 
   it('does NOT fire for a plain unit *.test.ts path', () => {
