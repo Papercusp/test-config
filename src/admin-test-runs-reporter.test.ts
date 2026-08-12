@@ -98,6 +98,25 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     // '@papercusp/template-kit'". Never a source regression (EI-11176).
     expect(shouldRecordTestRunPath('.wi3388-cargo-target/debug/sidecar/templates/papercusp-webapp/checks/composition-integrity.test.ts')).toBe(false);
     expect(shouldRecordTestRunPath('papercusp-desktop/src-tauri/target/debug/sidecar/templates/papercusp-webapp/checks/composition-integrity.test.ts')).toBe(false);
+    // Cross-target and sidecar-specific Cargo profiles do not put `debug` or
+    // `release` immediately below target/, so the narrower profile regex above
+    // must not be the only guard. This is the relocated target symlink shape
+    // that produced the phantom macOS bundle failures (EI-20206285706779155).
+    expect(
+      shouldRecordTestRunPath(
+        'papercusp-desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/Papercusp GUI.app/Contents/Resources/sidecar/templates/papercusp-webapp/checks/composition-integrity.test.ts',
+      ),
+    ).toBe(false);
+    expect(
+      shouldRecordTestRunPath(
+        'papercusp-desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Papercusp Server.app/Contents/Resources/sidecar/templates/papercusp-desktop-app/checks/composition-integrity.test.ts',
+      ),
+    ).toBe(false);
+    expect(
+      shouldRecordTestRunPath(
+        'papercusp-desktop/src-tauri/target/darwin-sidecar/templates/papercusp-agentic-desktop-app/checks/composition-integrity.test.ts',
+      ),
+    ).toBe(false);
     // …but the real SOURCE copies of those same checks still record.
     expect(shouldRecordTestRunPath('templates/papercusp-webapp/checks/composition-integrity.test.ts')).toBe(true);
     expect(shouldRecordTestRunPath('packages/operator-core/lib/testing-orphan-runs.test.ts')).toBe(true);

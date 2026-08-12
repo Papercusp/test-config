@@ -253,6 +253,11 @@ export function shouldRecordTestRunPath(filePath: string): boolean {
   // standard `target/{debug,release}/` cargo output.
   if (filePath.includes('cargo-target/')) return false;
   if (/(?:^|\/)target\/(?:debug|release)\//.test(filePath)) return false;
+  // Cross-target and sidecar-specific Cargo profiles do not put `debug` or
+  // `release` immediately below target/, so matching only the profile segment
+  // lets relocated bundles leak into the test-run ledger. A src-tauri/target
+  // tree is unambiguously Cargo output; keep the source templates/ tree live.
+  if (/(?:^|\/)src-tauri\/target\//.test(filePath)) return false;
   if (NON_SIGNAL_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return false;
   return true;
 }
