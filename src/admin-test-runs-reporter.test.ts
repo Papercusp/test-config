@@ -19,6 +19,7 @@ import AdminTestRunsReporter, {
   classifyGitEntry,
   computeIsScratchConfig,
   isScratchConfigFile,
+  isMutationProbeRun,
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
   shouldRecordTestRunPath,
@@ -71,6 +72,39 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       errors: () => [],
     } as unknown as Parameters<typeof r.onTestModuleEnd>[0];
     expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
+  });
+
+  it('skips mutation-probe modules before inspecting or queueing a test-run row', () => {
+    const previous = process.env.PAPERCUSP_MUTATION_PROBE;
+    process.env.PAPERCUSP_MUTATION_PROBE = '1';
+    try {
+      const r = new AdminTestRunsReporter();
+      const fakeModule = {
+        moduleId: '/tmp/mutation-probe.test.ts',
+        state: () => {
+          throw new Error('mutation-probe modules must be skipped before inspection');
+        },
+      } as unknown as Parameters<typeof r.onTestModuleEnd>[0];
+      expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCUSP_MUTATION_PROBE;
+      else process.env.PAPERCUSP_MUTATION_PROBE = previous;
+    }
+  });
+
+  it('recognizes only the explicit mutation-probe marker', () => {
+    const previous = process.env.PAPERCUSP_MUTATION_PROBE;
+    try {
+      delete process.env.PAPERCUSP_MUTATION_PROBE;
+      expect(isMutationProbeRun()).toBe(false);
+      process.env.PAPERCUSP_MUTATION_PROBE = '1';
+      expect(isMutationProbeRun()).toBe(true);
+      process.env.PAPERCUSP_MUTATION_PROBE = '0';
+      expect(isMutationProbeRun()).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCUSP_MUTATION_PROBE;
+      else process.env.PAPERCUSP_MUTATION_PROBE = previous;
+    }
   });
 
   it('captures the reporter saturation fields used by harness_shared.test_runs', () => {

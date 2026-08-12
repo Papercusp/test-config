@@ -16,6 +16,9 @@
  *   - never taint test output; never affect the process exit code
  *
  * Opt-out via PAPERCUSP_DISABLE_TEST_RUNS_REPORTER=1 (defineVitestConfig drops it).
+ * Mutation probes set PAPERCUSP_MUTATION_PROBE=1; those deliberate baseline and
+ * mutant outcomes are falsifiability evidence, not repository-health evidence,
+ * so this reporter skips them entirely.
  *
  * Vitest 4 API: onTestModuleEnd (per file) + onTestRunEnd (flush). Older
  * onFinished/onTaskUpdate names from Vitest 1-3 are NOT called.
@@ -131,6 +134,17 @@ function resolveTestRunSource(): TestRunSource {
   const override = process.env.PAPERCUSP_TEST_RUN_SOURCE;
   if (override && VALID_SOURCES.has(override as TestRunSource)) return override as TestRunSource;
   return process.env.CI ? 'ci' : 'local';
+}
+
+/**
+ * Mutation-probe runs deliberately produce a baseline and usually a failing
+ * mutant result. Neither is a repository-health measurement, so the reporter
+ * must not enqueue either row for harness_shared.test_runs.
+ *
+ * Exported so the marker contract is unit-testable without connecting to PG.
+ */
+export function isMutationProbeRun(): boolean {
+  return process.env.PAPERCUSP_MUTATION_PROBE === '1';
 }
 
 // ── inlined: resolveGitContext (was testing-branch-resolve.ts). 200ms timeout,
@@ -485,6 +499,7 @@ export default class AdminTestRunsReporter implements Reporter {
   /** Per-module hook — fire-and-forget the insert; onTestRunEnd awaits them. */
   onTestModuleEnd(testModule: TestModule): void {
     try {
+      if (isMutationProbeRun()) return;
       const filePath = toWorkspaceRel(testModule.moduleId);
       if (!shouldRecordTestRunPath(filePath)) return;
       const status = moduleStatus(testModule);
