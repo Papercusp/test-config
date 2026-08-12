@@ -34,10 +34,12 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
+  CENSUS_RECORD_VERSION,
   leakWeight,
   summarizeCensus,
   type FileVerdict,
   type LeakCensus,
+  type PostMortemFireRecord,
   type ResourceCounts,
 } from './handle-leak-delta.js';
 
@@ -48,7 +50,7 @@ import {
  * every test file in the repo — must be able to stamp the version without
  * importing this directory-walking module. See the definition for the full reason.
  */
-export { CENSUS_RECORD_VERSION, type PostMortemFireRecord } from './handle-leak-delta.js';
+export { CENSUS_RECORD_VERSION, type PostMortemFireRecord };
 
 /** One line of the JSONL artifact. `v` is absent on v1 records. */
 export type CensusRecord = FileVerdict & {
