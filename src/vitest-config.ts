@@ -41,6 +41,13 @@ const NO_REAL_PG_SETUP = resolve(__dirname, 'setup-no-real-pg.ts');
 // for shared-box tolerance — a no-op for any package without
 // @testing-library/dom on its graph. See the file's own doc comment.
 const TESTING_LIBRARY_TIMEOUT_SETUP = resolve(__dirname, 'setup-testing-library-timeout.ts');
+// WI-38215 / plan gate-suite-speedup-2026-08-12 D-014+D-016: attributes a leaked
+// timer/listener/registry entry to the file that LEFT it, instead of to the file
+// that happened to be running when it fired (which is what vitest reports, and it
+// sends you to edit an innocent file). Observe-and-report only — it never fails a
+// test; see the file's own doc comment for why, and for why it must be registered
+// FIRST (outermost bracket, so sibling setups' create/release pairs cancel out).
+const HANDLE_LEAK_SETUP = resolve(__dirname, 'setup-handle-leak-detector.ts');
 // The monorepo root (libs/test-config/src → up 3 = repo root). Whitelisted in
 // Vite's server.fs.allow below so a `vitest run --root <pkg>` invocation can
 // still serve this hoisted setup file + other workspace deps. Without it, a
@@ -299,9 +306,21 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   // against a testcontainer. Ordered FIRST so the rail is armed before any other
   // setup file can touch the db layer.
   const layerSetup = layer === 'unit' ? [NO_REAL_PG_SETUP] : [];
+  // HANDLE_LEAK_SETUP sits immediately after layerSetup: NO_REAL_PG_SETUP keeps its
+  // documented first position (it arms a rail at module-eval time, before anything
+  // can touch the db layer), while the leak detector still brackets every REMAINING
+  // setup's beforeAll/afterAll pair from the outside so those pairs cancel to zero
+  // instead of reading as leaks (WI-38215).
   const finalSetup = allowConsoleNoise
-    ? [...layerSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
-    : [...layerSetup, HERMETIC_ENV_SETUP, FAIL_ON_CONSOLE_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles];
+    ? [...layerSetup, HANDLE_LEAK_SETUP, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
+    : [
+        ...layerSetup,
+        HANDLE_LEAK_SETUP,
+        HERMETIC_ENV_SETUP,
+        FAIL_ON_CONSOLE_SETUP,
+        TESTING_LIBRARY_TIMEOUT_SETUP,
+        ...setupFiles,
+      ];
 
   const layerInclude =
     include ??

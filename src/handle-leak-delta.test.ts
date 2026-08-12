@@ -50,10 +50,15 @@ describe('classifyFile', () => {
     // The a-leaker case from the controlled probe (plan D-016): armed an uncleared
     // timer and dirtied a registry, so its own exit carries both.
     const v = classifyFile('a-leaker.test.ts', { Timeout: 1 }, { Timeout: 2, __registry: 1 });
-    expect(v.leaked).toEqual([
-      { resource: 'Timeout', delta: 1 },
-      { resource: '__registry', delta: 1 },
-    ]);
+    // Set-wise: the ORDER of equal-weight deltas is locale-collation dependent and is
+    // pinned by diffCounts' own determinism test above, not re-asserted here.
+    expect(v.leaked).toHaveLength(2);
+    expect(v.leaked).toEqual(
+      expect.arrayContaining([
+        { resource: 'Timeout', delta: 1 },
+        { resource: '__registry', delta: 1 },
+      ]),
+    );
     expect(v.consumed).toEqual([]);
     expect(isSourceClean(v)).toBe(false);
   });
