@@ -145,12 +145,15 @@ describe('installTimerLedger', () => {
   });
 
   it('works when the environment has no setImmediate (browser-like globals)', () => {
-    const globals = {
-      setTimeout: ((cb: unknown) => 1) as unknown as TimerGlobals['setTimeout'],
+    // Typed as TimerGlobals (not `satisfies` on a narrower literal) so setImmediate
+    // stays a declared-but-absent optional — which is the shape a browser-like
+    // environment actually presents.
+    const globals: TimerGlobals = {
+      setTimeout: (() => 1) as unknown as TimerGlobals['setTimeout'],
       clearTimeout: (() => {}) as TimerGlobals['clearTimeout'],
-      setInterval: ((cb: unknown) => 2) as unknown as TimerGlobals['setInterval'],
+      setInterval: (() => 2) as unknown as TimerGlobals['setInterval'],
       clearInterval: (() => {}) as TimerGlobals['clearInterval'],
-    } satisfies TimerGlobals;
+    };
     const ledger = installTimerLedger(globals);
     globals.setTimeout(...([() => {}, 1] as never[]));
     expect(ledger.collect()).toEqual({ 'timer:setTimeout': 1 });

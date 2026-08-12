@@ -311,11 +311,17 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   // can touch the db layer), while the leak detector still brackets every REMAINING
   // setup's beforeAll/afterAll pair from the outside so those pairs cancel to zero
   // instead of reading as leaks (WI-38215).
+  //
+  // EXCLUDED FROM THE BROWSER LAYER, for two independent reasons: it imports node:fs
+  // / node:os / node:path to write its artifact (unavailable in a real browser), and
+  // its whole premise — resources surviving in a REUSED NODE WORKER — does not apply
+  // to a browser context in the first place.
+  const leakSetup = layer === 'browser' ? [] : [HANDLE_LEAK_SETUP];
   const finalSetup = allowConsoleNoise
-    ? [...layerSetup, HANDLE_LEAK_SETUP, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
+    ? [...layerSetup, ...leakSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
     : [
         ...layerSetup,
-        HANDLE_LEAK_SETUP,
+        ...leakSetup,
         HERMETIC_ENV_SETUP,
         FAIL_ON_CONSOLE_SETUP,
         TESTING_LIBRARY_TIMEOUT_SETUP,
