@@ -229,6 +229,28 @@ export function dedupeByFile(records: readonly CensusRecord[]): {
   return { records: [...worst.values()], duplicates };
 }
 
+/**
+ * Merge every record's post-mortem fires into one ranked population.
+ *
+ * Deliberately reads the FULL record list rather than the deduplicated one: a
+ * duplicate record (a retry, a shard re-run) is dropped from the census because
+ * counting one file's untidiness twice would inflate it, but the fires it carries
+ * are distinct events that actually happened in that process — dropping them
+ * would lose observations, which is the opposite failure.
+ */
+export function mergePostMortemFires(records: readonly CensusRecord[]): PostMortemFireRecord[] {
+  const merged = new Map<string, PostMortemFireRecord>();
+  for (const record of records) {
+    for (const fire of record.postMortem ?? []) {
+      const key = JSON.stringify([fire.armedIn, fire.landedIn, fire.kind]);
+      const seen = merged.get(key);
+      if (seen) seen.count += fire.count;
+      else merged.set(key, { ...fire });
+    }
+  }
+  return [...merged.values()].sort((a, b) => b.count - a.count);
+}
+
 /** Build the census + its honesty envelope from already-parsed records. */
 export function buildCensusReport(
   records: readonly CensusRecord[],
@@ -250,6 +272,7 @@ export function buildCensusReport(
   const workerReuse = [...perPid.values()].some((n) => n > 1);
   return {
     census,
+    postMortemFires: mergePostMortemFires(records),
     leakRate: complete ? census.rate : null,
     denominator: {
       complete,
@@ -317,6 +340,23 @@ export function renderCensusReport(report: CensusReport): string {
   lines.push(`  workers reporting: ${report.processes}`);
   if (report.malformedLines > 0) lines.push(`  malformed lines: ${report.malformedLines}`);
   if (report.duplicateFileRecords > 0) lines.push(`  duplicate file records: ${report.duplicateFileRecords}`);
+
+  // POST-MORTEM FIRES lead the findings, above the hygiene counts, because they
+  // are a different and stronger claim. Everything below this block is "how
+  // untidy is the suite"; this block is "which file actually poisoned which",
+  // the question D-014 says must be answerable before the non-isolated split can
+  // ship. A run with a huge arm count and no fires is messy but not dangerous.
+  if (report.postMortemFires.length > 0) {
+    lines.push('  ⚠ POST-MORTEM FIRES — a timer fired AFTER its arming file finished (worst first):');
+    for (const fire of report.postMortemFires) {
+      lines.push(`    ${fire.armedIn} -> ${fire.landedIn} — ${fire.kind} ×${fire.count}`);
+    }
+    lines.push('    (armer -> file it landed in. THIS is cross-file poisoning; the counts below are hygiene.)');
+  } else {
+    // Said explicitly, because silence here would otherwise read as a clean bill
+    // when the true meaning may be that no v2 detector wrote any fire records.
+    lines.push('  post-mortem fires: none recorded (no timer observed firing after its arming file finished)');
+  }
 
   // Rendered per LENS, never as one list: a flat list invites a grand total, and
   // the lenses overlap on ref'd timers while each sees what the other cannot.

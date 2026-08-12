@@ -168,3 +168,101 @@ describe('installTimerLedger', () => {
     expect(ledger.collect()).toEqual({});
   });
 });
+
+/**
+ * POST-MORTEM FIRE DETECTION (D-020 §3).
+ *
+ * The arm counts above measure untidiness; these measure the harmful event —
+ * one file's callback executing while a LATER file is running. The two must not
+ * be conflated, so they are exercised separately.
+ */
+describe('installTimerLedger post-mortem fire detection', () => {
+  it('reports a timer that fires AFTER collect, naming the file that armed it', () => {
+    const { globals, fire } = makeFakeGlobals();
+    const fires: unknown[] = [];
+    const ledger = installTimerLedger(globals, {
+      file: 'armer.test.ts',
+      onPostMortemFire: (f) => fires.push(f),
+    });
+    const handle = globals.setTimeout(...([() => {}, 5000] as never[]));
+    ledger.collect();
+    fire(handle);
+    expect(fires).toEqual([{ armedIn: 'armer.test.ts', kind: 'setTimeout' }]);
+  });
+
+  it('does NOT report a timer that fires BEFORE collect — that is the file using its own timer', () => {
+    // The control that keeps the signal meaningful: without it every `await
+    // sleep(10)` in the repo would be reported as poisoning its own file.
+    const { globals, fire } = makeFakeGlobals();
+    const fires: unknown[] = [];
+    const ledger = installTimerLedger(globals, { file: 'armer.test.ts', onPostMortemFire: (f) => fires.push(f) });
+    const handle = globals.setTimeout(...([() => {}, 10] as never[]));
+    fire(handle);
+    expect(fires).toEqual([]);
+    ledger.collect();
+  });
+
+  it('still runs the original callback when it fires post-mortem', () => {
+    // The detector observes; it must never change what the suite does. A leaked
+    // callback that stopped running under the detector would hide the very
+    // failure the detector exists to attribute.
+    const { globals, fire } = makeFakeGlobals();
+    const ran = vi.fn();
+    const ledger = installTimerLedger(globals, { file: 'a.test.ts', onPostMortemFire: () => {} });
+    const handle = globals.setTimeout(...([ran, 1] as never[]));
+    ledger.collect();
+    fire(handle);
+    expect(ran).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports EVERY fire of a leaked interval, not just the first', () => {
+    // An interval is the unbounded case, and each fire is a separate intrusion
+    // into whatever file is running at that moment.
+    const { globals, fire } = makeFakeGlobals();
+    const fires: unknown[] = [];
+    const ledger = installTimerLedger(globals, { file: 'ticker.test.ts', onPostMortemFire: (f) => fires.push(f) });
+    const handle = globals.setInterval(...([() => {}, 10] as never[]));
+    ledger.collect();
+    fire(handle);
+    fire(handle);
+    fire(handle);
+    expect(fires).toHaveLength(3);
+    expect(fires[2]).toEqual({ armedIn: 'ticker.test.ts', kind: 'setInterval' });
+  });
+
+  it('survives an observer that THROWS — the callback still runs and the throw does not escape', () => {
+    // Rail 4: a diagnostic must never be the reason a suite fails.
+    const { globals, fire } = makeFakeGlobals();
+    const ran = vi.fn();
+    const ledger = installTimerLedger(globals, {
+      file: 'a.test.ts',
+      onPostMortemFire: () => {
+        throw new Error('observer exploded');
+      },
+    });
+    const handle = globals.setTimeout(...([ran, 1] as never[]));
+    ledger.collect();
+    expect(() => fire(handle)).not.toThrow();
+    expect(ran).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to "unknown" rather than dropping the event when no file was supplied', () => {
+    const { globals, fire } = makeFakeGlobals();
+    const fires: { armedIn: string }[] = [];
+    const ledger = installTimerLedger(globals, { onPostMortemFire: (f) => fires.push(f) });
+    const handle = globals.setTimeout(...([() => {}, 1] as never[]));
+    ledger.collect();
+    fire(handle);
+    expect(fires.map((f) => f.armedIn)).toEqual(['unknown']);
+  });
+
+  it('is inert when no observer is supplied — the ledger keeps working as a pure counter', () => {
+    const { globals, fire } = makeFakeGlobals();
+    const ran = vi.fn();
+    const ledger = installTimerLedger(globals);
+    const handle = globals.setTimeout(...([ran, 1] as never[]));
+    expect(ledger.collect()).toEqual({ 'timer:setTimeout': 1 });
+    expect(() => fire(handle)).not.toThrow();
+    expect(ran).toHaveBeenCalledTimes(1);
+  });
+});

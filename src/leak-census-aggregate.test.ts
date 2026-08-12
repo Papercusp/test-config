@@ -9,6 +9,7 @@ import {
   aggregateCensusDir,
   buildCensusReport,
   dedupeByFile,
+  mergePostMortemFires,
   parseCensusJsonl,
   renderCensusReport,
   splitByLens,
