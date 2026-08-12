@@ -38,6 +38,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, expect } from 'vitest';
 
 import { classifyFile, countResources, type ResourceCounts } from './handle-leak-delta.js';
+import { installTimerLedger, type TimerLedger } from './timer-leak-ledger.js';
 
 const ENABLED = process.env.PAPERCUSP_LEAK_DETECT !== '0';
 const REPORT_DIR = process.env.PAPERCUSP_LEAK_REPORT_DIR ?? join(tmpdir(), 'papercusp-leak-reports');
@@ -57,6 +58,7 @@ function snapshot(): ResourceCounts {
 
 let before: ResourceCounts = {};
 let file = '';
+let timers: TimerLedger | null = null;
 
 beforeAll(() => {
   if (!ENABLED) return;
@@ -65,11 +67,29 @@ beforeAll(() => {
   // when the worker (and this module's cache entry) is reused (D-016).
   file = expect.getState().testPath ?? 'unknown';
   before = snapshot();
+  // LENS 2 (D-017). Installed here — before any test body can call
+  // vi.useFakeTimers() — so fake-timer calls bypass the wrapper entirely and
+  // cannot be miscounted as real leaks.
+  timers = installTimerLedger(globalThis as never);
 });
 
 afterAll(() => {
   if (!ENABLED) return;
-  const verdict = classifyFile(file, before, snapshot());
+  // Collect ALWAYS, even if nothing else is reported: collect() is what restores
+  // the real timer API, and skipping it would leave the wrapper installed for
+  // every later file in a reused worker.
+  const armed = timers?.collect() ?? {};
+  timers = null;
+  const after = snapshot();
+  const verdict = classifyFile(file, before, after);
+  // LENS 2's findings are unbalanced ARMS, which are leaks by construction — there
+  // is no "negative" counterpart, so they only ever join `leaked`. Prefixed keys
+  // (`timer:setTimeout`) keep them distinguishable from LENS 1's bare Node resource
+  // names, which matters because the two lenses have different blind spots: a
+  // finding reported by only one of them tells you which instrument saw it.
+  for (const [resource, delta] of Object.entries(armed)) {
+    if (delta > 0) verdict.leaked.push({ resource, delta });
+  }
   if (verdict.leaked.length === 0 && verdict.consumed.length === 0) return;
   try {
     mkdirSync(REPORT_DIR, { recursive: true });
