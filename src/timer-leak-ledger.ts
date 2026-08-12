@@ -56,6 +56,40 @@ export type TimerGlobals = {
 /** Which API armed a still-pending timer. Becomes the resource name in the report. */
 export type TimerKind = 'setTimeout' | 'setInterval' | 'setImmediate';
 
+/**
+ * A timer that fired AFTER the file that armed it had already finished — the
+ * harmful event itself, not the hygiene proxy (D-020 §3).
+ *
+ * The arm counts this ledger returns from `collect()` measure UNTIDINESS: most of
+ * them are guards like `Promise.race` timeouts whose late callback resolves an
+ * already-settled promise and does nothing. A post-mortem FIRE is different in
+ * kind — it is a file's code running inside a later file's test run, which is
+ * exactly the cross-file poisoning that makes a non-isolated lane unsafe. It
+ * carries both halves of the attribution, so it answers "which file poisons
+ * which" rather than "how untidy is the suite".
+ *
+ * `landedIn` is deliberately NOT resolved here: this module has no access to the
+ * test runner's notion of the current file, and inventing one would couple a
+ * pure, unit-testable ledger to vitest. The installer supplies it at fire time.
+ */
+export type PostMortemFire = {
+  /** The file whose `beforeAll` installed the ledger that armed this timer. */
+  armedIn: string;
+  /** Which API armed it. */
+  kind: TimerKind;
+};
+
+export type InstallOptions = {
+  /** The file being bracketed — reported as `armedIn` on a post-mortem fire. */
+  file?: string;
+  /**
+   * Called when a timer armed under this ledger fires after `collect()`.
+   * Invoked BEFORE the original callback runs, so an observer sees the event
+   * even if the callback throws. Never called before `collect()`.
+   */
+  onPostMortemFire?: (fire: PostMortemFire) => void;
+};
+
 export type TimerLedger = {
   /** Restore the originals and return the counts of timers still armed, by kind. */
   collect: () => Record<string, number>;
@@ -78,8 +112,13 @@ const RETIRE_ON_FIRE: Record<TimerKind, boolean> = {
  * `Timeout`. Mixing them under one name would make the two lenses
  * indistinguishable in the artifact, and they have different blind spots.
  */
-export function installTimerLedger(globals: TimerGlobals): TimerLedger {
+export function installTimerLedger(globals: TimerGlobals, options: InstallOptions = {}): TimerLedger {
   const pending = new Map<unknown, TimerKind>();
+  // Flipped by collect(). Restoring the globals does NOT disarm timers that are
+  // already holding an instrumented closure, so those closures outlive the ledger
+  // — which is precisely the hook that makes post-mortem detection possible
+  // rather than a thing we would have to build separate machinery for.
+  let collected = false;
 
   const originals = {
     setTimeout: globals.setTimeout,
@@ -100,6 +139,16 @@ export function installTimerLedger(globals: TimerGlobals): TimerLedger {
               // Retire BEFORE invoking: if the callback throws, the timer still fired
               // and must not be reported as leaked.
               if (RETIRE_ON_FIRE[kind]) pending.delete(handle);
+              // Firing after collect() means the arming file has finished and this
+              // callback is now running inside whatever file came next.
+              if (collected && options.onPostMortemFire) {
+                try {
+                  options.onPostMortemFire({ armedIn: options.file ?? 'unknown', kind });
+                } catch {
+                  // Rail 4: a diagnostic must never be the reason a suite fails. An
+                  // observer that throws loses its own event, never the callback.
+                }
+              }
               return (callback as (...a: unknown[]) => unknown).apply(this, callbackArgs);
             }
           : callback;
@@ -125,6 +174,9 @@ export function installTimerLedger(globals: TimerGlobals): TimerLedger {
 
   return {
     collect() {
+      // Set BEFORE restoring, so a timer that fires during the restore itself is
+      // still classified as post-mortem rather than slipping through as live.
+      collected = true;
       // Restore FIRST and unconditionally: a half-restored global timer API would
       // corrupt every later test file in a reused worker, which is precisely the
       // class of damage this detector exists to find.

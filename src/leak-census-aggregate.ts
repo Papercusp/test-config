@@ -49,8 +49,38 @@ import {
  */
 export const CENSUS_RECORD_VERSION = 2;
 
+/**
+ * One post-mortem FIRE population: a timer armed by `armedIn` that fired after
+ * that file finished, while `landedIn` was running (D-020 §3).
+ *
+ * This is the only part of the artifact that reports an EVENT rather than a
+ * count of untidiness. The arm counts measure hygiene — most of them are guards
+ * whose late callback resolves an already-settled promise and does nothing. A
+ * fire is one file's code executing inside another file's test run, which is the
+ * cross-file poisoning that decides whether a non-isolated lane is safe.
+ */
+export type PostMortemFireRecord = {
+  /** The file that armed the timer, and had already finished when it fired. */
+  armedIn: string;
+  /** The file that was running when it fired — the one being poisoned. */
+  landedIn: string;
+  /** Which timer API armed it. */
+  kind: string;
+  /** How many times this (armer, landing, kind) triple fired. */
+  count: number;
+};
+
 /** One line of the JSONL artifact. `v` is absent on v1 records. */
-export type CensusRecord = FileVerdict & { pid?: number; v?: number };
+export type CensusRecord = FileVerdict & {
+  pid?: number;
+  v?: number;
+  /**
+   * Post-mortem fires observed since the previous record was written. The record
+   * is their TRANSPORT, not their attribution — each entry names its own armer
+   * and landing file, neither of which need be `file`.
+   */
+  postMortem?: PostMortemFireRecord[];
+};
 
 export type CensusDenominator = {
   /** True only when every parsed record proves it was written for a clean file too. */
@@ -87,6 +117,14 @@ export type CensusReport = {
   malformedLines: number;
   /** Records dropped because the same file was recorded more than once (retries, shards). */
   duplicateFileRecords: number;
+  /**
+   * Every post-mortem fire population seen, merged across records and pids and
+   * ranked by count. Reported SEPARATELY from the census counts and never folded
+   * into them: these are the observed poisoning events, a different measurement
+   * from "timers left armed", and summing the two would repeat the mistake D-019
+   * forbids for the two lenses.
+   */
+  postMortemFires: PostMortemFireRecord[];
 };
 
 /** Lens 2 (timer arm/clear bookkeeping) prefixes its keys; lens 1 uses bare Node names. */

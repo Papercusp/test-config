@@ -38,7 +38,8 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, expect } from 'vitest';
 
 import { classifyFile, countResources, type ResourceCounts } from './handle-leak-delta.js';
-import { installTimerLedger, type TimerLedger } from './timer-leak-ledger.js';
+import { CENSUS_RECORD_VERSION, type PostMortemFireRecord } from './leak-census-aggregate.js';
+import { installTimerLedger, type PostMortemFire, type TimerLedger } from './timer-leak-ledger.js';
 
 const ENABLED = process.env.PAPERCUSP_LEAK_DETECT !== '0';
 const REPORT_DIR = process.env.PAPERCUSP_LEAK_REPORT_DIR ?? join(tmpdir(), 'papercusp-leak-reports');
@@ -60,6 +61,50 @@ let before: ResourceCounts = {};
 let file = '';
 let timers: TimerLedger | null = null;
 
+/**
+ * POST-MORTEM FIRES seen in this worker since the last record was written.
+ *
+ * COLLAPSED BY (armer, landing, kind) rather than kept as an event list, because
+ * the volume is unbounded by construction: a leaked interval fires forever, and a
+ * single one at 10ms would append ~6,000 events a minute for the rest of the run.
+ * A count is the whole signal anyway — "cell-read poisons sse-prime 300 times" and
+ * "…once" are the same finding with different loudness.
+ */
+const postMortem = new Map<string, PostMortemFireRecord>();
+
+/**
+ * The file running at the moment a stray timer fires — the file being POISONED.
+ *
+ * Read at fire time, not at record-write time: the two differ whenever the fire
+ * lands between files, and the landing file is half of the attribution D-020 §3
+ * asks for. `expect.getState()` outside a test body is a plain global read, but it
+ * is the runner's internals, so a throw is treated as "unknown" rather than
+ * allowed to escape into a test's timer callback.
+ */
+function landingFile(): string {
+  try {
+    return expect.getState().testPath ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function recordPostMortemFire(fire: PostMortemFire): void {
+  const landedIn = landingFile();
+  // JSON.stringify, not a delimiter join: test paths are arbitrary strings and any
+  // literal separator is one someone can put in a filename.
+  const key = JSON.stringify([fire.armedIn, landedIn, fire.kind]);
+  const seen = postMortem.get(key);
+  if (seen) seen.count += 1;
+  else postMortem.set(key, { armedIn: fire.armedIn, landedIn, kind: fire.kind, count: 1 });
+}
+
+function drainPostMortem(): PostMortemFireRecord[] {
+  const drained = [...postMortem.values()];
+  postMortem.clear();
+  return drained;
+}
+
 beforeAll(() => {
   if (!ENABLED) return;
   // expect.getState().testPath is the file currently being run — the only seam that
@@ -70,7 +115,7 @@ beforeAll(() => {
   // LENS 2 (D-017). Installed here — before any test body can call
   // vi.useFakeTimers() — so fake-timer calls bypass the wrapper entirely and
   // cannot be miscounted as real leaks.
-  timers = installTimerLedger(globalThis as never);
+  timers = installTimerLedger(globalThis as never, { file, onPostMortemFire: recordPostMortemFire });
 });
 
 afterAll(() => {
@@ -90,10 +135,26 @@ afterAll(() => {
   for (const [resource, delta] of Object.entries(armed)) {
     if (delta > 0) verdict.leaked.push({ resource, delta });
   }
-  if (verdict.leaked.length === 0 && verdict.consumed.length === 0) return;
+  // A RECORD FOR EVERY OBSERVED FILE, clean or not — this is what `v: 2` asserts,
+  // and it is the entire reason a leak RATE can exist. v1 wrote a line only for a
+  // file WITH a finding, which made filesObserved == filesLeaking and any rate
+  // computed from it ~100%: a specific, confident, wrong number. The aggregator
+  // already keys off the version and flips `denominator.complete` itself, so this
+  // is the only edit the change needs.
+  //
+  // Post-mortem fires ride along on whichever record is written next. The record
+  // is their TRANSPORT, not their attribution: each fire names its own armer and
+  // landing file, so it is legible no matter which file's line carries it.
+  const fires = drainPostMortem();
+  const record = {
+    ...verdict,
+    ...(fires.length > 0 ? { postMortem: fires } : {}),
+    pid: process.pid,
+    v: CENSUS_RECORD_VERSION,
+  };
   try {
     mkdirSync(REPORT_DIR, { recursive: true });
-    appendFileSync(reportPath, `${JSON.stringify({ ...verdict, pid: process.pid })}\n`);
+    appendFileSync(reportPath, `${JSON.stringify(record)}\n`);
   } catch {
     // A diagnostic must never be the reason a suite fails. If the artifact cannot
     // be written (read-only tmp, ENOSPC), the observation is dropped silently —
