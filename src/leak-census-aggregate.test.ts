@@ -254,3 +254,82 @@ describe('aggregateCensusDir', () => {
     expect(report.denominator.observed).toBe(1);
   });
 });
+
+/**
+ * POST-MORTEM FIRES (D-020 §3) — the observed poisoning events, reported beside
+ * the hygiene counts and never folded into them.
+ */
+describe('post-mortem fires', () => {
+  const fire = (armedIn: string, landedIn: string, count: number, kind = 'setTimeout') => ({
+    armedIn,
+    landedIn,
+    kind,
+    count,
+  });
+
+  it('merges the same (armer, landing, kind) triple across records and pids', () => {
+    const merged = mergePostMortemFires([
+      { ...v2('a.test.ts', 0), postMortem: [fire('src.test.ts', 'x.test.ts', 2)] },
+      { ...v2('b.test.ts', 0, 77), postMortem: [fire('src.test.ts', 'x.test.ts', 3)] },
+    ]);
+    expect(merged).toEqual([fire('src.test.ts', 'x.test.ts', 5)]);
+  });
+
+  it('keeps the same armer separate per LANDING file — "which file poisons which" is the whole point', () => {
+    const merged = mergePostMortemFires([
+      { ...v2('a.test.ts', 0), postMortem: [fire('src.test.ts', 'x.test.ts', 1), fire('src.test.ts', 'y.test.ts', 4)] },
+    ]);
+    expect(merged.map((f) => `${f.landedIn}:${f.count}`)).toEqual(['y.test.ts:4', 'x.test.ts:1']);
+  });
+
+  it('distinguishes fires by KIND — an interval intruding is not the same finding as a timeout', () => {
+    const merged = mergePostMortemFires([
+      {
+        ...v2('a.test.ts', 0),
+        postMortem: [fire('s.test.ts', 'x.test.ts', 1), fire('s.test.ts', 'x.test.ts', 2, 'setInterval')],
+      },
+    ]);
+    expect(merged).toHaveLength(2);
+  });
+
+  it('KEEPS fires carried on a duplicate record even though the census drops it', () => {
+    // The two are governed differently on purpose: counting one file's untidiness
+    // twice would inflate the census, but the fires on a retry are distinct events
+    // that really happened. Dropping them would lose observations.
+    const report = buildCensusReport([
+      { ...v2('a.test.ts', 1), postMortem: [fire('s.test.ts', 'a.test.ts', 1)] },
+      { ...v2('a.test.ts', 1), postMortem: [fire('s.test.ts', 'a.test.ts', 1)] },
+    ]);
+    expect(report.duplicateFileRecords).toBe(1);
+    expect(report.census.filesObserved).toBe(1);
+    expect(report.postMortemFires).toEqual([fire('s.test.ts', 'a.test.ts', 2)]);
+  });
+
+  it('does NOT add fires to any leak count — they are a different measurement', () => {
+    const report = buildCensusReport([{ ...v2('a.test.ts', 0), postMortem: [fire('s.test.ts', 'a.test.ts', 9)] }]);
+    expect(report.census.filesLeaking).toBe(0);
+    expect(report.census.byResource).toEqual({});
+    expect(report.postMortemFires[0]?.count).toBe(9);
+  });
+
+  it('renders armer -> landing with the count, above the hygiene rows', () => {
+    const text = renderCensusReport(
+      buildCensusReport([{ ...v2('a.test.ts', 1), postMortem: [fire('cell-read.test.ts', 'sse-prime.test.ts', 3)] }]),
+    );
+    expect(text).toContain('cell-read.test.ts -> sse-prime.test.ts — setTimeout ×3');
+    // Above the hygiene rows: the fires are the stronger claim, and a reader who
+    // stops after the first finding should have read the poisoning, not the tidiness.
+    expect(text.indexOf('POST-MORTEM FIRES')).toBeLessThan(text.indexOf('handles left open'));
+  });
+
+  it('says "none recorded" explicitly rather than staying silent', () => {
+    // Silence would read as a clean bill; the honest reading is that nothing was
+    // OBSERVED, which is a different claim from "nothing happened".
+    const text = renderCensusReport(buildCensusReport([v2('a.test.ts', 1)]));
+    expect(text).toContain('post-mortem fires: none recorded');
+  });
+
+  it('survives records with no postMortem field at all (v1 artifacts)', () => {
+    expect(mergePostMortemFires([rec('a.test.ts', 1)])).toEqual([]);
+  });
+});

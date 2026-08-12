@@ -42,33 +42,13 @@ import {
 } from './handle-leak-delta.js';
 
 /**
- * Record version written by the detector.
- *
- * v1 — a line ONLY for files with a finding. Denominator unusable (see above).
- * v2 — a line for EVERY observed file. Denominator complete.
+ * The artifact's record-format contract is DEFINED in handle-leak-delta.ts and
+ * re-exported here, so a reader of the aggregator still finds it where they look
+ * for it. It lives there because the detector — a setup file that runs in front of
+ * every test file in the repo — must be able to stamp the version without
+ * importing this directory-walking module. See the definition for the full reason.
  */
-export const CENSUS_RECORD_VERSION = 2;
-
-/**
- * One post-mortem FIRE population: a timer armed by `armedIn` that fired after
- * that file finished, while `landedIn` was running (D-020 §3).
- *
- * This is the only part of the artifact that reports an EVENT rather than a
- * count of untidiness. The arm counts measure hygiene — most of them are guards
- * whose late callback resolves an already-settled promise and does nothing. A
- * fire is one file's code executing inside another file's test run, which is the
- * cross-file poisoning that decides whether a non-isolated lane is safe.
- */
-export type PostMortemFireRecord = {
-  /** The file that armed the timer, and had already finished when it fired. */
-  armedIn: string;
-  /** The file that was running when it fired — the one being poisoned. */
-  landedIn: string;
-  /** Which timer API armed it. */
-  kind: string;
-  /** How many times this (armer, landing, kind) triple fired. */
-  count: number;
-};
+export { CENSUS_RECORD_VERSION, type PostMortemFireRecord } from './handle-leak-delta.js';
 
 /** One line of the JSONL artifact. `v` is absent on v1 records. */
 export type CensusRecord = FileVerdict & {

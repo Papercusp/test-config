@@ -54,6 +54,44 @@ export type FileVerdict = {
   consumed: ResourceDelta[];
 };
 
+/**
+ * Record version written by the detector into the JSONL artifact.
+ *
+ * v1 — a line ONLY for files WITH a finding. `filesObserved == filesLeaking`, so
+ *      any rate derived from it reads ~100%: a specific, confident, wrong number.
+ * v2 — a line for EVERY observed file, so the denominator is the real file
+ *      population and a leak rate exists.
+ *
+ * IT LIVES HERE, in the pure module, rather than beside the aggregator that
+ * consumes it: the WRITER is a vitest setup file that runs in front of every test
+ * file in the repo, and importing the aggregator (which walks directories) just to
+ * read one integer would put that module in every worker's setup chain for no
+ * reason. Both ends already import this module, so this is the one place they can
+ * share a constant at zero import cost.
+ */
+export const CENSUS_RECORD_VERSION = 2;
+
+/**
+ * One post-mortem FIRE population: a timer armed by `armedIn` that fired after
+ * that file had finished, while `landedIn` was running (D-020 §3).
+ *
+ * This is the only part of the artifact that reports an EVENT rather than a count
+ * of untidiness. The arm counts measure hygiene — most are guards whose late
+ * callback resolves an already-settled promise and does nothing. A fire is one
+ * file's code executing inside another file's test run, which is the cross-file
+ * poisoning that decides whether a non-isolated lane is safe.
+ */
+export type PostMortemFireRecord = {
+  /** The file that armed the timer, and had already finished when it fired. */
+  armedIn: string;
+  /** The file that was running when it fired — the one being poisoned. */
+  landedIn: string;
+  /** Which timer API armed it. */
+  kind: string;
+  /** How many times this (armer, landing, kind) triple fired. */
+  count: number;
+};
+
 /** Aggregate census over many files. `rate` is a RATE, never an exclusion list (D-008). */
 export type LeakCensus = {
   filesObserved: number;

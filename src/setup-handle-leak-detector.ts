@@ -37,8 +37,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, expect } from 'vitest';
 
-import { classifyFile, countResources, type ResourceCounts } from './handle-leak-delta.js';
-import { CENSUS_RECORD_VERSION, type PostMortemFireRecord } from './leak-census-aggregate.js';
+import {
+  CENSUS_RECORD_VERSION,
+  classifyFile,
+  countResources,
+  type PostMortemFireRecord,
+  type ResourceCounts,
+} from './handle-leak-delta.js';
 import { installTimerLedger, type PostMortemFire, type TimerLedger } from './timer-leak-ledger.js';
 
 const ENABLED = process.env.PAPERCUSP_LEAK_DETECT !== '0';
