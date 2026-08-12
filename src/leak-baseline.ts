@@ -130,6 +130,39 @@ export type RatchetResult = {
   observedFiles: number;
 };
 
+/**
+ * Rewrite a census's file paths to repo-relative form.
+ *
+ * The detector records `expect.getState().testPath`, which is ABSOLUTE — correct
+ * for a raw observation, and useless in a COMMITTED baseline: this repo is
+ * checked out at more than one root (the shared tree and `papercup-release`),
+ * and CI is a third, so an absolute key would match nothing anywhere but the box
+ * that wrote it and every entry would read as a brand-new file. Normalizing here
+ * rather than in the detector keeps the artifact an unedited observation and
+ * puts the portability requirement at the one boundary that persists anything.
+ *
+ * A path OUTSIDE the repo is left absolute rather than mangled into a `../../`
+ * chain: it is genuinely not a repo file (a scratch probe, a temp fixture), and
+ * saying so plainly beats a relative path that silently means something else in
+ * another checkout. Idempotent, so a run whose paths are already relative is
+ * unchanged.
+ */
+export function relativizeReport(report: CensusReport, repoRoot: string): CensusReport {
+  const prefix = repoRoot.endsWith('/') ? repoRoot : `${repoRoot}/`;
+  const rel = (file: string): string => (file.startsWith(prefix) ? file.slice(prefix.length) : file);
+  const relVerdict = (v: FileVerdict): FileVerdict => ({ ...v, file: rel(v.file) });
+  return {
+    ...report,
+    observedFiles: report.observedFiles.map(rel),
+    postMortemFires: report.postMortemFires.map((f) => ({ ...f, armedIn: rel(f.armedIn), landedIn: rel(f.landedIn) })),
+    census: {
+      ...report.census,
+      sources: report.census.sources.map(relVerdict),
+      victims: report.census.victims.map(relVerdict),
+    },
+  };
+}
+
 /** Stable key for one (armer, landing, kind) fire population. */
 export function formatFireKey(fire: Pick<PostMortemFireRecord, 'armedIn' | 'landedIn' | 'kind'>): string {
   return `${fire.armedIn} -> ${fire.landedIn} [${fire.kind}]`;
@@ -152,16 +185,19 @@ export function lensUnits(verdict: FileVerdict): LeakBaselineEntry {
   return { timers, handles };
 }
 
-/** Every file the run recorded, mapped to its lens scalars. Clean files map to zeroes. */
+/**
+ * Every file the run recorded, mapped to its lens scalars. Clean files map to zeroes.
+ *
+ * Seeded from `observedFiles` — the recorded file SET, not the denominator count
+ * — because absence from this map is load-bearing in both directions: it is how
+ * "not exercised" is told apart from "clean", and a v1 artifact (which records
+ * only files with findings) therefore yields a map containing no clean files at
+ * all, which is the honest reading of it.
+ */
 function observedEntries(report: CensusReport): Map<string, LeakBaselineEntry> {
   const observed = new Map<string, LeakBaselineEntry>();
+  for (const file of report.observedFiles) observed.set(file, { timers: 0, handles: 0 });
   for (const v of report.census.sources) observed.set(v.file, lensUnits(v));
-  // Sources are the only files carrying leaks; the rest of the observed
-  // population is clean by construction. `filesObserved` counts them, but the
-  // census only retains verdicts for sources and victims, so a clean file is
-  // present in the denominator without a row here — which is all the ratchet
-  // needs, since a baseline entry is judged by whether it appears among sources.
-  for (const v of report.census.victims) if (!observed.has(v.file)) observed.set(v.file, { timers: 0, handles: 0 });
   return observed;
 }
 
@@ -307,6 +343,53 @@ export function ratchetDown(
   }
 
   return { ok: true, baseline: { version: 1, updated: now, files, postMortemFires }, lowered };
+}
+
+/**
+ * How wide a window the artifacts were written over, when that is wide enough to
+ * mean the census is a PILE OF RUNS rather than one run — else null.
+ *
+ * The distinction is not cosmetic. `dedupeByFile` keeps the worst observation of
+ * each file, so a union over history reports leaks at their historical maximum;
+ * a baseline seeded from one is unfalsifiable, because no single future run can
+ * ever reproduce the union that justified its numbers.
+ */
+export function describeStaleSpan(report: CensusReport, maxSpanMs: number): string | null {
+  const { oldestMs, newestMs, count, skippedStale } = report.artifacts;
+  if (oldestMs === null || newestMs === null) return null;
+  const spanMs = newestMs - oldestMs;
+  if (spanMs <= maxSpanMs) return null;
+  const mins = Math.round(spanMs / 60_000);
+  return `the ${count} artifact(s) read span ${mins} minutes (${skippedStale} already skipped as stale) — that is a UNION OF RUNS, not one run, and dedupeByFile keeps each file's WORST observation across it`;
+}
+
+/**
+ * Build the FIRST baseline from a census.
+ *
+ * This is the only surface that may ADD entries, and it exists because a ratchet
+ * has to start somewhere. It is deliberately separate from `ratchetDown` (which
+ * can never widen) rather than a flag on it: bootstrapping is a one-time,
+ * reviewable act that writes down a population someone has looked at, and
+ * folding it into the routine update path is exactly how a ratchet quietly
+ * becomes a parking lot. Requires a complete denominator for the same reason
+ * `ratchetDown` does — numbers baked in from an artifact that could not see
+ * clean files are numbers nobody can ever validate.
+ */
+export function seedBaseline(report: CensusReport, now: string): RatchetDownResult {
+  if (!report.denominator.complete) {
+    return { ok: false, reason: `refusing to seed: ${report.denominator.reason}` };
+  }
+  if (report.denominator.observed === 0) {
+    return { ok: false, reason: 'refusing to seed: the run recorded no files at all' };
+  }
+  const files: Record<string, LeakBaselineEntry> = {};
+  for (const source of report.census.sources) {
+    const units = lensUnits(source);
+    if (units.timers > 0 || units.handles > 0) files[source.file] = units;
+  }
+  const postMortemFires: Record<string, number> = {};
+  for (const fire of report.postMortemFires) postMortemFires[formatFireKey(fire)] = fire.count;
+  return { ok: true, baseline: { version: 1, updated: now, files, postMortemFires }, lowered: [] };
 }
 
 /** Parse a baseline document, tolerating a missing file (an unratcheted repo starts empty). */

@@ -5,11 +5,14 @@ import { buildCensusReport, type CensusRecord, type CensusReport } from './leak-
 import {
   EMPTY_BASELINE,
   compareToBaseline,
+  describeStaleSpan,
   formatFireKey,
   lensUnits,
   parseBaseline,
   ratchetDown,
+  relativizeReport,
   renderRatchetReport,
+  seedBaseline,
   serializeBaseline,
   type LeakBaseline,
   type LeakBaselineEntry,
@@ -136,7 +139,12 @@ describe('compareToBaseline', () => {
   });
 
   it('refuses to call anything CLEARED from a v1 artifact, where absent and clean are the same observation', () => {
-    const result = compareToBaseline(reportOf([v1('a.test.ts', { timers: 1 })]), baselineOf({ 'b.test.ts': { timers: 3, handles: 0 } }));
+    const result = compareToBaseline(
+      reportOf([v1('a.test.ts', { timers: 1 })]),
+      baselineOf({ 'a.test.ts': { timers: 1, handles: 0 }, 'b.test.ts': { timers: 3, handles: 0 } }),
+    );
+    // b.test.ts may have run clean, or may not have run. A v1 artifact cannot say.
+    expect(result.notExercised).toEqual(['b.test.ts']);
     expect(result.improvementsJudgeable).toBe(false);
     expect(result.improvements).toEqual([]);
     expect(result.improvementsUnjudgeableReason).toContain('FLOOR');
@@ -147,6 +155,19 @@ describe('compareToBaseline', () => {
     const result = compareToBaseline(reportOf([v2('a.test.ts')]), baselineOf({ 'a.test.ts': { timers: 3, handles: 0 } }));
     expect(result.improvementsJudgeable).toBe(true);
     expect(result.improvements).toEqual([{ kind: 'cleared', file: 'a.test.ts' }]);
+  });
+
+  it('reads the recorded file SET, not the denominator count — a clean v2 file is proven clean, a v1 one is not', () => {
+    // The distinction the v2 record exists to make, pinned at the seam that
+    // consumes it: the same baseline, the same file, the same absence of a
+    // finding — and two different, correct verdicts.
+    const fromV2 = compareToBaseline(reportOf([v2('a.test.ts')]), baselineOf({ 'a.test.ts': { timers: 1, handles: 0 } }));
+    expect(fromV2.notExercised).toEqual([]);
+    expect(fromV2.improvements).toEqual([{ kind: 'cleared', file: 'a.test.ts' }]);
+
+    const fromV1 = compareToBaseline(reportOf([v1('other.test.ts', { timers: 1 })]), baselineOf({ 'a.test.ts': { timers: 1, handles: 0 }, 'other.test.ts': { timers: 1, handles: 0 } }));
+    expect(fromV1.notExercised).toEqual(['a.test.ts']);
+    expect(fromV1.improvements).toEqual([]);
   });
 
   it('leaves a baseline file the run never exercised alone — neither failed nor cleared', () => {
@@ -247,6 +268,87 @@ describe('ratchetDown', () => {
     if (!gone.ok) return;
     expect(gone.baseline.postMortemFires).toEqual({ [key]: 2 });
     expect(gone.lowered).toEqual([{ kind: 'fire-cleared', key: 'x -> y [setInterval]' }]);
+  });
+});
+
+describe('relativizeReport', () => {
+  const ROOT = '/srv/checkout-a'; // synthetic; deliberately not under /home — this is shipped source
+  const absolute = reportOf([
+    { ...v2(`${ROOT}/libs/a.test.ts`, { timers: 2 }), postMortem: [{ armedIn: `${ROOT}/libs/a.test.ts`, landedIn: `${ROOT}/libs/b.test.ts`, kind: 'setTimeout', count: 1 }] },
+    v2(`${ROOT}/libs/b.test.ts`),
+  ]);
+
+  it('rewrites observed files, sources and fire endpoints to repo-relative paths', () => {
+    const rel = relativizeReport(absolute, ROOT);
+    expect(rel.observedFiles).toEqual(['libs/a.test.ts', 'libs/b.test.ts']);
+    expect(rel.census.sources.map((s) => s.file)).toEqual(['libs/a.test.ts']);
+    expect(rel.postMortemFires[0]).toMatchObject({ armedIn: 'libs/a.test.ts', landedIn: 'libs/b.test.ts' });
+  });
+
+  it('is idempotent, so an already-relative run is not mangled', () => {
+    const once = relativizeReport(absolute, ROOT);
+    expect(relativizeReport(once, ROOT)).toEqual(once);
+  });
+
+  it('leaves a path outside the repo absolute rather than inventing a ../ chain', () => {
+    const rel = relativizeReport(reportOf([v2('/tmp/scratch/probe.test.ts', { timers: 1 })]), ROOT);
+    expect(rel.observedFiles).toEqual(['/tmp/scratch/probe.test.ts']);
+  });
+
+  it('makes a baseline written on one checkout match a run from another', () => {
+    // The failure this prevents: without it, every file in the second checkout is
+    // a `new-source` regression and the baseline is dead on arrival.
+    const baseline = baselineOf({ 'libs/a.test.ts': { timers: 2, handles: 0 } });
+    const elsewhere = reportOf([v2('/opt/ci/build/libs/a.test.ts', { timers: 2 })]);
+    expect(compareToBaseline(elsewhere, baseline).verdict).toBe('regressed'); // unnormalized: broken
+    expect(compareToBaseline(relativizeReport(elsewhere, '/opt/ci/build'), baseline).verdict).toBe('held');
+  });
+});
+
+describe('seedBaseline', () => {
+  it('records every leaking file and fire, and nothing that is clean', () => {
+    const fire = { armedIn: 'a.test.ts', landedIn: 'b.test.ts', kind: 'setTimeout', count: 2 };
+    const seeded = seedBaseline(
+      reportOf([{ ...v2('a.test.ts', { timers: 3, handles: 1 }), postMortem: [fire] }, v2('clean.test.ts')]),
+      NOW,
+    );
+    expect(seeded.ok).toBe(true);
+    if (!seeded.ok) return;
+    expect(seeded.baseline.files).toEqual({ 'a.test.ts': { timers: 3, handles: 1 } });
+    expect(seeded.baseline.postMortemFires).toEqual({ [formatFireKey(fire)]: 2 });
+  });
+
+  it('refuses an incomplete denominator — numbers nobody could later validate', () => {
+    expect(seedBaseline(reportOf([v1('a.test.ts', { timers: 1 })]), NOW).ok).toBe(false);
+  });
+
+  it('is the ONLY surface that adds entries — ratchetDown still refuses to, on the same census', () => {
+    const census = reportOf([v2('a.test.ts', { timers: 3 })]);
+    const seeded = seedBaseline(census, NOW);
+    const ratcheted = ratchetDown(EMPTY_BASELINE, census, NOW);
+    expect(seeded.ok && Object.keys(seeded.baseline.files)).toEqual(['a.test.ts']);
+    expect(ratcheted.ok && Object.keys(ratcheted.baseline.files)).toEqual([]);
+  });
+});
+
+describe('describeStaleSpan', () => {
+  const spanning = (oldestMs: number, newestMs: number): CensusReport => ({
+    ...reportOf([v2('a.test.ts')]),
+    artifacts: { count: 9, oldestMs, newestMs, skippedStale: 3 },
+  });
+
+  it('is silent for a plausible single run', () => {
+    expect(describeStaleSpan(spanning(0, 30 * 60_000), 90 * 60_000)).toBeNull();
+  });
+
+  it('names the union when the artifacts span longer than one run could', () => {
+    const described = describeStaleSpan(spanning(0, 5 * 60 * 60_000), 90 * 60_000);
+    expect(described).toContain('UNION OF RUNS');
+    expect(described).toContain('300 minutes');
+  });
+
+  it('is silent when there are no artifacts at all — that is the no-data verdict\'s job, not this one', () => {
+    expect(describeStaleSpan(reportOf([]), 0)).toBeNull();
   });
 });
 

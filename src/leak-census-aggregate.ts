@@ -30,7 +30,7 @@
  * where everything leaks, and unsound the other way for a v1 artifact that
  * happens to contain a victim-only record.
  */
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -81,6 +81,20 @@ export type CensusReport = {
    */
   leakRate: number | null;
   denominator: CensusDenominator;
+  /**
+   * Every distinct file the artifact recorded, sorted — sources, victims and
+   * CLEAN files alike.
+   *
+   * The denominator's `observed` count is not a substitute for this list. A
+   * consumer that needs to know whether ONE named file was proven clean (the
+   * shrink-only ratchet is the reason v2 exists at all) cannot get that from a
+   * count, and `census.sources`/`census.victims` deliberately retain verdicts
+   * only for files with findings — so a clean file appears in neither. Without
+   * this list a v2 artifact answers that question exactly as poorly as a v1 one,
+   * and "ran and left nothing behind" is again indistinguishable from "never
+   * ran": the silent-false-clean direction, in the very field added to close it.
+   */
+  observedFiles: string[];
   /** Distinct pids that contributed records — i.e. how many vitest workers reported. */
   processes: number;
   /**
@@ -97,6 +111,18 @@ export type CensusReport = {
   workerReuse: boolean;
   /** Lines that were not parseable JSON. A worker killed mid-append truncates its last line. */
   malformedLines: number;
+  /**
+   * When the artifacts were written — the only evidence that a census describes
+   * ONE run rather than a pile of them.
+   *
+   * The default report directory is never cleaned, so it accumulates every run
+   * the detector has ever seen (measured 2026-08-12: 3,352 artifacts spanning
+   * hours). Aggregating that union is not merely noisy, it is WRONG IN ONE
+   * DIRECTION: `dedupeByFile` keeps the WORST observation of each file, so a leak
+   * fixed hours ago is still reported at its old size, and a baseline seeded from
+   * it can never be validated by any future run. `null` spans mean no artifacts.
+   */
+  artifacts: { count: number; oldestMs: number | null; newestMs: number | null; skippedStale: number };
   /** Records dropped because the same file was recorded more than once (retries, shards). */
   duplicateFileRecords: number;
   /**
@@ -236,7 +262,10 @@ export function mergePostMortemFires(records: readonly CensusRecord[]): PostMort
 /** Build the census + its honesty envelope from already-parsed records. */
 export function buildCensusReport(
   records: readonly CensusRecord[],
-  opts: { malformedLines?: number } = {},
+  opts: {
+    malformedLines?: number;
+    artifacts?: CensusReport['artifacts'];
+  } = {},
 ): CensusReport {
   const { records: unique, duplicates } = dedupeByFile(records);
   const census = summarizeCensus(unique);
@@ -256,6 +285,7 @@ export function buildCensusReport(
     census,
     postMortemFires: mergePostMortemFires(records),
     leakRate: complete ? census.rate : null,
+    observedFiles: unique.map((r) => r.file).sort(),
     denominator: {
       complete,
       observed: unique.length,
@@ -269,6 +299,7 @@ export function buildCensusReport(
     workerReuse,
     malformedLines: opts.malformedLines ?? 0,
     duplicateFileRecords: duplicates,
+    artifacts: opts.artifacts ?? { count: 0, oldestMs: null, newestMs: null, skippedStale: 0 },
   };
 }
 
@@ -279,7 +310,13 @@ export function buildCensusReport(
  * suite ran and wrote nothing" and "the directory is not there" are both answered
  * by an incomplete denominator, and neither is a clean bill of health.
  */
-export function aggregateCensusDir(dir: string): CensusReport {
+export function aggregateCensusDir(
+  dir: string,
+  opts: {
+    /** Ignore artifacts last written before this epoch-ms — how a caller scopes a cumulative directory to one run. */
+    modifiedSince?: number;
+  } = {},
+): CensusReport {
   let names: string[] = [];
   try {
     names = readdirSync(dir).filter((n) => n.startsWith('leaks-') && n.endsWith('.jsonl'));
@@ -288,18 +325,35 @@ export function aggregateCensusDir(dir: string): CensusReport {
   }
   const records: CensusRecord[] = [];
   let malformed = 0;
+  let skippedStale = 0;
+  let oldestMs: number | null = null;
+  let newestMs: number | null = null;
   for (const name of names) {
+    const path = join(dir, name);
     let contents = '';
+    let mtimeMs: number | null = null;
     try {
-      contents = readFileSync(join(dir, name), 'utf8');
+      mtimeMs = statSync(path).mtimeMs;
+      if (opts.modifiedSince !== undefined && mtimeMs < opts.modifiedSince) {
+        skippedStale += 1;
+        continue;
+      }
+      contents = readFileSync(path, 'utf8');
     } catch {
       continue;
+    }
+    if (mtimeMs !== null) {
+      if (oldestMs === null || mtimeMs < oldestMs) oldestMs = mtimeMs;
+      if (newestMs === null || mtimeMs > newestMs) newestMs = mtimeMs;
     }
     const parsed = parseCensusJsonl(contents);
     records.push(...parsed.records);
     malformed += parsed.malformed;
   }
-  return buildCensusReport(records, { malformedLines: malformed });
+  return buildCensusReport(records, {
+    malformedLines: malformed,
+    artifacts: { count: names.length - skippedStale, oldestMs, newestMs, skippedStale },
+  });
 }
 
 /**
