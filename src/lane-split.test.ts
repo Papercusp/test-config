@@ -148,6 +148,7 @@ describe('isStatefulTestSource', () => {
     const samples = [
       `afterEach(() => __resetThingForTests());`,
       `import './register-things';\n`,
+      `await expect(import('./wire-things')).resolves.toBeDefined();`,
       `process.env.HOME = '/tmp/test-home';`,
       `delete process.env[key];`,
       `Object.assign(process.env, { TZ: 'UTC' });`,
@@ -172,6 +173,25 @@ describe('isStatefulTestSource', () => {
     // The exact miss that produced the TARGET_ROLE_SPEND census flip.
     expect(viMockOnlyMatcher(SIDE_EFFECT_IMPORT_SOURCE)).toBe(false);
     expect(isStatefulTestSource(SIDE_EFFECT_IMPORT_SOURCE)).toBe(true);
+  });
+
+  it('classifies an expectation-wrapped dynamic import without catching ordinary dynamic imports', () => {
+    // Exact structural class behind stop-fanout-installed.test.ts's same-SHA flip: a prior
+    // pure-lane file had already evaluated the barrel, so this test inherited the AFTER state
+    // before it could assert the BEFORE state. Module evaluation is the subject here.
+    const moduleLoadIsTheSubject = `
+      expect(getExecutor()).toBeUndefined();
+      await expect(import('../agent-tools/index')).resolves.toBeDefined();
+      expect(getExecutor()).toBeTypeOf('function');
+    `;
+    expect(isStatefulTestSource(moduleLoadIsTheSubject)).toBe(true);
+
+    // Calibration: dynamic import is also a routine code-splitting/test-fixture tool. Moving all
+    // 1,226 such operator-core files out of the fast lane would fix correctness by deleting most
+    // of the speedup, so only the expectation-wrapped load-as-subject shape is stateful.
+    expect(isStatefulTestSource(`const mod = await import('./calculator');\nexpect(mod.add(1, 2)).toBe(3);`)).toBe(
+      false,
+    );
   });
 
   it('CONTROL C: beats the vi.mock-only matcher on process-environment mutation', () => {

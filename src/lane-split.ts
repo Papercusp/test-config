@@ -53,6 +53,15 @@
  * Measured on operator-core at adoption: 19 of 2,567 then-pure files move, leaving 2,548 in the
  * fast lane.
  *
+ * A FIFTH residual then materialised in `stop-fanout-installed.test.ts`: the test asserts a
+ * module-global seam is empty, dynamically imports the operator barrel to install it, then
+ * asserts the seam is populated. The pure lane ran it after a co-resident file had already
+ * imported that barrel, so the BEFORE assertion observed the inherited executor; an isolated
+ * run on the SAME SHA passed. An expectation-wrapped dynamic import is a narrow structural
+ * signal that module evaluation itself is the subject of the test, so those files belong in
+ * the isolated lane. This moves 4 of operator-core's 4,858 unit files, rather than classifying
+ * all 1,226 tests that happen to use a dynamic import as stateful.
+ *
  * ERR TOWARD STATEFUL, ALWAYS. Misclassifying a stateful file as pure costs correctness (a
  * polluted co-execution the gate is designed to refuse — D-009); misclassifying a pure file as
  * stateful costs only some speed. So the matcher deliberately does NOT strip comments or
@@ -138,6 +147,12 @@ export const STATEFUL_PATTERNS = [
   // more self-documenting the import, the more likely it carries a trailing comment, so the
   // naive anchor systematically missed the clearest cases.
   /^\s*import\s+['"][^'"]+['"]\s*;?\s*(?:\/\/.*|\/\*.*)?$/m,
+  // A dynamic import placed directly under an expectation is testing module evaluation itself
+  // (usually a before/after installation or a bind-time failure). Under isolate:false that
+  // module may already be cached by a co-resident file, so the expectation no longer exercises
+  // the transition it claims to guard. Keep ordinary `const mod = await import(...)` callers in
+  // the pure lane; this intentionally targets the narrow load-as-subject shape.
+  /\bexpect\s*\(\s*import\s*\(/,
   // Direct env assignment. The bracket arm deliberately admits a dynamic key (`process.env[k]`)
   // as well as a string literal: both mutate the same fork-wide object. Equality reads (`===`,
   // `!==`) do not match. Compound/nullish/logical assignment and ++/-- do.
