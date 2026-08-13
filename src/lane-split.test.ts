@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   STATEFUL_MARKERS,
+  STATEFUL_PATTERNS,
   classifyLanes,
   isStatefulTestSource,
   isUnitTestFile,
@@ -41,6 +42,41 @@ function regexOnlyStatefulMatcher(source: string): boolean {
 function absentFileIsPure(_rootDir: string, files: readonly string[]): { pure: string[] } {
   return { pure: [...files] };
 }
+
+// CONTROL C — the ORIGINAL vi.mock-only matcher, kept permanently as the control for the
+// module-global-state family. It is the implementation that shipped the 2026-08-13 gate
+// reds: it cannot see a registry that accumulates without any `vi.mock` in sight. If
+// STATEFUL_PATTERNS is ever dropped, the real subject collapses onto this control and the
+// paired assertions below stop distinguishing them.
+function viMockOnlyMatcher(source: string): boolean {
+  return STATEFUL_MARKERS.some((marker) => source.includes(marker));
+}
+
+// The two real shapes that reddened the gate, reduced to their essentials.
+//
+// REGISTRY_RESET_SOURCE is authority-op-registry.test.ts: it calls a test-only reset helper
+// because `_handlers` is a module-scoped Map that outlives a single test.
+const REGISTRY_RESET_SOURCE = `
+import { afterEach, describe, expect, it } from 'vitest';
+import { registerAuthorityOp, __resetAuthorityOpsForTests } from '../authority-op-registry';
+afterEach(() => __resetAuthorityOpsForTests());
+describe('registry', () => {
+  it('registers', () => { registerAuthorityOp('lock.acquire', async () => 1); });
+});
+`;
+
+// SIDE_EFFECT_IMPORT_SOURCE is routine-classification.registry.test.ts: a census over a
+// registry it populates by importing a module purely for what that module does at load.
+const SIDE_EFFECT_IMPORT_SOURCE = `
+import { describe, expect, it } from 'vitest';
+import { listSystemActions } from '../harness/routines/system-actions';
+import '../harness/routines/register-system-actions';
+describe('census', () => {
+  it('classifies every registered action', () => {
+    expect(listSystemActions().length).toBeGreaterThan(20);
+  });
+});
+`;
 
 // ─── fixtures ────────────────────────────────────────────────────────────────────────────
 
@@ -87,6 +123,39 @@ describe('isStatefulTestSource', () => {
     // only speed, so every ambiguity resolves to `true`.
     expect(isStatefulTestSource(`// historical note: this used to vi.mock('./db')\n`)).toBe(true);
   });
+
+  it('classifies every declared module-global-state pattern as stateful', () => {
+    for (const pattern of STATEFUL_PATTERNS) {
+      // Each pattern must actually fire on something — a pattern that matches nothing
+      // would sit in the list looking like coverage while providing none.
+      const sample = pattern.source.includes('__reset')
+        ? `afterEach(() => __resetThingForTests());`
+        : `import './register-things';\n`;
+      expect(pattern.test(sample)).toBe(true);
+      expect(isStatefulTestSource(sample)).toBe(true);
+    }
+  });
+
+  it('CONTROL C: beats the vi.mock-only matcher on a module-global REGISTRY reset', () => {
+    // The exact miss that produced `lock.acquire already registered` on the gate.
+    expect(viMockOnlyMatcher(REGISTRY_RESET_SOURCE)).toBe(false); // the shipped impl MISSED it …
+    expect(isStatefulTestSource(REGISTRY_RESET_SOURCE)).toBe(true); // … the real subject catches it.
+  });
+
+  it('CONTROL C: beats the vi.mock-only matcher on a bare side-effect import', () => {
+    // The exact miss that produced the TARGET_ROLE_SPEND census flip.
+    expect(viMockOnlyMatcher(SIDE_EFFECT_IMPORT_SOURCE)).toBe(false);
+    expect(isStatefulTestSource(SIDE_EFFECT_IMPORT_SOURCE)).toBe(true);
+  });
+
+  it('calibration: an ordinary BINDING import is not mistaken for a side-effect import', () => {
+    // Without this, a bare-import pattern that also matched `import { x } from 'y'` would
+    // beat CONTROL C by classifying the entire suite stateful — destroying the split while
+    // looking like a fix. PURE_SOURCE's own vitest import is the case that must stay pure.
+    expect(isStatefulTestSource(`import { describe, it } from 'vitest';\n`)).toBe(false);
+    expect(isStatefulTestSource(`import type { Foo } from './foo';\n`)).toBe(false);
+    expect(isStatefulTestSource(PURE_SOURCE)).toBe(false);
+  });
 });
 
 describe('isUnitTestFile', () => {
@@ -96,6 +165,19 @@ describe('isUnitTestFile', () => {
     expect(isUnitTestFile('lib/a.integration.test.ts')).toBe(false);
     expect(isUnitTestFile('lib/a.browser.test.ts')).toBe(false);
     expect(isUnitTestFile('lib/a.ts')).toBe(false);
+  });
+
+  it('rejects NON-TypeScript test files — the unit include is .test.ts(x) only', () => {
+    // The lane split hands vitest an EXPLICIT file list instead of a glob, so admitting an
+    // extension the `layerInclude` glob never matched ENROLS a file the suite never ran.
+    // `.test.js` did exactly that to lib/pot-eval/fixtures/seed-app/test/baseline.test.js —
+    // a `node:test` fixture — which vitest then failed with "No test suite found in file".
+    expect(isUnitTestFile('lib/pot-eval/fixtures/seed-app/test/baseline.test.js')).toBe(false);
+    expect(isUnitTestFile('lib/a.test.js')).toBe(false);
+    expect(isUnitTestFile('lib/a.test.jsx')).toBe(false);
+    expect(isUnitTestFile('lib/a.test.mjs')).toBe(false);
+    expect(isUnitTestFile('lib/a.test.cjs')).toBe(false);
+    expect(isUnitTestFile('lib/a.test.mts')).toBe(false);
   });
 });
 
@@ -111,6 +193,8 @@ describe('listUnitTestFiles', () => {
       'dist/f.test.ts': PURE_SOURCE,
       '.papercusp/g.test.ts': PURE_SOURCE,
       '_retired/h.test.ts': PURE_SOURCE,
+      // A node:test FIXTURE belonging to a seeded sample app — never a vitest suite.
+      'lib/fixtures/seed-app/test/baseline.test.js': `import { test } from 'node:test';\n`,
     });
     try {
       expect(listUnitTestFiles(dir)).toEqual(['./lib/a.test.ts', './lib/nested/deep/b.test.tsx']);

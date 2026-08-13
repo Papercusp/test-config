@@ -24,6 +24,14 @@
  * real leak that the WI-38215 handle-leak detector now NAMES rather than absorbs (D-029) — which
  * is what unblocked this split.
  *
+ * ⚠ THAT RESIDUAL THEN MATERIALISED — the paragraph above is kept verbatim because it called
+ * the failure correctly, not because it is still the whole filter. Within minutes of the split
+ * going live in the gate entrypoint, three files reddened the gate on module-global registry
+ * state, none of them containing a `vi.mock`. A SECOND marker family — {@link STATEFUL_PATTERNS}
+ * — now covers them, and the true structural residual measured 121/5891 files (2.1%), ~12× the
+ * 0.14% above. The estimate was not wrong so much as differently-scoped: it counted files that
+ * HAPPENED to fail one co-execution ordering, not files structurally able to.
+ *
  * ERR TOWARD STATEFUL, ALWAYS. Misclassifying a stateful file as pure costs correctness (a
  * polluted co-execution the gate is designed to refuse — D-009); misclassifying a pure file as
  * stateful costs only some speed. So the matcher deliberately does NOT strip comments or
@@ -58,13 +66,58 @@ export const STATEFUL_MARKERS = [
 ] as const;
 
 /**
- * Does this test file's SOURCE manipulate the module registry?
+ * Module-global STATE markers — the second family, closing the gap this file's header
+ * predicted in prose: "an accumulating module-level registry needs no `vi.mock` to break".
  *
- * Substring matching, on purpose: it cannot be defeated by a regex edge case, and every
- * ambiguity resolves toward `true` (isolated), the safe direction.
+ * That prediction came true on 2026-08-13, on three files at once, within minutes of the
+ * split going live in the gate entrypoint:
+ *
+ *   • `authority-op-registry.test.ts` — `registerAuthorityOp: kind 'lock.acquire' already
+ *     registered`. Its `_handlers` Map is module-scoped, so a CO-RESIDENT file that
+ *     registered the same kind at import time makes this file's first registration throw.
+ *   • `routine-classification.registry.test.ts` — a CENSUS over the live system-action
+ *     registry ("imports the registry for its side effects ... enumerates it"), which sees
+ *     whatever a co-resident file also registered.
+ *
+ * Neither contains a single `vi.mock`, so both were classified PURE and ran non-isolated.
+ *
+ * The two signals, chosen because they are properties of the TEST rather than of the
+ * subject under test (so they need no import graph to evaluate):
+ *
+ *   1. A `__reset…()` call. The double-underscore prefix is this repo's convention for a
+ *      TEST-ONLY escape hatch, and a test-only reset exists for exactly one reason: state
+ *      that outlives a single test. Calling one is a file SAYING it depends on module-global
+ *      state.
+ *   2. A BARE side-effect import (`import 'x';`, no bindings). Importing purely for what a
+ *      module does at load time is the definition of depending on module-load side effects
+ *      — and under `isolate: false` a module is loaded ONCE PER FORK, so the second file to
+ *      rely on it observes an already-populated registry, or never re-runs the effect.
+ *
+ * MEASURED before adoption (2026-08-13, 5,891 unit files): these two move 121 files
+ * (2.1%) out of the pure lane, leaving it at 69.3% of the suite — the D-013 speed win is
+ * preserved. They also catch all three files above. Note the residual they reveal is ~12×
+ * D-013's estimate of 0.14%, because that estimate counted only files that HAPPENED to
+ * fail one co-execution ordering, not files structurally able to.
+ */
+export const STATEFUL_PATTERNS = [
+  /\b__reset[A-Za-z0-9_]*\s*\(/,
+  /^\s*import\s+['"][^'"]+['"]\s*;?\s*$/m,
+] as const;
+
+/**
+ * Does this test file's SOURCE manipulate the module registry, or depend on module-global
+ * state that survives a file boundary under `isolate: false`?
+ *
+ * Substring matching for {@link STATEFUL_MARKERS}, on purpose: it cannot be defeated by a
+ * regex edge case. {@link STATEFUL_PATTERNS} needs real patterns (a bare import is a
+ * SHAPE, not a fixed string), but each is written to over-match rather than under-match.
+ * Every ambiguity resolves toward `true` (isolated), the safe direction.
  */
 export function isStatefulTestSource(source: string): boolean {
-  return STATEFUL_MARKERS.some((marker) => source.includes(marker));
+  return (
+    STATEFUL_MARKERS.some((marker) => source.includes(marker)) ||
+    STATEFUL_PATTERNS.some((pattern) => pattern.test(source))
+  );
 }
 
 /** Directory names never walked. Mirrors `baseExclude` in vitest-config.ts, plus build/caches. */
@@ -79,8 +132,26 @@ const SKIP_DIRS = new Set([
   '.git',
 ]);
 
-/** A UNIT test file: `*.test.ts(x)` but NOT the integration/browser layers. */
-const UNIT_TEST_FILE = /\.test\.[cm]?[jt]sx?$/;
+/**
+ * A UNIT test file: `*.test.ts(x)` but NOT the integration/browser layers.
+ *
+ * ⚠ THE EXTENSION SET MUST MATCH `layerInclude` IN vitest-config.ts, WHICH IS
+ * `['**\/*.test.ts', '**\/*.test.tsx']` — TypeScript only.
+ *
+ * The lane split replaces a GLOB include with an EXPLICIT file list, so any file this
+ * regex admits is handed to vitest directly. A regex WIDER than the glob therefore does
+ * not just mis-label a file's lane — it ENROLLS a file the suite never ran. That is not
+ * hypothetical: `[cm]?[jt]sx?` admitted `.test.js`, which pulled
+ * `lib/pot-eval/fixtures/seed-app/test/baseline.test.js` — a `node:test` FIXTURE for the
+ * pot-eval Hive, deliberately not a vitest suite — into the pure lane, where vitest
+ * failed it with "No test suite found in file" on every gate run.
+ *
+ * So the narrow direction is the SAFE one here, which is the reverse of the
+ * pure-vs-stateful judgement below: admitting too little only forgoes some speed, while
+ * admitting too much reds the gate on a file that was never part of the suite.
+ */
+const UNIT_TEST_FILE = /\.test\.tsx?$/;
+/** Kept deliberately WIDER than {@link UNIT_TEST_FILE}: this one only ever EXCLUDES. */
 const LAYERED_TEST_FILE = /\.(integration|browser)\.test\.[cm]?[jt]sx?$/;
 
 export function isUnitTestFile(relPath: string): boolean {
