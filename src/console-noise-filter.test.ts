@@ -292,6 +292,24 @@ describe('isSilencedConsoleMessage', () => {
     expect(isSilencedConsoleMessage('[stalled-loops-guard] disarmed su-dead: no recent activity')).toBe(false);
   });
 
+  it('silences the mem0 credential warn (EI-20299393830613909: unprovisioned-box weather)', () => {
+    // The exact shape warnOnce emits (mem0-client.ts: console.warn(`[mem0] ${reason}.`)).
+    // Whether it fires depends on how the RUN BOX is provisioned, not on the code
+    // under test, so it reds any unit test that transitively reaches the memory
+    // seam — work-items-urgent.test.ts failed this way 2× on 2026-08-12 despite
+    // never touching memory itself.
+    expect(
+      isSilencedConsoleMessage(
+        '[mem0] no Claude session and no Anthropic or OpenAI API key in operator-credentials ' +
+          'or env (add at /settings/api-keys).',
+      ),
+    ).toBe(true);
+    // Message text is specific enough not to swallow an unrelated [mem0] line —
+    // a real memory-path defect must still red.
+    expect(isSilencedConsoleMessage('[mem0] search failed for owner su-1: connection reset')).toBe(false);
+    expect(isSilencedConsoleMessage('[mem0] failed to persist memory')).toBe(false);
+  });
+
   describe('PostgreSQL UNREACHABLE (ECONNREFUSED) — the DOWN twin of the exhaustion entries (EI-13946)', () => {
     // The exact console shapes that tripped vitest-fail-on-console on a run box
     // with no reachable PG on :5432: orient.test.ts (gate-decisions fire-and-forget

@@ -329,5 +329,21 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // the same spy-vs-setup race documented for the VETO line above; a real regression still
   // surfaces as a failed assertion on `res.reArmedFireStarved` / `rearm` / `autoPause`.
   if (msg.includes('[stalled-loops-guard] FIRE-STARVED')) return true;
+  // mem0-client's warnOnce credential notice — the CREDENTIAL twin of the
+  // MEM0_TELEMETRY pin in setup-hermetic-env.ts, and the same "environment
+  // weather, not a code signal" class as the PG entries above. resolveLlm falls
+  // back and continues when the box has no Claude session and no Anthropic/OpenAI
+  // key (the warn's own text points a human at /settings/api-keys), so whether it
+  // fires depends entirely on how the RUN BOX is provisioned — not on the code
+  // under test. Any unit test that transitively reaches the memory seam therefore
+  // reds on an unprovisioned box and passes on a provisioned one: observed
+  // 2026-08-12 on work-items-urgent.test.ts (EI-20299393830613909), which only
+  // mocks ./pot/urgent-wake and never touches memory itself, failing 2× at
+  // 14:18Z/14:22Z this way while passing on either side. Keyed off the unique
+  // `[mem0]` tag + the exact reason text, so it cannot silence an unrelated
+  // memory warning; a genuine regression in the LLM-resolution path surfaces as a
+  // thrown error / failed assertion in mem0-client's own coverage, never as this
+  // incidental once-per-process log line.
+  if (msg.includes('[mem0] no Claude session and no Anthropic or OpenAI API key')) return true;
   return false;
 }
