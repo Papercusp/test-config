@@ -59,8 +59,8 @@
  * imported that barrel, so the BEFORE assertion observed the inherited executor; an isolated
  * run on the SAME SHA passed. An expectation-wrapped dynamic import is a narrow structural
  * signal that module evaluation itself is the subject of the test, so those files belong in
- * the isolated lane. This moves 4 of operator-core's 4,858 unit files, rather than classifying
- * all 1,226 tests that happen to use a dynamic import as stateful.
+ * the isolated lane. This moves 4 of operator-core's 4,126 enrolled unit files, rather than
+ * classifying all 838 tests that happen to use a dynamic import as stateful.
  *
  * ERR TOWARD STATEFUL, ALWAYS. Misclassifying a stateful file as pure costs correctness (a
  * polluted co-execution the gate is designed to refuse — D-009); misclassifying a pure file as
@@ -73,11 +73,11 @@
  * does not hoist correctly and is already broken independently of this split.
  */
 
-import { readdirSync, readFileSync, statSync, type Dirent } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
+import { join, relative, sep } from "node:path";
 
 /** The lanes. `null`/absent everywhere means "no split" — today's single isolated lane. */
-export type TestLane = 'pure' | 'stateful';
+export type TestLane = "pure" | "stateful";
 
 /**
  * Module-registry manipulators. A file containing ANY of these is stateful.
@@ -88,18 +88,43 @@ export type TestLane = 'pure' | 'stateful';
  * and closes the family properly rather than leaving a member out for sample-fidelity.
  */
 export const STATEFUL_MARKERS = [
-  'vi.mock(',
-  'vi.doMock(',
-  'vi.unmock(',
-  'vi.doUnmock(',
-  'vi.resetModules(',
+  "vi.mock(",
+  "vi.doMock(",
+  "vi.unmock(",
+  "vi.doUnmock(",
+  "vi.resetModules(",
   // Vitest's env stubs mutate the same process-wide object as a direct process.env write.
-  'vi.stubEnv(',
-  'vi.unstubAllEnvs(',
+  "vi.stubEnv(",
+  "vi.unstubAllEnvs(",
   // Vitest's global stubs mutate the reused fork's globalThis object. Even a file that cleans up
   // after each test can inherit a co-resident file's stale global BEFORE its first hook/test.
-  'vi.stubGlobal(',
-  'vi.unstubAllGlobals(',
+  "vi.stubGlobal(",
+  "vi.unstubAllGlobals(",
+  // Fake timers replace globalThis.setTimeout/setInterval/Date on the reused fork — the SAME
+  // hazard as vi.stubGlobal directly above, and for the reason stated there: a co-resident file
+  // can inherit a stale, FROZEN clock BEFORE its first hook or test runs, so cleaning up after
+  // yourself does not protect you from the file that ran before you.
+  //
+  // This is not hypothetical. It held the gate red repeatedly on 2026-08-13 (candidate 65b3fbd1
+  // and siblings) with a ROTATING cast of victims — which is the co-residency signature, since
+  // which files share a fork varies with scheduling. Two shapes, both only explicable by a
+  // frozen clock:
+  //   • metrics.test.ts asserted `elapsed >= 15` after a real `setTimeout(20)` and measured 0.
+  //     Under real timers that is impossible; contention makes elapsed LONGER, never zero.
+  //   • boot-gate.test.ts / fleet-monitors.test.ts hung the full 180s on tests whose SUBJECT is
+  //     "a deadline fires" — with the clock frozen it never does, so vitest's real timeout kills
+  //     them. (Host load was ruled out: PSI cpu stall was ~1% on a 128-core box.)
+  //
+  // The handle-leak detector cannot close this gap — it installs its ledger over the REAL timer
+  // API, so fake-timer calls bypass the wrapper entirely (see setup-handle-leak-detector.ts).
+  // That makes the lane classifier the only place this can be caught.
+  //
+  // useRealTimers/setSystemTime are included to close the family, exactly as unmock/doUnmock and
+  // unstubAllEnvs/unstubAllGlobals are above: a file that only ever RESTORES timers is still
+  // announcing that it manipulates the fork-wide clock.
+  "vi.useFakeTimers(",
+  "vi.useRealTimers(",
+  "vi.setSystemTime(",
 ] as const;
 
 /**
@@ -181,14 +206,14 @@ export function isStatefulTestSource(source: string): boolean {
 
 /** Directory names never walked. Mirrors `baseExclude` in vitest-config.ts, plus build/caches. */
 const SKIP_DIRS = new Set([
-  'node_modules',
-  'dist',
-  '.next',
-  '.papercusp',
-  '_retired',
-  'coverage',
-  '.vitest-tmp',
-  '.git',
+  "node_modules",
+  "dist",
+  ".next",
+  ".papercusp",
+  "_retired",
+  "coverage",
+  ".vitest-tmp",
+  ".git",
 ]);
 
 /**
@@ -248,7 +273,7 @@ export function listUnitTestFiles(rootDir: string): string[] {
         }
       }
       const rel = relative(rootDir, full);
-      if (isUnitTestFile(rel)) out.push(`./${rel.split(sep).join('/')}`);
+      if (isUnitTestFile(rel)) out.push(`./${rel.split(sep).join("/")}`);
     }
   };
   walk(rootDir);
@@ -263,14 +288,17 @@ export interface LaneClassification {
   unreadable: string[];
 }
 
-export function classifyLanes(rootDir: string, files: readonly string[]): LaneClassification {
+export function classifyLanes(
+  rootDir: string,
+  files: readonly string[],
+): LaneClassification {
   const pure: string[] = [];
   const stateful: string[] = [];
   const unreadable: string[] = [];
   for (const file of files) {
     let source: string;
     try {
-      source = readFileSync(join(rootDir, file), 'utf8');
+      source = readFileSync(join(rootDir, file), "utf8");
     } catch {
       // Unreadable ⇒ unclassifiable ⇒ isolated. A file must never reach the pure lane by
       // accident: "we could not tell" and "it is pure" are different answers.
@@ -307,9 +335,12 @@ export interface LaneSelection {
 }
 
 /** The `include` selection for one lane of `rootDir`'s unit suite. */
-export function resolveLaneInclude(rootDir: string, lane: TestLane): LaneSelection {
+export function resolveLaneInclude(
+  rootDir: string,
+  lane: TestLane,
+): LaneSelection {
   const all = listUnitTestFiles(rootDir);
   const { pure, stateful } = classifyLanes(rootDir, all);
-  const selected = lane === 'pure' ? pure : stateful;
+  const selected = lane === "pure" ? pure : stateful;
   return { include: selected.length > 0 ? selected : null, total: all.length };
 }
