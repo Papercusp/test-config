@@ -49,7 +49,7 @@ function absentFileIsPure(_rootDir: string, files: readonly string[]): { pure: s
 // STATEFUL_PATTERNS is ever dropped, the real subject collapses onto this control and the
 // paired assertions below stop distinguishing them.
 function viMockOnlyMatcher(source: string): boolean {
-  return STATEFUL_MARKERS.some((marker) => source.includes(marker));
+  return STATEFUL_MARKERS.slice(0, 5).some((marker) => source.includes(marker));
 }
 
 // The two real shapes that reddened the gate, reduced to their essentials.
@@ -75,6 +75,16 @@ describe('census', () => {
   it('classifies every registered action', () => {
     expect(listSystemActions().length).toBeGreaterThan(20);
   });
+});
+`;
+
+// design-phase-plugin-dsn.test.ts reduced to the process-wide state that made it fail in the
+// non-isolated lane and pass 66–72 seconds later in the same run group's isolated retry.
+const PROCESS_ENV_MUTATION_SOURCE = `
+const SAVED = ['HOME', 'PAPERCUSP_HOME'] as const;
+beforeEach(() => {
+  for (const key of SAVED) delete process.env[key];
+  process.env.HOME = '/tmp/design-phase-dsn';
 });
 `;
 
@@ -125,12 +135,18 @@ describe('isStatefulTestSource', () => {
   });
 
   it('classifies every declared module-global-state pattern as stateful', () => {
-    for (const pattern of STATEFUL_PATTERNS) {
+    const samples = [
+      `afterEach(() => __resetThingForTests());`,
+      `import './register-things';\n`,
+      `process.env.HOME = '/tmp/test-home';`,
+      `delete process.env[key];`,
+      `Object.assign(process.env, { TZ: 'UTC' });`,
+    ];
+    expect(STATEFUL_PATTERNS).toHaveLength(samples.length);
+    for (const [index, pattern] of STATEFUL_PATTERNS.entries()) {
       // Each pattern must actually fire on something — a pattern that matches nothing
       // would sit in the list looking like coverage while providing none.
-      const sample = pattern.source.includes('__reset')
-        ? `afterEach(() => __resetThingForTests());`
-        : `import './register-things';\n`;
+      const sample = samples[index]!;
       expect(pattern.test(sample)).toBe(true);
       expect(isStatefulTestSource(sample)).toBe(true);
     }
@@ -146,6 +162,23 @@ describe('isStatefulTestSource', () => {
     // The exact miss that produced the TARGET_ROLE_SPEND census flip.
     expect(viMockOnlyMatcher(SIDE_EFFECT_IMPORT_SOURCE)).toBe(false);
     expect(isStatefulTestSource(SIDE_EFFECT_IMPORT_SOURCE)).toBe(true);
+  });
+
+  it('CONTROL C: beats the vi.mock-only matcher on process-environment mutation', () => {
+    // The exact structural miss behind EI-20324961932717738. The subject and test blobs were
+    // identical across pass/fail commits; only the shared-fork execution mode differed.
+    expect(viMockOnlyMatcher(PROCESS_ENV_MUTATION_SOURCE)).toBe(false);
+    expect(isStatefulTestSource(PROCESS_ENV_MUTATION_SOURCE)).toBe(true);
+  });
+
+  it('classifies env assignments/deletions as stateful without mistaking reads for writes', () => {
+    expect(isStatefulTestSource(`process.env.PORT ?? '3055';`)).toBe(false);
+    expect(isStatefulTestSource(`process.env.PORT === '3070';`)).toBe(false);
+    expect(isStatefulTestSource(`process.env.PORT ??= '3055';`)).toBe(true);
+    expect(isStatefulTestSource(`process.env[key] ||= 'value';`)).toBe(true);
+    expect(isStatefulTestSource(`delete process.env.PAPERCUSP_HOME;`)).toBe(true);
+    expect(isStatefulTestSource(`Reflect.set(process.env, key, value);`)).toBe(true);
+    expect(isStatefulTestSource(`vi.stubEnv('TZ', 'UTC');`)).toBe(true);
   });
 
   it('catches a bare side-effect import carrying a TRAILING COMMENT', () => {

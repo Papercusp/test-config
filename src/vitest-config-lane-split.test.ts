@@ -66,9 +66,10 @@ describe('lane split — active', () => {
     expect(include.length).toBeGreaterThan(0);
     // Explicit paths, not the layer globs.
     expect(include.every((f) => f.startsWith('./'))).toBe(true);
-    // This very file uses no module-registry API, so it must be IN the pure lane —
-    // a calibration case, so an empty/degenerate list cannot pass this test.
-    expect(include).toContain('./src/vitest-config-lane-split.test.ts');
+    // This file restores PC_TEST_LANE through process.env and therefore belongs in the
+    // stateful lane. Use a genuinely pure sibling as the calibration case so an
+    // empty/degenerate list still cannot pass this test.
+    expect(include).toContain('./src/vitest-config-lightweight-subpath.test.ts');
   });
 
   it('stateful lane keeps isolation and selects the complement', () => {

@@ -14,15 +14,17 @@
  * already-loaded module. Those follow from isolate:false SEMANTICS, so they are not a bug list
  * that can be fixed file-by-file.
  *
- * THE FILTER. A file is STATEFUL if it manipulates the module registry — `vi.mock`, `vi.doMock`,
- * `vi.resetModules` (+ the `unmock` inverses, same family). Those files keep today's isolated
+ * THE FILTER. A file is STATEFUL if it manipulates state that survives a file boundary in a
+ * reused fork: the module registry (`vi.mock`, `vi.doMock`, `vi.resetModules` plus their inverse
+ * family), a module-global registry, or `process.env`. Those files keep today's isolated
  * behaviour, untouched. Everything else is PURE-lane eligible. On the falsification run behind
- * D-006, all 8 files that actually failed under `--no-isolate` were excluded by this filter
- * (8/8). ⚠ That is a NECESSARY-not-sufficient filter with a clean record on observed failures —
- * NOT proof at scale: an accumulating module-level registry needs no `vi.mock` to break. The
- * residual rate was MEASURED at 4/2809 files = 0.14% (D-013), and every one of those four is a
- * real leak that the WI-38215 handle-leak detector now NAMES rather than absorbs (D-029) — which
- * is what unblocked this split.
+ * D-006, all 8 files that actually failed under `--no-isolate` were excluded by the original
+ * module-registry filter (8/8). ⚠ That was a NECESSARY-not-sufficient filter with a clean record
+ * on observed failures — NOT proof at scale: an accumulating module-level registry needs no
+ * `vi.mock` to break, and a process-environment mutation needs no module-registry call at all.
+ * The original residual rate was MEASURED at 4/2809 files = 0.14% (D-013), and every one of those
+ * four was a real leak that the WI-38215 handle-leak detector named rather than absorbed (D-029)
+ * — which is what unblocked this split.
  *
  * ⚠ THAT RESIDUAL THEN MATERIALISED — the paragraph above is kept verbatim because it called
  * the failure correctly, not because it is still the whole filter. Within minutes of the split
@@ -31,6 +33,15 @@
  * — now covers them, and the true structural residual measured 121/5891 files (2.1%), ~12× the
  * 0.14% above. The estimate was not wrong so much as differently-scoped: it counted files that
  * HAPPENED to fail one co-execution ordering, not files structurally able to.
+ *
+ * A THIRD residual then materialised in `design-phase-plugin-dsn.test.ts`: the non-isolated pure
+ * lane read the native-PG fallback while an isolated fresh-process re-run on the SAME commit read
+ * the discovery file correctly (twice, 66–72 seconds apart in the test-run ledger). The test
+ * writes `HOME` and deletes/restores five PG-related environment keys. `process.env` belongs to
+ * the reused fork, so even well-intentioned save/restore hooks cannot make a file structurally
+ * independent of every co-resident file's setup/teardown. Environment writers therefore belong
+ * in the isolated lane. Measured before adoption on operator-core: 162 of 2,730 then-pure files
+ * move, leaving 2,568 files in the fast lane rather than trading gate correctness for that tail.
  *
  * ERR TOWARD STATEFUL, ALWAYS. Misclassifying a stateful file as pure costs correctness (a
  * polluted co-execution the gate is designed to refuse — D-009); misclassifying a pure file as
@@ -63,11 +74,15 @@ export const STATEFUL_MARKERS = [
   'vi.unmock(',
   'vi.doUnmock(',
   'vi.resetModules(',
+  // Vitest's env stubs mutate the same process-wide object as a direct process.env write.
+  'vi.stubEnv(',
+  'vi.unstubAllEnvs(',
 ] as const;
 
 /**
- * Module-global STATE markers — the second family, closing the gap this file's header
- * predicted in prose: "an accumulating module-level registry needs no `vi.mock` to break".
+ * Process-global STATE patterns — the remaining families, closing the gaps this file's header
+ * predicted in prose: "an accumulating module-level registry needs no `vi.mock` to break" and
+ * a process-environment mutation needs no module-registry call at all.
  *
  * That prediction came true on 2026-08-13, on three files at once, within minutes of the
  * split going live in the gate entrypoint:
@@ -109,11 +124,19 @@ export const STATEFUL_PATTERNS = [
   // more self-documenting the import, the more likely it carries a trailing comment, so the
   // naive anchor systematically missed the clearest cases.
   /^\s*import\s+['"][^'"]+['"]\s*;?\s*(?:\/\/.*|\/\*.*)?$/m,
+  // Direct env assignment. The bracket arm deliberately admits a dynamic key (`process.env[k]`)
+  // as well as a string literal: both mutate the same fork-wide object. Equality reads (`===`,
+  // `!==`) do not match. Compound/nullish/logical assignment and ++/-- do.
+  /\bprocess\.env(?:\.[A-Za-z_$][\w$]*|\[[^\]\n]+\])\s*(?:\?\?=|\|\|=|&&=|[+\-*/%&|^]?=(?!=)|\+\+|--)/,
+  // Deletion is the exact shape in design-phase-plugin-dsn.test.ts's save/scrub/restore hooks.
+  /\bdelete\s+process\.env(?:\.[A-Za-z_$][\w$]*|\[[^\]\n]+\])/,
+  // Bulk mutation bypasses the property-assignment pattern but has identical shared-fork scope.
+  /\b(?:Object\.assign|Reflect\.set)\s*\(\s*process\.env\b/,
 ] as const;
 
 /**
- * Does this test file's SOURCE manipulate the module registry, or depend on module-global
- * state that survives a file boundary under `isolate: false`?
+ * Does this test file's SOURCE manipulate the module registry, process environment, or other
+ * process-global state that survives a file boundary under `isolate: false`?
  *
  * Substring matching for {@link STATEFUL_MARKERS}, on purpose: it cannot be defeated by a
  * regex edge case. {@link STATEFUL_PATTERNS} needs real patterns (a bare import is a
