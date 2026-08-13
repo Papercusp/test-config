@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { mkdirSync, existsSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
-import { resolveLaneInclude, type TestLane } from './lane-split';
+// @ts-expect-error TS5097 — Node's native TypeScript config loader requires the
+// real `.ts` runtime specifier; neither extensionless nor `.js` resolves here.
+import { resolveLaneInclude, type TestLane } from './lane-split.ts';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
