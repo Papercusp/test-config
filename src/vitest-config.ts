@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { mkdirSync, existsSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
+import { resolveLaneInclude, type TestLane } from './lane-split.ts';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
@@ -18,6 +19,15 @@ export interface DefineVitestConfigOptions {
   exclude?: string[];
   /** Disable the default vitest-fail-on-console setup. Default: false. */
   allowConsoleNoise?: boolean;
+  /**
+   * OPT IN to the pure/stateful lane split (unit layer only). Default: false.
+   *
+   * Opting in changes NOTHING on its own — it only makes this workspace willing to honour
+   * the `PC_TEST_LANE` env var. With the var unset (every ordinary run, and every re-run the
+   * green-checkpoint gate performs) the config resolves exactly as it does today: the full
+   * suite, isolated. See {@link resolveRequestedLane} for why both conditions are required.
+   */
+  laneSplit?: boolean;
 }
 
 // EI-7787/WI-3199: `.papercusp/**` is the agent scratch/tmp/log/state tree
@@ -288,8 +298,72 @@ export function sharedHostWorkerCap(pool: 'forks' | 'threads' = 'forks'): {
   return cap > 0 ? { maxWorkers: cap, minWorkers: 1 } : {};
 }
 
+/**
+ * Env var naming which lane to run. Honoured ONLY by a workspace that passed
+ * `laneSplit: true` — see {@link resolveRequestedLane}.
+ */
+export const PC_TEST_LANE_ENV = 'PC_TEST_LANE';
+
+/**
+ * An `include` entry that matches nothing, used when a lane is legitimately EMPTY.
+ *
+ * Passing `[]` instead would be a silent catastrophe: vitest treats an empty `include` as
+ * "use the default include", i.e. the WHOLE suite — so an empty pure lane would run every
+ * stateful file NON-ISOLATED, which is precisely the configuration D-006 measured as
+ * unadoptable. A path that cannot exist is the honest encoding of "select nothing".
+ */
+const EMPTY_LANE_INCLUDE = '__pc-empty-lane__/matches-nothing.test.ts';
+
+/**
+ * Which lane (if any) this invocation should run.
+ *
+ * TWO conditions must BOTH hold — the workspace opted in AND the env var names a lane. That
+ * conjunction is the whole safety story for the gate:
+ *
+ *   • `scripts/affected-tests.mjs` sets the env var for the two lane legs it runs;
+ *   • the green-checkpoint's isolation + confirming co-execution re-runs go through
+ *     `resolveWorkspaceTestInvocation` → `npm run test --workspace <ws> -- <files>`, which
+ *     sets NO lane env — so those re-runs resolve the DEFAULT config and stay ISOLATED
+ *     BY CONSTRUCTION, with no change to green-checkpoint.ts.
+ *
+ * That last point is what makes the split safe to adopt. D-009 established that a polluted
+ * pure lane must not be able to reach the confirm path non-isolated (WI-6956 classifies
+ * "passes alone, fails co-executed" as a REAL concurrency defect and holds the gate red),
+ * and D-011 verified by experiment that a forced-isolate confirm keeps exactly that
+ * detection power. Here the confirm pass is isolated because it never opts in, rather than
+ * because something remembered to force a flag back on.
+ *
+ * An UNRECOGNISED value throws rather than falling back: a typo'd lane that silently ran the
+ * whole suite twice would be a pure waste that looks like a success.
+ */
+function resolveRequestedLane(layer: TestLayer, laneSplit: boolean): TestLane | null {
+  const raw = process.env[PC_TEST_LANE_ENV]?.trim();
+  if (!raw) return null;
+  // Not opted in ⇒ the env var is INERT here. Keeps a lane leg's inherited environment from
+  // silently re-shaping an unrelated workspace's suite.
+  if (!laneSplit) return null;
+  if (layer !== 'unit') {
+    throw new Error(
+      `${PC_TEST_LANE_ENV}=${raw} was set for the '${layer}' layer, but the lane split is a UNIT-layer ` +
+        `mechanism (it partitions files by module-registry use). Remove laneSplit from this config.`,
+    );
+  }
+  if (raw !== 'pure' && raw !== 'stateful') {
+    throw new Error(`${PC_TEST_LANE_ENV} must be 'pure' or 'stateful' (got '${raw}').`);
+  }
+  return raw;
+}
+
 export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig {
-  const { layer, setupFiles = [], globalSetup = [], include, exclude = [], allowConsoleNoise = false } = opts;
+  const {
+    layer,
+    setupFiles = [],
+    globalSetup = [],
+    include,
+    exclude = [],
+    allowConsoleNoise = false,
+    laneSplit = false,
+  } = opts;
   // Turn the silent "No test files found" footgun into an actionable error when
   // an integration/browser test is run by path under the unit config.
   if (layer === 'unit') guardLayeredTestPathUnderUnit();
@@ -336,6 +410,40 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       ? ['**/*.browser.test.ts', '**/*.browser.test.tsx']
       : ['**/*.test.ts', '**/*.test.tsx']);
 
+  // ── PURE/STATEFUL LANE SPLIT (plan gate-suite-speedup-2026-08-12) ──────────────────────
+  // The pure lane drops `isolate`, letting files SHARE a fork's module registry instead of
+  // cold-transpiling the operator-core graph once per file (D-004/D-013: -83% accumulated
+  // import). Global isolate:false is NOT adoptable (D-006) — only the files that never touch
+  // the module registry are eligible, and that membership is decided per file in lane-split.ts.
+  const lane = resolveRequestedLane(layer, laneSplit);
+  let laneInclude: string[] | null = null;
+  if (lane) {
+    if (include) {
+      // A caller-supplied include and a content-derived lane list are two different answers to
+      // "which files run". Refuse rather than silently letting one win.
+      throw new Error(
+        `laneSplit cannot be combined with an explicit \`include\` — the lane list is derived from ` +
+          `file CONTENTS and would silently override it.`,
+      );
+    }
+    // The scan is rooted at the process cwd; `npm run test --workspace <ws>` runs there.
+    const selection = resolveLaneInclude(process.cwd(), lane);
+    if (selection.total === 0) {
+      // FATAL, deliberately. The workspace test script carries --passWithNoTests, so a wrong
+      // root would exit 0 and read as a green run of a suite that never executed — the exact
+      // silent-zero that invalidated this plan's v1 measurement harness (D-012).
+      throw new Error(
+        `${PC_TEST_LANE_ENV}=${lane} found ZERO unit test files under ${process.cwd()}. ` +
+          `Refusing to run: --passWithNoTests would turn that into a false green.`,
+      );
+    }
+    laneInclude = selection.include;
+    process.stderr.write(
+      `[lane-split] lane=${lane} files=${laneInclude?.length ?? 0}/${selection.total} ` +
+        `isolate=${lane === 'pure' ? 'false' : 'true'} root=${process.cwd()}\n`,
+    );
+  }
+
   return defineConfig({
     plugins: [tsconfigPaths({ ignoreConfigErrors: true })],
     // Use a project-local Vite cache dir instead of os.tmpdir() (which is
@@ -350,7 +458,13 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
     // instead of dying on a /@fs/ allow-list miss (see MONOREPO_ROOT above).
     server: { fs: { allow: [MONOREPO_ROOT] } },
     test: {
-      include: layerInclude,
+      // A lane run enumerates its files EXPLICITLY (content-derived membership); everything
+      // else keeps the layer's globs, byte-for-byte as before.
+      include: lane ? (laneInclude ?? [EMPTY_LANE_INCLUDE]) : layerInclude,
+      // TOP-LEVEL `isolate` — `poolOptions.forks.isolate` was REMOVED in vitest 4 and is
+      // ignored SILENTLY (D-029), which would make the split look like it does nothing.
+      // Spread conditionally so a non-lane run's config is untouched, not merely undefined.
+      ...(lane === 'pure' ? { isolate: false } : {}),
       exclude: [
         ...baseExclude,
         ...exclude,
