@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { mkdirSync, existsSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
-import { resolveLaneInclude, type TestLane } from './lane-split.ts';
+import { resolveLaneInclude, type TestLane } from './lane-split';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
