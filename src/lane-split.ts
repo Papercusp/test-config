@@ -101,7 +101,14 @@ export const STATEFUL_MARKERS = [
  */
 export const STATEFUL_PATTERNS = [
   /\b__reset[A-Za-z0-9_]*\s*\(/,
-  /^\s*import\s+['"][^'"]+['"]\s*;?\s*$/m,
+  // ⚠ The trailing-comment branch is LOAD-BEARING, not tidiness. The first version of this
+  // pattern ended at `;?\s*$` and therefore missed
+  //     import './reconcile-rule'; // registers plan-item-reconcile:done into the global engine
+  // — a bare side-effect import whose OWN COMMENT states it populates a global registry. That
+  // file then failed the very pure-lane validation run this marker was added to prevent. The
+  // more self-documenting the import, the more likely it carries a trailing comment, so the
+  // naive anchor systematically missed the clearest cases.
+  /^\s*import\s+['"][^'"]+['"]\s*;?\s*(?:\/\/.*|\/\*.*)?$/m,
 ] as const;
 
 /**

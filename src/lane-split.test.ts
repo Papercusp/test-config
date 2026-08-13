@@ -148,6 +148,18 @@ describe('isStatefulTestSource', () => {
     expect(isStatefulTestSource(SIDE_EFFECT_IMPORT_SOURCE)).toBe(true);
   });
 
+  it('catches a bare side-effect import carrying a TRAILING COMMENT', () => {
+    // REGRESSION, found by the full pure-lane validation run rather than by review. The first
+    // version of the pattern anchored at `;?\s*$`, so this real line from
+    // lib/plan-items/reconcile-rule.test.ts:18 did NOT match — and that file then failed the
+    // run. Note its comment ANNOUNCES the global mutation, so the naive anchor was worst
+    // exactly where the evidence was clearest.
+    const real = `import './reconcile-rule'; // registers plan-item-reconcile:done into the global engine\n`;
+    expect(isStatefulTestSource(real)).toBe(true);
+    expect(isStatefulTestSource(`import './x'; /* sets up the registry */\n`)).toBe(true);
+    expect(isStatefulTestSource(`import './x' // no semicolon\n`)).toBe(true);
+  });
+
   it('calibration: an ordinary BINDING import is not mistaken for a side-effect import', () => {
     // Without this, a bare-import pattern that also matched `import { x } from 'y'` would
     // beat CONTROL C by classifying the entire suite stateful — destroying the split while
