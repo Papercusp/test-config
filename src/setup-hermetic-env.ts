@@ -1,4 +1,6 @@
 /**
+ * Also pins OUTBOUND THIRD-PARTY TELEMETRY off — see MEM0_TELEMETRY below.
+ *
  * Scrubs agent-spawn env pollution so tests behave identically under any
  * runner (dev shell, CI, an orchestrator-SPAWNED agent like the hourly
  * green-checkpoint). Spawned agents carry per-spawn env pins that leak into
@@ -86,6 +88,28 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// A test must never make an unsolicited call to the public internet. mem0ai ships
+// telemetry ON by default (`MEM0_TELEMETRY` is only disabled by the exact string
+// 'false'), and `_Memory._autoInitialize` → `_initializeTelemetry` fires an 'init'
+// event — a LIFECYCLE event, so it bypasses the 10% sample rate and runs on EVERY
+// construction. `UnifiedTelemetry.captureEvent` POSTs to https://us.i.posthog.com
+// and, when that fetch fails, swallows the error but logs `console.error(
+// 'Telemetry event capture failed:', …)` — which vitest-fail-on-console promotes to
+// a test failure. So any test that (transitively) builds a Memory reds whenever the
+// box's egress is unhealthy: found 2026-08-13 (EI-20299393830613909), where
+// work-items-urgent.test.ts failed 3× in 6h on ERR_SSL_WRONG_VERSION_NUMBER while
+// passing on a re-run minutes later — a load/network-dependent red that is
+// indistinguishable from a real regression and cannot be reproduced on demand.
+// This is the same class as the voice-ipc redirect below (an orphaned-socket
+// console.error redding local-audio-socket), and the fix belongs here for the same
+// reason: two test files had each grown their own `process.env.MEM0_TELEMETRY =
+// 'false'` line (memory/session-extraction-llm.test.ts, generic/memory
+// extraction-llm.test.ts), which protects only the files an agent happened to
+// hand-patch. Centralizing it makes it hold for every test file in every workspace.
+// Those local lines are kept deliberately: a run through a bare vitest config that
+// skips setupFiles (the known false-green trap, EI-14190) still gets them.
+process.env.MEM0_TELEMETRY = 'false';
 
 process.env.PAPERCUSP_PGBOUNCER = '0';
 // Same rule as the voice-ipc redirect below — a unit test must never read the real
