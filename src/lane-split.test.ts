@@ -88,6 +88,16 @@ beforeEach(() => {
 });
 `;
 
+// cross-origin-url.test.ts reduced to the process-global mutation that made its first SSR test
+// inherit a co-resident `window` under isolate:false. Cleanup after later tests is insufficient:
+// the file must start from an isolated global object.
+const VITEST_GLOBAL_MUTATION_SOURCE = `
+import { afterEach, it, vi } from 'vitest';
+afterEach(() => vi.unstubAllGlobals());
+it('starts without window', () => expect(typeof window).toBe('undefined'));
+it('uses a browser location', () => vi.stubGlobal('window', { location: {} }));
+`;
+
 // ─── fixtures ────────────────────────────────────────────────────────────────────────────
 
 /** A scratch tree OUTSIDE the repo (TMPDIR is forced to a short /tmp path by vitest-config). */
@@ -169,6 +179,13 @@ describe('isStatefulTestSource', () => {
     // identical across pass/fail commits; only the shared-fork execution mode differed.
     expect(viMockOnlyMatcher(PROCESS_ENV_MUTATION_SOURCE)).toBe(false);
     expect(isStatefulTestSource(PROCESS_ENV_MUTATION_SOURCE)).toBe(true);
+  });
+
+  it('CONTROL C: classifies Vitest global stubs as stateful', () => {
+    // The exact structural miss behind the cross-origin-url.test.ts same-SHA fail/pass flip.
+    // An afterEach cleanup cannot erase a polluted global inherited before the first test.
+    expect(viMockOnlyMatcher(VITEST_GLOBAL_MUTATION_SOURCE)).toBe(false);
+    expect(isStatefulTestSource(VITEST_GLOBAL_MUTATION_SOURCE)).toBe(true);
   });
 
   it('classifies env assignments/deletions as stateful without mistaking reads for writes', () => {

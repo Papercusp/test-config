@@ -16,8 +16,8 @@
  *
  * THE FILTER. A file is STATEFUL if it manipulates state that survives a file boundary in a
  * reused fork: the module registry (`vi.mock`, `vi.doMock`, `vi.resetModules` plus their inverse
- * family), a module-global registry, or `process.env`. Those files keep today's isolated
- * behaviour, untouched. Everything else is PURE-lane eligible. On the falsification run behind
+ * family), a module-global registry, `process.env`, or Vitest's process-global stubs. Those files
+ * keep today's isolated behaviour, untouched. Everything else is PURE-lane eligible. On the falsification run behind
  * D-006, all 8 files that actually failed under `--no-isolate` were excluded by the original
  * module-registry filter (8/8). ⚠ That was a NECESSARY-not-sufficient filter with a clean record
  * on observed failures — NOT proof at scale: an accumulating module-level registry needs no
@@ -42,6 +42,16 @@
  * independent of every co-resident file's setup/teardown. Environment writers therefore belong
  * in the isolated lane. Measured before adoption on operator-core: 162 of 2,730 then-pure files
  * move, leaving 2,568 files in the fast lane rather than trading gate correctness for that tail.
+ *
+ * A FOURTH residual then materialised in `cross-origin-url.test.ts`: its first test requires
+ * `window` to be absent, while later tests call `vi.stubGlobal('window', ...)`. The pure lane ran
+ * it after a co-resident file had left a window-shaped global behind, so destructuring
+ * `window.location` failed; the same SHA passed 47.8 seconds later in an isolated process.
+ * `vi.stubGlobal` mutates the reused fork's `globalThis` just as `vi.stubEnv` mutates its
+ * `process.env`, and a local `unstub` hook cannot make the file independent of the state it
+ * inherits before its first test. Vitest global-stub users therefore belong in the isolated lane.
+ * Measured on operator-core at adoption: 19 of 2,567 then-pure files move, leaving 2,548 in the
+ * fast lane.
  *
  * ERR TOWARD STATEFUL, ALWAYS. Misclassifying a stateful file as pure costs correctness (a
  * polluted co-execution the gate is designed to refuse — D-009); misclassifying a pure file as
@@ -77,6 +87,10 @@ export const STATEFUL_MARKERS = [
   // Vitest's env stubs mutate the same process-wide object as a direct process.env write.
   'vi.stubEnv(',
   'vi.unstubAllEnvs(',
+  // Vitest's global stubs mutate the reused fork's globalThis object. Even a file that cleans up
+  // after each test can inherit a co-resident file's stale global BEFORE its first hook/test.
+  'vi.stubGlobal(',
+  'vi.unstubAllGlobals(',
 ] as const;
 
 /**
