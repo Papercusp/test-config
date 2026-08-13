@@ -72,6 +72,21 @@
  *    genuinely wants the request-only-host branch still sets the var itself, in its own
  *    beforeEach/test body, which runs after this module-level scrub and so still wins.
  *
+ *  - PORT — the operator's own listen port, and the ONLY entry here that is not
+ *    PAPERCUSP_-prefixed. Every su/psu agent shell on this box carries `PORT` (3070 for
+ *    the release operator, 3055 for dev). Under `isolate: true` a value a test set never
+ *    escaped that file; under the P-003 pure lane's `isolate: false` the forks pool reuses
+ *    the worker and it leaks FORWARD to every later file. Measured 2026-08-13 in the 4-arm
+ *    lane-split run (plan gate-suite-speedup-2026-08-12, D-034/D-035): self-url.test.ts's
+ *    "defaults to :3055 when PORT is undefined" case read a leaked ':3070' and redded a
+ *    file that passes in isolation. The consumers are the `process.env.PORT ?? '3055'`
+ *    fallbacks (self-url.ts, agents-list.ts, oracle/prompts.ts, review/approve.ts,
+ *    merge/approve.ts, plans/expand-generators.ts) — scrubbing makes that documented :3055
+ *    default reliable instead of inheriting the launching shell's port. Six test files had
+ *    each grown their own savedPort/restore dance, the same hand-patched-workaround shape
+ *    as PAPERCUSP_BACKGROUND_WORKERS above; they keep working unchanged, because a test
+ *    that sets PORT does so in its own beforeEach/test body, after this module-level scrub.
+ *
  *  - PAPERCUSP_VOICE_IPC_DIR (redirected, not scrubbed) — the voice-socket state root
  *    (sockets/ + voice-ipc.json). Without a redirect, any test that (transitively)
  *    starts the local voice socket reaps the REAL ~/.papercusp/sockets — an orphaned
@@ -144,6 +159,7 @@ if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
 }
 delete process.env.PAPERCUSP_BACKGROUND_WORKERS;
 delete process.env.PAPERCUSP_HONO_PORT;
+delete process.env.PORT;
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_POT_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
