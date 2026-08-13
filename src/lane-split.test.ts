@@ -107,6 +107,34 @@ it('starts without window', () => expect(typeof window).toBe('undefined'));
 it('uses a browser location', () => vi.stubGlobal('window', { location: {} }));
 `;
 
+// The fake-timer polluter shape behind the 2026-08-13 gate reds (candidate 65b3fbd1 and
+// siblings). Note the afterEach restore: this file is WELL-BEHAVED and still poisons the fork,
+// because a co-resident file scheduled between the install and the restore — or simply running
+// before this file's hooks are registered — observes a FROZEN globalThis clock. That is the same
+// argument that put vi.stubGlobal in STATEFUL_MARKERS, applied to the timer API.
+const FAKE_TIMER_SOURCE = `
+import { afterEach, it, vi } from 'vitest';
+afterEach(() => vi.useRealTimers());
+it('expires the lease on the deadline', () => {
+  vi.useFakeTimers();
+  vi.advanceTimersByTime(5000);
+});
+`;
+
+// The VICTIM shape, for calibration. It measures real elapsed time but manipulates nothing
+// process-global, so it must stay in the fast pure lane — the fix removes the POLLUTER from the
+// shared fork rather than exiling everything that reads a clock.
+const REAL_ELAPSED_VICTIM_SOURCE = `
+import { describe, expect, it } from 'vitest';
+describe('Series + startTimer', () => {
+  it('startTimer measures elapsed ms', async () => {
+    const done = startTimer();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(done()).toBeGreaterThanOrEqual(15);
+  });
+});
+`;
+
 // ─── fixtures ────────────────────────────────────────────────────────────────────────────
 
 /** A scratch tree OUTSIDE the repo (TMPDIR is forced to a short /tmp path by vitest-config). */
@@ -226,6 +254,29 @@ describe("isStatefulTestSource", () => {
     // An afterEach cleanup cannot erase a polluted global inherited before the first test.
     expect(viMockOnlyMatcher(VITEST_GLOBAL_MUTATION_SOURCE)).toBe(false);
     expect(isStatefulTestSource(VITEST_GLOBAL_MUTATION_SOURCE)).toBe(true);
+  });
+
+  it("CONTROL C: classifies fake-timer installs as stateful", () => {
+    // The structural miss behind the 2026-08-13 rotating gate reds. vi.useFakeTimers() replaces
+    // globalThis.setTimeout/Date on the reused fork — identical in kind to vi.stubGlobal above —
+    // yet the marker family omitted it, leaving 47 operator-core files free to freeze the clock
+    // for 2,504 co-residents. Victims measured 0ms for a real 20ms sleep, or hung the full 180s
+    // waiting on a deadline that could never fire.
+    expect(viMockOnlyMatcher(FAKE_TIMER_SOURCE)).toBe(false);
+    expect(isStatefulTestSource(FAKE_TIMER_SOURCE)).toBe(true);
+  });
+
+  it("closes the fake-timer family: restore-only and setSystemTime also classify stateful", () => {
+    // Matches the unmock/unstubAllGlobals precedent — a file that only RESTORES timers is still
+    // announcing it manipulates the fork-wide clock.
+    expect(isStatefulTestSource(`afterEach(() => vi.useRealTimers());`)).toBe(true);
+    expect(isStatefulTestSource(`vi.setSystemTime(new Date('2026-01-01'));`)).toBe(true);
+  });
+
+  it("calibration: a test that merely MEASURES real time stays pure", () => {
+    // Guards the fix against over-reach. The victims of this bug must not be exiled from the
+    // fast lane as a side effect of removing the polluters from it.
+    expect(isStatefulTestSource(REAL_ELAPSED_VICTIM_SOURCE)).toBe(false);
   });
 
   it("classifies env assignments/deletions as stateful without mistaking reads for writes", () => {
