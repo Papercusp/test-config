@@ -197,10 +197,8 @@ describe('sweepAbandonedHermeticDirs', () => {
 
 describe('createHermeticDir', () => {
   it('creates the root, mints a pid-stamped dir, and sweeps abandoned siblings first', () => {
-    const nested = join(root, 'папercusp-voice-ipc-hermetic'.replace(/[^\x20-\x7e]/g, 'p'));
+    const nested = join(root, 'papercusp-voice-ipc-hermetic');
     mkdirSync(nested, { recursive: true });
-    const abandoned = seed(DEAD_PID, 'hhhhhh', HERMETIC_SWEEP_MIN_AGE_MS * 2);
-    rmSync(abandoned, { recursive: true, force: true });
     const stale = join(nested, `${DEAD_PID}-iiiiii`);
     mkdirSync(stale);
     const when = (Date.now() - HERMETIC_SWEEP_MIN_AGE_MS * 2) / 1000;
