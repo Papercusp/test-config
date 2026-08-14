@@ -100,9 +100,11 @@
  *
  * Keep this list to PROVEN leak classes — broad env wipes hide real bugs.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+import { createHermeticDir } from './hermetic-tmpdir.js';
 
 // A test must never make an unsolicited call to the public internet. mem0ai ships
 // telemetry ON by default (`MEM0_TELEMETRY` is only disabled by the exact string
@@ -136,8 +138,6 @@ process.env.PAPERCUSP_PGBOUNCER = '0';
 // Against the pre-fix resolver this is a no-op: that reader never matched the file.
 process.env.PAPERCUSP_SKIP_PG_DISCOVERY = '1';
 if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
-  const voiceIpcHermeticDir = mkdtempSync(join(tmpdir(), 'voice-ipc-hermetic-'));
-  process.env.PAPERCUSP_VOICE_IPC_DIR = voiceIpcHermeticDir;
   // This module runs at the START of every vitest FILE fleet-wide (it's the
   // first entry in every defineVitestConfig's setupFiles) with no matching
   // teardown hook of its own — so the tmpdir it mints here was never removed.
@@ -145,10 +145,20 @@ if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
   // (/tmp/pcv), degrading every mkdir/readdir/stat that touches it (including
   // the testcontainer start-lock under the same tree) and contributing to
   // spurious integration-test timeouts + elevated host load fleet-wide
-  // (found + bulk-cleaned 2026-07-09, EI-8888-adjacent). `process.on('exit')`
-  // is the right hook here (not vitest's globalTeardown, which only fires for
-  // the pool's OWN root process, not each per-file worker that actually calls
-  // this) — `rmSync` is safe to use in an 'exit' handler (sync-only context).
+  // (found + bulk-cleaned 2026-07-09, EI-8888-adjacent).
+  //
+  // The `process.on('exit')` hook below was that 2026-07-09 fix, and on its own it
+  // is NOT sufficient — it REGRESSED into the identical leak (74,385 dirs, WI-38830
+  // 2026-08-14). Node runs 'exit' handlers only on a NORMAL exit; `pool: 'forks'`
+  // terminates each per-file worker with a signal, which runs no handler at all.
+  // So the dir now lives under a single swept parent (see hermetic-tmpdir.ts):
+  // `createHermeticDir` reaps siblings whose creating pid is gone, which is the
+  // part that holds when the dying process cannot cooperate. The 'exit' handler
+  // stays for the clean path — it is correct and cheap, and it keeps the
+  // steady-state population near zero instead of one sweep behind. `rmSync` is
+  // safe in an 'exit' handler (sync-only context).
+  const voiceIpcHermeticDir = createHermeticDir(join(tmpdir(), 'papercusp-voice-ipc-hermetic'));
+  process.env.PAPERCUSP_VOICE_IPC_DIR = voiceIpcHermeticDir;
   process.on('exit', () => {
     try {
       rmSync(voiceIpcHermeticDir, { recursive: true, force: true });
