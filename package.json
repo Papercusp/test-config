@@ -30,6 +30,11 @@
       "types": "./src/pg.ts",
       "import": "./src/pg.ts",
       "default": "./src/pg.ts"
+    },
+    "./acceptance-environment": {
+      "types": "./src/acceptance-environment.ts",
+      "import": "./src/acceptance-environment.ts",
+      "default": "./src/acceptance-environment.ts"
     }
   },
   "scripts": {
