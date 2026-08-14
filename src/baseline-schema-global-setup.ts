@@ -349,7 +349,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * `libs/papercusp/libs/db/sql`. Robust to wherever this shared file is hoisted
  * (its own package's src, a node_modules symlink, …), unlike a fixed `../../..`.
  */
-function findRepoRoot(): string {
+function findRepoRoot(): string | null {
   let dir = __dirname;
   for (let i = 0; i < 12; i++) {
     if (existsSync(resolve(dir, 'libs/papercusp/libs/db/sql'))) return dir;
@@ -357,17 +357,14 @@ function findRepoRoot(): string {
     if (parent === dir) break;
     dir = parent;
   }
-  throw new Error(
-    `baseline-schema globalSetup: could not locate the monorepo root (no libs/papercusp/libs/db/sql found walking up from ${__dirname})`,
-  );
+  return null;
 }
 
 const REPO_ROOT = findRepoRoot();
-const SQL_DIR = resolve(REPO_ROOT, 'libs/papercusp/libs/db/sql');
-const MIGRATION_RUNNER = resolve(
-  REPO_ROOT,
-  'libs/papercusp/packages/embedded-postgres-server/src/migration-runner.js',
-);
+const SQL_DIR = REPO_ROOT ? resolve(REPO_ROOT, 'libs/papercusp/libs/db/sql') : null;
+const MIGRATION_RUNNER = REPO_ROOT
+  ? resolve(REPO_ROOT, 'libs/papercusp/packages/embedded-postgres-server/src/migration-runner.js')
+  : null;
 
 // Boot pre-step (roles + extensions) — mirrors embedded-postgres-server/src/index.js.
 const BOOT_PREREQS_DDL = `
@@ -382,6 +379,17 @@ const BOOT_PREREQS_DDL = `
 `;
 
 export default async function setup({ provide }: TestProject) {
+  // This package is also consumed by managed hives that do not contain the
+  // Papercusp operator's migration corpus. Its pure helper tests must remain
+  // importable there, and an accidentally inherited globalSetup must be a
+  // transparent no-op rather than crashing test collection.
+  if (!REPO_ROOT || !SQL_DIR || !MIGRATION_RUNNER) {
+    process.stderr.write(
+      `[baseline-schema-global-setup] skipping: ${__dirname} is outside a Papercusp operator monorepo\n`,
+    );
+    return;
+  }
+
   // NO-DOCKER ESCAPE HATCH (EI-13104) — see the module doc comment above. Checked
   // first so a sandboxed caller with no docker.sock access never touches
   // PostgreSqlContainer at all.
