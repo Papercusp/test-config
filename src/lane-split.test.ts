@@ -14,10 +14,16 @@
  * genuinely-pure sources in the pure lane.
  */
 
-import { describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { describe, expect, it } from "vitest";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  symlinkSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   STATEFUL_MARKERS,
   STATEFUL_PATTERNS,
@@ -26,7 +32,7 @@ import {
   isUnitTestFile,
   listUnitTestFiles,
   resolveLaneInclude,
-} from './lane-split.ts';
+} from "./lane-split.ts";
 
 // ─── CONTROLS: deliberately-wrong implementations, permanently resident ──────────────────
 //
@@ -39,7 +45,10 @@ function regexOnlyStatefulMatcher(source: string): boolean {
 
 // CONTROL B — treats an unreadable/absent file as PURE (the unsafe default: "we could not
 // tell" collapsed into "it is fine"). The real classifier must send it to the stateful lane.
-function absentFileIsPure(_rootDir: string, files: readonly string[]): { pure: string[] } {
+function absentFileIsPure(
+  _rootDir: string,
+  files: readonly string[],
+): { pure: string[] } {
   return { pure: [...files] };
 }
 
@@ -98,15 +107,46 @@ it('starts without window', () => expect(typeof window).toBe('undefined'));
 it('uses a browser location', () => vi.stubGlobal('window', { location: {} }));
 `;
 
+// The fake-timer polluter shape behind the 2026-08-13 gate reds (candidate 65b3fbd1 and
+// siblings). Note the afterEach restore: this file is WELL-BEHAVED and still poisons the fork,
+// because a co-resident file scheduled between the install and the restore — or simply running
+// before this file's hooks are registered — observes a FROZEN globalThis clock. That is the same
+// argument that put vi.stubGlobal in STATEFUL_MARKERS, applied to the timer API.
+const FAKE_TIMER_SOURCE = `
+import { afterEach, it, vi } from 'vitest';
+afterEach(() => vi.useRealTimers());
+it('expires the lease on the deadline', () => {
+  vi.useFakeTimers();
+  vi.advanceTimersByTime(5000);
+});
+`;
+
+// The VICTIM shape, for calibration. It measures real elapsed time but manipulates nothing
+// process-global, so it must stay in the fast pure lane — the fix removes the POLLUTER from the
+// shared fork rather than exiling everything that reads a clock.
+const REAL_ELAPSED_VICTIM_SOURCE = `
+import { describe, expect, it } from 'vitest';
+describe('Series + startTimer', () => {
+  it('startTimer measures elapsed ms', async () => {
+    const done = startTimer();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(done()).toBeGreaterThanOrEqual(15);
+  });
+});
+`;
+
 // ─── fixtures ────────────────────────────────────────────────────────────────────────────
 
 /** A scratch tree OUTSIDE the repo (TMPDIR is forced to a short /tmp path by vitest-config). */
-function makeTree(files: Record<string, string>): { dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'lane-split-'));
+function makeTree(files: Record<string, string>): {
+  dir: string;
+  cleanup: () => void;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "lane-split-"));
   for (const [rel, contents] of Object.entries(files)) {
     const full = join(dir, rel);
-    mkdirSync(join(full, '..'), { recursive: true });
-    writeFileSync(full, contents, 'utf8');
+    mkdirSync(join(full, ".."), { recursive: true });
+    writeFileSync(full, contents, "utf8");
   }
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
@@ -118,36 +158,43 @@ describe('adder', () => {
 });
 `;
 
-describe('isStatefulTestSource', () => {
-  it('classifies every declared marker as stateful', () => {
+describe("isStatefulTestSource", () => {
+  it("classifies every declared marker as stateful", () => {
     for (const marker of STATEFUL_MARKERS) {
-      expect(isStatefulTestSource(`beforeEach(() => { ${marker}'./x'); });`)).toBe(true);
+      expect(
+        isStatefulTestSource(`beforeEach(() => { ${marker}'./x'); });`),
+      ).toBe(true);
     }
   });
 
-  it('calibration: a genuinely pure file is NOT stateful', () => {
+  it("calibration: a genuinely pure file is NOT stateful", () => {
     // Without this, a matcher that returned `true` unconditionally would pass every
     // control test below while making the split pointless.
     expect(isStatefulTestSource(PURE_SOURCE)).toBe(false);
   });
 
-  it('CONTROL A: beats the line-anchored regex on a non-anchored registry call', () => {
+  it("CONTROL A: beats the line-anchored regex on a non-anchored registry call", () => {
     // A real shape: the call is not the first token on its line.
     const source = `it('x', async () => { await vi.resetModules(); });`;
     expect(regexOnlyStatefulMatcher(source)).toBe(false); // the wrong impl MISSES it …
     expect(isStatefulTestSource(source)).toBe(true); // … the real subject catches it.
   });
 
-  it('errs toward stateful: a marker inside a comment still classifies stateful', () => {
+  it("errs toward stateful: a marker inside a comment still classifies stateful", () => {
     // Deliberate. Misclassifying stateful→pure costs correctness; pure→stateful costs
     // only speed, so every ambiguity resolves to `true`.
-    expect(isStatefulTestSource(`// historical note: this used to vi.mock('./db')\n`)).toBe(true);
+    expect(
+      isStatefulTestSource(
+        `// historical note: this used to vi.mock('./db')\n`,
+      ),
+    ).toBe(true);
   });
 
-  it('classifies every declared module-global-state pattern as stateful', () => {
+  it("classifies every declared module-global-state pattern as stateful", () => {
     const samples = [
       `afterEach(() => __resetThingForTests());`,
       `import './register-things';\n`,
+      `await expect(import('./wire-things')).resolves.toBeDefined();`,
       `process.env.HOME = '/tmp/test-home';`,
       `delete process.env[key];`,
       `Object.assign(process.env, { TZ: 'UTC' });`,
@@ -162,43 +209,91 @@ describe('isStatefulTestSource', () => {
     }
   });
 
-  it('CONTROL C: beats the vi.mock-only matcher on a module-global REGISTRY reset', () => {
+  it("CONTROL C: beats the vi.mock-only matcher on a module-global REGISTRY reset", () => {
     // The exact miss that produced `lock.acquire already registered` on the gate.
     expect(viMockOnlyMatcher(REGISTRY_RESET_SOURCE)).toBe(false); // the shipped impl MISSED it …
     expect(isStatefulTestSource(REGISTRY_RESET_SOURCE)).toBe(true); // … the real subject catches it.
   });
 
-  it('CONTROL C: beats the vi.mock-only matcher on a bare side-effect import', () => {
+  it("CONTROL C: beats the vi.mock-only matcher on a bare side-effect import", () => {
     // The exact miss that produced the TARGET_ROLE_SPEND census flip.
     expect(viMockOnlyMatcher(SIDE_EFFECT_IMPORT_SOURCE)).toBe(false);
     expect(isStatefulTestSource(SIDE_EFFECT_IMPORT_SOURCE)).toBe(true);
   });
 
-  it('CONTROL C: beats the vi.mock-only matcher on process-environment mutation', () => {
+  it("classifies an expectation-wrapped dynamic import without catching ordinary dynamic imports", () => {
+    // Exact structural class behind stop-fanout-installed.test.ts's same-SHA flip: a prior
+    // pure-lane file had already evaluated the barrel, so this test inherited the AFTER state
+    // before it could assert the BEFORE state. Module evaluation is the subject here.
+    const moduleLoadIsTheSubject = `
+      expect(getExecutor()).toBeUndefined();
+      await expect(import('../agent-tools/index')).resolves.toBeDefined();
+      expect(getExecutor()).toBeTypeOf('function');
+    `;
+    expect(isStatefulTestSource(moduleLoadIsTheSubject)).toBe(true);
+
+    // Calibration: dynamic import is also a routine code-splitting/test-fixture tool. Moving all
+    // 838 such operator-core files out of the fast lane would fix correctness by deleting most
+    // of the speedup, so only the expectation-wrapped load-as-subject shape is stateful.
+    expect(
+      isStatefulTestSource(
+        `const mod = await import('./calculator');\nexpect(mod.add(1, 2)).toBe(3);`,
+      ),
+    ).toBe(false);
+  });
+
+  it("CONTROL C: beats the vi.mock-only matcher on process-environment mutation", () => {
     // The exact structural miss behind EI-20324961932717738. The subject and test blobs were
     // identical across pass/fail commits; only the shared-fork execution mode differed.
     expect(viMockOnlyMatcher(PROCESS_ENV_MUTATION_SOURCE)).toBe(false);
     expect(isStatefulTestSource(PROCESS_ENV_MUTATION_SOURCE)).toBe(true);
   });
 
-  it('CONTROL C: classifies Vitest global stubs as stateful', () => {
+  it("CONTROL C: classifies Vitest global stubs as stateful", () => {
     // The exact structural miss behind the cross-origin-url.test.ts same-SHA fail/pass flip.
     // An afterEach cleanup cannot erase a polluted global inherited before the first test.
     expect(viMockOnlyMatcher(VITEST_GLOBAL_MUTATION_SOURCE)).toBe(false);
     expect(isStatefulTestSource(VITEST_GLOBAL_MUTATION_SOURCE)).toBe(true);
   });
 
-  it('classifies env assignments/deletions as stateful without mistaking reads for writes', () => {
+  it("CONTROL C: classifies fake-timer installs as stateful", () => {
+    // The structural miss behind the 2026-08-13 rotating gate reds. vi.useFakeTimers() replaces
+    // globalThis.setTimeout/Date on the reused fork — identical in kind to vi.stubGlobal above —
+    // yet the marker family omitted it, leaving 47 operator-core files free to freeze the clock
+    // for 2,504 co-residents. Victims measured 0ms for a real 20ms sleep, or hung the full 180s
+    // waiting on a deadline that could never fire.
+    expect(viMockOnlyMatcher(FAKE_TIMER_SOURCE)).toBe(false);
+    expect(isStatefulTestSource(FAKE_TIMER_SOURCE)).toBe(true);
+  });
+
+  it("closes the fake-timer family: restore-only and setSystemTime also classify stateful", () => {
+    // Matches the unmock/unstubAllGlobals precedent — a file that only RESTORES timers is still
+    // announcing it manipulates the fork-wide clock.
+    expect(isStatefulTestSource(`afterEach(() => vi.useRealTimers());`)).toBe(true);
+    expect(isStatefulTestSource(`vi.setSystemTime(new Date('2026-01-01'));`)).toBe(true);
+  });
+
+  it("calibration: a test that merely MEASURES real time stays pure", () => {
+    // Guards the fix against over-reach. The victims of this bug must not be exiled from the
+    // fast lane as a side effect of removing the polluters from it.
+    expect(isStatefulTestSource(REAL_ELAPSED_VICTIM_SOURCE)).toBe(false);
+  });
+
+  it("classifies env assignments/deletions as stateful without mistaking reads for writes", () => {
     expect(isStatefulTestSource(`process.env.PORT ?? '3055';`)).toBe(false);
     expect(isStatefulTestSource(`process.env.PORT === '3070';`)).toBe(false);
     expect(isStatefulTestSource(`process.env.PORT ??= '3055';`)).toBe(true);
     expect(isStatefulTestSource(`process.env[key] ||= 'value';`)).toBe(true);
-    expect(isStatefulTestSource(`delete process.env.PAPERCUSP_HOME;`)).toBe(true);
-    expect(isStatefulTestSource(`Reflect.set(process.env, key, value);`)).toBe(true);
+    expect(isStatefulTestSource(`delete process.env.PAPERCUSP_HOME;`)).toBe(
+      true,
+    );
+    expect(isStatefulTestSource(`Reflect.set(process.env, key, value);`)).toBe(
+      true,
+    );
     expect(isStatefulTestSource(`vi.stubEnv('TZ', 'UTC');`)).toBe(true);
   });
 
-  it('catches a bare side-effect import carrying a TRAILING COMMENT', () => {
+  it("catches a bare side-effect import carrying a TRAILING COMMENT", () => {
     // REGRESSION, found by the full pure-lane validation run rather than by review. The first
     // version of the pattern anchored at `;?\s*$`, so this real line from
     // lib/plan-items/reconcile-rule.test.ts:18 did NOT match — and that file then failed the
@@ -206,128 +301,150 @@ describe('isStatefulTestSource', () => {
     // exactly where the evidence was clearest.
     const real = `import './reconcile-rule'; // registers plan-item-reconcile:done into the global engine\n`;
     expect(isStatefulTestSource(real)).toBe(true);
-    expect(isStatefulTestSource(`import './x'; /* sets up the registry */\n`)).toBe(true);
+    expect(
+      isStatefulTestSource(`import './x'; /* sets up the registry */\n`),
+    ).toBe(true);
     expect(isStatefulTestSource(`import './x' // no semicolon\n`)).toBe(true);
   });
 
-  it('calibration: an ordinary BINDING import is not mistaken for a side-effect import', () => {
+  it("calibration: an ordinary BINDING import is not mistaken for a side-effect import", () => {
     // Without this, a bare-import pattern that also matched `import { x } from 'y'` would
     // beat CONTROL C by classifying the entire suite stateful — destroying the split while
     // looking like a fix. PURE_SOURCE's own vitest import is the case that must stay pure.
-    expect(isStatefulTestSource(`import { describe, it } from 'vitest';\n`)).toBe(false);
-    expect(isStatefulTestSource(`import type { Foo } from './foo';\n`)).toBe(false);
+    expect(
+      isStatefulTestSource(`import { describe, it } from 'vitest';\n`),
+    ).toBe(false);
+    expect(isStatefulTestSource(`import type { Foo } from './foo';\n`)).toBe(
+      false,
+    );
     expect(isStatefulTestSource(PURE_SOURCE)).toBe(false);
   });
 });
 
-describe('isUnitTestFile', () => {
-  it('accepts unit tests and rejects the layered suites', () => {
-    expect(isUnitTestFile('lib/a.test.ts')).toBe(true);
-    expect(isUnitTestFile('lib/a.test.tsx')).toBe(true);
-    expect(isUnitTestFile('lib/a.integration.test.ts')).toBe(false);
-    expect(isUnitTestFile('lib/a.browser.test.ts')).toBe(false);
-    expect(isUnitTestFile('lib/a.ts')).toBe(false);
+describe("isUnitTestFile", () => {
+  it("accepts unit tests and rejects the layered suites", () => {
+    expect(isUnitTestFile("lib/a.test.ts")).toBe(true);
+    expect(isUnitTestFile("lib/a.test.tsx")).toBe(true);
+    expect(isUnitTestFile("lib/a.integration.test.ts")).toBe(false);
+    expect(isUnitTestFile("lib/a.browser.test.ts")).toBe(false);
+    expect(isUnitTestFile("lib/a.ts")).toBe(false);
   });
 
-  it('rejects NON-TypeScript test files — the unit include is .test.ts(x) only', () => {
+  it("rejects NON-TypeScript test files — the unit include is .test.ts(x) only", () => {
     // The lane split hands vitest an EXPLICIT file list instead of a glob, so admitting an
     // extension the `layerInclude` glob never matched ENROLS a file the suite never ran.
     // `.test.js` did exactly that to lib/pot-eval/fixtures/seed-app/test/baseline.test.js —
     // a `node:test` fixture — which vitest then failed with "No test suite found in file".
-    expect(isUnitTestFile('lib/pot-eval/fixtures/seed-app/test/baseline.test.js')).toBe(false);
-    expect(isUnitTestFile('lib/a.test.js')).toBe(false);
-    expect(isUnitTestFile('lib/a.test.jsx')).toBe(false);
-    expect(isUnitTestFile('lib/a.test.mjs')).toBe(false);
-    expect(isUnitTestFile('lib/a.test.cjs')).toBe(false);
-    expect(isUnitTestFile('lib/a.test.mts')).toBe(false);
+    expect(
+      isUnitTestFile("lib/pot-eval/fixtures/seed-app/test/baseline.test.js"),
+    ).toBe(false);
+    expect(isUnitTestFile("lib/a.test.js")).toBe(false);
+    expect(isUnitTestFile("lib/a.test.jsx")).toBe(false);
+    expect(isUnitTestFile("lib/a.test.mjs")).toBe(false);
+    expect(isUnitTestFile("lib/a.test.cjs")).toBe(false);
+    expect(isUnitTestFile("lib/a.test.mts")).toBe(false);
   });
 });
 
-describe('listUnitTestFiles', () => {
-  it('finds unit tests recursively, skips excluded trees and layered suites', () => {
+describe("listUnitTestFiles", () => {
+  it("finds unit tests recursively, skips excluded trees and layered suites", () => {
     const { dir, cleanup } = makeTree({
-      'lib/a.test.ts': PURE_SOURCE,
-      'lib/nested/deep/b.test.tsx': PURE_SOURCE,
-      'lib/c.integration.test.ts': PURE_SOURCE,
-      'lib/d.browser.test.ts': PURE_SOURCE,
-      'lib/notatest.ts': PURE_SOURCE,
-      'node_modules/pkg/e.test.ts': PURE_SOURCE,
-      'dist/f.test.ts': PURE_SOURCE,
-      '.papercusp/g.test.ts': PURE_SOURCE,
-      '_retired/h.test.ts': PURE_SOURCE,
+      "lib/a.test.ts": PURE_SOURCE,
+      "lib/nested/deep/b.test.tsx": PURE_SOURCE,
+      "lib/c.integration.test.ts": PURE_SOURCE,
+      "lib/d.browser.test.ts": PURE_SOURCE,
+      "lib/notatest.ts": PURE_SOURCE,
+      "node_modules/pkg/e.test.ts": PURE_SOURCE,
+      "dist/f.test.ts": PURE_SOURCE,
+      ".papercusp/g.test.ts": PURE_SOURCE,
+      "_retired/h.test.ts": PURE_SOURCE,
       // A node:test FIXTURE belonging to a seeded sample app — never a vitest suite.
-      'lib/fixtures/seed-app/test/baseline.test.js': `import { test } from 'node:test';\n`,
+      "lib/fixtures/seed-app/test/baseline.test.js": `import { test } from 'node:test';\n`,
     });
     try {
-      expect(listUnitTestFiles(dir)).toEqual(['./lib/a.test.ts', './lib/nested/deep/b.test.tsx']);
+      expect(listUnitTestFiles(dir)).toEqual([
+        "./lib/a.test.ts",
+        "./lib/nested/deep/b.test.tsx",
+      ]);
     } finally {
       cleanup();
     }
   });
 
-  it('emits root-relative paths with a ./ prefix, not absolute ones', () => {
+  it("emits root-relative paths with a ./ prefix, not absolute ones", () => {
     // Load-bearing: vitest resolves `include` against the project root (the WORKSPACE dir).
     // Absolute or repo-root-relative paths match ZERO files from a workspace-scoped run.
-    const { dir, cleanup } = makeTree({ 'lib/a.test.ts': PURE_SOURCE });
+    const { dir, cleanup } = makeTree({ "lib/a.test.ts": PURE_SOURCE });
     try {
       const files = listUnitTestFiles(dir);
-      expect(files).toEqual(['./lib/a.test.ts']);
-      expect(files.every((f) => !f.startsWith('/'))).toBe(true);
+      expect(files).toEqual(["./lib/a.test.ts"]);
+      expect(files.every((f) => !f.startsWith("/"))).toBe(true);
     } finally {
       cleanup();
     }
   });
 
-  it('does not descend into a symlinked directory', () => {
-    const { dir, cleanup } = makeTree({ 'lib/a.test.ts': PURE_SOURCE, 'other/b.test.ts': PURE_SOURCE });
+  it("does not descend into a symlinked directory", () => {
+    const { dir, cleanup } = makeTree({
+      "lib/a.test.ts": PURE_SOURCE,
+      "other/b.test.ts": PURE_SOURCE,
+    });
     try {
-      symlinkSync(join(dir, 'other'), join(dir, 'lib', 'link'), 'dir');
+      symlinkSync(join(dir, "other"), join(dir, "lib", "link"), "dir");
       // `./lib/link/b.test.ts` must NOT appear — following it would double-count b.
-      expect(listUnitTestFiles(dir)).toEqual(['./lib/a.test.ts', './other/b.test.ts']);
+      expect(listUnitTestFiles(dir)).toEqual([
+        "./lib/a.test.ts",
+        "./other/b.test.ts",
+      ]);
     } finally {
       cleanup();
     }
   });
 });
 
-describe('classifyLanes', () => {
-  it('splits by module-registry use', () => {
+describe("classifyLanes", () => {
+  it("splits by module-registry use", () => {
     const { dir, cleanup } = makeTree({
-      'lib/pure.test.ts': PURE_SOURCE,
-      'lib/stateful.test.ts': `vi.mock('./db');\n${PURE_SOURCE}`,
+      "lib/pure.test.ts": PURE_SOURCE,
+      "lib/stateful.test.ts": `vi.mock('./db');\n${PURE_SOURCE}`,
     });
     try {
-      const { pure, stateful, unreadable } = classifyLanes(dir, listUnitTestFiles(dir));
-      expect(pure).toEqual(['./lib/pure.test.ts']);
-      expect(stateful).toEqual(['./lib/stateful.test.ts']);
+      const { pure, stateful, unreadable } = classifyLanes(
+        dir,
+        listUnitTestFiles(dir),
+      );
+      expect(pure).toEqual(["./lib/pure.test.ts"]);
+      expect(stateful).toEqual(["./lib/stateful.test.ts"]);
       expect(unreadable).toEqual([]);
     } finally {
       cleanup();
     }
   });
 
-  it('CONTROL B: an unreadable file goes to the STATEFUL lane, never the pure one', () => {
-    const { dir, cleanup } = makeTree({ 'lib/pure.test.ts': PURE_SOURCE });
+  it("CONTROL B: an unreadable file goes to the STATEFUL lane, never the pure one", () => {
+    const { dir, cleanup } = makeTree({ "lib/pure.test.ts": PURE_SOURCE });
     try {
-      const files = ['./lib/pure.test.ts', './lib/does-not-exist.test.ts'];
+      const files = ["./lib/pure.test.ts", "./lib/does-not-exist.test.ts"];
       // The wrong impl calls the unreadable file pure …
-      expect(absentFileIsPure(dir, files).pure).toContain('./lib/does-not-exist.test.ts');
+      expect(absentFileIsPure(dir, files).pure).toContain(
+        "./lib/does-not-exist.test.ts",
+      );
       // … the real classifier quarantines it, and says so.
       const { pure, stateful, unreadable } = classifyLanes(dir, files);
-      expect(pure).toEqual(['./lib/pure.test.ts']); // calibration: the readable pure file still lands pure
-      expect(stateful).toEqual(['./lib/does-not-exist.test.ts']);
-      expect(unreadable).toEqual(['./lib/does-not-exist.test.ts']);
+      expect(pure).toEqual(["./lib/pure.test.ts"]); // calibration: the readable pure file still lands pure
+      expect(stateful).toEqual(["./lib/does-not-exist.test.ts"]);
+      expect(unreadable).toEqual(["./lib/does-not-exist.test.ts"]);
     } finally {
       cleanup();
     }
   });
 
-  it('the two lanes PARTITION the input — no file lost, none duplicated', () => {
+  it("the two lanes PARTITION the input — no file lost, none duplicated", () => {
     const { dir, cleanup } = makeTree({
-      'lib/a.test.ts': PURE_SOURCE,
-      'lib/b.test.ts': `vi.doMock('./x');`,
-      'lib/c.test.ts': `vi.resetModules();`,
-      'lib/d.test.ts': PURE_SOURCE,
+      "lib/a.test.ts": PURE_SOURCE,
+      "lib/b.test.ts": `vi.doMock('./x');`,
+      "lib/c.test.ts": `vi.resetModules();`,
+      "lib/d.test.ts": PURE_SOURCE,
     });
     try {
       const all = listUnitTestFiles(dir);
@@ -340,16 +457,19 @@ describe('classifyLanes', () => {
   });
 });
 
-describe('resolveLaneInclude', () => {
-  it('returns only the requested lane, and reports the discovered total', () => {
+describe("resolveLaneInclude", () => {
+  it("returns only the requested lane, and reports the discovered total", () => {
     const { dir, cleanup } = makeTree({
-      'lib/pure.test.ts': PURE_SOURCE,
-      'lib/stateful.test.ts': `vi.mock('./db');`,
+      "lib/pure.test.ts": PURE_SOURCE,
+      "lib/stateful.test.ts": `vi.mock('./db');`,
     });
     try {
-      expect(resolveLaneInclude(dir, 'pure')).toEqual({ include: ['./lib/pure.test.ts'], total: 2 });
-      expect(resolveLaneInclude(dir, 'stateful')).toEqual({
-        include: ['./lib/stateful.test.ts'],
+      expect(resolveLaneInclude(dir, "pure")).toEqual({
+        include: ["./lib/pure.test.ts"],
+        total: 2,
+      });
+      expect(resolveLaneInclude(dir, "stateful")).toEqual({
+        include: ["./lib/stateful.test.ts"],
         total: 2,
       });
     } finally {
@@ -361,24 +481,36 @@ describe('resolveLaneInclude', () => {
     // The dangerous case: an empty `include` falls back to the DEFAULT include, so a lane
     // that legitimately selects nothing would run every file — in the pure lane, that means
     // running the stateful files NON-ISOLATED. `null` forces the caller to handle it.
-    const { dir, cleanup } = makeTree({ 'lib/stateful.test.ts': `vi.mock('./db');` });
+    const { dir, cleanup } = makeTree({
+      "lib/stateful.test.ts": `vi.mock('./db');`,
+    });
     try {
-      expect(resolveLaneInclude(dir, 'pure').include).toBeNull();
-      expect(resolveLaneInclude(dir, 'stateful').include).toEqual(['./lib/stateful.test.ts']);
+      expect(resolveLaneInclude(dir, "pure").include).toBeNull();
+      expect(resolveLaneInclude(dir, "stateful").include).toEqual([
+        "./lib/stateful.test.ts",
+      ]);
     } finally {
       cleanup();
     }
   });
 
-  it('distinguishes an EMPTY LANE from a WRONG ROOT via `total`', () => {
+  it("distinguishes an EMPTY LANE from a WRONG ROOT via `total`", () => {
     // Both yield include:null, and conflating them is how a suite that never ran reads as
     // green under --passWithNoTests. total==0 is the wrong-root signal; total>0 with a null
     // include is a legitimately empty lane.
-    const { dir, cleanup } = makeTree({ 'lib/stateful.test.ts': `vi.mock('./db');` });
-    const empty = makeTree({ 'lib/not-a-test.ts': PURE_SOURCE });
+    const { dir, cleanup } = makeTree({
+      "lib/stateful.test.ts": `vi.mock('./db');`,
+    });
+    const empty = makeTree({ "lib/not-a-test.ts": PURE_SOURCE });
     try {
-      expect(resolveLaneInclude(dir, 'pure')).toEqual({ include: null, total: 1 });
-      expect(resolveLaneInclude(empty.dir, 'pure')).toEqual({ include: null, total: 0 });
+      expect(resolveLaneInclude(dir, "pure")).toEqual({
+        include: null,
+        total: 1,
+      });
+      expect(resolveLaneInclude(empty.dir, "pure")).toEqual({
+        include: null,
+        total: 0,
+      });
     } finally {
       cleanup();
       empty.cleanup();
