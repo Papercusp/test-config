@@ -193,6 +193,7 @@ describe("isStatefulTestSource", () => {
   it("classifies every declared module-global-state pattern as stateful", () => {
     const samples = [
       `afterEach(() => __resetThingForTests());`,
+      `beforeEach(() => _resetPlanTemplateRegistryForTests());`,
       `import './register-things';\n`,
       `await expect(import('./wire-things')).resolves.toBeDefined();`,
       `process.env.HOME = '/tmp/test-home';`,
@@ -213,6 +214,16 @@ describe("isStatefulTestSource", () => {
     // The exact miss that produced `lock.acquire already registered` on the gate.
     expect(viMockOnlyMatcher(REGISTRY_RESET_SOURCE)).toBe(false); // the shipped impl MISSED it …
     expect(isStatefulTestSource(REGISTRY_RESET_SOURCE)).toBe(true); // … the real subject catches it.
+  });
+
+  it("classifies the single-underscore _reset…ForTests registry convention as stateful", () => {
+    // Exact structural miss behind the rubric-template pure-lane red: several tests clear
+    // the shared plan-template Map through this helper while a co-resident file relies on
+    // the built-in registration performed once at module load.
+    expect(
+      isStatefulTestSource(`beforeEach(() => _resetPlanTemplateRegistryForTests());`),
+    ).toBe(true);
+    expect(isStatefulTestSource(`_resetHandleMapForTests();`)).toBe(true);
   });
 
   it("CONTROL C: beats the vi.mock-only matcher on a bare side-effect import", () => {

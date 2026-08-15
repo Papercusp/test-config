@@ -164,6 +164,11 @@ export const STATEFUL_MARKERS = [
  */
 export const STATEFUL_PATTERNS = [
   /\b__reset[A-Za-z0-9_]*\s*\(/,
+  // The older single-underscore convention is equally stateful. In particular,
+  // `_resetPlanTemplateRegistryForTests()` clears a module-global Map shared by every
+  // file in an `isolate:false` fork. Missing this spelling let one co-resident test
+  // erase the built-in rubric registration underneath rubric-template.test.ts.
+  /\b_reset[A-Za-z0-9_]*ForTests\s*\(/,
   // ⚠ The trailing-comment branch is LOAD-BEARING, not tidiness. The first version of this
   // pattern ended at `;?\s*$` and therefore missed
   //     import './reconcile-rule'; // registers plan-item-reconcile:done into the global engine
