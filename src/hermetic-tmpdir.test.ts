@@ -32,9 +32,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   createHermeticDir,
   creatorIsAlive,
+  GENERIC_SCRATCH_SWEEP_EXCLUDE,
+  GENERIC_SCRATCH_SWEEP_MAX_AGE_MS,
   HERMETIC_SWEEP_MAX_AGE_MS,
   HERMETIC_SWEEP_MIN_AGE_MS,
   sweepAbandonedHermeticDirs,
+  sweepStaleTestScratch,
 } from './hermetic-tmpdir.js';
 
 let root: string;
@@ -192,6 +195,53 @@ describe('sweepAbandonedHermeticDirs', () => {
     };
     expect(() => sweepAbandonedHermeticDirs(root, { isAlive })).not.toThrow();
     expect(readdirSync(root)).toHaveLength(0);
+  });
+});
+
+/** Create `<name>` (no pid stamp) under root, aged `ageMs` into the past. */
+function seedNamed(name: string, ageMs: number): string {
+  const path = join(root, name);
+  mkdirSync(path, { recursive: true });
+  const when = (Date.now() - ageMs) / 1000;
+  utimesSync(path, when, when);
+  return path;
+}
+
+describe('sweepStaleTestScratch', () => {
+  // These dirs are NOT pid-stamped (17 real test files mint their own prefix
+  // directly at the TMPDIR root — WI-38869), so every case here is a non-pid name.
+
+  it('KEEPS a non-pid-named dir under the age threshold, however long it has run', () => {
+    // The property this function exists to hold: sweepAbandonedHermeticDirs would
+    // reap this the moment it crosses 60s (no parseable pid ⇒ not alive). A live
+    // multi-minute test must not lose its scratch dir at the 1-minute mark.
+    const live = seedNamed('some-test-abc123', HERMETIC_SWEEP_MIN_AGE_MS * 5);
+    const result = sweepStaleTestScratch(root);
+    expect(result.removed).toBe(0);
+    expect(existsSync(live)).toBe(true);
+  });
+
+  it('reaps a non-pid-named dir once it is older than GENERIC_SCRATCH_SWEEP_MAX_AGE_MS', () => {
+    const stale = seedNamed('some-test-def456', GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000);
+    const result = sweepStaleTestScratch(root);
+    expect(result.removed).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+  });
+
+  it('never removes a name in GENERIC_SCRATCH_SWEEP_EXCLUDE, however old', () => {
+    for (const name of GENERIC_SCRATCH_SWEEP_EXCLUDE) {
+      seedNamed(name, GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 10);
+    }
+    const result = sweepStaleTestScratch(root);
+    expect(result.removed).toBe(0);
+    for (const name of GENERIC_SCRATCH_SWEEP_EXCLUDE) {
+      expect(existsSync(join(root, name))).toBe(true);
+    }
+  });
+
+  it('is a no-op on a root that does not exist, and never throws', () => {
+    const missing = join(root, 'nope', 'still-nope');
+    expect(() => sweepStaleTestScratch(missing)).not.toThrow();
   });
 });
 

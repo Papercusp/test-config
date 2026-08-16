@@ -104,7 +104,21 @@ import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { createHermeticDir } from './hermetic-tmpdir.js';
+import { createHermeticDir, sweepStaleTestScratch } from './hermetic-tmpdir.js';
+
+// WI-38869: at least 17 OTHER test files each mint their own scratch dir directly
+// at the /tmp/pcv TOP LEVEL (mkdtempSync(join(tmpdir(), '<own-prefix>-'))) with no
+// nest and no sweep of their own — same fork-signal-kill leak as the voice-ipc
+// regression above, just uncentralized across call sites instead of migrating each
+// one. This runs at the start of every vitest FILE fleet-wide (same hot path as the
+// voice-ipc mint below) and reaps anything past GENERIC_SCRATCH_SWEEP_MAX_AGE_MS
+// (age-only — these dirs are not pid-stamped, see hermetic-tmpdir.ts). Best-effort;
+// never let a sweep failure block a test file from loading.
+try {
+  sweepStaleTestScratch(tmpdir());
+} catch {
+  /* best-effort — never let cleanup fail the process */
+}
 
 // A test must never make an unsolicited call to the public internet. mem0ai ships
 // telemetry ON by default (`MEM0_TELEMETRY` is only disabled by the exact string
