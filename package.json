@@ -1,0 +1,64 @@
+{
+  "name": "@papercusp/test-config",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./nest": {
+      "types": "./src/nest-test-app.ts",
+      "import": "./src/nest-test-app.ts",
+      "default": "./src/nest-test-app.ts"
+    },
+    "./nuqs-mock": {
+      "types": "./src/nuqs-mock.ts",
+      "import": "./src/nuqs-mock.ts",
+      "default": "./src/nuqs-mock.ts"
+    },
+    "./vitest-config": {
+      "types": "./src/vitest-config.ts",
+      "import": "./src/vitest-config.ts",
+      "default": "./src/vitest-config.ts"
+    },
+    "./pg": {
+      "types": "./src/pg.ts",
+      "import": "./src/pg.ts",
+      "default": "./src/pg.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:integration": "vitest run --config vitest.integration.config.ts --passWithNoTests"
+  },
+  "dependencies": {
+    "@nestjs/testing": "^11.0.0",
+    "@papercusp/module-singleton": "*",
+    "@testcontainers/postgresql": "^11.0.0",
+    "drizzle-orm": "^0.45.2",
+    "msw": "^2.7.0",
+    "supertest": "^7.0.0",
+    "testcontainers": "^11.0.0",
+    "vite-tsconfig-paths": "^5.1.4",
+    "vitest-fail-on-console": "^0.7.1"
+  },
+  "devDependencies": {
+    "@types/supertest": "^6.0.0",
+    "nuqs": "^2.8.9"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "vitest": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/common": { "optional": true },
+    "@nestjs/core": { "optional": true }
+  },
+  "description": "Shared Vitest config + testcontainers (PG/Redis/Typesense) + generic createFreshTestDb isolation + MSW + schema-driven fixtures + in-process Hono client; NestJS boot helper via the ./nest subpath."
+}
