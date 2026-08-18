@@ -5,11 +5,15 @@ import { defineConfig, type ViteUserConfig as UserConfig } from 'vitest/config';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { mkdirSync, existsSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 // Node's native TypeScript config loader requires the real `.ts` runtime
 // specifier; neither extensionless nor `.js` resolves here.
 import { resolveLaneInclude, type TestLane } from './lane-split.ts';
+// EI-20767792192323374: the TMPDIR policy (and the three incidents encoded in it) now lives in its
+// own module so the TEST LAUNCHERS can apply it too — which is the only place it can actually
+// relocate Vitest's module-cache root. See that file's header for the ordering bug; the call below
+// is kept because it still governs every mkdtemp() a test performs at runtime.
+import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
@@ -69,122 +73,24 @@ const HANDLE_LEAK_SETUP = resolve(__dirname, 'setup-handle-leak-detector.ts');
 // though the tests pass when run workspace-locally (2026-06-11).
 const MONOREPO_ROOT = resolve(__dirname, '..', '..', '..');
 
-// Ensure Vitest's internal tmpDir (join(os.tmpdir(), nanoid())) lands in a
-// writable directory. On this dev box TMPDIR=/tmp/claude is set but does not
-// exist / cannot be created (sandboxed /tmp), so Vitest's ModuleFetcher fails
-// to mkdir the 'ssr' subdir before any test file loads (ENOENT). Override
-// TMPDIR — but it MUST be SHORT and OUTSIDE the repo. The previous in-repo
-// <root>/.vitest-tmp broke two whole test classes and red-pinned the gate
-// (gate-greening 2026-06-30 / EI-5541):
-//   (1) Unix-domain socket paths under it exceeded the 108-char sun_path limit
-//       → `listen EINVAL` for the IPC e2e + wake-executor/wake-resume tests;
-//   (2) temp dirs created under it have a .git ancestor (the repo), so the
-//       "non-git dir" detection tests (detectPapercupRoot, lockDomainForProjectDir,
-//       readCloneDefaultBranch, realGitCommit) wrongly resolved the repo.
-// A short /tmp dir (/tmp/pcv) is writable on this box, ~8 chars (socket paths stay
-// ~55 chars), and has NO repo-root marker ancestor (.git / package.json) up to / —
-// so it fixes both classes at the source WITHOUT tripping findRepoRoot's marker walk
-// (a home-rooted dir does trip it, since $HOME carries workspace markers).
-// This runs when vitest.config.ts is evaluated, BEFORE the Vitest instance is
-// constructed (which is when the nanoid subdir is first computed), so the
-// override takes effect for every subsequent tmpdir() call in that process.
-/** True if `dir` (or any ancestor up to /) holds a repo-root marker (.git / package.json) — i.e.
- *  TMPDIR points INSIDE a repo. This is the 2026-06-30 root cause of silent git-sync stranding:
- *  when TMPDIR is in-repo, tests that `mkdtemp` a scratch git repo (lockdom-*, flg-repo-*,
- *  realGitCommit, green-checkpoint) leave EMBEDDED repos (a nested .git) in the working tree; a
- *  no-commit one makes `git add -A` FATAL (exit 128) → git-sync stages nothing → the WHOLE tree
- *  strands uncommitted for hours. Forcing TMPDIR out to /tmp keeps those scratch repos out of the
- *  tree entirely (and also fixes the sun_path-108 socket + non-git-detection classes noted above).
- *  Previously the override only fired when TMPDIR was unset/missing — so anything that SET it to an
- *  in-repo path that existed slipped through. */
-function tmpdirIsInsideRepo(dir: string): boolean {
-  let p = resolve(dir);
-  for (;;) {
-    if (existsSync(resolve(p, '.git')) || existsSync(resolve(p, 'package.json'))) return true;
-    const parent = dirname(p);
-    if (parent === p) return false; // reached the filesystem root
-    p = parent;
-  }
-}
-
-// 2026-07-13 (green-checkpoint red, candidate 06368a3a): the "shortTmp has NO repo-root
-// marker up to /" premise above is asserted in a comment but was never VERIFIED at
-// runtime — `tmpdirIsInsideRepo` only ever checked the CURRENT TMPDIR value, never the
-// `/tmp/pcv` candidate this block is about to commit to. On this heavily shared,
-// multi-tenant box, some OTHER concurrent process mkdir'd a bare `.git` directly at
-// `/tmp` (not inside its own scratch subdir) and never cleaned it up — poisoning every
-// ancestor under it, INCLUDING `/tmp/pcv` itself, and silently defeating
-// hasGitAncestor/findRepoRoot for the whole box (the exact "non-git dir" detection
-// class EI-5541 already names, reintroduced from a new angle). Two confirmed-failing
-// gate tests (locks/non-repo-tmpdir.test.ts, locks/coordination-domain.test.ts) reproduced
-// this locally against the polluted box.
-// Self-heal it at the source: a `.git` entry directly at the well-known `/tmp` root that
-// is a completely EMPTY directory cannot be a real repo/worktree marker (a real one always
-// has at least a HEAD file / objects dir / config) — remove it before deciding whether an
-// override is needed, so the "marker-free up to /" premise this file depends on actually
-// holds instead of merely being documented.
-function scrubStrayEmptyGitMarker(dir: string): void {
-  const gitPath = resolve(dir, '.git');
-  try {
-    if (statSync(gitPath).isDirectory() && readdirSync(gitPath).length === 0) {
-      rmSync(gitPath, { recursive: true, force: true });
-    }
-  } catch {
-    // doesn't exist, isn't a directory, or isn't empty (a real repo) — never touch it.
-  }
-}
-scrubStrayEmptyGitMarker('/tmp');
-
-/**
- * True if `dir` exists AND is actually WRITABLE — existence alone is not enough
- * (EI-6063). The implement-runner capability sandbox sets `TMPDIR=/tmp/claude`
- * pointing at a READ-ONLY bind mount that DOES exist (`existsSync` → true), so the
- * original `!cur || !existsSync(cur) || tmpdirIsInsideRepo(cur)` guard never fired
- * and every `npx vitest run` in that sandbox died before any test loaded with
- * `ENOENT: no such file or directory, mkdir '/tmp/claude/<id>/ssr'` (a read-only
- * mount surfaces as ENOENT/EROFS/EACCES on write, never on a plain stat/existsSync
- * check). Probe with a real mkdir+rm — the only way to tell "exists" from "writable".
- */
-export function isWritableDir(dir: string): boolean {
-  const probe = resolve(dir, `.pcv-write-probe-${process.pid}-${Date.now()}`);
-  try {
-    mkdirSync(probe);
-    rmSync(probe, { recursive: true, force: true });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-{
-  const cur = process.env.TMPDIR;
-  const needsOverride = !cur || !existsSync(cur) || tmpdirIsInsideRepo(cur) || !isWritableDir(cur);
-  if (needsOverride) {
-    // EI-6063: try /tmp first (short, keeps unix-socket sun_path paths well under the
-    // 108-char limit — see the block comment above), but some sandboxes mount ALL of
-    // /tmp read-only (not just a TMPDIR=/tmp/claude subpath) — fall back to /dev/shm,
-    // the one tmpfs the implement-runner sandbox confirms is always writable.
-    const candidates = ['/tmp/pcv', '/dev/shm/pcv'];
-    for (const shortTmp of candidates) {
-      try {
-        mkdirSync(shortTmp, { recursive: true });
-      } catch {
-        continue; // this candidate's parent is itself unwritable — try the next
-      }
-      if (isWritableDir(shortTmp)) {
-        process.env.TMPDIR = shortTmp;
-        break;
-      }
-      // exists but still not writable (e.g. mkdirSync silently no-op'd on a
-      // read-only mount that tolerates recursive:true on an already-existing
-      // dir) — fall through to the next candidate.
-    }
-    // If NEITHER candidate is writable, leave TMPDIR as whatever it was: every
-    // writable path this box offers has been exhausted, and failing loudly at the
-    // real mkdir call site is more diagnosable than silently pointing at a dir that
-    // will just fail the same way one level down.
-  }
-}
+// TMPDIR policy — moved to ./tmpdir-guard.ts (EI-20767792192323374), which carries the full
+// rationale: the three incidents that pin the choice of `/tmp/pcv` (EI-5541 sun_path-108 +
+// non-git-detection, 2026-06-30 in-repo TMPDIR stranding git-sync, EI-6063 exists≠writable), the
+// stray-`/tmp/.git` scrub, and the shared-root clause.
+//
+// ⚠ THE COMMENT THAT USED TO LIVE HERE WAS FALSE, and it cost a gate-freezing incident. It claimed:
+//   "This runs when vitest.config.ts is evaluated, BEFORE the Vitest instance is constructed
+//    (which is when the nanoid subdir is first computed)"
+// The opposite is true on Vitest 4. `createVitest()` does `new Vitest(...)` as its FIRST statement,
+// and Vitest's `_tmpDir = join(tmpdir(), nanoid())` is a CLASS FIELD INITIALIZER evaluated right
+// there; `createViteServer()` — which loads THIS file — runs ~12 lines later. So the call below
+// CANNOT relocate vitest's module-cache root. That root landed at bare `/tmp/<nanoid>` in every
+// workspace until the launchers started setting TMPDIR themselves (see tmpdir-guard.ts).
+//
+// The call is still correct and still needed: it governs every `mkdtemp()` a TEST performs at
+// runtime, which happens long after config evaluation.
+export { isWritableDir } from './tmpdir-guard.ts';
+ensurePapercuspTmpdir();
 
 // Custom reporter that writes one row per test FILE to harness_shared.test_runs —
 // powers the /admin/testing status chips. AUTO-WIRED below so EVERY workspace using
