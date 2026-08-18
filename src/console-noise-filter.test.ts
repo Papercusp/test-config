@@ -404,6 +404,14 @@ describe('isSilencedConsoleMessage', () => {
     });
   });
 
+  it('silences the stage-stall named-hop observability line (host-load-keyed misattribution: WI-39450 reds #16-#18, EI-20452279670598227)', () => {
+    expect(
+      isSilencedConsoleMessage(
+        "[stage-stall] STAGE STALL for A: 'merge-apply (features-by-id::k1)' still pending after 15000ms — this is the hung await (named-hop pipeline observability, P-012)",
+      ),
+    ).toBe(true);
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(

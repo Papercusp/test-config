@@ -345,5 +345,23 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // thrown error / failed assertion in mem0-client's own coverage, never as this
   // incidental once-per-process log line.
   if (msg.includes('[mem0] no Claude session and no Anthropic or OpenAI API key')) return true;
+  // logIfStageStalls (sync/hyperbee/stage-stall-log.ts, P-012 named-hop pipeline
+  // observability) deliberately console.errors when ANY wrapped await is still
+  // pending after 15s — its own doc: "an observability side-channel, never a
+  // timeout". Whether it fires in a test depends on HOST LOAD, not on the code
+  // under test: on this shared box at load1 ~100+ a legitimate merge-apply/drain
+  // await routinely exceeds 15s mid-suite, and the ambient emission lands in
+  // whatever unrelated file is running — red-pinning the green-checkpoint via
+  // load-test-rig.test.ts on 3 consecutive runs (WI-39450 reds #16-#18,
+  // 2026-08-17/18) and fleet-transition-events.test.ts (EI-20452279670598227),
+  // i.e. the same WI-1660 misattribution class as the entries above, keyed to
+  // load instead of a spy race. Silencing the exact `[stage-stall]` tag cannot
+  // hide a real defect: stage-stall-log.test.ts asserts the emission via its own
+  // local console.error spies (unaffected by this predicate — the spy replaces
+  // the console before the tracker sees it), and a genuine stall-detection
+  // regression surfaces as a failed assertion there and in outbox-drain-stall /
+  // read-merge-stage-stall's dedicated coverage, never as this incidental,
+  // intentionally loud production journal line.
+  if (msg.includes('[stage-stall] STAGE STALL for')) return true;
   return false;
 }
