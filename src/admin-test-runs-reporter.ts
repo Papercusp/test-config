@@ -226,7 +226,16 @@ export function captureReporterSaturationSnapshot(): { loopLagP95Ms: number | nu
   return { loopLagP95Ms, rssMb };
 }
 
-function toWorkspaceRel(absPath: string): string {
+/**
+ * EXPORTED for the coverage-census attribution setup (plan
+ * deterministic-coverage-census-2026-08-17, P-004), which stamps the CURRENT test file onto
+ * each `coverage_evidence` traffic row. That row joins back to `test_runs` on
+ * `(run_group_id, file_path)`, so the two paths must be derived by the SAME function — a
+ * second, "equivalent" relativizer is exactly how a join key silently stops matching (one
+ * side keeps a `./` prefix, or resolves a different root under a submodule) and the evidence
+ * becomes unattributable with nothing failing.
+ */
+export function toWorkspaceRel(absPath: string): string {
   const root = inferWorkspaceRoot();
   return relative(root, absPath).split(/[/\\]/).join(posix.sep);
 }
