@@ -30,6 +30,11 @@
       "types": "./src/pg.ts",
       "import": "./src/pg.ts",
       "default": "./src/pg.ts"
+    },
+    "./admin-test-runs-reporter": {
+      "types": "./src/admin-test-runs-reporter.ts",
+      "import": "./src/admin-test-runs-reporter.ts",
+      "default": "./src/admin-test-runs-reporter.ts"
     }
   },
   "scripts": {
