@@ -38,7 +38,8 @@
     }
   },
   "scripts": {
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:integration": "vitest run --config vitest.integration.config.ts --passWithNoTests"
   },
   "dependencies": {
