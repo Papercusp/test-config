@@ -14,8 +14,22 @@
  * `isolate` key at all, and an un-opted-in workspace ignores the env var even when it is set.
  */
 
+import { relative, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { defineVitestConfig, PC_TEST_LANE_ENV } from './vitest-config.ts';
+
+/**
+ * The lane split derives its file list from `process.cwd()` (see
+ * `resolveLaneInclude`), so the entries it emits are relative to whatever root
+ * the run was launched from — `./src/x.test.ts` from this workspace, but
+ * `./libs/test-config/src/x.test.ts` when the same config is loaded as a
+ * project of the repository-root topology. Derive the expected entry the same
+ * way the subject does instead of hard-coding one root's spelling; a literal
+ * made this file the only red in the root run while it passed workspace-locally.
+ */
+function laneEntryFor(fileName: string): string {
+  return `./${relative(process.cwd(), resolve(import.meta.dirname, fileName))}`;
+}
 
 /** The `test` block of a resolved config, loosely typed — we only probe two fields. */
 function testBlock(config: ReturnType<typeof defineVitestConfig>): Record<string, unknown> {
@@ -69,7 +83,7 @@ describe('lane split — active', () => {
     // This file restores PC_TEST_LANE through process.env and therefore belongs in the
     // stateful lane. Use a genuinely pure sibling as the calibration case so an
     // empty/degenerate list still cannot pass this test.
-    expect(include).toContain('./src/vitest-config-lightweight-subpath.test.ts');
+    expect(include).toContain(laneEntryFor('vitest-config-lightweight-subpath.test.ts'));
   });
 
   it('stateful lane keeps isolation and selects the complement', () => {
