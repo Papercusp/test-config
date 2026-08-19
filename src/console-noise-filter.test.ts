@@ -412,6 +412,29 @@ describe('isSilencedConsoleMessage', () => {
     ).toBe(true);
   });
 
+  describe('learning-retain degrade warns (WI-39914: load-keyed misattribution — gate red #40 via load-test-rig.test.ts)', () => {
+    it('silences the retainFeed leg-degrade warn (the observed gate-killer)', () => {
+      expect(
+        isSilencedConsoleMessage(
+          format('[learning.retainFeed] memory leg failed:', 'memory leg exceeded the read budget'),
+        ),
+      ).toBe(true);
+    });
+    it('silences the family siblings (retain counts / plan-children / detail reads)', () => {
+      expect(
+        isSilencedConsoleMessage(format('[learning.retain] improvements-count read failed:', 'timeout')),
+      ).toBe(true);
+      expect(isSilencedConsoleMessage(format('[learning.retainPlanChildren] read failed:', 'timeout'))).toBe(true);
+      expect(isSilencedConsoleMessage(format('[learning.retainDetail] plan read failed:', 'timeout'))).toBe(true);
+    });
+    it('does NOT silence a learning.retain message that is not a degrade ("failed:" absent)', () => {
+      expect(isSilencedConsoleMessage('[learning.retainFeed] unexpected cursor shape')).toBe(false);
+    });
+    it('does NOT silence a non-retain leg-failure warn (tag prefix required)', () => {
+      expect(isSilencedConsoleMessage(format('[some-other-feed] memory leg failed:', 'boom'))).toBe(false);
+    });
+  });
+
   it('does NOT silence a genuine application error (e.g. a real PG constraint violation)', () => {
     expect(
       isSilencedConsoleMessage(
