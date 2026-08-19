@@ -363,5 +363,25 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // read-merge-stage-stall's dedicated coverage, never as this incidental,
   // intentionally loud production journal line.
   if (msg.includes('[stage-stall] STAGE STALL for')) return true;
+  // learning-retain-read.ts's best-effort degrade warns (WI-39914) — the LOAD-KEYED
+  // twin of the [stage-stall] entry above, from the WI-39900 retainCounts read stack.
+  // Every retain read leg is deliberately catch+continue under a shared read deadline
+  // (readRetainFeed's own comment: "a leg that HANGS must degrade exactly like one
+  // that throws"), and each catch warns with a `[learning.retain*] … failed:` tag.
+  // Whether the warn fires depends on HOST LOAD, not the code under test: under PSI
+  // memory pressure (avg60 5.4–15.7 on 2026-08-19) a legitimate memory-leg read
+  // exceeds its budget mid-suite, and the ambient warn lands in whatever unrelated
+  // file is running — gate run #40 (cand 0255fbf3, 10:57Z) red-pinned the
+  // green-checkpoint via load-test-rig.test.ts on exactly "[learning.retainFeed]
+  // memory leg failed: memory leg exceeded the read budget" (WI-39450 red #40), the
+  // same misattribution class as the entries above. Silencing the exact tag family
+  // cannot hide a real defect: the degrade contract is asserted STRUCTURALLY in
+  // learning-retain-read.test.ts (the returned `degraded` array, counts degrading to
+  // null — never 0) with local console.warn spies, so a genuine regression surfaces
+  // as a failed assertion there, never as this incidental best-effort log line.
+  // Covers [learning.retainFeed] / [learning.retain] / [learning.retainPlanChildren]
+  // / [learning.retainDetail]; requires BOTH the tag prefix and "failed:" so it
+  // cannot silence an unrelated learning.retain* message.
+  if (msg.startsWith('[learning.retain') && msg.includes('failed:')) return true;
   return false;
 }
