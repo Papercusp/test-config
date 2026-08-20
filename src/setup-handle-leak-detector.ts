@@ -151,6 +151,16 @@ afterAll(() => {
     // A diagnostic must never fail a suite if the runner's timer state is
     // unavailable while hooks are unwinding.
   }
+  if (fakeTimersActive) {
+    // Vitest captured the ledger wrapper when fake timers were installed. Remove
+    // the fake clock BEFORE collect() restores the ledger's originals, otherwise
+    // useRealTimers() would put that already-collected wrapper back on globals.
+    try {
+      vi.useRealTimers();
+    } catch {
+      // A diagnostic must never be the reason a suite fails.
+    }
+  }
   // Collect ALWAYS, even if nothing else is reported: collect() is what restores
   // the real timer API, and skipping it would leave the wrapper installed for
   // every later file in a reused worker.
@@ -167,15 +177,6 @@ afterAll(() => {
     if (delta > 0) verdict.leaked.push({ resource, delta });
   }
   verdict.leaked.push(...fakeTimerFinding(fakeTimersActive));
-  if (fakeTimersActive) {
-    // Keep a leaking fake clock from poisoning a reused worker after recording
-    // it. This is best-effort only; the finding above remains if cleanup fails.
-    try {
-      vi.useRealTimers();
-    } catch {
-      // A diagnostic must never be the reason a suite fails.
-    }
-  }
   // A RECORD FOR EVERY OBSERVED FILE, clean or not — this is what `v: 2` asserts,
   // and it is the entire reason a leak RATE can exist. v1 wrote a line only for a
   // file WITH a finding, which made filesObserved == filesLeaking and any rate
