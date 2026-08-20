@@ -150,6 +150,29 @@ export function isMutationProbeRun(): boolean {
 // ── inlined: resolveGitContext (was testing-branch-resolve.ts). 200ms timeout,
 //    cached 30s, fail-soft → {branch:null,commit:null}. ──
 interface GitContext { branch: string | null; commit: string | null; }
+
+/**
+ * A best-effort snapshot of the shared checkout around one test run. A run
+ * that starts or ends with an unreadable snapshot is dirty by definition: the
+ * commit SHA alone is not proof that the executed files matched that commit.
+ * This mirrors the shared-tree ingestion path in operator-core's
+ * `computeWorktreeDirty` helper, but stays local so this auto-wired reporter
+ * remains loadable by packages that do not depend on operator-core.
+ */
+export interface WorktreeGitSnapshot {
+  commit: string | null;
+  porcelain: string | null;
+}
+
+export function computeWorktreeDirty(before: WorktreeGitSnapshot, after: WorktreeGitSnapshot): boolean {
+  if (!before.commit || !after.commit) return true;
+  if (before.commit !== after.commit) return true;
+  if (before.porcelain === null || after.porcelain === null) return true;
+  if (before.porcelain.trim().length > 0) return true;
+  if (after.porcelain.trim().length > 0) return true;
+  return false;
+}
+
 let _gitCache: { value: GitContext; expiresAt: number } | null = null;
 function runGit(cmd: string, cwd: string, timeoutMs: number): Promise<string | null> {
   return new Promise((resolveP) => {
@@ -179,6 +202,22 @@ async function resolveGitContext(): Promise<GitContext> {
   return value;
 }
 
+/**
+ * Snapshot the whole shared tree rather than only the currently reported
+ * module. Vitest's onInit hook runs before module discovery, and an unrelated
+ * generated artifact can still invalidate the commit identity stamped on a
+ * row. The fail-safe null handling in computeWorktreeDirty makes git timeout
+ * or failure visible as dirty instead of silently restoring the old default.
+ */
+async function captureWorktreeSnapshot(): Promise<WorktreeGitSnapshot> {
+  const root = inferWorkspaceRoot();
+  const [commit, porcelain] = await Promise.all([
+    runGit('git rev-parse HEAD', root, 2_000),
+    runGit('git status --porcelain --untracked-files=all', root, 2_000),
+  ]);
+  return { commit, porcelain };
+}
+
 interface TestRunRow {
   filePath: string; // workspace-relative POSIX
   status: 'pass' | 'fail' | 'skip' | 'cancelled' | 'error';
@@ -190,6 +229,8 @@ interface TestRunRow {
    *  outside the repo tree (a throwaway/mutation-testing config) — see
    *  `isScratchConfigFile`. */
   isScratchConfig: boolean;
+  /** EI-20327093837421120: true when the shared tree was not stable around the run. */
+  worktreeDirty: boolean;
 }
 
 let _loopLagMonitor: ReturnType<typeof monitorEventLoopDelay> | null = null;
@@ -414,10 +455,10 @@ async function insertRow(row: TestRunRow): Promise<void> {
     await Promise.race([
       pg.sql`
         INSERT INTO harness_shared.test_runs
-          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha, harness_slug, workspace_id, loop_lag_p95_ms, rss_mb, is_scratch_config)
+          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha, harness_slug, workspace_id, loop_lag_p95_ms, rss_mb, is_scratch_config, worktree_dirty)
         VALUES
           (${row.filePath}, 'vitest', ${row.status}, ${row.durationMs}, ${row.startedAt},
-           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit}, ${harnessSlug}, ${workspaceId}, ${loopLagP95Ms}, ${rssMb}, ${row.isScratchConfig})
+           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit}, ${harnessSlug}, ${workspaceId}, ${loopLagP95Ms}, ${rssMb}, ${row.isScratchConfig}, ${row.worktreeDirty})
       `,
       new Promise((_, reject) => setTimeout(() => reject(new Error('pg_insert_timeout')), 1000)),
     ]).catch(() => {
@@ -494,8 +535,14 @@ export function computeIsScratchConfig(ctx: Pick<Vitest, 'vite'>): boolean {
   }
 }
 
+type PendingTestRunRow = Omit<TestRunRow, 'worktreeDirty'>;
+
 export default class AdminTestRunsReporter implements Reporter {
-  private pending: Promise<void>[] = [];
+  private pending: PendingTestRunRow[] = [];
+  /** Captured in onInit, before Vitest starts executing test modules. */
+  private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
+  /** Vitest can call both onTestRunEnd and onExit; flush rows exactly once. */
+  private flushed = false;
   /** EI-18767688096795873: computed once in onInit from the run's resolved
    *  config file — see computeIsScratchConfig / isScratchConfigFile. */
   private isScratchConfig = false;
@@ -503,9 +550,11 @@ export default class AdminTestRunsReporter implements Reporter {
   onInit(ctx: Vitest): void {
     ensureLoopLagMonitor();
     this.isScratchConfig = computeIsScratchConfig(ctx);
+    this.worktreeBefore = captureWorktreeSnapshot();
+    this.flushed = false;
   }
 
-  /** Per-module hook — fire-and-forget the insert; onTestRunEnd awaits them. */
+  /** Per-module hook — queue the row until the end snapshot is available. */
   onTestModuleEnd(testModule: TestModule): void {
     try {
       if (isMutationProbeRun()) return;
@@ -522,20 +571,37 @@ export default class AdminTestRunsReporter implements Reporter {
 
       const outputTail = buildOutputTail(testModule, status);
 
-      this.pending.push(
-        insertRow({ filePath, status, durationMs, startedAt, finishedAt, outputTail, isScratchConfig: this.isScratchConfig }),
-      );
+      this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail, isScratchConfig: this.isScratchConfig });
     } catch {
       /* swallow — D-007 */
     }
   }
 
+  private async flushPending(): Promise<void> {
+    if (this.flushed) return;
+    this.flushed = true;
+    if (this.pending.length === 0) return;
+
+    let worktreeDirty = true;
+    try {
+      const before = this.worktreeBefore ? await this.worktreeBefore : await captureWorktreeSnapshot();
+      const after = await captureWorktreeSnapshot();
+      worktreeDirty = computeWorktreeDirty(before, after);
+    } catch {
+      // D-007: missing proof of stability is dirty, never a false clean.
+      worktreeDirty = true;
+    }
+
+    const rows = this.pending.splice(0);
+    await Promise.race([
+      Promise.allSettled(rows.map((row) => insertRow({ ...row, worktreeDirty }))),
+      new Promise((r) => setTimeout(r, 5000)),
+    ]);
+  }
+
   async onTestRunEnd(): Promise<void> {
     try {
-      await Promise.race([
-        Promise.allSettled(this.pending),
-        new Promise((r) => setTimeout(r, 5000)),
-      ]);
+      await this.flushPending();
     } catch {
       /* swallow — D-007 */
     } finally {
@@ -545,10 +611,7 @@ export default class AdminTestRunsReporter implements Reporter {
 
   async onExit(): Promise<void> {
     try {
-      await Promise.race([
-        Promise.allSettled(this.pending),
-        new Promise((r) => setTimeout(r, 5000)),
-      ]);
+      await this.flushPending();
     } catch {
       /* swallow — D-007 */
     } finally {

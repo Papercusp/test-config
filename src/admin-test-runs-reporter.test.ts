@@ -17,6 +17,7 @@ import AdminTestRunsReporter, {
   buildOutputTail,
   captureReporterSaturationSnapshot,
   classifyGitEntry,
+  computeWorktreeDirty,
   computeIsScratchConfig,
   isScratchConfigFile,
   isMutationProbeRun,
@@ -270,6 +271,28 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
   it('onExit resolves cleanly with no pending work', async () => {
     const r = new AdminTestRunsReporter();
     await expect(r.onExit()).resolves.toBeUndefined();
+  });
+});
+
+describe('computeWorktreeDirty (EI-20327093837421120)', () => {
+  const clean = (commit: string) => ({ commit, porcelain: '' });
+
+  it('keeps a clean stable tree clean', () => {
+    expect(computeWorktreeDirty(clean('abc'), clean('abc'))).toBe(false);
+  });
+
+  it('marks a tracked fixture mutated during the run dirty', () => {
+    expect(computeWorktreeDirty(clean('abc'), { commit: 'abc', porcelain: ' M tracked-fixture.ts' })).toBe(true);
+  });
+
+  it('marks a pre-existing dirty tree dirty even when it stays stable', () => {
+    const dirty = { commit: 'abc', porcelain: ' M generated-contract.ts' };
+    expect(computeWorktreeDirty(dirty, dirty)).toBe(true);
+  });
+
+  it('fails safe when either snapshot cannot be read', () => {
+    expect(computeWorktreeDirty({ commit: null, porcelain: '' }, clean('abc'))).toBe(true);
+    expect(computeWorktreeDirty(clean('abc'), { commit: 'abc', porcelain: null })).toBe(true);
   });
 });
 
