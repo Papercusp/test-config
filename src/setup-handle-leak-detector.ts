@@ -37,12 +37,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { pinModuleState } from '@papercusp/module-singleton';
-import { afterAll, beforeAll, expect } from 'vitest';
+import { afterAll, beforeAll, expect, vi } from 'vitest';
 
 import {
   CENSUS_RECORD_VERSION,
   classifyFile,
   countResources,
+  fakeTimerFinding,
   type PostMortemFireRecord,
   type ResourceCounts,
 } from './handle-leak-delta.js';
@@ -139,6 +140,17 @@ beforeAll(() => {
 
 afterAll(() => {
   if (!ENABLED) return;
+  // Vitest's fake clock replaces the timer APIs after the real timer ledger is
+  // installed, so its arms are intentionally invisible to `collect()`. Capture
+  // the state before teardown and report it as a synthetic timer-lens finding;
+  // this names the polluting file directly instead of blaming a later victim.
+  let fakeTimersActive = false;
+  try {
+    fakeTimersActive = vi.isFakeTimers();
+  } catch {
+    // A diagnostic must never fail a suite if the runner's timer state is
+    // unavailable while hooks are unwinding.
+  }
   // Collect ALWAYS, even if nothing else is reported: collect() is what restores
   // the real timer API, and skipping it would leave the wrapper installed for
   // every later file in a reused worker.
@@ -153,6 +165,16 @@ afterAll(() => {
   // finding reported by only one of them tells you which instrument saw it.
   for (const [resource, delta] of Object.entries(armed)) {
     if (delta > 0) verdict.leaked.push({ resource, delta });
+  }
+  verdict.leaked.push(...fakeTimerFinding(fakeTimersActive));
+  if (fakeTimersActive) {
+    // Keep a leaking fake clock from poisoning a reused worker after recording
+    // it. This is best-effort only; the finding above remains if cleanup fails.
+    try {
+      vi.useRealTimers();
+    } catch {
+      // A diagnostic must never be the reason a suite fails.
+    }
   }
   // A RECORD FOR EVERY OBSERVED FILE, clean or not — this is what `v: 2` asserts,
   // and it is the entire reason a leak RATE can exist. v1 wrote a line only for a

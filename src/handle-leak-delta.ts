@@ -45,6 +45,18 @@ export type ResourceCounts = Record<string, number>;
 /** One resource type whose count moved across a test file's execution. */
 export type ResourceDelta = { resource: string; delta: number };
 
+/**
+ * Synthetic timer-lens resource used when a Vitest file leaves its fake clock
+ * installed at teardown. Fake-timer arms never reach the real timer ledger, so
+ * this state signal must be reported separately from its arm/clear counts.
+ */
+export const FAKE_TIMER_ACTIVE_RESOURCE = 'timer:fake-timers-active';
+
+/** Return the one-unit finding for a fake clock left active at file end. */
+export function fakeTimerFinding(active: boolean): ResourceDelta[] {
+  return active ? [{ resource: FAKE_TIMER_ACTIVE_RESOURCE, delta: 1 }] : [];
+}
+
 /** What one test file did to its worker's resource population. */
 export type FileVerdict = {
   file: string;

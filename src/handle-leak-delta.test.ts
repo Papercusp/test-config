@@ -1,13 +1,25 @@
 import { describe, expect, it } from 'vitest';
 import {
+  FAKE_TIMER_ACTIVE_RESOURCE,
   classifyFile,
   countResources,
   diffCounts,
+  fakeTimerFinding,
   isSourceClean,
   leakWeight,
   summarizeCensus,
   type FileVerdict,
 } from './handle-leak-delta.js';
+
+describe('fakeTimerFinding', () => {
+  it('reports a fake clock left active as one synthetic timer-lens finding', () => {
+    expect(fakeTimerFinding(true)).toEqual([{ resource: FAKE_TIMER_ACTIVE_RESOURCE, delta: 1 }]);
+  });
+
+  it('does not report a file that restored real timers', () => {
+    expect(fakeTimerFinding(false)).toEqual([]);
+  });
+});
 
 describe('countResources', () => {
   it('folds the flat getActiveResourcesInfo array into counts', () => {
