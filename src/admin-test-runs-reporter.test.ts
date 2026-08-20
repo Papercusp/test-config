@@ -24,6 +24,7 @@ import AdminTestRunsReporter, {
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
   shouldRecordTestRunPath,
+  type TestRunRow,
 } from './admin-test-runs-reporter';
 
 afterEach(() => {
@@ -271,6 +272,56 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
   it('onExit resolves cleanly with no pending work', async () => {
     const r = new AdminTestRunsReporter();
     await expect(r.onExit()).resolves.toBeUndefined();
+  });
+
+  it('persists worktree_dirty=true when a tracked fixture changes during the run', async () => {
+    const snapshots = [
+      { commit: 'abc', porcelain: '' },
+      { commit: 'abc', porcelain: ' M tracked-fixture.ts' },
+    ];
+    const persisted: TestRunRow[] = [];
+    const r = new AdminTestRunsReporter(
+      async () => snapshots.shift()!,
+      async (row) => {
+        persisted.push(row);
+      },
+    );
+    r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+    r.onTestModuleEnd({
+      moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
+      state: () => 'passed',
+      diagnostic: () => ({ duration: 12 }),
+      errors: () => [],
+    } as unknown as Parameters<typeof r.onTestModuleEnd>[0]);
+
+    await r.onTestRunEnd();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].worktreeDirty).toBe(true);
+  });
+
+  it('persists worktree_dirty=false for a clean stable run', async () => {
+    const snapshots = [
+      { commit: 'abc', porcelain: '' },
+      { commit: 'abc', porcelain: '' },
+    ];
+    const persisted: TestRunRow[] = [];
+    const r = new AdminTestRunsReporter(
+      async () => snapshots.shift()!,
+      async (row) => {
+        persisted.push(row);
+      },
+    );
+    r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+    r.onTestModuleEnd({
+      moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
+      state: () => 'passed',
+      diagnostic: () => ({ duration: 12 }),
+      errors: () => [],
+    } as unknown as Parameters<typeof r.onTestModuleEnd>[0]);
+
+    await r.onTestRunEnd();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].worktreeDirty).toBe(false);
   });
 });
 

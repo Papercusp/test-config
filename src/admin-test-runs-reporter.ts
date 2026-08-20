@@ -218,7 +218,7 @@ async function captureWorktreeSnapshot(): Promise<WorktreeGitSnapshot> {
   return { commit, porcelain };
 }
 
-interface TestRunRow {
+export interface TestRunRow {
   filePath: string; // workspace-relative POSIX
   status: 'pass' | 'fail' | 'skip' | 'cancelled' | 'error';
   durationMs: number;
@@ -232,6 +232,9 @@ interface TestRunRow {
   /** EI-20327093837421120: true when the shared tree was not stable around the run. */
   worktreeDirty: boolean;
 }
+
+export type WorktreeSnapshotReader = () => Promise<WorktreeGitSnapshot>;
+export type TestRunRowWriter = (row: TestRunRow) => Promise<void>;
 
 let _loopLagMonitor: ReturnType<typeof monitorEventLoopDelay> | null = null;
 
@@ -547,10 +550,25 @@ export default class AdminTestRunsReporter implements Reporter {
    *  config file — see computeIsScratchConfig / isScratchConfigFile. */
   private isScratchConfig = false;
 
+  constructor(
+    readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
+    writeRow?: TestRunRowWriter,
+  ) {
+    // Vitest constructs reporters with its options object. Keep that runtime
+    // contract intact while allowing the unit suite to inject deterministic
+    // snapshot/writer seams.
+    this.readWorktreeSnapshot =
+      typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
+    this.writeRow = writeRow ?? insertRow;
+  }
+
+  private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
+  private readonly writeRow: TestRunRowWriter;
+
   onInit(ctx: Vitest): void {
     ensureLoopLagMonitor();
     this.isScratchConfig = computeIsScratchConfig(ctx);
-    this.worktreeBefore = captureWorktreeSnapshot();
+    this.worktreeBefore = this.readWorktreeSnapshot();
     this.flushed = false;
   }
 
@@ -584,8 +602,8 @@ export default class AdminTestRunsReporter implements Reporter {
 
     let worktreeDirty = true;
     try {
-      const before = this.worktreeBefore ? await this.worktreeBefore : await captureWorktreeSnapshot();
-      const after = await captureWorktreeSnapshot();
+      const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot();
+      const after = await this.readWorktreeSnapshot();
       worktreeDirty = computeWorktreeDirty(before, after);
     } catch {
       // D-007: missing proof of stability is dirty, never a false clean.
@@ -594,7 +612,7 @@ export default class AdminTestRunsReporter implements Reporter {
 
     const rows = this.pending.splice(0);
     await Promise.race([
-      Promise.allSettled(rows.map((row) => insertRow({ ...row, worktreeDirty }))),
+      Promise.allSettled(rows.map((row) => this.writeRow({ ...row, worktreeDirty }))),
       new Promise((r) => setTimeout(r, 5000)),
     ]);
   }
