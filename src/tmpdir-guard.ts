@@ -52,7 +52,80 @@
  * `/tmp/pcv` is short (socket paths stay ~55 chars), outside the repo, and marker-free up to `/`.
  */
 import { dirname, resolve } from 'node:path';
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, statfsSync, statSync } from 'node:fs';
+
+const GIB = 1024 ** 3;
+
+/**
+ * Reuse disk-space-alarm's CRITICAL knobs rather than adding a test-only policy surface. A
+ * warning-level filesystem may still have hundreds of GiB available on a large volume; the
+ * critical tier is the point at which committing a whole Vitest run to that filesystem is unsafe.
+ */
+export const DEFAULT_TMPDIR_CRITICAL_HEADROOM = Object.freeze({
+  freePctMin: 0.02,
+  freeBytesMin: 2 * GIB,
+});
+
+export interface TmpdirStatfs {
+  blocks: number | bigint;
+  bavail: number | bigint;
+  bsize: number | bigint;
+}
+
+export interface TmpdirGuardDeps {
+  hasCriticalHeadroom?: (dir: string, env: NodeJS.ProcessEnv) => boolean;
+}
+
+function positiveEnvNumber(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+): number {
+  const value = Number(env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * Does `dir` have enough byte headroom to host a new test run? Fail OPEN when statfs is
+ * unavailable: the existing mkdir+rm probe still catches an already-full/read-only path, while an
+ * unreadable metric must not make every test launcher unusable on a non-Linux or unusual sandbox.
+ */
+export function tmpdirHasCriticalHeadroom(
+  dir: string,
+  env: NodeJS.ProcessEnv = process.env,
+  readStatfs: (path: string) => TmpdirStatfs = (path) => statfsSync(path),
+): boolean {
+  try {
+    const fsst = readStatfs(dir);
+    const blockSize = Number(fsst.bsize);
+    const totalBytes = Number(fsst.blocks) * blockSize;
+    const freeBytes = Number(fsst.bavail) * blockSize;
+    if (
+      !Number.isFinite(totalBytes) ||
+      totalBytes <= 0 ||
+      !Number.isFinite(freeBytes) ||
+      freeBytes < 0
+    ) {
+      return true;
+    }
+
+    const freePctMin =
+      positiveEnvNumber(
+        env,
+        'PAPERCUSP_DISK_ALARM_CRITICAL_PCT',
+        DEFAULT_TMPDIR_CRITICAL_HEADROOM.freePctMin * 100,
+      ) / 100;
+    const freeBytesMin =
+      positiveEnvNumber(
+        env,
+        'PAPERCUSP_DISK_ALARM_CRITICAL_GB',
+        DEFAULT_TMPDIR_CRITICAL_HEADROOM.freeBytesMin / GIB,
+      ) * GIB;
+    return freeBytes >= freeBytesMin && freeBytes / totalBytes >= freePctMin;
+  } catch {
+    return true;
+  }
+}
 
 /**
  * Ordered TMPDIR candidates. `/tmp` first (short — keeps `sun_path` well under 108); `/dev/shm`
@@ -156,11 +229,25 @@ export function tmpdirNeedsOverride(cur: string | undefined): boolean {
  * starts it, i.e. in the launcher. See the module comment for why a call from inside
  * `vitest.config.ts` is too late for vitest's own cache root.
  */
-export function ensurePapercuspTmpdir(env: NodeJS.ProcessEnv = process.env): string | undefined {
+export function ensurePapercuspTmpdir(
+  env: NodeJS.ProcessEnv = process.env,
+  deps: TmpdirGuardDeps = {},
+): string | undefined {
   // Scrub before deciding: a stray empty `/tmp/.git` would make every candidate below look in-repo.
   scrubStrayEmptyGitMarker('/tmp');
 
-  if (!tmpdirNeedsOverride(env.TMPDIR)) return env.TMPDIR;
+  const hasCriticalHeadroom =
+    deps.hasCriticalHeadroom ??
+    ((dir: string, candidateEnv: NodeJS.ProcessEnv) =>
+      tmpdirHasCriticalHeadroom(dir, candidateEnv));
+
+  if (
+    env.TMPDIR &&
+    !tmpdirNeedsOverride(env.TMPDIR) &&
+    hasCriticalHeadroom(env.TMPDIR, env)
+  ) {
+    return env.TMPDIR;
+  }
 
   for (const candidate of PAPERCUSP_TMPDIR_CANDIDATES) {
     try {
@@ -168,7 +255,7 @@ export function ensurePapercuspTmpdir(env: NodeJS.ProcessEnv = process.env): str
     } catch {
       continue; // this candidate's parent is itself unwritable — try the next
     }
-    if (isWritableDir(candidate)) {
+    if (isWritableDir(candidate) && hasCriticalHeadroom(candidate, env)) {
       env.TMPDIR = candidate;
       return candidate;
     }

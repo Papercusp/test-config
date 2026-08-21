@@ -7,6 +7,7 @@ import {
   SHARED_TMP_ROOTS,
   ensurePapercuspTmpdir,
   isWritableDir,
+  tmpdirHasCriticalHeadroom,
   tmpdirIsInsideRepo,
   tmpdirNeedsOverride,
 } from './tmpdir-guard.ts';
@@ -112,6 +113,40 @@ describe('ensurePapercuspTmpdir', () => {
     const before = process.env.TMPDIR;
     ensurePapercuspTmpdir({ TMPDIR: '/tmp' });
     expect(process.env.TMPDIR).toBe(before);
+  });
+
+  it('skips a writable candidate on a critically-low filesystem and falls back', () => {
+    const env: NodeJS.ProcessEnv = { TMPDIR: '/tmp' };
+    const chosen = ensurePapercuspTmpdir(env, {
+      hasCriticalHeadroom: (dir) => dir !== '/tmp/pcv',
+    });
+    expect(chosen).toBe('/dev/shm/pcv');
+    expect(env.TMPDIR).toBe('/dev/shm/pcv');
+  });
+});
+
+describe('tmpdirHasCriticalHeadroom', () => {
+  const statfs = (blocks: number, freeBlocks: number) => () => ({
+    blocks,
+    bavail: freeBlocks,
+    bsize: 1024 ** 3,
+  });
+
+  it('rejects a huge filesystem below the shared critical percentage even with many GiB free', () => {
+    expect(tmpdirHasCriticalHeadroom('/tmp/pcv', {}, statfs(1_000, 19))).toBe(false);
+    expect(tmpdirHasCriticalHeadroom('/tmp/pcv', {}, statfs(1_000, 21))).toBe(true);
+  });
+
+  it('rejects a small filesystem below the shared absolute byte floor', () => {
+    expect(tmpdirHasCriticalHeadroom('/tmp/pcv', {}, statfs(20, 1))).toBe(false);
+  });
+
+  it('fails open when statfs is unavailable so the writability probe remains authoritative', () => {
+    expect(
+      tmpdirHasCriticalHeadroom('/tmp/pcv', {}, () => {
+        throw new Error('statfs unavailable');
+      }),
+    ).toBe(true);
   });
 });
 
