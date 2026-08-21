@@ -31,6 +31,11 @@
       "import": "./src/pg.ts",
       "default": "./src/pg.ts"
     },
+    "./tmpdir-guard": {
+      "types": "./src/tmpdir-guard.ts",
+      "import": "./src/tmpdir-guard.ts",
+      "default": "./src/tmpdir-guard.ts"
+    },
     "./admin-test-runs-reporter": {
       "types": "./src/admin-test-runs-reporter.ts",
       "import": "./src/admin-test-runs-reporter.ts",
