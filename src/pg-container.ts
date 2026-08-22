@@ -1,15 +1,9 @@
-import {
-  PostgreSqlContainer,
-  type StartedPostgreSqlContainer,
-} from "@testcontainers/postgresql";
-import postgres from "postgres";
-import { randomBytes } from "node:crypto";
-import { withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
-import { SubstrateCircuitBreaker } from "./substrate-circuit-breaker.ts";
-import {
-  RETRYABLE_PG_STARTUP_MSG,
-  withPgStartupRetry,
-} from "./pg-reachability.ts";
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import postgres from 'postgres';
+import { randomBytes } from 'node:crypto';
+import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
+import { SubstrateCircuitBreaker } from './substrate-circuit-breaker.ts';
+import { RETRYABLE_PG_STARTUP_MSG, withPgStartupRetry } from './pg-reachability.ts';
 
 let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
 
@@ -27,10 +21,7 @@ function substrateFailfastThreshold(): number {
   const n = raw ? Number(raw) : NaN;
   return Number.isInteger(n) && n >= 1 ? n : 3;
 }
-const substrateBreaker = new SubstrateCircuitBreaker(
-  substrateFailfastThreshold(),
-  "getTestPg (shared test Postgres)",
-);
+const substrateBreaker = new SubstrateCircuitBreaker(substrateFailfastThreshold(), 'getTestPg (shared test Postgres)');
 
 /**
  * A stable, human-readable descriptor of WHICH container an error came from
@@ -45,9 +36,9 @@ function describeContainer(container: StartedPostgreSqlContainer): string {
   const safe = (fn: () => unknown): string => {
     try {
       const v = fn();
-      return v == null ? "?" : String(v);
+      return v == null ? '?' : String(v);
     } catch {
-      return "?";
+      return '?';
     }
   };
   const id = safe(() => container.getId()).slice(0, 12);
@@ -74,9 +65,7 @@ export async function withContainerRecoveryReResolution<T>(
 ): Promise<T> {
   const maxResolutions = options.maxResolutions ?? 2;
   if (!Number.isInteger(maxResolutions) || maxResolutions < 1) {
-    throw new Error(
-      `withContainerRecoveryReResolution: maxResolutions must be a positive integer`,
-    );
+    throw new Error(`withContainerRecoveryReResolution: maxResolutions must be a positive integer`);
   }
 
   let container = await resolve();
@@ -86,10 +75,7 @@ export async function withContainerRecoveryReResolution<T>(
       return container;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (
-        !RETRYABLE_PG_STARTUP_MSG.test(message) ||
-        resolution >= maxResolutions
-      ) {
+      if (!RETRYABLE_PG_STARTUP_MSG.test(message) || resolution >= maxResolutions) {
         throw error;
       }
       await retire(container);
@@ -107,7 +93,7 @@ export async function withContainerRecoveryReResolution<T>(
  * what stranded the gym on pg16 while the test infra + operator moved to pg18
  * (EI-8784); gym-provision-image.test.ts asserts they stay in lockstep.
  */
-export const TEST_PG_IMAGE = "pgvector/pgvector:pg18";
+export const TEST_PG_IMAGE = 'pgvector/pgvector:pg18';
 
 // Framework roles, ensured CREATE-OR-FIX (login + correct password) once per container.
 // The container is shared + REUSED, and roles are cluster-global. Some tests historically
@@ -210,148 +196,139 @@ export async function getTestPg(): Promise<string> {
     // the packaged desktop uncaught. pgvector/pgvector:pg18 exists on Docker Hub
     // (verified via `docker manifest inspect` + a version pull: reports
     // "PostgreSQL 18.4 (Debian 18.4-1.pgdg12+1)" — same major as the shipped 18.3).
-    containerPromise = withTestcontainerStartLock(
-      "shared-docker-testcontainers-start",
-      () =>
-        withContainerRecoveryReResolution(
-          () =>
-            new PostgreSqlContainer(TEST_PG_IMAGE)
-              .withDatabase("papercusp_test")
-              // WI-4133: this ONE container is `.withReuse()`d by EVERY vitest
-              // process on the box (all forks, all packages, ~30+ fleet agents at
-              // once) — each opening its own client pool (createFreshPgDb: max 4;
-              // createFreshTestDb/migrated variants similar). The stock PG default
-              // `max_connections=100` (sized for a laptop, per the analogous fix
-              // for the operator's own DB — see agent-insights
-              // pg-connection-exhaustion-too-many-clients) is trivially blown past
-              // by fleet-wide concurrency, surfacing as "sorry, too many clients
-              // already" in heavy operator-boot integration suites (gym
-              // autoloop-cycle, etc.) even though WI-3821's CPU-load admission
-              // gate is healthy — that gate staggers *host load*, not *PG
-              // connection count*, so it does not prevent this. Raising the
-              // ceiling on this test-only container is free (no production data,
-              // no persistence to protect) and mirrors the native-PG fix exactly.
-              .withCommand(["postgres", "-c", "max_connections=500"])
-              // EI-21116464706451765: @testcontainers/postgresql's stock healthcheck
-              // runs `pg_isready` INSIDE this PID-1-postmaster container. During
-              // crash recovery it exits 2 as an unknown postmaster child, which
-              // makes Postgres terminate every server process and restart recovery;
-              // the 250ms healthcheck then repeats the crash indefinitely. Keep the
-              // Docker health bit non-destructive and let the host-side
-              // FRAMEWORK_ROLES_DDL loop below own real SQL readiness. The sibling
-              // listening-port wait still prevents returning before the TCP port is
-              // published, and the host loop refuses until Postgres is writable.
-              .withHealthCheck({
-                test: ["CMD-SHELL", "exit 0"],
-                interval: 1000,
-                timeout: 1000,
-                retries: 1,
-              })
-              .withReuse()
-              .start(),
-          async (container) => {
-            // Heal the cluster-global framework roles once per container (see above).
-            //
-            // RETRY ON "in recovery mode" — this container is `.withReuse()`d across
-            // EVERY concurrent vitest process on the box (all forks of this run, other
-            // packages' concurrent runs, the green-checkpoint, ~30+ fleet agents at
-            // once). Docker's reuse-hash matching isn't perfectly stable under that much
-            // concurrent churn, so a fresh `docker ps` regularly shows several
-            // short-lived pgvector/pgvector:pg18 containers being created/torn down
-            // side-by-side with the long-lived ones — and this process can attach to
-            // one that is mid-startup crash-recovery (WAL redo), a normal but BRIEF
-            // (sub-second to a few seconds) PG state, not a real outage (WI-3578 live
-            // finding, 2026-07-09: 3 consecutive integration-test runs on a healthy,
-            // unloaded box each hit `FATAL: the database system is in recovery mode`
-            // on the FIRST framework-role-ensure attempt, then succeeded once retried).
-            // A bounded retry rides out the window instead of failing every concurrent
-            // suite that happens to touch the container during it.
-            //
-            // TIME-BOUNDED, not attempt-count-bounded (WI-5254/WI-5256, 2026-07-17):
-            // the original fixed 6-attempt/~10.5s budget (500ms*attempt backoff) was
-            // sized for the "healthy, unloaded box" case above — but under today's much
-            // heavier fleet load (50+ concurrent agents) the recovery window regularly
-            // outlasts it: harness_shared.test_runs shows curation-state.integration and
-            // render-templates.integration each failing on this exact "in recovery mode"
-            // message with durations of 8.2-10.0s, i.e. exhausting the full old budget
-            // and then failing anyway. Ride out a LONGER window (up to 30s total) with
-            // backoff capped at 3s/attempt, so a slower-but-still-transient recovery
-            // still resolves instead of flaking the whole suite. This does not weaken
-            // the SubstrateCircuitBreaker above it — a genuinely-down substrate still
-            // trips that after `threshold` fully-exhausted acquisitions; it just makes
-            // each individual exhaustion a truer signal of "actually down" rather than
-            // "recovery took longer than an arbitrary 10s".
-            //
-            // ALSO RETRY ON "not yet accepting connections" (WI-5263, 2026-07-17): an
-            // EARLIER point in the same PG startup sequence than "in recovery mode" —
-            // `FATAL: the database system is not yet accepting connections / DETAIL:
-            // Consistent recovery state has not been yet reached` — observed in
-            // engineer-issues-view-dml.integration.test.ts's quarantine history with
-            // the identical "attach mid-restart" mechanism as above. Same transient
-            // class, same budget.
-            //
-            // HOST-SIDE CLIENT, NOT `container.exec(['psql', ...])` (EI-18680404964770187,
-            // 2026-07-26): the old implementation ran psql INSIDE the container, where it
-            // is reparented to PID 1 (the postmaster in this image). Postgres reaps
-            // UNKNOWN children in HandleChildCrash/CleanupBackend — an in-container psql
-            // that exits nonzero (e.g. the exact "in recovery mode" FATAL this loop is
-            // retrying) is treated as a crashed backend and makes the postmaster kill
-            // every active server process and force a full crash-recovery cycle
-            // (observed outage window ~3min, ~6x this loop's own 30s budget). Worse,
-            // EVERY retry attempt while recovering is itself another in-container exec
-            // that can exit nonzero and re-trigger the same crash — the retry loop was
-            // feeding the fault it was trying to ride out, and under fleet load N
-            // concurrent agents amplify each other. The container already publishes a
-            // host port (`getConnectionUri()`, used two lines below this block anyway),
-            // so run the DDL from a normal `postgres` client against that TCP port
-            // instead: a failed host-side connection is just a rejected promise — it can
-            // never be reaped by the postmaster and can never restart the cluster.
-            const RETRY_BUDGET_MS = 30_000;
-            const RETRYABLE_STARTUP_MSG =
-              /in recovery mode|not yet accepting connections|connection.*(refused|terminated|closed)|ECONNREFUSED|ECONNRESET|ETIMEDOUT/i;
-            const retryStartedAt = Date.now();
-            let lastErr: unknown;
-            for (let attempt = 1; ; attempt++) {
-              const admin = postgres(container.getConnectionUri(), {
-                max: 1,
-                onnotice: () => {},
-                connect_timeout: 10,
-              });
-              try {
-                await admin.unsafe(FRAMEWORK_ROLES_DDL);
-                lastErr = undefined;
-                break;
-              } catch (e) {
-                lastErr = new Error(
-                  `getTestPg: framework-role ensure failed ${describeContainer(container)}: ` +
-                    `${e instanceof Error ? e.message : String(e)}`,
-                  { cause: e },
-                );
-              } finally {
-                await admin.end({ timeout: 5 }).catch(() => {});
-              }
-              const msg =
-                lastErr instanceof Error ? lastErr.message : String(lastErr);
-              const elapsedMs = Date.now() - retryStartedAt;
-              if (
-                !RETRYABLE_STARTUP_MSG.test(msg) ||
-                elapsedMs >= RETRY_BUDGET_MS
-              ) {
-                throw lastErr;
-              }
-              await new Promise((r) =>
-                setTimeout(r, Math.min(attempt * 500, 3000)),
+    containerPromise = withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
+      withContainerRecoveryReResolution(
+        () =>
+          new PostgreSqlContainer(TEST_PG_IMAGE)
+            .withDatabase('papercusp_test')
+            // WI-4133: this ONE container is `.withReuse()`d by EVERY vitest
+            // process on the box (all forks, all packages, ~30+ fleet agents at
+            // once) — each opening its own client pool (createFreshPgDb: max 4;
+            // createFreshTestDb/migrated variants similar). The stock PG default
+            // `max_connections=100` (sized for a laptop, per the analogous fix
+            // for the operator's own DB — see agent-insights
+            // pg-connection-exhaustion-too-many-clients) is trivially blown past
+            // by fleet-wide concurrency, surfacing as "sorry, too many clients
+            // already" in heavy operator-boot integration suites (gym
+            // autoloop-cycle, etc.) even though WI-3821's CPU-load admission
+            // gate is healthy — that gate staggers *host load*, not *PG
+            // connection count*, so it does not prevent this. Raising the
+            // ceiling on this test-only container is free (no production data,
+            // no persistence to protect) and mirrors the native-PG fix exactly.
+            .withCommand(['postgres', '-c', 'max_connections=500'])
+            // EI-21116464706451765: @testcontainers/postgresql's stock healthcheck
+            // runs `pg_isready` INSIDE this PID-1-postmaster container. During
+            // crash recovery it exits 2 as an unknown postmaster child, which
+            // makes Postgres terminate every server process and restart recovery;
+            // the 250ms healthcheck then repeats the crash indefinitely. Keep the
+            // Docker health bit non-destructive and let the host-side
+            // FRAMEWORK_ROLES_DDL loop below own real SQL readiness. The sibling
+            // listening-port wait still prevents returning before the TCP port is
+            // published, and the host loop refuses until Postgres is writable.
+            .withHealthCheck({
+              test: ['CMD-SHELL', 'exit 0'],
+              interval: 1000,
+              timeout: 1000,
+              retries: 1,
+            })
+            .withReuse()
+            .start(),
+        async (container) => {
+          // Heal the cluster-global framework roles once per container (see above).
+          //
+          // RETRY ON "in recovery mode" — this container is `.withReuse()`d across
+          // EVERY concurrent vitest process on the box (all forks of this run, other
+          // packages' concurrent runs, the green-checkpoint, ~30+ fleet agents at
+          // once). Docker's reuse-hash matching isn't perfectly stable under that much
+          // concurrent churn, so a fresh `docker ps` regularly shows several
+          // short-lived pgvector/pgvector:pg18 containers being created/torn down
+          // side-by-side with the long-lived ones — and this process can attach to
+          // one that is mid-startup crash-recovery (WAL redo), a normal but BRIEF
+          // (sub-second to a few seconds) PG state, not a real outage (WI-3578 live
+          // finding, 2026-07-09: 3 consecutive integration-test runs on a healthy,
+          // unloaded box each hit `FATAL: the database system is in recovery mode`
+          // on the FIRST framework-role-ensure attempt, then succeeded once retried).
+          // A bounded retry rides out the window instead of failing every concurrent
+          // suite that happens to touch the container during it.
+          //
+          // TIME-BOUNDED, not attempt-count-bounded (WI-5254/WI-5256, 2026-07-17):
+          // the original fixed 6-attempt/~10.5s budget (500ms*attempt backoff) was
+          // sized for the "healthy, unloaded box" case above — but under today's much
+          // heavier fleet load (50+ concurrent agents) the recovery window regularly
+          // outlasts it: harness_shared.test_runs shows curation-state.integration and
+          // render-templates.integration each failing on this exact "in recovery mode"
+          // message with durations of 8.2-10.0s, i.e. exhausting the full old budget
+          // and then failing anyway. Ride out a LONGER window (up to 30s total) with
+          // backoff capped at 3s/attempt, so a slower-but-still-transient recovery
+          // still resolves instead of flaking the whole suite. This does not weaken
+          // the SubstrateCircuitBreaker above it — a genuinely-down substrate still
+          // trips that after `threshold` fully-exhausted acquisitions; it just makes
+          // each individual exhaustion a truer signal of "actually down" rather than
+          // "recovery took longer than an arbitrary 10s".
+          //
+          // ALSO RETRY ON "not yet accepting connections" (WI-5263, 2026-07-17): an
+          // EARLIER point in the same PG startup sequence than "in recovery mode" —
+          // `FATAL: the database system is not yet accepting connections / DETAIL:
+          // Consistent recovery state has not been yet reached` — observed in
+          // engineer-issues-view-dml.integration.test.ts's quarantine history with
+          // the identical "attach mid-restart" mechanism as above. Same transient
+          // class, same budget.
+          //
+          // HOST-SIDE CLIENT, NOT `container.exec(['psql', ...])` (EI-18680404964770187,
+          // 2026-07-26): the old implementation ran psql INSIDE the container, where it
+          // is reparented to PID 1 (the postmaster in this image). Postgres reaps
+          // UNKNOWN children in HandleChildCrash/CleanupBackend — an in-container psql
+          // that exits nonzero (e.g. the exact "in recovery mode" FATAL this loop is
+          // retrying) is treated as a crashed backend and makes the postmaster kill
+          // every active server process and force a full crash-recovery cycle
+          // (observed outage window ~3min, ~6x this loop's own 30s budget). Worse,
+          // EVERY retry attempt while recovering is itself another in-container exec
+          // that can exit nonzero and re-trigger the same crash — the retry loop was
+          // feeding the fault it was trying to ride out, and under fleet load N
+          // concurrent agents amplify each other. The container already publishes a
+          // host port (`getConnectionUri()`, used two lines below this block anyway),
+          // so run the DDL from a normal `postgres` client against that TCP port
+          // instead: a failed host-side connection is just a rejected promise — it can
+          // never be reaped by the postmaster and can never restart the cluster.
+          const RETRY_BUDGET_MS = 30_000;
+          const RETRYABLE_STARTUP_MSG =
+            /in recovery mode|not yet accepting connections|connection.*(refused|terminated|closed)|ECONNREFUSED|ECONNRESET|ETIMEDOUT/i;
+          const retryStartedAt = Date.now();
+          let lastErr: unknown;
+          for (let attempt = 1; ; attempt++) {
+            const admin = postgres(container.getConnectionUri(), {
+              max: 1,
+              onnotice: () => {},
+              connect_timeout: 10,
+            });
+            try {
+              await admin.unsafe(FRAMEWORK_ROLES_DDL);
+              lastErr = undefined;
+              break;
+            } catch (e) {
+              lastErr = new Error(
+                `getTestPg: framework-role ensure failed ${describeContainer(container)}: ` +
+                  `${e instanceof Error ? e.message : String(e)}`,
+                { cause: e },
               );
+            } finally {
+              await admin.end({ timeout: 5 }).catch(() => {});
             }
-            return container;
-          },
-          async (container) => {
-            // The reusable-container lookup only considers RUNNING containers. Stop
-            // the exhausted candidate before the next resolve so it cannot be
-            // selected again by the reuse hash.
-            await container.stop();
-          },
-        ),
+            const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+            const elapsedMs = Date.now() - retryStartedAt;
+            if (!RETRYABLE_STARTUP_MSG.test(msg) || elapsedMs >= RETRY_BUDGET_MS) {
+              throw lastErr;
+            }
+            await new Promise((r) => setTimeout(r, Math.min(attempt * 500, 3000)));
+          }
+        },
+        async (container) => {
+          // The reusable-container lookup only considers RUNNING containers. Stop
+          // the exhausted candidate before the next resolve so it cannot be
+          // selected again by the reuse hash.
+          await container.stop();
+        },
+      ),
     )
       .then((container) => {
         // Substrate reachable — reset the fail-fast streak. Recorded here (once
@@ -393,7 +370,7 @@ export async function getTestPg(): Promise<string> {
  * while nothing is running — never for a suite.
  */
 export async function teardownTestPg(): Promise<void> {
-  if (process.env.FORCE_TEST_PG_TEARDOWN !== "1") return;
+  if (process.env.FORCE_TEST_PG_TEARDOWN !== '1') return;
   if (containerPromise) {
     const c = await containerPromise;
     await c.stop();
@@ -417,6 +394,6 @@ export interface TestSchemaHandle {
  */
 export async function withTestSchema(): Promise<TestSchemaHandle> {
   const connectionUri = await getTestPg();
-  const schema = `t_${randomBytes(6).toString("hex")}`;
+  const schema = `t_${randomBytes(6).toString('hex')}`;
   return { schema, connectionUri };
 }
