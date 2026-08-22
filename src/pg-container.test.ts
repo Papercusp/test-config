@@ -28,6 +28,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { withContainerRecoveryReResolution } from './pg-container.ts';
 
 const SOURCE = readFileSync(fileURLToPath(new URL('./pg-container.ts', import.meta.url)), 'utf8');
 
@@ -106,5 +107,103 @@ describe('getTestPg no-docker escape hatch (EI-10533)', () => {
     expect(SOURCE).toMatch(/no-docker escape hatch.*framework-role ensure/s);
     expect(SOURCE).toMatch(/shared-infra churn/);
     expect(SOURCE).toMatch(/EI-10533/);
+  });
+});
+
+describe('withContainerRecoveryReResolution', () => {
+  it('retires a retryable failed candidate and resolves a fresh one', async () => {
+    const resolved = ['wedged', 'fresh'];
+    const ensured: string[] = [];
+    const retired: string[] = [];
+
+    const result = await withContainerRecoveryReResolution(
+      async () => resolved.shift()!,
+      async (container) => {
+        ensured.push(container);
+        if (container === 'wedged') throw new Error('FATAL: the database system is in recovery mode');
+      },
+      async (container) => {
+        retired.push(container);
+      },
+    );
+
+    expect(result).toBe('fresh');
+    expect(ensured).toEqual(['wedged', 'fresh']);
+    expect(retired).toEqual(['wedged']);
+  });
+
+  it('does not retire or re-resolve a non-retryable ensure failure', async () => {
+    let resolveCount = 0;
+    const retired: string[] = [];
+
+    await expect(
+      withContainerRecoveryReResolution(
+        async () => {
+          resolveCount += 1;
+          return 'candidate';
+        },
+        async () => {
+          throw new Error('password authentication failed');
+        },
+        async (container) => {
+          retired.push(container);
+        },
+      ),
+    ).rejects.toThrow('password authentication failed');
+
+    expect(resolveCount).toBe(1);
+    expect(retired).toEqual([]);
+  });
+
+  it('honors the maximum number of resolutions', async () => {
+    let resolveCount = 0;
+    let retireCount = 0;
+
+    await expect(
+      withContainerRecoveryReResolution(
+        async () => {
+          resolveCount += 1;
+          return `candidate-${resolveCount}`;
+        },
+        async () => {
+          throw new Error('ECONNREFUSED: database connection refused');
+        },
+        async () => {
+          retireCount += 1;
+        },
+        { maxResolutions: 2 },
+      ),
+    ).rejects.toThrow('ECONNREFUSED');
+
+    expect(resolveCount).toBe(2);
+    expect(retireCount).toBe(1);
+  });
+
+  it('rejects a non-positive resolution limit before resolving', async () => {
+    let resolveCount = 0;
+
+    await expect(
+      withContainerRecoveryReResolution(
+        async () => {
+          resolveCount += 1;
+          return 'candidate';
+        },
+        async () => {},
+        async () => {},
+        { maxResolutions: 0 },
+      ),
+    ).rejects.toThrow('maxResolutions must be a positive integer');
+
+    expect(resolveCount).toBe(0);
+  });
+});
+
+describe('getTestPg reused-container recovery re-resolution', () => {
+  it('serializes start, readiness ensure, retirement, and re-resolution', () => {
+    expect(SOURCE).toMatch(
+      /withTestcontainerStartLock\(\s*['"]shared-docker-testcontainers-start['"][\s\S]*withContainerRecoveryReResolution\(/,
+    );
+    expect(SOURCE).toMatch(/withContainerRecoveryReResolution\([\s\S]*async \(container\) => \{/);
+    expect(SOURCE).toMatch(/await container\.stop\(\)/);
   });
 });
