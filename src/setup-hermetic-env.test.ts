@@ -34,6 +34,15 @@ describe('setup-hermetic-env: outbound telemetry is pinned off', () => {
     expect(readMem0TelemetryFlag(process.env)).toBe(false);
   });
 
+  it('scrubs the live listener bind so route tests stay on the hermetic loopback policy', () => {
+    // A spawned operator can export PAPERCUSP_BIND_HOST=0.0.0.0. Carrying that
+    // production bind into a unit worker makes currentRemoteAuthPolicy throw
+    // before auth handlers run unless the full remote-admin origin policy is
+    // also present. The test default is loopback; remote-policy tests pass
+    // explicit env objects or set the variable themselves.
+    expect(process.env.PAPERCUSP_BIND_HOST).toBeUndefined();
+  });
+
   // CONTROLS — deliberately-wrong values, kept permanently. If these ever pass
   // as "disabled", the gate transcription above has drifted from mem0ai and the
   // calibration case above is no longer proving anything.

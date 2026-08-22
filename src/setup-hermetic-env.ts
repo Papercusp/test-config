@@ -184,6 +184,13 @@ if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
 delete process.env.PAPERCUSP_BACKGROUND_WORKERS;
 delete process.env.PAPERCUSP_HONO_PORT;
 delete process.env.PORT;
+// Spawned operator sessions carry the live listener bind into child tests. A
+// fleet runner commonly uses `0.0.0.0`, but unit tests have no remote-admin
+// origin policy and `currentRemoteAuthPolicy()` intentionally throws for that
+// incomplete production configuration. Keep every test worker on the
+// loopback-default path; tests that exercise remote binding pass an explicit
+// env object or set the variable locally.
+delete process.env.PAPERCUSP_BIND_HOST;
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_POT_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
