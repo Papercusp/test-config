@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -164,15 +164,22 @@ describe('test launchers apply the TMPDIR policy before they spawn vitest', () =
   // (scripts/mutation-probe.sh tier 2) instead of mutating the shared checkout, where git-sync's
   // sweep can commit the mutant even when nothing goes wrong. Defaults to the real thing.
   const LAUNCHER_ROOT = process.env.PC_TMPDIR_GUARD_LAUNCHER_ROOT ?? REPO_ROOT;
+  const HOST_LAUNCHERS = LAUNCHERS.filter((rel) => existsSync(join(LAUNCHER_ROOT, rel)));
   // Any child-process invocation (the import statement carries no `(`, so it never matches).
   const INVOCATION = /\b(?:spawnSync|spawn|execSync|execFileSync)\s*\(/;
 
-  it.each(LAUNCHERS)('%s imports ensurePapercuspTmpdir from the guard module', (rel) => {
+  it('checks either the complete Papercusp launcher pair or no host launchers', () => {
+    // test-config is a shared library: SideStage does not own Papercusp's two
+    // launchers, while a Papercusp checkout must never silently lose only one.
+    expect(HOST_LAUNCHERS).toEqual(HOST_LAUNCHERS.length === 0 ? [] : [...LAUNCHERS]);
+  });
+
+  it.each(HOST_LAUNCHERS)('%s imports ensurePapercuspTmpdir from the guard module', (rel) => {
     const src = readFileSync(join(LAUNCHER_ROOT, rel), 'utf8');
     expect(src).toMatch(/import\s*\{[^}]*ensurePapercuspTmpdir[^}]*\}\s*from\s*['"][^'"]*tmpdir-guard\.ts['"]/);
   });
 
-  it.each(LAUNCHERS)('%s CALLS ensurePapercuspTmpdir() before any child-process spawn', (rel) => {
+  it.each(HOST_LAUNCHERS)('%s CALLS ensurePapercuspTmpdir() before any child-process spawn', (rel) => {
     const src = readFileSync(join(LAUNCHER_ROOT, rel), 'utf8');
     const callIdx = src.indexOf('ensurePapercuspTmpdir()');
     expect(callIdx, `${rel} never calls ensurePapercuspTmpdir()`).toBeGreaterThan(-1);
