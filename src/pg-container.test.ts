@@ -55,6 +55,26 @@ describe('getTestPg framework-role ensure (EI-18680404964770187)', () => {
   });
 });
 
+describe('getTestPg container healthcheck (EI-21116464706451765)', () => {
+  it('never runs pg_isready inside the PID-1-postmaster container', () => {
+    // The stock @testcontainers/postgresql healthcheck is destructive during
+    // recovery: its nonzero child exit makes Postgres restart recovery again.
+    // A harmless Docker liveness bit is sufficient because getTestPg performs
+    // the authoritative SQL readiness probe from the host immediately after.
+    expect(SOURCE).toMatch(/\.withHealthCheck\(\{[\s\S]*?test:\s*\['CMD-SHELL',\s*'exit 0'\]/);
+    const healthcheckBlock = SOURCE.match(/\.withHealthCheck\(\{[\s\S]*?\}\)/)?.[0] ?? '';
+    expect(healthcheckBlock).not.toContain('pg_isready');
+  });
+
+  it('keeps host-side SQL readiness after the non-destructive Docker healthcheck', () => {
+    const healthcheckIdx = SOURCE.indexOf("test: ['CMD-SHELL', 'exit 0']");
+    const hostProbeIdx = SOURCE.indexOf('postgres(container.getConnectionUri()');
+    expect(healthcheckIdx).toBeGreaterThan(-1);
+    expect(hostProbeIdx).toBeGreaterThan(healthcheckIdx);
+    expect(SOURCE).toMatch(/admin\.unsafe\(FRAMEWORK_ROLES_DDL\)/);
+  });
+});
+
 /**
  * Regression guard for EI-10533: the no-docker escape-hatch path
  * (`PAPERCUSP_TEST_PG_ADMIN_URL` — a bare `postgres` admin client against the

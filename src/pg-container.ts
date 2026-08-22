@@ -178,6 +178,21 @@ export async function getTestPg(): Promise<string> {
           // ceiling on this test-only container is free (no production data,
           // no persistence to protect) and mirrors the native-PG fix exactly.
           .withCommand(['postgres', '-c', 'max_connections=500'])
+          // EI-21116464706451765: @testcontainers/postgresql's stock healthcheck
+          // runs `pg_isready` INSIDE this PID-1-postmaster container. During
+          // crash recovery it exits 2 as an unknown postmaster child, which
+          // makes Postgres terminate every server process and restart recovery;
+          // the 250ms healthcheck then repeats the crash indefinitely. Keep the
+          // Docker health bit non-destructive and let the host-side
+          // FRAMEWORK_ROLES_DDL loop below own real SQL readiness. The sibling
+          // listening-port wait still prevents returning before the TCP port is
+          // published, and the host loop refuses until Postgres is writable.
+          .withHealthCheck({
+            test: ['CMD-SHELL', 'exit 0'],
+            interval: 1000,
+            timeout: 1000,
+            retries: 1,
+          })
           .withReuse()
           .start(),
       );
