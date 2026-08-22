@@ -3,7 +3,7 @@ import postgres from 'postgres';
 import { randomBytes } from 'node:crypto';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 import { SubstrateCircuitBreaker } from './substrate-circuit-breaker.ts';
-import { withPgStartupRetry } from './pg-reachability.ts';
+import { RETRYABLE_PG_STARTUP_MSG, withPgStartupRetry } from './pg-reachability.ts';
 
 let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
 
@@ -48,6 +48,43 @@ function describeContainer(container: StartedPostgreSqlContainer): string {
   const host = safe(() => container.getHost());
   const port = safe(() => container.getMappedPort(5432));
   return `[testcontainer ${id} @ ${host}:${port}]`;
+}
+
+/**
+ * Re-resolve a reused container after its bounded startup retry is exhausted.
+ *
+ * `withReuse()` resolves by configuration hash, not by database readiness. A
+ * running-but-wedged container therefore keeps being returned to every caller;
+ * waiting longer only makes the same dead endpoint fail more slowly. Retiring
+ * the candidate first makes the next resolve skip it and provision a fresh
+ * container. The caller owns the bounded retry inside `ensure` and only calls
+ * this helper after that retry has actually exhausted.
+ */
+export async function withContainerRecoveryReResolution<T>(
+  resolve: () => Promise<T>,
+  ensure: (container: T) => Promise<void>,
+  retire: (container: T) => Promise<void>,
+  options: { maxResolutions?: number } = {},
+): Promise<T> {
+  const maxResolutions = options.maxResolutions ?? 2;
+  if (!Number.isInteger(maxResolutions) || maxResolutions < 1) {
+    throw new Error(`withContainerRecoveryReResolution: maxResolutions must be a positive integer`);
+  }
+
+  let container = await resolve();
+  for (let resolution = 1; ; resolution++) {
+    try {
+      await ensure(container);
+      return container;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!RETRYABLE_PG_STARTUP_MSG.test(message) || resolution >= maxResolutions) {
+        throw error;
+      }
+      await retire(container);
+      container = await resolve();
+    }
+  }
 }
 
 /**
