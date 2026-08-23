@@ -112,6 +112,14 @@
  * `lstatSync` fixes it and is the more correct call anyway — the question is how
  * old the ENTRY we may remove is, never how old its target is.
  *
+ * The trade-off, stated so nobody has to rediscover it: a symlink's own mtime is
+ * fixed at creation and never advances, so a link is now judged on its age rather
+ * than on its target's. A link created beside a target that is still being written
+ * therefore ages out on schedule instead of being held alive by that target. That
+ * is the same rule every other non-pid entry at this root already lives under, and
+ * the same 4h threshold bounds it — a test run long enough to be hurt by it is
+ * already far outside what GENERIC_SCRATCH_SWEEP_MAX_AGE_MS is scoped to protect.
+ *
  * ── Why the sweep is safe (it must never delete a LIVE peer's dir) ───────────
  * The dir name carries its creator's pid, so liveness is a `kill(pid, 0)` away.
  * Three guards keep a false reap out of reach:
