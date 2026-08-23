@@ -28,7 +28,6 @@ import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { exec } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
-import { monitorEventLoopDelay } from 'node:perf_hooks';
 
 /**
  * EI-19307211919650123: classify the `.git` entry at `dir` for the root walk.
@@ -236,38 +235,18 @@ export interface TestRunRow {
 export type WorktreeSnapshotReader = () => Promise<WorktreeGitSnapshot>;
 export type TestRunRowWriter = (row: TestRunRow) => Promise<void>;
 
-let _loopLagMonitor: ReturnType<typeof monitorEventLoopDelay> | null = null;
-
-function ensureLoopLagMonitor(): void {
-  if (_loopLagMonitor) return;
-  try {
-    _loopLagMonitor = monitorEventLoopDelay({ resolution: 20 });
-    _loopLagMonitor.enable();
-  } catch {
-    _loopLagMonitor = null;
-  }
-}
-
 export function captureReporterSaturationSnapshot(): { loopLagP95Ms: number | null; rssMb: number | null } {
-  let loopLagP95Ms: number | null = null;
-  try {
-    ensureLoopLagMonitor();
-    const p95Ns = _loopLagMonitor?.percentile(95);
-    if (typeof p95Ns === 'number' && Number.isFinite(p95Ns)) {
-      loopLagP95Ms = Math.round((p95Ns / 1_000_000) * 10) / 10;
-    }
-    _loopLagMonitor?.reset();
-  } catch {
-    loopLagP95Ms = null;
-  }
-
+  // This reporter is a child process. Its event loop is mostly idle while
+  // Vitest workers run, so it cannot measure the operator host loop used by
+  // testing:runs' critical-band classifier. Persist no false-provenance
+  // sample; the reader will expose saturationSuspect as unknown.
   let rssMb: number | null = null;
   try {
     rssMb = Math.round((process.memoryUsage().rss / 1_048_576) * 10) / 10;
   } catch {
     rssMb = null;
   }
-  return { loopLagP95Ms, rssMb };
+  return { loopLagP95Ms: null, rssMb };
 }
 
 /**
@@ -566,7 +545,6 @@ export default class AdminTestRunsReporter implements Reporter {
   private readonly writeRow: TestRunRowWriter;
 
   onInit(ctx: Vitest): void {
-    ensureLoopLagMonitor();
     this.isScratchConfig = computeIsScratchConfig(ctx);
     this.worktreeBefore = this.readWorktreeSnapshot();
     this.flushed = false;

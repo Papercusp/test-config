@@ -112,7 +112,10 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
   it('captures the reporter saturation fields used by harness_shared.test_runs', () => {
     const snap = captureReporterSaturationSnapshot();
     expect(snap.rssMb).toEqual(expect.any(Number));
-    expect(snap.loopLagP95Ms === null || typeof snap.loopLagP95Ms === 'number').toBe(true);
+    // The reporter is a child process and cannot observe the operator host
+    // loop that testing:runs classifies. A local histogram would be an
+    // invalid positive-looking signal, so the provenance is explicitly null.
+    expect(snap.loopLagP95Ms).toBeNull();
   });
 
   it('does not record retired, scratch, or sibling-checkout test paths', () => {
