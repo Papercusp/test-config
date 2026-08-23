@@ -107,7 +107,7 @@
  *     creator's pid look alive. That merely delays the reap; MAX_AGE is the backstop
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** Never touch a dir younger than this — a peer may have just created it. */
@@ -258,7 +258,13 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
     const path = join(root, name);
     let ageMs: number;
     try {
-      ageMs = now - statSync(path).mtimeMs;
+      // lstat, NOT stat: stat FOLLOWS a symlink, so a link whose target this
+      // sweep already removed throws ENOENT here and takes the `continue` below —
+      // permanently unreachable, because nothing ever makes a dangling link
+      // stat-able again. See "dangling symlinks" in the module doc. lstat is also
+      // the right question regardless: we want the age of the ENTRY we may remove,
+      // never the age of whatever it points at.
+      ageMs = now - lstatSync(path).mtimeMs;
     } catch {
       continue; // vanished under us — a peer swept it first
     }
