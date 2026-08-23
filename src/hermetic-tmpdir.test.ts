@@ -17,11 +17,14 @@
  */
 import {
   existsSync,
+  lstatSync,
+  lutimesSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -310,6 +313,39 @@ describe('sweep window rotation (WI-41107)', () => {
     const result = sweepStaleTestScratch(root, { scanCap: CAP, startAt: 999 });
     expect(result.scanned).toBe(3);
     expect(result.removed).toBe(3);
+  });
+
+  /**
+   * The floor the rotation fix exposed: /tmp/pcv drained to ~5,400 entries and then
+   * stuck at 298 that ten full-cap sweeps removed zero of. All 298 were symlinks
+   * whose targets this sweep had already deleted — `statSync` follows the link,
+   * throws ENOENT, and takes the "a peer swept it first" branch forever.
+   */
+  it('reaps a stale DANGLING symlink instead of skipping it forever', () => {
+    const target = seedNamed('lockdom-abc123', STALE_MS);
+    const link = join(root, 'lockdom-abc123-link');
+    symlinkSync(target, link);
+    // Exactly how these arise in the wild: an earlier pass removed the target.
+    rmSync(target, { recursive: true, force: true });
+    const when = (Date.now() - STALE_MS) / 1000;
+    lutimesSync(link, when, when);
+
+    // Precondition — the link is present but un-stat-able, which is the trap.
+    expect(readdirSync(root)).toEqual(['lockdom-abc123-link']);
+    expect(() => statSync(link)).toThrow();
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+
+    expect(sweepStaleTestScratch(root, { scanCap: CAP }).removed).toBe(1);
+    expect(readdirSync(root)).toHaveLength(0);
+  });
+
+  it('KEEPS a young dangling symlink — lstat must not turn into an age-blind delete', () => {
+    const link = join(root, 'lockdom-young-link');
+    symlinkSync(join(root, 'gone'), link);
+    const when = (Date.now() - FRESH_MS) / 1000;
+    lutimesSync(link, when, when);
+    expect(sweepStaleTestScratch(root, { scanCap: CAP }).removed).toBe(0);
+    expect(readdirSync(root)).toEqual(['lockdom-young-link']);
   });
 
   it('is a no-op on an empty root — the rotation modulo cannot divide by zero', () => {

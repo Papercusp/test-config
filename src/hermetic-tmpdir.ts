@@ -96,6 +96,22 @@
  * host's 7d systemd-tmpfiles sweep — the measured population held ZERO entries
  * older than 7d, which is the fingerprint of that sweep doing the whole job.
  *
+ * ── Dangling symlinks: the residue the rotation fix exposed (WI-41107) ───────
+ * With rotation landed, /tmp/pcv drained 31,096 -> ~5,400 entries in ~13 minutes of
+ * ordinary fleet test traffic — and then stopped at a hard floor of 298 stale
+ * entries that ten consecutive full-cap sweeps removed ZERO of.
+ *
+ * All 298 were `lockdom-*-link` SYMLINKS pointing at dirs this sweep had itself
+ * already removed. The age probe was `statSync`, which FOLLOWS the link: on a
+ * dangling link it throws ENOENT and takes the "vanished under us — a peer swept
+ * it first" branch. That branch is right for a racing peer and exactly wrong here,
+ * because nothing ever makes a dangling link stat-able again: each one became
+ * immortal at the moment the sweep deleted its target, and only the host's 7d
+ * systemd-tmpfiles pass ever collected them.
+ *
+ * `lstatSync` fixes it and is the more correct call anyway — the question is how
+ * old the ENTRY we may remove is, never how old its target is.
+ *
  * ── Why the sweep is safe (it must never delete a LIVE peer's dir) ───────────
  * The dir name carries its creator's pid, so liveness is a `kill(pid, 0)` away.
  * Three guards keep a false reap out of reach:
