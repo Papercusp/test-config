@@ -62,6 +62,40 @@
  * The 'exit' handler is KEPT for the clean path — it is correct, it is cheap, and
  * it keeps the steady-state population near zero rather than one sweep-interval deep.
  *
+ * ── Why the scan window must ROTATE (WI-41107) — the sweep above was INERT ───
+ * The root-level sweep shipped above and then removed NOTHING for weeks. Measured
+ * 2026-08-23 on /tmp/pcv: 31,096 entries, 26,051 of them already past the 4h
+ * threshold — and a faithful simulation of one `sweepStaleTestScratch` pass
+ * reported `removed: 0`, with all 400 scanned entries in the 60s–4h "keep" band.
+ *
+ * The cause is that the scan always began at readdir index 0, so the scanCap
+ * window covered a FIXED 1.29% of the directory — and that particular slice is
+ * exactly the one that stays fresh. Median entry age by readdir-position decile:
+ *
+ *     decile 0 (where the window sat):  2.62h   ← under the 4h threshold
+ *     deciles 1-9:                     18.8h .. 40.6h
+ *
+ * Removing entries frees directory slots at the front of readdir order, and the
+ * next mkdtemp reuses those freed slots — so the front of the listing refills
+ * with brand-new dirs as fast as the sweeper clears it. The sweeper then re-scans
+ * that same refilling zone forever and never reaches the 98.7% of the directory
+ * holding the actual backlog. A cleaner that is pinned to the one region it just
+ * cleaned is not a cleaner; nothing about it looks broken from the inside, which
+ * is why it survived a full test suite and a code review.
+ *
+ * The fix is a RANDOM start offset per call, wrapping around the end — it keeps
+ * the per-process cost contract exactly (still `scanCap` stats, still a rounding
+ * error on the startup path) while making coverage of the whole directory a
+ * matter of time rather than impossible. Raising scanCap instead would have to
+ * reach 31k stats per test FILE to get the same coverage, which is the very cost
+ * scanCap exists to prevent; sorting by mtime would have to stat everything too.
+ *
+ * Note this is a COVERAGE fix, not a rate fix: with ~1,300 test processes/hour
+ * each clearing the stale share of a 400-entry window, a 26k backlog drains in
+ * minutes rather than never. What had actually been collecting these dirs was the
+ * host's 7d systemd-tmpfiles sweep — the measured population held ZERO entries
+ * older than 7d, which is the fingerprint of that sweep doing the whole job.
+ *
  * ── Why the sweep is safe (it must never delete a LIVE peer's dir) ───────────
  * The dir name carries its creator's pid, so liveness is a `kill(pid, 0)` away.
  * Three guards keep a false reap out of reach:
@@ -163,6 +197,14 @@ export interface SweepOptions {
    * See `sweepStaleTestScratch`, the only intended caller.
    */
   ageOnly?: boolean;
+  /**
+   * Readdir index to begin the `scanCap` window at, wrapping around the end.
+   * Defaults to a RANDOM index per call — see "why the scan window must rotate"
+   * in the module doc. Pass `0` (or any fixed index) to make a test deterministic;
+   * with `entries.length <= scanCap` the wrap covers everything either way, so
+   * only a test that deliberately overflows `scanCap` can observe the difference.
+   */
+  startAt?: number;
 }
 
 export interface SweepResult {
@@ -199,7 +241,17 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
     return result;
   }
 
-  for (const name of entries) {
+  // Rotate the scanCap window (see the module doc). `% entries.length` is only
+  // reached when there is at least one entry, so the modulo cannot divide by zero.
+  const startAt =
+    entries.length === 0
+      ? 0
+      : ((opts.startAt ?? Math.floor(Math.random() * entries.length)) % entries.length +
+          entries.length) %
+        entries.length;
+
+  for (let i = 0; i < entries.length; i++) {
+    const name = entries[(startAt + i) % entries.length];
     if (exclude?.has(name)) continue;
     if (result.scanned >= scanCap) break;
     result.scanned += 1;

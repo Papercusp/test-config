@@ -245,6 +245,84 @@ describe('sweepStaleTestScratch', () => {
   });
 });
 
+/**
+ * WI-41107: the scan window must ROTATE, or the sweeper is inert.
+ *
+ * Measured on the real /tmp/pcv: 31,096 entries, 26,051 of them past the 4h
+ * threshold, and one faithful sweep pass removed ZERO — because the window always
+ * started at readdir index 0, and freed slots at the front of readdir order are
+ * immediately reused by the next mkdtemp. The front of the listing therefore
+ * refills with fresh dirs as fast as the sweeper clears it, and the backlog behind
+ * it is never reached. Every existing test above passes against that defect: none
+ * of them overflows scanCap, so none can see it.
+ */
+describe('sweep window rotation (WI-41107)', () => {
+  const CAP = 5;
+  const FRESH_MS = HERMETIC_SWEEP_MIN_AGE_MS * 2;
+  const STALE_MS = GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000;
+
+  /** Seed `count` dirs, then age the first `CAP` in READDIR ORDER fresh and the rest stale. */
+  function seedFreshFrontStaleBacklog(count: number): void {
+    for (let i = 0; i < count; i++) seedNamed(`rot-${i}`, 0);
+    readdirSync(root).forEach((name, idx) => {
+      const when = (Date.now() - (idx < CAP ? FRESH_MS : STALE_MS)) / 1000;
+      utimesSync(join(root, name), when, when);
+    });
+  }
+
+  it('CONTROL: pinned at index 0, a fresh readdir front hides the entire stale backlog', () => {
+    // This is the shipped-but-inert behaviour, reproduced. It is what makes the
+    // rotation test below a real guard rather than a restatement of "old dirs go".
+    seedFreshFrontStaleBacklog(40);
+    const result = sweepStaleTestScratch(root, { scanCap: CAP, startAt: 0 });
+    expect(result.scanned).toBe(CAP);
+    expect(result.removed).toBe(0);
+    expect(readdirSync(root)).toHaveLength(40);
+  });
+
+  it('rotating the window reaches the backlog behind that same fresh front', () => {
+    seedFreshFrontStaleBacklog(40);
+    let removed = 0;
+    // Bounded well above the ~7 passes needed to cover 35 stale entries 5 at a
+    // time, so a slow-but-working rotation still finishes inside the loop.
+    for (let i = 0; i < 200 && readdirSync(root).length > CAP; i++) {
+      removed += sweepStaleTestScratch(root, { scanCap: CAP }).removed;
+    }
+    expect(removed).toBe(35);
+    // Only the fresh front survives — nothing under the age threshold was reaped.
+    expect(readdirSync(root)).toHaveLength(CAP);
+  });
+
+  it('still covers the whole directory in one pass when it fits inside scanCap', () => {
+    // The wrap must not cost coverage on a small root — that is every other test
+    // in this file, and it is why they keep passing with a random start index.
+    for (let i = 0; i < 3; i++) seedNamed(`small-${i}`, STALE_MS);
+    const result = sweepStaleTestScratch(root, { scanCap: CAP });
+    expect(result.scanned).toBe(3);
+    expect(result.removed).toBe(3);
+    expect(readdirSync(root)).toHaveLength(0);
+  });
+
+  it('accepts a startAt beyond the entry count without skipping work', () => {
+    // startAt is normalised modulo the entry count, so a stale caller index (or a
+    // directory that shrank under a retry) can never silently scan nothing.
+    for (let i = 0; i < 3; i++) seedNamed(`wrap-${i}`, STALE_MS);
+    const result = sweepStaleTestScratch(root, { scanCap: CAP, startAt: 999 });
+    expect(result.scanned).toBe(3);
+    expect(result.removed).toBe(3);
+  });
+
+  it('is a no-op on an empty root — the rotation modulo cannot divide by zero', () => {
+    expect(() => sweepStaleTestScratch(root, { scanCap: CAP })).not.toThrow();
+    expect(sweepStaleTestScratch(root, { scanCap: CAP })).toEqual({
+      scanned: 0,
+      removed: 0,
+      keptAlive: 0,
+      keptYoung: 0,
+    });
+  });
+});
+
 describe('createHermeticDir', () => {
   it('creates the root, mints a pid-stamped dir, and sweeps abandoned siblings first', () => {
     const nested = join(root, 'papercusp-voice-ipc-hermetic');
