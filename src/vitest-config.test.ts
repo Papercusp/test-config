@@ -40,6 +40,10 @@ describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
     );
     withArgv('lib/foo.integration.test.ts');
     expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
+      /from the repository root \(not the owning package cwd\)/,
+    );
+    withArgv('lib/foo.integration.test.ts');
+    expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
       /npm run test:file -- lib\/foo\.integration\.test\.ts/,
     );
   });
@@ -48,6 +52,10 @@ describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
     withArgv('lib/foo.browser.test.ts');
     expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
       /owning package's browser config is vitest\.browser\.config\.ts/,
+    );
+    withArgv('lib/foo.browser.test.ts');
+    expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
+      /from the repository root \(not the owning package cwd\)/,
     );
     withArgv('lib/foo.browser.test.ts');
     expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(
