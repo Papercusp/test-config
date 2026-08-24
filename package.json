@@ -26,6 +26,11 @@
       "import": "./src/vitest-config.ts",
       "default": "./src/vitest-config.ts"
     },
+    "./lane-split": {
+      "types": "./src/lane-split.ts",
+      "import": "./src/lane-split.ts",
+      "default": "./src/lane-split.ts"
+    },
     "./pg": {
       "types": "./src/pg.ts",
       "import": "./src/pg.ts",
