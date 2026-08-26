@@ -22,9 +22,7 @@ describe('teardownTestPg (WI-1992)', () => {
     // Still up: a fresh connection works after the call.
     const sql = postgres(uri, { max: 1, onnotice: () => {} });
     try {
-      const rows = (await sql.unsafe('SELECT 1 AS ok')) as Array<{
-        ok: number;
-      }>;
+      const rows = (await sql.unsafe('SELECT 1 AS ok')) as Array<{ ok: number }>;
       expect(rows[0]!.ok).toBe(1);
     } finally {
       await sql.end({ timeout: 5 });
@@ -38,7 +36,9 @@ describe('getTestPg DSM backing (WI-41781)', () => {
   itDockerContainer('keeps dynamic shared memory off the host-wide /dev/shm tmpfs', async () => {
     const sql = postgres(await getTestPg(), { max: 1, onnotice: () => {} });
     try {
-      const rows = await sql.unsafe<Array<{ dynamic_shared_memory_type: string }>>('SHOW dynamic_shared_memory_type');
+      const rows = await sql.unsafe<Array<{ dynamic_shared_memory_type: string }>>(
+        'SHOW dynamic_shared_memory_type',
+      );
       expect(rows[0]?.dynamic_shared_memory_type).toBe('mmap');
     } finally {
       await sql.end({ timeout: 5 });
