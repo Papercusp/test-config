@@ -215,7 +215,20 @@ export async function getTestPg(): Promise<string> {
             // connection count*, so it does not prevent this. Raising the
             // ceiling on this test-only container is free (no production data,
             // no persistence to protect) and mirrors the native-PG fix exactly.
-            .withCommand(['postgres', '-c', 'max_connections=500'])
+            .withCommand([
+              'postgres',
+              '-c',
+              'max_connections=500',
+              // WI-41781: POSIX DSM allocates parallel-query segments from the
+              // host's shared /dev/shm. Every reused test container on this box
+              // contends for that single 64 MiB tmpfs, so an otherwise ordinary
+              // 32 MiB segment can fail nondeterministically while fresh-schema
+              // migrations are running. mmap stores test-only DSM files in the
+              // container's data directory instead, isolating each container
+              // from the host-wide /dev/shm burst without changing production.
+              '-c',
+              'dynamic_shared_memory_type=mmap',
+            ])
             // EI-21116464706451765: @testcontainers/postgresql's stock healthcheck
             // runs `pg_isready` INSIDE this PID-1-postmaster container. During
             // crash recovery it exits 2 as an unknown postmaster child, which

@@ -29,3 +29,19 @@ describe('teardownTestPg (WI-1992)', () => {
     }
   });
 });
+
+describe('getTestPg DSM backing (WI-41781)', () => {
+  const itDockerContainer = process.env.PAPERCUSP_TEST_PG_ADMIN_URL ? it.skip : it;
+
+  itDockerContainer('keeps dynamic shared memory off the host-wide /dev/shm tmpfs', async () => {
+    const sql = postgres(await getTestPg(), { max: 1, onnotice: () => {} });
+    try {
+      const rows = await sql.unsafe<Array<{ dynamic_shared_memory_type: string }>>(
+        'SHOW dynamic_shared_memory_type',
+      );
+      expect(rows[0]?.dynamic_shared_memory_type).toBe('mmap');
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
+});
