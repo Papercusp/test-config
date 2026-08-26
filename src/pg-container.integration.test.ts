@@ -8,12 +8,12 @@
  * Deliberately does NOT exercise the FORCE_TEST_PG_TEARDOWN=1 escape hatch —
  * doing so would stop the shared container for real concurrent suites.
  */
-import { describe, expect, it } from 'vitest';
-import postgres from 'postgres';
-import { getTestPg, teardownTestPg } from './pg-container.ts';
+import { describe, expect, it } from "vitest";
+import postgres from "postgres";
+import { getTestPg, teardownTestPg } from "./pg-container.ts";
 
-describe('teardownTestPg (WI-1992)', () => {
-  it('does NOT stop the shared reused container from a test teardown', async () => {
+describe("teardownTestPg (WI-1992)", () => {
+  it("does NOT stop the shared reused container from a test teardown", async () => {
     const uri = await getTestPg();
 
     // The old behavior: any afterAll calling this stopped the box-shared container.
@@ -22,7 +22,9 @@ describe('teardownTestPg (WI-1992)', () => {
     // Still up: a fresh connection works after the call.
     const sql = postgres(uri, { max: 1, onnotice: () => {} });
     try {
-      const rows = (await sql.unsafe('SELECT 1 AS ok')) as Array<{ ok: number }>;
+      const rows = (await sql.unsafe("SELECT 1 AS ok")) as Array<{
+        ok: number;
+      }>;
       expect(rows[0]!.ok).toBe(1);
     } finally {
       await sql.end({ timeout: 5 });
@@ -30,18 +32,23 @@ describe('teardownTestPg (WI-1992)', () => {
   });
 });
 
-describe('getTestPg DSM backing (WI-41781)', () => {
-  const itDockerContainer = process.env.PAPERCUSP_TEST_PG_ADMIN_URL ? it.skip : it;
+describe("getTestPg DSM backing (WI-41781)", () => {
+  const itDockerContainer = process.env.PAPERCUSP_TEST_PG_ADMIN_URL
+    ? it.skip
+    : it;
 
-  itDockerContainer('keeps dynamic shared memory off the host-wide /dev/shm tmpfs', async () => {
-    const sql = postgres(await getTestPg(), { max: 1, onnotice: () => {} });
-    try {
-      const rows = await sql.unsafe<Array<{ dynamic_shared_memory_type: string }>>(
-        'SHOW dynamic_shared_memory_type',
-      );
-      expect(rows[0]?.dynamic_shared_memory_type).toBe('mmap');
-    } finally {
-      await sql.end({ timeout: 5 });
-    }
-  });
+  itDockerContainer(
+    "keeps dynamic shared memory off the host-wide /dev/shm tmpfs",
+    async () => {
+      const sql = postgres(await getTestPg(), { max: 1, onnotice: () => {} });
+      try {
+        const rows = await sql.unsafe<
+          Array<{ dynamic_shared_memory_type: string }>
+        >("SHOW dynamic_shared_memory_type");
+        expect(rows[0]?.dynamic_shared_memory_type).toBe("mmap");
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    },
+  );
 });
