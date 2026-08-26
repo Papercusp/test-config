@@ -68,7 +68,7 @@ describe("getTestPg container healthcheck (EI-21116464706451765)", () => {
     // A harmless Docker liveness bit is sufficient because getTestPg performs
     // the authoritative SQL readiness probe from the host immediately after.
     expect(SOURCE).toMatch(
-      /\.withHealthCheck\(\{[\s\S]*?test:\s*\['CMD-SHELL',\s*'exit 0'\]/,
+      /\.withHealthCheck\(\{[\s\S]*?test:\s*\[["']CMD-SHELL["'],\s*["']exit 0["']\]/,
     );
     const healthcheckBlock =
       SOURCE.match(/\.withHealthCheck\(\{[\s\S]*?\}\)/)?.[0] ?? "";
@@ -76,9 +76,11 @@ describe("getTestPg container healthcheck (EI-21116464706451765)", () => {
   });
 
   it("keeps host-side SQL readiness after the non-destructive Docker healthcheck", () => {
-    const healthcheckIdx = SOURCE.indexOf("test: ['CMD-SHELL', 'exit 0']");
-    const hostProbeIdx = SOURCE.indexOf(
-      "postgres(container.getConnectionUri()",
+    const healthcheckIdx = SOURCE.search(
+      /test:\s*\[["']CMD-SHELL["'],\s*["']exit 0["']\]/,
+    );
+    const hostProbeIdx = SOURCE.search(
+      /postgres\(\s*container\.getConnectionUri\(\)/,
     );
     expect(healthcheckIdx).toBeGreaterThan(-1);
     expect(hostProbeIdx).toBeGreaterThan(healthcheckIdx);
@@ -101,7 +103,7 @@ describe("getTestPg container healthcheck (EI-21116464706451765)", () => {
 describe("getTestPg no-docker escape hatch (EI-10533)", () => {
   it("wraps the PAPERCUSP_TEST_PG_ADMIN_URL role-ensure in the shared startup-retry helper", () => {
     expect(SOURCE).toMatch(
-      /import\s*\{[\s\S]*withPgStartupRetry[\s\S]*\}\s*from\s*'\.\/pg-reachability\.ts'/,
+      /import\s*\{[\s\S]*withPgStartupRetry[\s\S]*\}\s*from\s*["']\.\/pg-reachability\.ts["']/,
     );
     // The withPgStartupRetry(...) call must appear strictly BEFORE the
     // container-path's own retry loop comment block, i.e. inside the
