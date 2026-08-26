@@ -304,8 +304,6 @@ export async function getTestPg(): Promise<string> {
           // instead: a failed host-side connection is just a rejected promise — it can
           // never be reaped by the postmaster and can never restart the cluster.
           const RETRY_BUDGET_MS = 30_000;
-          const RETRYABLE_STARTUP_MSG =
-            /in recovery mode|not yet accepting connections|connection.*(refused|terminated|closed)|ECONNREFUSED|ECONNRESET|ETIMEDOUT/i;
           const retryStartedAt = Date.now();
           let lastErr: unknown;
           for (let attempt = 1; ; attempt++) {
@@ -329,7 +327,7 @@ export async function getTestPg(): Promise<string> {
             }
             const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
             const elapsedMs = Date.now() - retryStartedAt;
-            if (!RETRYABLE_STARTUP_MSG.test(msg) || elapsedMs >= RETRY_BUDGET_MS) {
+            if (!RETRYABLE_PG_STARTUP_MSG.test(msg) || elapsedMs >= RETRY_BUDGET_MS) {
               throw lastErr;
             }
             await new Promise((r) => setTimeout(r, Math.min(attempt * 500, 3000)));

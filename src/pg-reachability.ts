@@ -23,15 +23,16 @@
 import postgres from 'postgres';
 
 /**
- * Superset retryable-startup-error signature (EI-10533): recovery-mode /
- * not-yet-accepting-connections, plus the generic connection-drop shapes
+ * Superset retryable-startup-error signature (EI-10533 / WI-42246):
+ * recovery-mode / not-yet-accepting-connections / SQLSTATE 57P03's shorter
+ * "database system is starting up" wording, plus the generic connection-drop shapes
  * (ECONNREFUSED/ECONNRESET/ETIMEDOUT/"connection … refused|terminated|closed")
  * that pg-container.ts's shared-test-container retry loop already tolerates.
  * Exported so every bounded-retry call site (this probe, and
  * `withPgStartupRetry` below) shares ONE definition instead of drifting.
  */
 export const RETRYABLE_PG_STARTUP_MSG =
-  /in recovery mode|not yet accepting connections|connection.*(refused|terminated|closed)|ECONNREFUSED|ECONNRESET|ETIMEDOUT|connect_timeout|timeout/i;
+  /in recovery mode|not yet accepting connections|database system is starting up|connection.*(refused|terminated|closed)|ECONNREFUSED|ECONNRESET|ETIMEDOUT|connect_timeout|timeout/i;
 
 const RETRYABLE_MSG = RETRYABLE_PG_STARTUP_MSG;
 

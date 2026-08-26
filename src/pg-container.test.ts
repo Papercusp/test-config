@@ -51,6 +51,7 @@ describe('getTestPg framework-role ensure (EI-18680404964770187)', () => {
   it('still retries on the transient startup FATALs the old exec-based loop rode out', () => {
     expect(SOURCE).toMatch(/in recovery mode/);
     expect(SOURCE).toMatch(/not yet accepting connections/);
+    expect(SOURCE).toMatch(/RETRYABLE_PG_STARTUP_MSG\.test\(msg\)/);
   });
 });
 

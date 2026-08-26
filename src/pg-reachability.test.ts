@@ -53,6 +53,15 @@ describe('probePgReachable — EI-2627', () => {
     expect(unsafe).toHaveBeenCalledTimes(2);
   });
 
+  it('retries PostgreSQL 57P03 "database system is starting up", then succeeds', async () => {
+    unsafe.mockRejectedValueOnce(new Error('the database system is starting up')).mockResolvedValueOnce(undefined);
+    const resultPromise = probePgReachable('postgres://x', 5000);
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+    expect(result.ok).toBe(true);
+    expect(unsafe).toHaveBeenCalledTimes(2);
+  });
+
   it('retries an "in recovery mode" error and an ECONNREFUSED alike', async () => {
     unsafe
       .mockRejectedValueOnce(new Error('FATAL: the database system is in recovery mode'))
@@ -136,6 +145,17 @@ describe('withPgStartupRetry — EI-10533', () => {
     const op = vi
       .fn()
       .mockRejectedValueOnce(new Error('FATAL: the database system is in recovery mode'))
+      .mockResolvedValueOnce('ok');
+    const resultPromise = withPgStartupRetry(op, 5000);
+    await vi.runAllTimersAsync();
+    await expect(resultPromise).resolves.toBe('ok');
+    expect(op).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries PostgreSQL 57P03 "database system is starting up", then succeeds', async () => {
+    const op = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('FATAL: the database system is starting up'))
       .mockResolvedValueOnce('ok');
     const resultPromise = withPgStartupRetry(op, 5000);
     await vi.runAllTimersAsync();
