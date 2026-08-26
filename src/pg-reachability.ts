@@ -20,7 +20,7 @@
  * shared by both call sites so the retry-vs-fail-fast judgment (and the box's
  * `docker ps`-actionable diagnosis) lives in exactly one place.
  */
-import postgres from 'postgres';
+import postgres from "postgres";
 
 /**
  * Superset retryable-startup-error signature (EI-10533 / WI-42246):
@@ -51,13 +51,20 @@ export interface PgReachabilityResult {
  * (auth, "no such database", …) returns immediately — that is a genuine
  * staleness/config signal, not something a retry can ride out.
  */
-export async function probePgReachable(dsn: string, budgetMs = 15_000): Promise<PgReachabilityResult> {
+export async function probePgReachable(
+  dsn: string,
+  budgetMs = 15_000,
+): Promise<PgReachabilityResult> {
   const startedAt = Date.now();
   let lastError: string | undefined;
   for (let attempt = 1; ; attempt++) {
-    const probe = postgres(dsn, { max: 1, onnotice: () => {}, connect_timeout: 5 });
+    const probe = postgres(dsn, {
+      max: 1,
+      onnotice: () => {},
+      connect_timeout: 5,
+    });
     try {
-      await probe.unsafe('SELECT 1');
+      await probe.unsafe("SELECT 1");
       return { ok: true, elapsedMs: Date.now() - startedAt };
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
@@ -78,7 +85,11 @@ export async function probePgReachable(dsn: string, budgetMs = 15_000): Promise<
  * cryptic error ("no such database: papercusp_it") deep inside a later query.
  * For fixtures that need reachability confirmed before proceeding.
  */
-export async function assertPgReachable(dsn: string, label: string, budgetMs = 15_000): Promise<void> {
+export async function assertPgReachable(
+  dsn: string,
+  label: string,
+  budgetMs = 15_000,
+): Promise<void> {
   const result = await probePgReachable(dsn, budgetMs);
   if (result.ok) return;
   throw new Error(
@@ -110,7 +121,10 @@ export async function assertPgReachable(dsn: string, label: string, budgetMs = 1
  * masking TypeError on top, hiding the actual (transient, self-resolving)
  * cause entirely.
  */
-export async function withPgStartupRetry<T>(op: () => Promise<T>, budgetMs = 30_000): Promise<T> {
+export async function withPgStartupRetry<T>(
+  op: () => Promise<T>,
+  budgetMs = 30_000,
+): Promise<T> {
   const startedAt = Date.now();
   for (let attempt = 1; ; attempt++) {
     try {
