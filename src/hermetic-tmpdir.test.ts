@@ -26,11 +26,11 @@ import {
   statSync,
   symlinkSync,
   utimesSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   createHermeticDir,
@@ -41,7 +41,7 @@ import {
   HERMETIC_SWEEP_MIN_AGE_MS,
   sweepAbandonedHermeticDirs,
   sweepStaleTestScratch,
-} from "./hermetic-tmpdir.js";
+} from './hermetic-tmpdir.js';
 
 let root: string;
 
@@ -50,7 +50,7 @@ const DEAD_PID = 0;
 const ALIVE_PID = process.pid;
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), "hermetic-tmpdir-test-"));
+  root = mkdtempSync(join(tmpdir(), 'hermetic-tmpdir-test-'));
 });
 
 afterEach(() => {
@@ -84,15 +84,13 @@ function naiveAgeOnlySweep(dir: string, olderThanMs: number): number {
   return removed;
 }
 
-describe("creatorIsAlive", () => {
-  it("reports our own pid as alive", () => {
+describe('creatorIsAlive', () => {
+  it('reports our own pid as alive', () => {
     expect(creatorIsAlive(ALIVE_PID)).toBe(true);
   });
 
-  it("reports a pid whose process is gone (ESRCH) as dead", () => {
-    const esrch = Object.assign(new Error("no such process"), {
-      code: "ESRCH",
-    });
+  it('reports a pid whose process is gone (ESRCH) as dead', () => {
+    const esrch = Object.assign(new Error('no such process'), { code: 'ESRCH' });
     expect(
       creatorIsAlive(123456, () => {
         throw esrch;
@@ -100,12 +98,10 @@ describe("creatorIsAlive", () => {
     ).toBe(false);
   });
 
-  it("treats EPERM as ALIVE — the pid exists, it is just not ours", () => {
+  it('treats EPERM as ALIVE — the pid exists, it is just not ours', () => {
     // The safe direction: a dir we decline to reap is collected later by maxAge,
     // but a dir we reap early destroys a running process's state.
-    const eperm = Object.assign(new Error("operation not permitted"), {
-      code: "EPERM",
-    });
+    const eperm = Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
     expect(
       creatorIsAlive(1, () => {
         throw eperm;
@@ -113,72 +109,67 @@ describe("creatorIsAlive", () => {
     ).toBe(true);
   });
 
-  it("rejects a non-pid parsed out of a malformed dir name", () => {
+  it('rejects a non-pid parsed out of a malformed dir name', () => {
     expect(creatorIsAlive(Number.NaN)).toBe(false);
     expect(creatorIsAlive(-1)).toBe(false);
   });
 });
 
-describe("sweepAbandonedHermeticDirs", () => {
-  it("removes a dir whose creating process is gone", () => {
-    const abandoned = seed(DEAD_PID, "aaaaaa", HERMETIC_SWEEP_MIN_AGE_MS * 2);
+describe('sweepAbandonedHermeticDirs', () => {
+  it('removes a dir whose creating process is gone', () => {
+    const abandoned = seed(DEAD_PID, 'aaaaaa', HERMETIC_SWEEP_MIN_AGE_MS * 2);
     const result = sweepAbandonedHermeticDirs(root);
     expect(result.removed).toBe(1);
     expect(existsSync(abandoned)).toBe(false);
   });
 
-  it("KEEPS a dir whose creating process is still running", () => {
+  it('KEEPS a dir whose creating process is still running', () => {
     // The load-bearing case. A long integration run holds its dir for tens of
     // minutes; reaping it is data loss inside a live test, not cleanup.
-    const live = seed(ALIVE_PID, "bbbbbb", HERMETIC_SWEEP_MIN_AGE_MS * 2);
+    const live = seed(ALIVE_PID, 'bbbbbb', HERMETIC_SWEEP_MIN_AGE_MS * 2);
     const result = sweepAbandonedHermeticDirs(root);
     expect(result.removed).toBe(0);
     expect(result.keptAlive).toBe(1);
     expect(existsSync(live)).toBe(true);
   });
 
-  it("CONTROL: an age-only sweeper deletes that same live dir", () => {
+  it('CONTROL: an age-only sweeper deletes that same live dir', () => {
     // Calibrates the case above: it passes because of the liveness check, not
     // because the fixture happened to be un-deletable.
-    const live = seed(ALIVE_PID, "bbbbbb", HERMETIC_SWEEP_MIN_AGE_MS * 2);
+    const live = seed(ALIVE_PID, 'bbbbbb', HERMETIC_SWEEP_MIN_AGE_MS * 2);
     expect(naiveAgeOnlySweep(root, HERMETIC_SWEEP_MIN_AGE_MS)).toBe(1);
     expect(existsSync(live)).toBe(false);
   });
 
-  it("KEEPS a too-young dir even when its creator is already gone", () => {
+  it('KEEPS a too-young dir even when its creator is already gone', () => {
     // Guards the mkdtemp/write race: a peer that has just created its dir must be
     // invisible to a concurrent sweeper.
-    const fresh = seed(DEAD_PID, "cccccc", 1_000);
+    const fresh = seed(DEAD_PID, 'cccccc', 1_000);
     const result = sweepAbandonedHermeticDirs(root);
     expect(result.removed).toBe(0);
     expect(result.keptYoung).toBe(1);
     expect(existsSync(fresh)).toBe(true);
   });
 
-  it("reaps past maxAge even when the pid still looks alive (recycled-pid backstop)", () => {
+  it('reaps past maxAge even when the pid still looks alive (recycled-pid backstop)', () => {
     // This host wraps pids ~daily under fleet load, so a dead creator's pid can be
     // reassigned to a live process. Without this backstop such a dir is immortal.
-    const ancient = seed(
-      ALIVE_PID,
-      "dddddd",
-      HERMETIC_SWEEP_MAX_AGE_MS + 60_000,
-    );
+    const ancient = seed(ALIVE_PID, 'dddddd', HERMETIC_SWEEP_MAX_AGE_MS + 60_000);
     const result = sweepAbandonedHermeticDirs(root);
     expect(result.removed).toBe(1);
     expect(existsSync(ancient)).toBe(false);
   });
 
-  it("bounds work with scanCap so test startup cannot pay for a large backlog", () => {
-    for (let i = 0; i < 10; i++)
-      seed(DEAD_PID, `e${i}`, HERMETIC_SWEEP_MIN_AGE_MS * 2);
+  it('bounds work with scanCap so test startup cannot pay for a large backlog', () => {
+    for (let i = 0; i < 10; i++) seed(DEAD_PID, `e${i}`, HERMETIC_SWEEP_MIN_AGE_MS * 2);
     const result = sweepAbandonedHermeticDirs(root, { scanCap: 3 });
     expect(result.scanned).toBe(3);
     expect(result.removed).toBe(3);
     expect(readdirSync(root)).toHaveLength(7);
   });
 
-  it("reaps an entry whose name carries no parseable pid", () => {
-    const junk = join(root, "not-a-pid-shaped-name");
+  it('reaps an entry whose name carries no parseable pid', () => {
+    const junk = join(root, 'not-a-pid-shaped-name');
     mkdirSync(junk);
     const when = (Date.now() - HERMETIC_SWEEP_MIN_AGE_MS * 2) / 1000;
     utimesSync(junk, when, when);
@@ -186,8 +177,8 @@ describe("sweepAbandonedHermeticDirs", () => {
     expect(existsSync(junk)).toBe(false);
   });
 
-  it("is a no-op on a root that does not exist, and never throws", () => {
-    const missing = join(root, "nope", "still-nope");
+  it('is a no-op on a root that does not exist, and never throws', () => {
+    const missing = join(root, 'nope', 'still-nope');
     expect(() => sweepAbandonedHermeticDirs(missing)).not.toThrow();
     expect(sweepAbandonedHermeticDirs(missing)).toEqual({
       scanned: 0,
@@ -197,9 +188,9 @@ describe("sweepAbandonedHermeticDirs", () => {
     });
   });
 
-  it("survives an entry that vanishes between readdir and stat", () => {
-    seed(DEAD_PID, "ffffff", HERMETIC_SWEEP_MIN_AGE_MS * 2);
-    const racer = seed(DEAD_PID, "gggggg", HERMETIC_SWEEP_MIN_AGE_MS * 2);
+  it('survives an entry that vanishes between readdir and stat', () => {
+    seed(DEAD_PID, 'ffffff', HERMETIC_SWEEP_MIN_AGE_MS * 2);
+    const racer = seed(DEAD_PID, 'gggggg', HERMETIC_SWEEP_MIN_AGE_MS * 2);
     // A racing peer removes one entry after we have listed the directory.
     const isAlive = (pid: number) => {
       rmSync(racer, { recursive: true, force: true });
@@ -219,35 +210,32 @@ function seedNamed(name: string, ageMs: number): string {
   return path;
 }
 
-describe("sweepStaleTestScratch", () => {
+describe('sweepStaleTestScratch', () => {
   // These dirs are NOT pid-stamped (17 real test files mint their own prefix
   // directly at the TMPDIR root — WI-38869), so every case here is a non-pid name.
 
-  it("KEEPS a non-pid-named dir under the age threshold, however long it has run", () => {
+  it('KEEPS a non-pid-named dir under the age threshold, however long it has run', () => {
     // The property this function exists to hold: sweepAbandonedHermeticDirs would
     // reap this the moment it crosses 60s (no parseable pid ⇒ not alive). A live
     // multi-minute test must not lose its scratch dir at the 1-minute mark.
-    const live = seedNamed("some-test-abc123", HERMETIC_SWEEP_MIN_AGE_MS * 5);
+    const live = seedNamed('some-test-abc123', HERMETIC_SWEEP_MIN_AGE_MS * 5);
     const result = sweepStaleTestScratch(root);
     expect(result.removed).toBe(0);
     expect(existsSync(live)).toBe(true);
   });
 
-  it("reaps a non-pid-named dir once it is older than GENERIC_SCRATCH_SWEEP_MAX_AGE_MS", () => {
-    const stale = seedNamed(
-      "some-test-def456",
-      GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000,
-    );
+  it('reaps a non-pid-named dir once it is older than GENERIC_SCRATCH_SWEEP_MAX_AGE_MS', () => {
+    const stale = seedNamed('some-test-def456', GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000);
     const result = sweepStaleTestScratch(root);
     expect(result.removed).toBe(1);
     expect(existsSync(stale)).toBe(false);
   });
 
-  it("never removes a name in GENERIC_SCRATCH_SWEEP_EXCLUDE, however old", () => {
+  it('never removes a name in GENERIC_SCRATCH_SWEEP_EXCLUDE, however old', () => {
     // WI-41782: the affected-test log namespace owns its own child-retention
     // policy. If it falls out of this set, the broader /tmp/pcv sweep can remove
     // that entire namespace (and a still-needed full-run log) as one old entry.
-    expect(GENERIC_SCRATCH_SWEEP_EXCLUDE).toContain("papercusp-affected-tests");
+    expect(GENERIC_SCRATCH_SWEEP_EXCLUDE).toContain('papercusp-affected-tests');
     for (const name of GENERIC_SCRATCH_SWEEP_EXCLUDE) {
       seedNamed(name, GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 10);
     }
@@ -258,8 +246,8 @@ describe("sweepStaleTestScratch", () => {
     }
   });
 
-  it("is a no-op on a root that does not exist, and never throws", () => {
-    const missing = join(root, "nope", "still-nope");
+  it('is a no-op on a root that does not exist, and never throws', () => {
+    const missing = join(root, 'nope', 'still-nope');
     expect(() => sweepStaleTestScratch(missing)).not.toThrow();
   });
 });
@@ -275,7 +263,7 @@ describe("sweepStaleTestScratch", () => {
  * it is never reached. Every existing test above passes against that defect: none
  * of them overflows scanCap, so none can see it.
  */
-describe("sweep window rotation (WI-41107)", () => {
+describe('sweep window rotation (WI-41107)', () => {
   const CAP = 5;
   const FRESH_MS = HERMETIC_SWEEP_MIN_AGE_MS * 2;
   const STALE_MS = GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000;
@@ -289,7 +277,7 @@ describe("sweep window rotation (WI-41107)", () => {
     });
   }
 
-  it("CONTROL: pinned at index 0, a fresh readdir front hides the entire stale backlog", () => {
+  it('CONTROL: pinned at index 0, a fresh readdir front hides the entire stale backlog', () => {
     // This is the shipped-but-inert behaviour, reproduced. It is what makes the
     // rotation test below a real guard rather than a restatement of "old dirs go".
     seedFreshFrontStaleBacklog(40);
@@ -299,7 +287,7 @@ describe("sweep window rotation (WI-41107)", () => {
     expect(readdirSync(root)).toHaveLength(40);
   });
 
-  it("rotating the window reaches the backlog behind that same fresh front", () => {
+  it('rotating the window reaches the backlog behind that same fresh front', () => {
     seedFreshFrontStaleBacklog(40);
     let removed = 0;
     // Bounded well above the ~7 passes needed to cover 35 stale entries 5 at a
@@ -312,7 +300,7 @@ describe("sweep window rotation (WI-41107)", () => {
     expect(readdirSync(root)).toHaveLength(CAP);
   });
 
-  it("still covers the whole directory in one pass when it fits inside scanCap", () => {
+  it('still covers the whole directory in one pass when it fits inside scanCap', () => {
     // The wrap must not cost coverage on a small root — that is every other test
     // in this file, and it is why they keep passing with a random start index.
     for (let i = 0; i < 3; i++) seedNamed(`small-${i}`, STALE_MS);
@@ -322,7 +310,7 @@ describe("sweep window rotation (WI-41107)", () => {
     expect(readdirSync(root)).toHaveLength(0);
   });
 
-  it("accepts a startAt beyond the entry count without skipping work", () => {
+  it('accepts a startAt beyond the entry count without skipping work', () => {
     // startAt is normalised modulo the entry count, so a stale caller index (or a
     // directory that shrank under a retry) can never silently scan nothing.
     for (let i = 0; i < 3; i++) seedNamed(`wrap-${i}`, STALE_MS);
@@ -337,9 +325,9 @@ describe("sweep window rotation (WI-41107)", () => {
    * whose targets this sweep had already deleted — `statSync` follows the link,
    * throws ENOENT, and takes the "a peer swept it first" branch forever.
    */
-  it("reaps a stale DANGLING symlink instead of skipping it forever", () => {
-    const target = seedNamed("lockdom-abc123", STALE_MS);
-    const link = join(root, "lockdom-abc123-link");
+  it('reaps a stale DANGLING symlink instead of skipping it forever', () => {
+    const target = seedNamed('lockdom-abc123', STALE_MS);
+    const link = join(root, 'lockdom-abc123-link');
     symlinkSync(target, link);
     // Exactly how these arise in the wild: an earlier pass removed the target.
     rmSync(target, { recursive: true, force: true });
@@ -347,7 +335,7 @@ describe("sweep window rotation (WI-41107)", () => {
     lutimesSync(link, when, when);
 
     // Precondition — the link is present but un-stat-able, which is the trap.
-    expect(readdirSync(root)).toEqual(["lockdom-abc123-link"]);
+    expect(readdirSync(root)).toEqual(['lockdom-abc123-link']);
     expect(() => statSync(link)).toThrow();
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
 
@@ -355,16 +343,16 @@ describe("sweep window rotation (WI-41107)", () => {
     expect(readdirSync(root)).toHaveLength(0);
   });
 
-  it("KEEPS a young dangling symlink — lstat must not turn into an age-blind delete", () => {
-    const link = join(root, "lockdom-young-link");
-    symlinkSync(join(root, "gone"), link);
+  it('KEEPS a young dangling symlink — lstat must not turn into an age-blind delete', () => {
+    const link = join(root, 'lockdom-young-link');
+    symlinkSync(join(root, 'gone'), link);
     const when = (Date.now() - FRESH_MS) / 1000;
     lutimesSync(link, when, when);
     expect(sweepStaleTestScratch(root, { scanCap: CAP }).removed).toBe(0);
-    expect(readdirSync(root)).toEqual(["lockdom-young-link"]);
+    expect(readdirSync(root)).toEqual(['lockdom-young-link']);
   });
 
-  it("is a no-op on an empty root — the rotation modulo cannot divide by zero", () => {
+  it('is a no-op on an empty root — the rotation modulo cannot divide by zero', () => {
     expect(() => sweepStaleTestScratch(root, { scanCap: CAP })).not.toThrow();
     expect(sweepStaleTestScratch(root, { scanCap: CAP })).toEqual({
       scanned: 0,
@@ -375,9 +363,9 @@ describe("sweep window rotation (WI-41107)", () => {
   });
 });
 
-describe("createHermeticDir", () => {
-  it("creates the root, mints a pid-stamped dir, and sweeps abandoned siblings first", () => {
-    const nested = join(root, "papercusp-voice-ipc-hermetic");
+describe('createHermeticDir', () => {
+  it('creates the root, mints a pid-stamped dir, and sweeps abandoned siblings first', () => {
+    const nested = join(root, 'papercusp-voice-ipc-hermetic');
     mkdirSync(nested, { recursive: true });
     const stale = join(nested, `${DEAD_PID}-iiiiii`);
     mkdirSync(stale);
@@ -393,15 +381,15 @@ describe("createHermeticDir", () => {
     expect(mine.startsWith(join(nested, `${process.pid}-`))).toBe(true);
   });
 
-  it("creates a root that does not exist yet", () => {
-    const fresh = join(root, "deep", "not-created-yet");
+  it('creates a root that does not exist yet', () => {
+    const fresh = join(root, 'deep', 'not-created-yet');
     const mine = createHermeticDir(fresh);
     expect(existsSync(mine)).toBe(true);
   });
 
-  it("gives two calls in the same process distinct dirs", () => {
-    const a = createHermeticDir(join(root, "shared"));
-    const b = createHermeticDir(join(root, "shared"));
+  it('gives two calls in the same process distinct dirs', () => {
+    const a = createHermeticDir(join(root, 'shared'));
+    const b = createHermeticDir(join(root, 'shared'));
     expect(a).not.toBe(b);
     expect(existsSync(a)).toBe(true);
     expect(existsSync(b)).toBe(true);

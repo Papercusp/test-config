@@ -131,14 +131,8 @@
  *     creator's pid look alive. That merely delays the reap; MAX_AGE is the backstop
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
-import {
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  rmSync,
-} from "node:fs";
-import { join } from "node:path";
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 
 /** Never touch a dir younger than this — a peer may have just created it. */
 export const HERMETIC_SWEEP_MIN_AGE_MS = 60_000;
@@ -175,15 +169,15 @@ export const GENERIC_SCRATCH_SWEEP_MAX_AGE_MS = 4 * 60 * 60 * 1_000;
  * age-swept inside that namespace by scripts/affected-tests.mjs.)
  */
 export const GENERIC_SCRATCH_SWEEP_EXCLUDE: ReadonlySet<string> = new Set([
-  "fs-mutex-locks",
-  "testcontainers-locks",
-  "papercusp-voice-ipc-hermetic",
-  "papercusp-affected-tests",
+  'fs-mutex-locks',
+  'testcontainers-locks',
+  'papercusp-voice-ipc-hermetic',
+  'papercusp-affected-tests',
 ]);
 
 /** Directory name minted per process: `<pid>-<mkdtemp suffix>`. */
 function pidFromEntryName(name: string): number {
-  const dash = name.indexOf("-");
+  const dash = name.indexOf('-');
   if (dash <= 0) return Number.NaN;
   return Number.parseInt(name.slice(0, dash), 10);
 }
@@ -206,7 +200,7 @@ export function creatorIsAlive(
     kill(pid, 0);
     return true;
   } catch (err) {
-    return (err as NodeJS.ErrnoException | null)?.code === "EPERM";
+    return (err as NodeJS.ErrnoException | null)?.code === 'EPERM';
   }
 }
 
@@ -257,10 +251,7 @@ export interface SweepResult {
  * concurrently. A racing peer that removes an entry between our readdir and our
  * rm is the NORMAL case, not an error, and cleanup must never fail a test run.
  */
-export function sweepAbandonedHermeticDirs(
-  root: string,
-  opts: SweepOptions = {},
-): SweepResult {
+export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}): SweepResult {
   const now = opts.now ?? Date.now();
   const minAgeMs = opts.minAgeMs ?? HERMETIC_SWEEP_MIN_AGE_MS;
   const maxAgeMs = opts.maxAgeMs ?? HERMETIC_SWEEP_MAX_AGE_MS;
@@ -268,12 +259,7 @@ export function sweepAbandonedHermeticDirs(
   const isAlive = opts.isAlive ?? ((pid: number) => creatorIsAlive(pid));
   const exclude = opts.exclude;
   const ageOnly = opts.ageOnly ?? false;
-  const result: SweepResult = {
-    scanned: 0,
-    removed: 0,
-    keptAlive: 0,
-    keptYoung: 0,
-  };
+  const result: SweepResult = { scanned: 0, removed: 0, keptAlive: 0, keptYoung: 0 };
 
   let entries: string[];
   try {
@@ -287,8 +273,7 @@ export function sweepAbandonedHermeticDirs(
   const startAt =
     entries.length === 0
       ? 0
-      : (((opts.startAt ?? Math.floor(Math.random() * entries.length)) %
-          entries.length) +
+      : ((opts.startAt ?? Math.floor(Math.random() * entries.length)) % entries.length +
           entries.length) %
         entries.length;
 
@@ -314,8 +299,7 @@ export function sweepAbandonedHermeticDirs(
       result.keptYoung += 1;
       continue;
     }
-    const keep =
-      ageMs <= maxAgeMs && (ageOnly || isAlive(pidFromEntryName(name)));
+    const keep = ageMs <= maxAgeMs && (ageOnly || isAlive(pidFromEntryName(name)));
     if (keep) {
       result.keptAlive += 1;
       continue;
@@ -343,7 +327,7 @@ export function sweepAbandonedHermeticDirs(
  */
 export function sweepStaleTestScratch(
   root: string,
-  opts: Omit<SweepOptions, "ageOnly" | "isAlive"> = {},
+  opts: Omit<SweepOptions, 'ageOnly' | 'isAlive'> = {},
 ): SweepResult {
   return sweepAbandonedHermeticDirs(root, {
     maxAgeMs: GENERIC_SCRATCH_SWEEP_MAX_AGE_MS,
@@ -359,10 +343,7 @@ export function sweepStaleTestScratch(
  * Returns the new dir. The caller owns registering whatever teardown it wants; the
  * sweep above is what makes the dir safe to abandon when that teardown never runs.
  */
-export function createHermeticDir(
-  root: string,
-  opts: SweepOptions = {},
-): string {
+export function createHermeticDir(root: string, opts: SweepOptions = {}): string {
   mkdirSync(root, { recursive: true });
   sweepAbandonedHermeticDirs(root, opts);
   return mkdtempSync(join(root, `${process.pid}-`));
