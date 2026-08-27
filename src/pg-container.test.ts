@@ -34,6 +34,47 @@ const SOURCE = readFileSync(
   fileURLToPath(new URL("./pg-container.ts", import.meta.url)),
   "utf8",
 );
+const HARNESS_ZERO_FIXTURE_SOURCES = [
+  {
+    name: "coord-links-blocks-notify",
+    source: readFileSync(
+      fileURLToPath(
+        new URL(
+          "../../papercusp/libs/db/src/coord-links-blocks-notify.integration.test.ts",
+          import.meta.url,
+        ),
+      ),
+      "utf8",
+    ),
+  },
+  {
+    name: "workspace-host-tenant-rls-migration",
+    source: readFileSync(
+      fileURLToPath(
+        new URL(
+          "../../papercusp/libs/db/src/workspace-host-tenant-rls-migration.integration.test.ts",
+          import.meta.url,
+        ),
+      ),
+      "utf8",
+    ),
+  },
+  {
+    name: "operator-core-org-test-db",
+    source: readFileSync(
+      fileURLToPath(
+        new URL("../../../packages/operator-core/test/_org-test-db.ts", import.meta.url),
+      ),
+      "utf8",
+    ),
+  },
+] as const;
+
+function harnessZeroRoleDefinitions(source: string): string[] {
+  return [...source.matchAll(/(?:CREATE|ALTER)\s+ROLE\s+harness_zero\b[^;]*;/g)].map(
+    ([definition]) => definition,
+  );
+}
 
 describe("getTestPg framework-role ensure (EI-18680404964770187)", () => {
   it("never runs psql (or any command) inside the shared container via container.exec", () => {
@@ -85,6 +126,36 @@ describe("getTestPg container healthcheck (EI-21116464706451765)", () => {
     expect(healthcheckIdx).toBeGreaterThan(-1);
     expect(hostProbeIdx).toBeGreaterThan(healthcheckIdx);
     expect(SOURCE).toMatch(/admin\.unsafe\(FRAMEWORK_ROLES_DDL\)/);
+  });
+});
+
+describe("harness_zero test-role boundary (EI-21638847910599943)", () => {
+  it("normalizes both new and pre-existing roles to the sync-role privilege boundary", () => {
+    const definitions = harnessZeroRoleDefinitions(SOURCE);
+
+    expect(definitions).toHaveLength(2);
+    for (const definition of definitions) {
+      expect(definition).toMatch(/\bLOGIN\b/);
+      expect(definition).toMatch(/\bREPLICATION\b/);
+      expect(definition).toMatch(/\bNOSUPERUSER\b/);
+      expect(definition).toMatch(/\bBYPASSRLS\b/);
+      expect(definition).not.toMatch(/\bSUPERUSER\b/);
+    }
+  });
+
+  it("keeps each fixture's fallback role definition inside that same boundary", () => {
+    for (const fixture of HARNESS_ZERO_FIXTURE_SOURCES) {
+      const definitions = harnessZeroRoleDefinitions(fixture.source);
+
+      expect(definitions, fixture.name).not.toHaveLength(0);
+      for (const definition of definitions) {
+        expect(definition, fixture.name).toMatch(/\bLOGIN\b/);
+        expect(definition, fixture.name).toMatch(/\bREPLICATION\b/);
+        expect(definition, fixture.name).toMatch(/\bNOSUPERUSER\b/);
+        expect(definition, fixture.name).toMatch(/\bBYPASSRLS\b/);
+        expect(definition, fixture.name).not.toMatch(/\bSUPERUSER\b/);
+      }
+    }
   });
 });
 

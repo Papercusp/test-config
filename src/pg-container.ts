@@ -109,25 +109,28 @@ export async function withContainerRecoveryReResolution<T>(
  */
 export const TEST_PG_IMAGE = "pgvector/pgvector:pg18";
 
-// Framework roles, ensured CREATE-OR-FIX (login + correct password) once per container.
+// Framework roles, ensured CREATE-OR-FIX (login + fixed privilege attributes +
+// correct password) once per container.
 // The container is shared + REUSED, and roles are cluster-global. Some tests historically
 // created harness_app password-less / NOLOGIN (voice-lease, substrate-outbox-trigger),
 // which — since most other tests create it only `IF NOT EXISTS` — left a stale unusable
 // role that broke every later password-login test ("password authentication failed for
 // user harness_app"). Ensuring the roles here (ALTER to fix an existing one) makes the
-// shared cluster's roles deterministic regardless of which test ran first.
+// shared cluster's roles deterministic regardless of which test ran first. In particular,
+// harness_zero is the sync role: it needs LOGIN + REPLICATION + BYPASSRLS, but must never
+// be SUPERUSER in tests because that would make ACL-denial assertions meaningless.
 const FRAMEWORK_ROLES_DDL = `
   DO $$ BEGIN
     -- The container is REUSED across vitest processes, so two runs can execute this
     -- block concurrently; IF NOT EXISTS/CREATE then races to a unique_violation on
     -- pg_authid_rolname_index. The xact-scoped advisory lock serializes them.
     PERFORM pg_advisory_xact_lock(hashtext('papercusp-test-framework-roles'));
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='harness_app')   THEN CREATE ROLE harness_app   LOGIN PASSWORD 'harness_app_pwd';
-    ELSE ALTER ROLE harness_app   LOGIN PASSWORD 'harness_app_pwd'; END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='harness_admin') THEN CREATE ROLE harness_admin LOGIN SUPERUSER PASSWORD 'harness_admin_pwd';
-    ELSE ALTER ROLE harness_admin LOGIN SUPERUSER PASSWORD 'harness_admin_pwd'; END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='harness_zero')  THEN CREATE ROLE harness_zero  LOGIN REPLICATION SUPERUSER PASSWORD 'harness_zero_pwd';
-    ELSE ALTER ROLE harness_zero  LOGIN REPLICATION SUPERUSER PASSWORD 'harness_zero_pwd'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='harness_app')   THEN CREATE ROLE harness_app   LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS PASSWORD 'harness_app_pwd';
+    ELSE ALTER ROLE harness_app   LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS PASSWORD 'harness_app_pwd'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='harness_admin') THEN CREATE ROLE harness_admin LOGIN SUPERUSER NOREPLICATION PASSWORD 'harness_admin_pwd';
+    ELSE ALTER ROLE harness_admin LOGIN SUPERUSER NOREPLICATION PASSWORD 'harness_admin_pwd'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='harness_zero')  THEN CREATE ROLE harness_zero  LOGIN REPLICATION NOSUPERUSER BYPASSRLS PASSWORD 'harness_zero_pwd';
+    ELSE ALTER ROLE harness_zero  LOGIN REPLICATION NOSUPERUSER BYPASSRLS PASSWORD 'harness_zero_pwd'; END IF;
   END $$;
 `;
 
