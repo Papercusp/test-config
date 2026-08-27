@@ -10,7 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import AdminTestRunsReporter, {
@@ -19,6 +19,7 @@ import AdminTestRunsReporter, {
   classifyGitEntry,
   computeWorktreeDirty,
   computeIsScratchConfig,
+  formatTestCaseError,
   isScratchConfigFile,
   isMutationProbeRun,
   resolveTestRunHarnessSlug,
@@ -190,6 +191,68 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     } as unknown as Parameters<typeof buildOutputTail>[0];
     const tail = buildOutputTail(fakeModule, 'fail');
     expect(tail).toBe('suite > fails: expected 1 to be 2');
+  });
+
+  it('formats TestCase.result errors with bounded actual and expected values', () => {
+    const error = {
+      message: 'expected object to match',
+      actual: '{ service_select: false }',
+      expected: '{ service_select: true }',
+    };
+    expect(formatTestCaseError(error)).toBe(
+      'expected object to match\nactual: { service_select: false }\nexpected: { service_select: true }',
+    );
+    const fakeModule = {
+      state: () => 'failed',
+      errors: () => [],
+      children: { allTests: () => [{ fullName: 'suite > fails', result: () => ({ state: 'failed', errors: [error] }) }] },
+    } as unknown as Parameters<typeof buildOutputTail>[0];
+    expect(buildOutputTail(fakeModule, 'fail')).toContain('actual: { service_select: false }');
+    expect(buildOutputTail(fakeModule, 'fail')).toContain('expected: { service_select: true }');
+  });
+
+  it('writes and merges optional structured failure details across reporter groups', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'papercusp-reporter-details-'));
+    const detailsPath = join(dir, 'failure-details.json');
+    const previous = process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+    process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = detailsPath;
+    const makeReporter = () =>
+      new AdminTestRunsReporter(
+        async () => ({ commit: 'abc', porcelain: '' }),
+        async () => undefined,
+      );
+    const makeModule = (file: string, test: string, actual: string, expected: string) => ({
+      moduleId: join(process.cwd(), file),
+      state: () => 'failed',
+      diagnostic: () => ({ duration: 1 }),
+      errors: () => [],
+      children: {
+        allTests: () => [{ fullName: test, result: () => ({ state: 'failed', errors: [{ message: 'diff', actual, expected }] }) }],
+      },
+    });
+    try {
+      const first = makeReporter();
+      first.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      first.onTestModuleEnd(makeModule('src/first.test.ts', 'first', 'actual-a', 'expected-a') as never);
+      await first.onTestRunEnd();
+
+      const second = makeReporter();
+      second.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      second.onTestModuleEnd(makeModule('src/second.test.ts', 'second', 'actual-b', 'expected-b') as never);
+      await second.onTestRunEnd();
+
+      const payload = JSON.parse(readFileSync(detailsPath, 'utf8')) as {
+        failures: Array<{ file: string; test: string; actual?: string; expected?: string }>;
+      };
+      expect(payload.failures).toEqual(expect.arrayContaining([
+        expect.objectContaining({ file: 'libs/test-config/src/first.test.ts', test: 'first', actual: 'actual-a', expected: 'expected-a' }),
+        expect.objectContaining({ file: 'libs/test-config/src/second.test.ts', test: 'second', actual: 'actual-b', expected: 'expected-b' }),
+      ]));
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+      else process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('buildOutputTail prefers module-level errors and stays null for passing modules', () => {

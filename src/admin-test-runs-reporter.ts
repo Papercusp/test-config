@@ -26,7 +26,7 @@
 
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { exec } from 'node:child_process';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 
 /**
@@ -230,6 +230,132 @@ export interface TestRunRow {
   isScratchConfig: boolean;
   /** EI-20327093837421120: true when the shared tree was not stable around the run. */
   worktreeDirty: boolean;
+}
+
+/** A structured assertion detail captured from Vitest's TestCase result. */
+export interface TestFailureDetail {
+  file: string;
+  test: string;
+  message?: string;
+  actual?: string;
+  expected?: string;
+}
+
+const FAILURE_DETAIL_VALUE_MAX_CHARS = 2_000;
+const FAILURE_DETAILS_MAX_RECORDS = 2_000;
+
+function boundFailureText(value: string, maxChars = FAILURE_DETAIL_VALUE_MAX_CHARS): string {
+  if (maxChars <= 0) return '';
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 1)}…`;
+}
+
+function stringifyFailureValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    const seen = new WeakSet<object>();
+    const encoded = JSON.stringify(value, (_key, child: unknown) => {
+      if (typeof child === 'bigint') return `${child}n`;
+      if (typeof child === 'object' && child !== null) {
+        if (seen.has(child)) return '[Circular]';
+        seen.add(child);
+      }
+      return child;
+    });
+    if (encoded !== undefined) return encoded;
+  } catch {
+    /* fall through to the fail-soft string conversion */
+  }
+  try {
+    return String(value);
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+function errorField(error: unknown, field: 'message' | 'actual' | 'expected'): unknown {
+  try {
+    if (error && typeof error === 'object') return (error as Record<string, unknown>)[field];
+  } catch {
+    /* fail-soft */
+  }
+  return undefined;
+}
+
+/**
+ * Format one Vitest TestError without relying on its already-elided message.
+ * The structured values are deliberately appended after the message so the
+ * module-level 4KB tail retains them when a stack is long.
+ */
+export function formatTestCaseError(error: unknown): string {
+  let message: string | undefined;
+  try {
+    const raw = error instanceof Error ? error.message : errorField(error, 'message');
+    if (raw !== undefined && raw !== null) message = boundFailureText(stringifyFailureValue(raw));
+  } catch {
+    /* fail-soft */
+  }
+  const lines = message ? [message] : [];
+  for (const field of ['actual', 'expected'] as const) {
+    const value = errorField(error, field);
+    if (value === undefined) continue;
+    lines.push(`${field}: ${boundFailureText(stringifyFailureValue(value))}`);
+  }
+  if (lines.length > 0) return lines.join('\n');
+  return stringifyFailureValue(error);
+}
+
+function readFailureDetailsFile(file: string): TestFailureDetail[] {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+      failures?: unknown;
+      details?: unknown;
+    };
+    const raw = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.failures) ? parsed.failures : parsed.details);
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((entry): TestFailureDetail | null => {
+        if (!entry || typeof entry !== 'object') return null;
+        const value = entry as Record<string, unknown>;
+        if (typeof value.file !== 'string' || !value.file || typeof value.test !== 'string' || !value.test) return null;
+        const detail: TestFailureDetail = { file: value.file, test: value.test };
+        for (const field of ['message', 'actual', 'expected'] as const) {
+          if (value[field] !== undefined) detail[field] = boundFailureText(stringifyFailureValue(value[field]));
+        }
+        return detail;
+      })
+      .filter((entry): entry is TestFailureDetail => entry !== null)
+      .slice(0, FAILURE_DETAILS_MAX_RECORDS);
+  } catch {
+    return [];
+  }
+}
+
+function writeFailureDetails(details: TestFailureDetail[]): void {
+  const path = process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH?.trim();
+  if (!path || details.length === 0) return;
+
+  const existing = readFailureDetailsFile(path);
+  const merged = new Map<string, TestFailureDetail>();
+  for (const detail of [...existing, ...details]) {
+    const key = `${detail.file}\u0000${detail.test}`;
+    const previous = merged.get(key);
+    merged.set(key, {
+      ...(previous ?? {}),
+      ...detail,
+      ...(previous?.message && !detail.message ? { message: previous.message } : {}),
+      ...(previous?.actual !== undefined && detail.actual === undefined ? { actual: previous.actual } : {}),
+      ...(previous?.expected !== undefined && detail.expected === undefined ? { expected: previous.expected } : {}),
+    });
+  }
+
+  const payload = JSON.stringify({ version: 1, failures: [...merged.values()].slice(0, FAILURE_DETAILS_MAX_RECORDS) });
+  const temp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(temp, payload, { encoding: 'utf8', mode: 0o600 });
+    renameSync(temp, path);
+  } catch {
+    try { unlinkSync(temp); } catch { /* fail-soft */ }
+  }
 }
 
 export type WorktreeSnapshotReader = () => Promise<WorktreeGitSnapshot>;
@@ -470,7 +596,7 @@ export function buildOutputTail(
     const errs = testModule.errors?.() ?? [];
     if (errs.length > 0) {
       tail = errs
-        .map((e: unknown) => (e instanceof Error ? e.message : ((e as { message?: string })?.message ?? String(e))))
+        .map((e: unknown) => formatTestCaseError(e))
         .join('\n')
         .slice(-4000);
     }
@@ -489,7 +615,7 @@ export function buildOutputTail(
       const res = tc.result?.();
       if (res?.state !== 'failed') continue;
       for (const e of res.errors ?? []) {
-        lines.push(`${tc.fullName ?? '(test)'}: ${e?.message ?? String(e)}`);
+        lines.push(`${tc.fullName ?? '(test)'}: ${formatTestCaseError(e)}`);
         if (lines.length >= 20) break;
       }
       if (lines.length >= 20) break;
@@ -497,6 +623,43 @@ export function buildOutputTail(
     if (lines.length > 0) tail = lines.join('\n').slice(-4000);
   } catch { /* fail-soft */ }
   return tail;
+}
+
+function collectTestFailureDetails(testModule: TestModule, file: string): TestFailureDetail[] {
+  const details: TestFailureDetail[] = [];
+  try {
+    const collection = (testModule as unknown as {
+      children?: { allTests?: () => Iterable<unknown> };
+    }).children;
+    for (const t of collection?.allTests?.() ?? []) {
+      const tc = t as {
+        fullName?: string;
+        result?: () => {
+          state?: string;
+          errors?: ReadonlyArray<{ message?: unknown; actual?: unknown; expected?: unknown } | undefined>;
+        };
+      };
+      const result = tc.result?.();
+      if (result?.state !== 'failed') continue;
+      const test = typeof tc.fullName === 'string' && tc.fullName.trim() ? tc.fullName : '(test)';
+      for (const error of result.errors ?? []) {
+        if (!error) continue;
+        const detail: TestFailureDetail = { file, test };
+        const message = errorField(error, 'message');
+        const actual = errorField(error, 'actual');
+        const expected = errorField(error, 'expected');
+        if (message !== undefined) detail.message = boundFailureText(stringifyFailureValue(message));
+        if (actual !== undefined) detail.actual = boundFailureText(stringifyFailureValue(actual));
+        if (expected !== undefined) detail.expected = boundFailureText(stringifyFailureValue(expected));
+        if (detail.actual !== undefined || detail.expected !== undefined) details.push(detail);
+        break;
+      }
+      if (details.length >= 20) break;
+    }
+  } catch {
+    /* fail-soft */
+  }
+  return details;
 }
 
 /**
@@ -528,6 +691,9 @@ export default class AdminTestRunsReporter implements Reporter {
   /** EI-18767688096795873: computed once in onInit from the run's resolved
    *  config file — see computeIsScratchConfig / isScratchConfigFile. */
   private isScratchConfig = false;
+  /** Optional structured assertion values for testing:run's private sidecar. */
+  private failureDetails: TestFailureDetail[] = [];
+  private failureDetailsFlushed = false;
 
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
@@ -548,6 +714,8 @@ export default class AdminTestRunsReporter implements Reporter {
     this.isScratchConfig = computeIsScratchConfig(ctx);
     this.worktreeBefore = this.readWorktreeSnapshot();
     this.flushed = false;
+    this.failureDetails = [];
+    this.failureDetailsFlushed = false;
   }
 
   /** Per-module hook — queue the row until the end snapshot is available. */
@@ -566,6 +734,7 @@ export default class AdminTestRunsReporter implements Reporter {
       const startedAt = new Date(finishedAt.getTime() - durationMs);
 
       const outputTail = buildOutputTail(testModule, status);
+      this.failureDetails.push(...collectTestFailureDetails(testModule, filePath));
 
       this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail, isScratchConfig: this.isScratchConfig });
     } catch {
@@ -595,12 +764,20 @@ export default class AdminTestRunsReporter implements Reporter {
     ]);
   }
 
+  private flushFailureDetails(): void {
+    if (this.failureDetailsFlushed) return;
+    this.failureDetailsFlushed = true;
+    const details = this.failureDetails.splice(0);
+    writeFailureDetails(details);
+  }
+
   async onTestRunEnd(): Promise<void> {
     try {
       await this.flushPending();
     } catch {
       /* swallow — D-007 */
     } finally {
+      this.flushFailureDetails();
       await closeSharedPg();
     }
   }
@@ -611,6 +788,7 @@ export default class AdminTestRunsReporter implements Reporter {
     } catch {
       /* swallow — D-007 */
     } finally {
+      this.flushFailureDetails();
       await closeSharedPg();
     }
   }
