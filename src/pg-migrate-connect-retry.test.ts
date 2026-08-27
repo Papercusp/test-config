@@ -11,10 +11,13 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import {
+  TEST_DB_DEFERRED_MARKER,
+  TEST_DB_DEFERRED_SWEEP_LIMIT,
+  TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS,
   dropDatabaseWithLock,
   isConnectTimeout,
   TEST_DB_DROP_LOCK_KEY,
-  TEST_DB_DROP_LOCK_TIMEOUT_MS,
+  TEST_DB_DROP_STATEMENT_TIMEOUT_MS,
   withConnectRetry,
 } from './pg-migrate.ts';
 
@@ -92,17 +95,21 @@ describe('withConnectRetry', () => {
 describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
   it('serializes the forced drop and always releases the advisory lock', async () => {
     const queries: string[] = [];
-    await dropDatabaseWithLock({
+    const result = await dropDatabaseWithLock({
       unsafe: async (query) => {
         queries.push(query);
+        if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
+        return [];
       },
     }, 'it_guarded');
 
+    expect(result).toBe('dropped');
     expect(queries).toEqual([
-      `SET lock_timeout = '${TEST_DB_DROP_LOCK_TIMEOUT_MS}ms'`,
-      `SELECT pg_advisory_lock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`,
-      `SET lock_timeout = '0'`,
+      `SELECT pg_try_advisory_lock(hashtext('${TEST_DB_DROP_LOCK_KEY}')) AS acquired`,
+      `SET statement_timeout = '${TEST_DB_DROP_STATEMENT_TIMEOUT_MS}ms'`,
       'DROP DATABASE IF EXISTS "it_guarded" WITH (FORCE)',
+      expect.stringContaining(`WHERE c.description = '${TEST_DB_DEFERRED_MARKER}'`),
+      `SET statement_timeout = '0'`,
       `SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`,
     ]);
   });
@@ -114,7 +121,9 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
       dropDatabaseWithLock({
         unsafe: async (query) => {
           queries.push(query);
+          if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
           if (query.startsWith('DROP DATABASE')) throw failure;
+          return [];
         },
       }, 'it_guarded'),
     ).rejects.toBe(failure);
@@ -122,22 +131,59 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
     expect(queries.at(-1)).toBe(`SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`);
   });
 
-  it('surfaces a bounded, stage-labelled error when the drop lane is contended', async () => {
+  it('defers immediately instead of queueing behind a slow holder', async () => {
     const queries: string[] = [];
-    const lockTimeout = Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
-    await expect(
-      dropDatabaseWithLock({
-        unsafe: async (query) => {
-          queries.push(query);
-          if (query.includes('pg_advisory_lock')) throw lockTimeout;
-        },
-      }, 'it_guarded'),
-    ).rejects.toThrow(
-      `makeDrop: stage=drop-lock-acquire timed out after ${TEST_DB_DROP_LOCK_TIMEOUT_MS}ms ` +
-        `(lock=${TEST_DB_DROP_LOCK_KEY}, database=it_guarded)`,
-    );
+    const result = await dropDatabaseWithLock({
+      unsafe: async (query) => {
+        queries.push(query);
+        if (query.includes('pg_try_advisory_lock')) return [{ acquired: false }];
+        return [];
+      },
+    }, 'it_guarded');
 
+    expect(result).toBe('deferred');
     expect(queries.some((query) => query.startsWith('DROP DATABASE'))).toBe(false);
     expect(queries.some((query) => query.includes('pg_advisory_unlock'))).toBe(false);
+    expect(queries).toContain(`COMMENT ON DATABASE "it_guarded" IS '${TEST_DB_DEFERRED_MARKER}'`);
+  });
+
+  it('defers a pathologically slow drop without stranding the lock lane', async () => {
+    const queries: string[] = [];
+    const statementTimeout = Object.assign(new Error('canceling statement due to statement timeout'), {
+      code: '57014',
+    });
+    const result = await dropDatabaseWithLock({
+      unsafe: async (query) => {
+        queries.push(query);
+        if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
+        if (query.startsWith('DROP DATABASE')) throw statementTimeout;
+        return [];
+      },
+    }, 'it_guarded');
+
+    expect(result).toBe('deferred');
+    expect(queries).toContain(`COMMENT ON DATABASE "it_guarded" IS '${TEST_DB_DEFERRED_MARKER}'`);
+    expect(queries.at(-1)).toBe(`SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`);
+  });
+
+  it('drains only a bounded batch of explicitly deferred databases', async () => {
+    const queries: string[] = [];
+    const deferred = Array.from({ length: TEST_DB_DEFERRED_SWEEP_LIMIT + 2 }, (_, index) => ({
+      datname: `it_deferred_${index}`,
+    }));
+    const result = await dropDatabaseWithLock({
+      unsafe: async (query) => {
+        queries.push(query);
+        if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
+        if (query.includes('FROM pg_database d')) return deferred.slice(0, TEST_DB_DEFERRED_SWEEP_LIMIT);
+        return [];
+      },
+    }, 'it_guarded');
+
+    expect(result).toBe('dropped');
+    const sweptDrops = queries.filter((query) => query.includes('it_deferred_'));
+    expect(sweptDrops).toHaveLength(TEST_DB_DEFERRED_SWEEP_LIMIT);
+    expect(queries.filter((query) => query === `SET statement_timeout = '${TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS}ms'`))
+      .toHaveLength(TEST_DB_DEFERRED_SWEEP_LIMIT);
   });
 });

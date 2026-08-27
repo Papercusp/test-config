@@ -108,42 +108,107 @@ async function createFreshDb(prefix = 'it'): Promise<{ url: string; name: string
 /**
  * Every fresh test database lives on one reused PostgreSQL cluster. DROP DATABASE
  * is I/O-heavy, so concurrent Vitest teardowns amplify filesystem contention and
- * can strand every afterAll hook at its timeout. Serialize only the destructive
- * statement; database creation and schema provisioning remain parallel.
+ * can strand every afterAll hook at its timeout. Only one process attempts the
+ * destructive statement at a time; contenders defer instead of queueing behind a
+ * slow holder, and later holders drain a bounded batch of explicitly-deferred DBs.
  */
 export const TEST_DB_DROP_LOCK_KEY = 'papercusp-test-drop-database';
-export const TEST_DB_DROP_LOCK_TIMEOUT_MS = 75_000;
+export const TEST_DB_DROP_STATEMENT_TIMEOUT_MS = 20_000;
+export const TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS = 5_000;
+export const TEST_DB_DEFERRED_SWEEP_LIMIT = 3;
+export const TEST_DB_DEFERRED_MARKER = 'papercusp-test-db-drop-deferred';
+
+const TEST_DB_DEFER_MARK_TIMEOUT_MS = 2_000;
 
 type SqlExecutor = { unsafe: (query: string) => Promise<unknown> };
 
-/** Execute one forced database drop while holding the cluster-wide drop lane. */
-export async function dropDatabaseWithLock(admin: SqlExecutor, name: string): Promise<void> {
+export type TestDbDropResult = 'dropped' | 'deferred';
+
+function quoteIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function quoteLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+async function markDatabaseDropDeferred(admin: SqlExecutor, name: string): Promise<void> {
+  try {
+    await admin.unsafe(`SET statement_timeout = '${TEST_DB_DEFER_MARK_TIMEOUT_MS}ms'`);
+    await admin.unsafe(
+      `COMMENT ON DATABASE ${quoteIdentifier(name)} IS ${quoteLiteral(TEST_DB_DEFERRED_MARKER)}`,
+    );
+  } catch {
+    // Best effort: the database may already have disappeared, or the shared
+    // catalog may itself be saturated. Teardown must never recreate the hook
+    // timeout cascade merely because its deferred-cleanup marker could not land.
+  } finally {
+    await admin.unsafe(`SET statement_timeout = '0'`).catch(() => {});
+  }
+}
+
+async function sweepDeferredDatabaseDrops(admin: SqlExecutor): Promise<void> {
+  let rows: Array<{ datname: string }>;
+  try {
+    rows = (await admin.unsafe(
+      `SELECT d.datname
+         FROM pg_database d
+         JOIN pg_shdescription c
+           ON c.objoid = d.oid
+          AND c.classoid = 'pg_database'::regclass
+        WHERE c.description = ${quoteLiteral(TEST_DB_DEFERRED_MARKER)}
+        ORDER BY d.datname
+        LIMIT ${TEST_DB_DEFERRED_SWEEP_LIMIT}`,
+    )) as Array<{ datname: string }>;
+  } catch {
+    return;
+  }
+
+  for (const row of rows) {
+    try {
+      await admin.unsafe(`SET statement_timeout = '${TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS}ms'`);
+      await admin.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(row.datname)} WITH (FORCE)`);
+    } catch {
+      // Keep its marker for the next holder. Stop after the first slow/failing
+      // survivor so a janitor sweep cannot consume the caller's hook budget.
+      break;
+    }
+  }
+}
+
+/** Execute or safely defer one forced database drop on the cluster-wide lane. */
+export async function dropDatabaseWithLock(admin: SqlExecutor, name: string): Promise<TestDbDropResult> {
   let lockHeld = false;
   try {
-    // Bound only lock acquisition. Restore the session default before DROP so a
-    // legitimately slow filesystem cleanup is not cancelled by this budget.
-    await admin.unsafe(`SET lock_timeout = '${TEST_DB_DROP_LOCK_TIMEOUT_MS}ms'`);
-    try {
-      await admin.unsafe(`SELECT pg_advisory_lock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`);
-    } catch (e) {
-      if (isLockTimeout(e)) {
-        throw new Error(
-          `makeDrop: stage=drop-lock-acquire timed out after ${TEST_DB_DROP_LOCK_TIMEOUT_MS}ms ` +
-            `(lock=${TEST_DB_DROP_LOCK_KEY}, database=${name}); another test process is dropping a database`,
-          { cause: e },
-        );
-      }
-      throw e;
+    const rows = (await admin.unsafe(
+      `SELECT pg_try_advisory_lock(hashtext('${TEST_DB_DROP_LOCK_KEY}')) AS acquired`,
+    )) as Array<{ acquired?: boolean }>;
+    if (rows[0]?.acquired !== true) {
+      await markDatabaseDropDeferred(admin, name);
+      return 'deferred';
     }
     lockHeld = true;
-    await admin.unsafe(`SET lock_timeout = '0'`);
+
+    await admin.unsafe(`SET statement_timeout = '${TEST_DB_DROP_STATEMENT_TIMEOUT_MS}ms'`);
     // WITH (FORCE) terminates lingering sessions as part of the same statement,
-    // closing the old pg_terminate_backend -> DROP race (WI-4311).
-    await admin.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+    // closing the old pg_terminate_backend -> DROP race (WI-4311). A pathological
+    // filesystem cleanup is cancelled and marked for a later bounded sweep rather
+    // than pinning this holder (and every contender) past the Vitest hook budget.
+    try {
+      await admin.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(name)} WITH (FORCE)`);
+    } catch (e) {
+      if (!isStatementTimeout(e)) throw e;
+      await markDatabaseDropDeferred(admin, name);
+      return 'deferred';
+    }
+
+    await sweepDeferredDatabaseDrops(admin);
+    return 'dropped';
   } finally {
     if (lockHeld) {
       // The caller closes this connection immediately afterwards; never mask the
       // original drop error with a best-effort unlock failure.
+      await admin.unsafe(`SET statement_timeout = '0'`).catch(() => {});
       await admin.unsafe(`SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`).catch(() => {});
     }
   }
@@ -252,6 +317,11 @@ function templateLockTimeoutMs(value?: number): number {
 function isLockTimeout(e: unknown): boolean {
   const x = e as { code?: string; message?: string } | null;
   return x?.code === '55P03' || /lock timeout/i.test(x?.message ?? '');
+}
+
+function isStatementTimeout(e: unknown): boolean {
+  const x = e as { code?: string; message?: string } | null;
+  return x?.code === '57014' || /statement timeout/i.test(x?.message ?? '');
 }
 
 async function terminateBackends(admin: postgres.Sql, dbName: string): Promise<void> {
