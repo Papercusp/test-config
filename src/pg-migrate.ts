@@ -105,31 +105,63 @@ async function createFreshDb(prefix = 'it'): Promise<{ url: string; name: string
   return { url: swapDbName(adminUri, name), name, adminUri };
 }
 
+/**
+ * Every fresh test database lives on one reused PostgreSQL cluster. DROP DATABASE
+ * is I/O-heavy, so concurrent Vitest teardowns amplify filesystem contention and
+ * can strand every afterAll hook at its timeout. Serialize only the destructive
+ * statement; database creation and schema provisioning remain parallel.
+ */
+export const TEST_DB_DROP_LOCK_KEY = 'papercusp-test-drop-database';
+export const TEST_DB_DROP_LOCK_TIMEOUT_MS = 75_000;
+
+type SqlExecutor = { unsafe: (query: string) => Promise<unknown> };
+
+/** Execute one forced database drop while holding the cluster-wide drop lane. */
+export async function dropDatabaseWithLock(admin: SqlExecutor, name: string): Promise<void> {
+  let lockHeld = false;
+  try {
+    // Bound only lock acquisition. Restore the session default before DROP so a
+    // legitimately slow filesystem cleanup is not cancelled by this budget.
+    await admin.unsafe(`SET lock_timeout = '${TEST_DB_DROP_LOCK_TIMEOUT_MS}ms'`);
+    try {
+      await admin.unsafe(`SELECT pg_advisory_lock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`);
+    } catch (e) {
+      if (isLockTimeout(e)) {
+        throw new Error(
+          `makeDrop: stage=drop-lock-acquire timed out after ${TEST_DB_DROP_LOCK_TIMEOUT_MS}ms ` +
+            `(lock=${TEST_DB_DROP_LOCK_KEY}, database=${name}); another test process is dropping a database`,
+          { cause: e },
+        );
+      }
+      throw e;
+    }
+    lockHeld = true;
+    await admin.unsafe(`SET lock_timeout = '0'`);
+    // WITH (FORCE) terminates lingering sessions as part of the same statement,
+    // closing the old pg_terminate_backend -> DROP race (WI-4311).
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+  } finally {
+    if (lockHeld) {
+      // The caller closes this connection immediately afterwards; never mask the
+      // original drop error with a best-effort unlock failure.
+      await admin.unsafe(`SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`).catch(() => {});
+    }
+  }
+}
+
 function makeDrop(adminUri: string, name: string): () => Promise<void> {
   return () =>
     // EI-10571: this runs in every integration test file's `afterAll` teardown
     // (default vitest hookTimeout 60_000ms) — a raw connect against the shared,
     // fleet-hammered container with no retry turned a transient CONNECT_TIMEOUT
-    // into a hook-timeout failure. `pg_terminate_backend` (no-op if none match)
-    // + `DROP DATABASE IF EXISTS` are both idempotent, so retrying the whole
-    // block (fresh client each attempt) is safe.
+    // into a hook-timeout failure. The forced drop is idempotent, so retrying the
+    // whole block (fresh client each attempt) is safe. dropDatabaseWithLock()
+    // serializes the I/O-heavy destructive statement across Vitest processes
+    // (WI-42514).
     withConnectRetry(async () => {
       const a = postgres(adminUri, { max: 1, onnotice: () => {} });
       try {
-        // WI-4311: pg_terminate_backend only SIGNALS other backends — it returns
-        // before they've actually disconnected. A plain DROP DATABASE issued right
-        // after can then find a not-yet-closed backend and either ERROR ("is being
-        // accessed by other users") or, under host I/O contention, sit blocked
-        // waiting on the connection to fully tear down before it can proceed with
-        // its own (I/O-heavy) file cleanup — observed on the shared dev box as
-        // backends parked in `DROP DATABASE` state for 6s-267s+ under heavy fleet
-        // load. `WITH (FORCE)` (PG13+) makes DROP DATABASE terminate remaining
-        // connections ITSELF as part of the same statement, closing this race
-        // instead of racing pg_terminate_backend's async signal against it.
-        await a.unsafe(
-          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${name}' AND pid <> pg_backend_pid()`,
-        );
-        await a.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+        await dropDatabaseWithLock(a, name);
       } finally {
         await a.end({ timeout: 5 });
       }

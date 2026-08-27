@@ -10,7 +10,13 @@
  *   npx vitest run libs/test-config/src/pg-migrate-connect-retry.test.ts
  */
 import { describe, expect, it, vi } from 'vitest';
-import { isConnectTimeout, withConnectRetry } from './pg-migrate.ts';
+import {
+  dropDatabaseWithLock,
+  isConnectTimeout,
+  TEST_DB_DROP_LOCK_KEY,
+  TEST_DB_DROP_LOCK_TIMEOUT_MS,
+  withConnectRetry,
+} from './pg-migrate.ts';
 
 /** A postgres-js-shaped connect-timeout error (code is the reliable signal). */
 function connectTimeout(): Error & { code: string } {
@@ -80,5 +86,58 @@ describe('withConnectRetry', () => {
     await expect(withConnectRetry(fn, { sleep })).rejects.toBe(boom);
     expect(fn).toHaveBeenCalledTimes(1);
     expect(delays).toEqual([]);
+  });
+});
+
+describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
+  it('serializes the forced drop and always releases the advisory lock', async () => {
+    const queries: string[] = [];
+    await dropDatabaseWithLock({
+      unsafe: async (query) => {
+        queries.push(query);
+      },
+    }, 'it_guarded');
+
+    expect(queries).toEqual([
+      `SET lock_timeout = '${TEST_DB_DROP_LOCK_TIMEOUT_MS}ms'`,
+      `SELECT pg_advisory_lock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`,
+      `SET lock_timeout = '0'`,
+      'DROP DATABASE IF EXISTS "it_guarded" WITH (FORCE)',
+      `SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`,
+    ]);
+  });
+
+  it('unlocks when the forced drop itself fails without masking the error', async () => {
+    const queries: string[] = [];
+    const failure = new Error('drop failed');
+    await expect(
+      dropDatabaseWithLock({
+        unsafe: async (query) => {
+          queries.push(query);
+          if (query.startsWith('DROP DATABASE')) throw failure;
+        },
+      }, 'it_guarded'),
+    ).rejects.toBe(failure);
+
+    expect(queries.at(-1)).toBe(`SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`);
+  });
+
+  it('surfaces a bounded, stage-labelled error when the drop lane is contended', async () => {
+    const queries: string[] = [];
+    const lockTimeout = Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
+    await expect(
+      dropDatabaseWithLock({
+        unsafe: async (query) => {
+          queries.push(query);
+          if (query.includes('pg_advisory_lock')) throw lockTimeout;
+        },
+      }, 'it_guarded'),
+    ).rejects.toThrow(
+      `makeDrop: stage=drop-lock-acquire timed out after ${TEST_DB_DROP_LOCK_TIMEOUT_MS}ms ` +
+        `(lock=${TEST_DB_DROP_LOCK_KEY}, database=it_guarded)`,
+    );
+
+    expect(queries.some((query) => query.startsWith('DROP DATABASE'))).toBe(false);
+    expect(queries.some((query) => query.includes('pg_advisory_unlock'))).toBe(false);
   });
 });
