@@ -26,7 +26,7 @@
  * the crash again.
  */
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { withContainerRecoveryReResolution } from "./pg-container.ts";
 
@@ -34,41 +34,33 @@ const SOURCE = readFileSync(
   fileURLToPath(new URL("./pg-container.ts", import.meta.url)),
   "utf8",
 );
+// These fixtures live in Papercusp's nested source checkout, which is not
+// present in every consumer harness that vendors @papercusp/test-config.
+// Keep the portable source guard below active everywhere, and inspect the
+// nested fixtures whenever the owning checkout is available.
 const HARNESS_ZERO_FIXTURE_SOURCES = [
   {
     name: "coord-links-blocks-notify",
-    source: readFileSync(
-      fileURLToPath(
-        new URL(
-          "../../papercusp/libs/db/src/coord-links-blocks-notify.integration.test.ts",
-          import.meta.url,
-        ),
-      ),
-      "utf8",
+    url: new URL(
+      "../../papercusp/libs/db/src/coord-links-blocks-notify.integration.test.ts",
+      import.meta.url,
     ),
   },
   {
     name: "workspace-host-tenant-rls-migration",
-    source: readFileSync(
-      fileURLToPath(
-        new URL(
-          "../../papercusp/libs/db/src/workspace-host-tenant-rls-migration.integration.test.ts",
-          import.meta.url,
-        ),
-      ),
-      "utf8",
+    url: new URL(
+      "../../papercusp/libs/db/src/workspace-host-tenant-rls-migration.integration.test.ts",
+      import.meta.url,
     ),
   },
   {
     name: "operator-core-org-test-db",
-    source: readFileSync(
-      fileURLToPath(
-        new URL("../../../packages/operator-core/test/_org-test-db.ts", import.meta.url),
-      ),
-      "utf8",
-    ),
+    url: new URL("../../../packages/operator-core/test/_org-test-db.ts", import.meta.url),
   },
-] as const;
+].flatMap(({ name, url }) => {
+  const path = fileURLToPath(url);
+  return existsSync(path) ? [{ name, source: readFileSync(path, "utf8") }] : [];
+});
 
 function harnessZeroRoleDefinitions(source: string): string[] {
   return [...source.matchAll(/(?:CREATE|ALTER)\s+ROLE\s+harness_zero\b[^;]*;/g)].map(
@@ -143,7 +135,9 @@ describe("harness_zero test-role boundary (EI-21638847910599943)", () => {
     }
   });
 
-  it("keeps each fixture's fallback role definition inside that same boundary", () => {
+  it.skipIf(HARNESS_ZERO_FIXTURE_SOURCES.length === 0)(
+    "keeps each fixture's fallback role definition inside that same boundary",
+    () => {
     for (const fixture of HARNESS_ZERO_FIXTURE_SOURCES) {
       const definitions = harnessZeroRoleDefinitions(fixture.source);
 
@@ -156,7 +150,8 @@ describe("harness_zero test-role boundary (EI-21638847910599943)", () => {
         expect(definition, fixture.name).not.toMatch(/\bSUPERUSER\b/);
       }
     }
-  });
+    },
+  );
 });
 
 /**
