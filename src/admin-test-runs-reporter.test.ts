@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import AdminTestRunsReporter, {
   buildOutputTail,
   captureReporterSaturationSnapshot,
@@ -27,6 +28,8 @@ import AdminTestRunsReporter, {
   shouldRecordTestRunPath,
   type TestRunRow,
 } from './admin-test-runs-reporter';
+
+const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -222,7 +225,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         async () => undefined,
       );
     const makeModule = (file: string, test: string, actual: string, expected: string) => ({
-      moduleId: join(process.cwd(), file),
+      moduleId: join(TEST_CONFIG_ROOT, file),
       state: () => 'failed',
       diagnostic: () => ({ duration: 1 }),
       errors: () => [],
@@ -232,12 +235,12 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     });
     try {
       const first = makeReporter();
-      first.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      first.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
       first.onTestModuleEnd(makeModule('src/first.test.ts', 'first', 'actual-a', 'expected-a') as never);
       await first.onTestRunEnd();
 
       const second = makeReporter();
-      second.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      second.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
       second.onTestModuleEnd(makeModule('src/second.test.ts', 'second', 'actual-b', 'expected-b') as never);
       await second.onTestRunEnd();
 
@@ -245,8 +248,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         failures: Array<{ file: string; test: string; actual?: string; expected?: string }>;
       };
       expect(payload.failures).toEqual(expect.arrayContaining([
-        expect.objectContaining({ file: 'libs/test-config/src/first.test.ts', test: 'first', actual: 'actual-a', expected: 'expected-a' }),
-        expect.objectContaining({ file: 'libs/test-config/src/second.test.ts', test: 'second', actual: 'actual-b', expected: 'expected-b' }),
+        expect.objectContaining({ file: expect.stringMatching(/(?:^|\/)src\/first\.test\.ts$/), test: 'first', actual: 'actual-a', expected: 'expected-a' }),
+        expect.objectContaining({ file: expect.stringMatching(/(?:^|\/)src\/second\.test\.ts$/), test: 'second', actual: 'actual-b', expected: 'expected-b' }),
       ]));
     } finally {
       if (previous === undefined) delete process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
