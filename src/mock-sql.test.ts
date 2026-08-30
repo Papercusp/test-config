@@ -78,13 +78,19 @@ describe('mockSqlThrowOnUnmatched', () => {
         { name: 'dbOrgMock' },
       );
 
-      const err = await q(sql, 'SELECT 1 FROM adv_sessions').catch((e: unknown) => e as Error);
+      // `then(onOk, onErr)` rather than `.catch`: it also asserts the call
+      // actually REJECTED, instead of silently passing if it started resolving.
+      const err = await q(sql, 'SELECT 1 FROM adv_sessions').then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
 
-      expect(err.message).toContain('dbOrgMock'); // WHICH mock refused
-      expect(err.message).toContain('adv_sessions'); // WHICH query
-      expect(err.message).toContain('presence'); // what WAS routed
-      expect(err.message).toContain('harness_plans');
-      expect(err.message).toContain('fallback'); // the deliberate escape
+      expect(err).toBeInstanceOf(Error);
+      expect(err?.message).toContain('dbOrgMock'); // WHICH mock refused
+      expect(err?.message).toContain('adv_sessions'); // WHICH query
+      expect(err?.message).toContain('presence'); // what WAS routed
+      expect(err?.message).toContain('harness_plans');
+      expect(err?.message).toContain('fallback'); // the deliberate escape
     });
   });
 
