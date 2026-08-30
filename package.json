@@ -21,6 +21,11 @@
       "import": "./src/nuqs-mock.ts",
       "default": "./src/nuqs-mock.ts"
     },
+    "./mock-sql": {
+      "types": "./src/mock-sql.ts",
+      "import": "./src/mock-sql.ts",
+      "default": "./src/mock-sql.ts"
+    },
     "./vitest-config": {
       "types": "./src/vitest-config.ts",
       "import": "./src/vitest-config.ts",
