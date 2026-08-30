@@ -2,7 +2,12 @@ import { hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 
-const DEFAULT_TIMEOUT_MS = 180_000;
+/**
+ * The default wait budget is part of the test-fixture contract: callers that
+ * wrap startup in an outer Vitest hook must leave enough headroom for the
+ * lock's diagnostic to be reported instead of having Vitest cancel first.
+ */
+export const TESTCONTAINER_START_LOCK_TIMEOUT_MS = 180_000;
 const DEFAULT_STALE_MS = 10 * 60_000;
 const DEFAULT_RETRY_MS = 250;
 
@@ -100,7 +105,10 @@ export async function withTestcontainerStartLock<T>(
 
   const root = lockRoot();
   const lockDir = join(root, `${safeName(name)}.lock`);
-  const timeoutMs = opts.timeoutMs ?? intEnv('PAPERCUSP_TESTCONTAINERS_START_LOCK_TIMEOUT_MS', DEFAULT_TIMEOUT_MS);
+  const timeoutMs = opts.timeoutMs ?? intEnv(
+    'PAPERCUSP_TESTCONTAINERS_START_LOCK_TIMEOUT_MS',
+    TESTCONTAINER_START_LOCK_TIMEOUT_MS,
+  );
   const staleMs = opts.staleMs ?? intEnv('PAPERCUSP_TESTCONTAINERS_START_LOCK_STALE_MS', DEFAULT_STALE_MS);
   const retryMs = opts.retryMs ?? intEnv('PAPERCUSP_TESTCONTAINERS_START_LOCK_RETRY_MS', DEFAULT_RETRY_MS);
   const startedAt = Date.now();
@@ -132,7 +140,7 @@ export async function withTestcontainerStartLock<T>(
       }
 
       // EI-7818: age-based staleness (above) can NEVER fire under the DEFAULT
-      // config, because DEFAULT_TIMEOUT_MS (180s) is smaller than DEFAULT_STALE_MS
+      // config, because TESTCONTAINER_START_LOCK_TIMEOUT_MS (180s) is smaller than DEFAULT_STALE_MS
       // (600s) — a caller always hits its own `elapsed > timeoutMs` throw below
       // long before the lock is old enough to be judged stale, so a crashed
       // holder's lock wedges EVERY subsequent caller for a full timeoutMs, FOREVER
