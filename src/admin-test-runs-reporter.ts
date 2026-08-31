@@ -136,6 +136,49 @@ function resolveTestRunSource(): TestRunSource {
 }
 
 /**
+ * WI-1702898 — `source='ci'` is an EVIDENCE CLAIM, and a dirty tree cannot support it.
+ *
+ * A run against a tree ~100 agents are concurrently mutating proves nothing about any
+ * sha: the files that executed are not the files any commit contains. Those rows were
+ * nonetheless written as `source='ci'` (3,126 of them on 2026-08-31), where they are
+ * indistinguishable from real gate evidence and silently inflate every aggregate over
+ * it — including the one an agent reaches for when asked "how is the greening going".
+ *
+ * The row is still WRITTEN: it is real flakiness/timing data. What it loses is the
+ * claim to be CI evidence. `local` is the honest bucket (that is what an unstable
+ * working tree is), `run_group_id` still carries the gate-run provenance, and
+ * `worktree_dirty` still carries the reason.
+ */
+export function resolveRecordedTestRunSource(
+  declared: TestRunSource,
+  worktreeDirty: boolean,
+): TestRunSource {
+  return declared === 'ci' && worktreeDirty ? 'local' : declared;
+}
+
+/**
+ * WI-1702898 — the JUDGED sha, stamped by the runner that knows it, preferred over the
+ * sha this process can infer.
+ *
+ * The gate used to stamp nothing here, on the stated premise that "the reporter resolves
+ * it with `git rev-parse HEAD` in the checkout it ran in, which for the gate IS the
+ * judged candidate". The premise is right and the mechanism is not: that resolution runs
+ * under a 200ms fail-soft timeout and degrades to `null`, so under fleet load an entire
+ * suite lands with `commit_sha=NULL` — 6,337 files on 2026-08-31. The largest body of
+ * test evidence on the box could not be joined to what was being judged, which is what
+ * made "what is failing on the candidate" unanswerable in the first place.
+ *
+ * An explicit stamp is an OBSERVATION by the process that chose the sha; a local
+ * `rev-parse` is an INFERENCE about which checkout we happen to be sitting in. When both
+ * exist the observation wins — the same precedence the gate-candidate cell draws between
+ * its `retriage-marker` and `run-probe` sources.
+ */
+export function resolveTestRunCommit(inferred: string | null): string | null {
+  const stamped = process.env.PAPERCUSP_TEST_RUN_COMMIT?.trim();
+  return stamped || inferred;
+}
+
+/**
  * Mutation-probe runs deliberately produce a baseline and usually a failing
  * mutant result. Neither is a repository-health measurement, so the reporter
  * must not enqueue either row for harness_shared.test_runs.
@@ -556,7 +599,10 @@ async function insertRow(row: TestRunRow): Promise<void> {
   const pg = await tryGetPg();
   if (!pg) return;
 
-  const source = resolveTestRunSource();
+  // WI-1702898: both of these are the difference between a row that can answer
+  // "what is failing on the candidate" and one that silently cannot.
+  const source = resolveRecordedTestRunSource(resolveTestRunSource(), row.worktreeDirty);
+  commit = resolveTestRunCommit(commit);
   const runGroupId = process.env.PAPERCUSP_TEST_RUN_GROUP ?? null;
   const harnessSlug = resolveTestRunHarnessSlug();
   const workspaceId = resolveTestRunWorkspaceId();
