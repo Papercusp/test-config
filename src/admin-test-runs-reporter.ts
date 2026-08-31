@@ -521,10 +521,13 @@ async function closeSharedPg(): Promise<void> {
  * Checked in that order (most explicit override first). Exported so the
  * precedence is unit-testable without touching this function's PG/git IO.
  *
- * This does NOT undo the release gate's deliberate exclusion: green-checkpoint
- * strips every `PAPERCUSP_*` var (see its own `buildGateChildEnv` comment) —
- * and, since this fix landed, `HARNESS_SLUG` too — from its children's env
- * before setting only what IT wants, specifically so its rows stay unattributed
+ * This does NOT undo the release gate's deliberate exclusion. green-checkpoint
+ * REBUILDS its children's env from an ALLOWLIST rather than stripping keys from
+ * the host's: `canonicalGreenCheckpointSourceEnv` (called by
+ * `buildGreenCheckpointEnv`) keeps only `GREEN_CHECKPOINT_SOURCE_ENV_KEYS` plus
+ * the `AFFECTED_` / `VITEST_` prefixes, so neither `PAPERCUSP_*` nor
+ * `HARNESS_SLUG` survives into the child. It then stamps only what IT wants,
+ * specifically so its rows stay unattributed
  * (`source='ci'` rows are about the checkpoint tree, not one hive's own suite).
  */
 export function resolveTestRunHarnessSlug(): string | null {
