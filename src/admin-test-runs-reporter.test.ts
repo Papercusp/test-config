@@ -23,6 +23,8 @@ import AdminTestRunsReporter, {
   formatTestCaseError,
   isScratchConfigFile,
   isMutationProbeRun,
+  resolveRecordedTestRunSource,
+  resolveTestRunCommit,
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
   shouldRecordTestRunPath,
@@ -33,6 +35,56 @@ const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe('WI-1702898 — a test_runs row must be joinable to the sha it judged', () => {
+  const saved = { ...process.env };
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it('refuses to record a DIRTY-TREE run as source=ci', () => {
+    // A tree ~100 agents are mutating proves nothing about any sha. Recorded as `ci`,
+    // 3,126 such rows sat indistinguishable from real gate evidence on 2026-08-31.
+    expect(resolveRecordedTestRunSource('ci', true)).toBe('local');
+  });
+
+  it('leaves a CLEAN ci run alone — this narrows the claim, it does not delete it', () => {
+    expect(resolveRecordedTestRunSource('ci', false)).toBe('ci');
+  });
+
+  it('never PROMOTES a non-ci source, in either dirty state', () => {
+    for (const dirty of [true, false]) {
+      expect(resolveRecordedTestRunSource('local', dirty)).toBe('local');
+      expect(resolveRecordedTestRunSource('admin-ui', dirty)).toBe('admin-ui');
+    }
+  });
+
+  it('prefers the runner STAMP over the locally inferred sha', () => {
+    // The stamp is an observation by the process that chose the sha; the inferred value
+    // is a guess about which checkout we are sitting in, behind a 200ms timeout.
+    process.env.PAPERCUSP_TEST_RUN_COMMIT = 'adbf27530285830455f8d8df32a45752cfaff332';
+    expect(resolveTestRunCommit('someotherhead')).toBe('adbf27530285830455f8d8df32a45752cfaff332');
+  });
+
+  it('falls back to the inferred sha when nothing stamped one', () => {
+    delete process.env.PAPERCUSP_TEST_RUN_COMMIT;
+    expect(resolveTestRunCommit('localhead')).toBe('localhead');
+  });
+
+  it('an EMPTY or whitespace stamp is not a stamp — it must not blank a real inferred sha', () => {
+    // A stamp that resolved to '' is exactly the NULL this fix exists to remove; letting
+    // it win would reintroduce the defect through the fix for it.
+    for (const blank of ['', '   ']) {
+      process.env.PAPERCUSP_TEST_RUN_COMMIT = blank;
+      expect(resolveTestRunCommit('localhead')).toBe('localhead');
+    }
+  });
+
+  it('still reports null when neither source has a sha — an honest NULL, not a fake one', () => {
+    delete process.env.PAPERCUSP_TEST_RUN_COMMIT;
+    expect(resolveTestRunCommit(null)).toBeNull();
+  });
 });
 
 describe('AdminTestRunsReporter fail-soft contract', () => {
