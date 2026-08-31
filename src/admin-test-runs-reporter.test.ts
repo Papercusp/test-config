@@ -24,6 +24,7 @@ import AdminTestRunsReporter, {
   isScratchConfigFile,
   isMutationProbeRun,
   resolveRecordedTestRunSource,
+  resolveReporterHostLoopLag,
   resolveTestRunCommit,
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
@@ -166,12 +167,32 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
   });
 
   it('captures the reporter saturation fields used by harness_shared.test_runs', () => {
+    const previous = process.env.PAPERCUSP_RESOURCE_GOVERNOR_HEALTH_DIR;
+    process.env.PAPERCUSP_RESOURCE_GOVERNOR_HEALTH_DIR = '/tmp/papercusp-no-live-health-for-test';
     const snap = captureReporterSaturationSnapshot();
-    expect(snap.rssMb).toEqual(expect.any(Number));
-    // The reporter is a child process and cannot observe the operator host
-    // loop that testing:runs classifies. A local histogram would be an
-    // invalid positive-looking signal, so the provenance is explicitly null.
-    expect(snap.loopLagP95Ms).toBeNull();
+    try {
+      expect(snap.rssMb).toEqual(expect.any(Number));
+      // No host snapshot at this path: absence remains an explicit unknown.
+      expect(snap.loopLagP95Ms).toBeNull();
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCUSP_RESOURCE_GOVERNOR_HEALTH_DIR;
+      else process.env.PAPERCUSP_RESOURCE_GOVERNOR_HEALTH_DIR = previous;
+    }
+  });
+
+  it('accepts only a fresh measured host snapshot for loop-lag attribution', () => {
+    const measured = {
+      sampledAtMs: 10_000,
+      signals: {
+        'latency.eventLoopP95Ms': {
+          state: 'measured', value: 323.5, unit: 'milliseconds', observedAtMs: 9_500,
+        },
+      },
+    };
+    expect(resolveReporterHostLoopLag(measured, 10_000)).toBe(323.5);
+    expect(resolveReporterHostLoopLag({ ...measured, sampledAtMs: 1 }, 10_000)).toBeNull();
+    expect(resolveReporterHostLoopLag({ ...measured, signals: { 'latency.eventLoopP95Ms': { ...measured.signals['latency.eventLoopP95Ms'], state: 'unknown' } } }, 10_000)).toBeNull();
+    expect(resolveReporterHostLoopLag({ ...measured, signals: { 'latency.eventLoopP95Ms': { ...measured.signals['latency.eventLoopP95Ms'], unit: 'percent' } } }, 10_000)).toBeNull();
   });
 
   it('does not record retired, scratch, or sibling-checkout test paths', () => {
