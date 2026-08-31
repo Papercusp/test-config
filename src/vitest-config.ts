@@ -466,7 +466,26 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         );
         return undefined; // still fail the run — diagnosability, not suppression.
       },
-      hookTimeout: layer === 'integration' ? 90_000 : 60_000,
+      // EI-21863578695350444 (2026-08-30): `createOrgTestDb`/`getOrBuildTemplate`
+      // (~230 *.integration.test.ts consumers) cache a fully-migrated schema in a
+      // Postgres TEMPLATE db keyed by the migration-set content hash, so most
+      // beforeAll calls just CLONE it (measured: device-store's 9-test suite,
+      // clone path, 23.4s total). But that template is invalidated by EVERY new
+      // migration (877 files today, growing continuously on this tree), and
+      // exactly one process per fleet must then pay the FULL cold rebuild — ~877
+      // sequential DDL round-trips against the ONE Postgres container `.withReuse()`d
+      // by every concurrent vitest fork fleet-wide (WI-4133: "~30+ fleet agents at
+      // once"; the SAME contention class WI-4133's max_connections=500 and
+      // WI-5254/5256's widened recovery-mode retry already address for other
+      // symptoms). That builder's cost is genuinely load-dependent and can exceed
+      // even a generous fixed hookTimeout during a busy window — not a hang, not a
+      // bug in the fixture. Same pattern as testTimeout's VITEST_UNIT_TIMEOUT_MS
+      // above: keep dev/CI fast-failing by default, let the gate ask for more
+      // headroom via env instead of everyone guessing a bigger constant.
+      hookTimeout:
+        layer === 'integration'
+          ? Number(process.env.VITEST_INTEGRATION_HOOK_TIMEOUT_MS) || 90_000
+          : 60_000,
       setupFiles: finalSetup,
       globalSetup,
       reporters: process.env.CI

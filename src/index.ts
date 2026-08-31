@@ -48,6 +48,13 @@ export { makeFixture, makeFixtures, _resetFixtureCounters } from './make-fixture
 export { resolveRepoFile, readRepoFile } from './repo-file.ts';
 export { honoTestClient } from './hono-test-client.ts';
 export type { HonoTestClient, HonoTestResponse, HonoTestClientOptions, RequestableApp } from './hono-test-client.ts';
+// NOTE: mockSqlThrowOnUnmatched/renderQueryText are intentionally NOT re-exported here —
+// import them from '@papercusp/test-config/mock-sql'. `mock-sql.ts` has ZERO imports, and
+// its audience is UNIT-tier tests (it exists to mock getOrgPg's sql so a unit test never
+// touches live PG). Reaching it through this barrel would make the lightest tier of test
+// statically pull testcontainers/msw/@nestjs-testing/drizzle — the exact weight this
+// barrel's header warns about (EI-13226's spurious `--localstorage-file` warning, and the
+// esbuild crash in EI-8888/EI-8821). A lightweight export belongs behind its own subpath.
 // NOTE: bootNestTestApp is intentionally NOT re-exported here — import it from
 // '@papercusp/test-config/nest' so projects without NestJS never load @nestjs/*.
 // NOTE: nuqsParsers/createNuqsMock are intentionally NOT re-exported here either —
