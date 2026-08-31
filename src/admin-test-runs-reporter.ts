@@ -28,6 +28,7 @@ import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { exec } from 'node:child_process';
 import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
+import { homedir } from 'node:os';
 
 /**
  * EI-19307211919650123: classify the `.git` entry at `dir` for the root walk.
@@ -413,18 +414,65 @@ function writeFailureDetails(details: TestFailureDetail[]): void {
 export type WorktreeSnapshotReader = () => Promise<WorktreeGitSnapshot>;
 export type TestRunRowWriter = (row: TestRunRow) => Promise<void>;
 
+/**
+ * Resolve a host-level loop-lag value from the resource-governor snapshot.
+ *
+ * The Vitest reporter runs in a child process, so its own event-loop histogram
+ * is not the operator host signal consumed by `testing:runs`. The host
+ * publisher already writes that signal atomically; consume only a fresh,
+ * measured millisecond reading and preserve `null` for malformed, stale, or
+ * unknown snapshots. Kept pure so the provenance/freshness boundary is tested
+ * without depending on the live host file.
+ */
+export function resolveReporterHostLoopLag(
+  snapshot: unknown,
+  nowMs: number,
+  maxAgeMs = 15_000,
+): number | null {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  if (!Number.isFinite(nowMs) || !Number.isFinite(maxAgeMs) || maxAgeMs < 0) return null;
+  const root = snapshot as {
+    sampledAtMs?: unknown;
+    signals?: Record<string, { state?: unknown; value?: unknown; unit?: unknown; observedAtMs?: unknown }>;
+  };
+  const signal = root.signals?.['latency.eventLoopP95Ms'];
+  if (!signal || signal.state !== 'measured' || signal.unit !== 'milliseconds') return null;
+  if (typeof signal.value !== 'number' || !Number.isFinite(signal.value) || signal.value < 0) return null;
+  const observedAtMs = typeof signal.observedAtMs === 'number' ? signal.observedAtMs : root.sampledAtMs;
+  if (!Number.isFinite(observedAtMs)) return null;
+  const ageMs = nowMs - observedAtMs;
+  if (ageMs < 0 || ageMs > maxAgeMs) return null;
+  return signal.value;
+}
+
+function readReporterHostLoopLag(env: NodeJS.ProcessEnv = process.env, nowMs = Date.now()): number | null {
+  const explicit = env.PAPERCUSP_TEST_RUN_LOOP_LAG_P95_MS?.trim();
+  if (explicit) {
+    const value = Number(explicit);
+    if (Number.isFinite(value) && value >= 0) return value;
+  }
+  const healthDir = env.PAPERCUSP_RESOURCE_GOVERNOR_HEALTH_DIR
+    ? env.PAPERCUSP_RESOURCE_GOVERNOR_HEALTH_DIR
+    : join(homedir(), '.papercusp', 'runtime', 'resource-governor');
+  try {
+    const snapshot = JSON.parse(readFileSync(join(healthDir, 'live-health.json'), 'utf8')) as unknown;
+    return resolveReporterHostLoopLag(snapshot, nowMs);
+  } catch {
+    return null;
+  }
+}
+
 export function captureReporterSaturationSnapshot(): { loopLagP95Ms: number | null; rssMb: number | null } {
-  // This reporter is a child process. Its event loop is mostly idle while
-  // Vitest workers run, so it cannot measure the operator host loop used by
-  // testing:runs' critical-band classifier. Persist no false-provenance
-  // sample; the reader will expose saturationSuspect as unknown.
+  // Read the host publisher's atomic snapshot rather than measuring this child
+  // process. A missing/stale file remains an explicit unknown (`null`).
+  const loopLagP95Ms = readReporterHostLoopLag();
   let rssMb: number | null = null;
   try {
     rssMb = Math.round((process.memoryUsage().rss / 1_048_576) * 10) / 10;
   } catch {
     rssMb = null;
   }
-  return { loopLagP95Ms: null, rssMb };
+  return { loopLagP95Ms, rssMb };
 }
 
 /**
