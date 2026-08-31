@@ -190,7 +190,16 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       },
     };
     expect(resolveReporterHostLoopLag(measured, 10_000)).toBe(323.5);
-    expect(resolveReporterHostLoopLag({ ...measured, sampledAtMs: 1 }, 10_000)).toBeNull();
+    expect(resolveReporterHostLoopLag({
+      ...measured,
+      sampledAtMs: 1,
+      signals: {
+        'latency.eventLoopP95Ms': {
+          ...measured.signals['latency.eventLoopP95Ms'],
+          observedAtMs: 1,
+        },
+      },
+    }, 30_000)).toBeNull();
     expect(resolveReporterHostLoopLag({ ...measured, signals: { 'latency.eventLoopP95Ms': { ...measured.signals['latency.eventLoopP95Ms'], state: 'unknown' } } }, 10_000)).toBeNull();
     expect(resolveReporterHostLoopLag({ ...measured, signals: { 'latency.eventLoopP95Ms': { ...measured.signals['latency.eventLoopP95Ms'], unit: 'percent' } } }, 10_000)).toBeNull();
   });
@@ -439,6 +448,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     await r.onTestRunEnd();
     expect(persisted).toHaveLength(1);
     expect(persisted[0].worktreeDirty).toBe(true);
+    expect(persisted[0].commitSha).toBe('abc');
   });
 
   it('persists worktree_dirty=false for a clean stable run', async () => {
@@ -464,6 +474,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     await r.onTestRunEnd();
     expect(persisted).toHaveLength(1);
     expect(persisted[0].worktreeDirty).toBe(false);
+    expect(persisted[0].commitSha).toBe('abc');
   });
 });
 

@@ -283,6 +283,9 @@ export interface TestRunRow {
   isScratchConfig: boolean;
   /** EI-20327093837421120: true when the shared tree was not stable around the run. */
   worktreeDirty: boolean;
+  /** The post-run snapshot's commit. Reuse the same 2s integrity probe rather
+   * than re-running a 200ms best-effort lookup once per persisted file. */
+  commitSha: string | null;
 }
 
 /** A structured assertion detail captured from Vitest's TestCase result. */
@@ -438,12 +441,16 @@ export function resolveReporterHostLoopLag(
   const signal = root.signals?.['latency.eventLoopP95Ms'];
   if (!signal || signal.state !== 'measured' || signal.unit !== 'milliseconds') return null;
   if (typeof signal.value !== 'number' || !Number.isFinite(signal.value) || signal.value < 0) return null;
-  const observedAtMs = typeof signal.observedAtMs === 'number' ? signal.observedAtMs : root.sampledAtMs;
-  if (!Number.isFinite(observedAtMs)) return null;
+  const observedAtMs = typeof signal.observedAtMs === 'number'
+    ? signal.observedAtMs
+    : (typeof root.sampledAtMs === 'number' ? root.sampledAtMs : null);
+  if (observedAtMs === null || !Number.isFinite(observedAtMs)) return null;
   const ageMs = nowMs - observedAtMs;
   if (ageMs < 0 || ageMs > maxAgeMs) return null;
   return signal.value;
 }
+
+let _hostLoopLagCache: { path: string; readAtMs: number; value: number | null } | null = null;
 
 function readReporterHostLoopLag(env: NodeJS.ProcessEnv = process.env, nowMs = Date.now()): number | null {
   const explicit = env.PAPERCUSP_TEST_RUN_LOOP_LAG_P95_MS?.trim();
@@ -454,12 +461,19 @@ function readReporterHostLoopLag(env: NodeJS.ProcessEnv = process.env, nowMs = D
   const healthDir = env.PAPERCUSP_RESOURCE_GOVERNOR_HEALTH_DIR
     ? env.PAPERCUSP_RESOURCE_GOVERNOR_HEALTH_DIR
     : join(homedir(), '.papercusp', 'runtime', 'resource-governor');
-  try {
-    const snapshot = JSON.parse(readFileSync(join(healthDir, 'live-health.json'), 'utf8')) as unknown;
-    return resolveReporterHostLoopLag(snapshot, nowMs);
-  } catch {
-    return null;
+  const healthPath = join(healthDir, 'live-health.json');
+  if (_hostLoopLagCache && _hostLoopLagCache.path === healthPath && nowMs - _hostLoopLagCache.readAtMs < 1_000) {
+    return _hostLoopLagCache.value;
   }
+  let value: number | null = null;
+  try {
+    const snapshot = JSON.parse(readFileSync(healthPath, 'utf8')) as unknown;
+    value = resolveReporterHostLoopLag(snapshot, nowMs);
+  } catch {
+    value = null;
+  }
+  _hostLoopLagCache = { path: healthPath, readAtMs: nowMs, value };
+  return value;
 }
 
 export function captureReporterSaturationSnapshot(): { loopLagP95Ms: number | null; rssMb: number | null } {
@@ -646,11 +660,11 @@ export function resolveTestRunWorkspaceId(): string | null {
 
 async function insertRow(row: TestRunRow): Promise<void> {
   let branch: string | null = null;
-  let commit: string | null = null;
+  let commit: string | null = row.commitSha;
   try {
     const ctx = await resolveGitContext();
     branch = ctx.branch;
-    commit = ctx.commit;
+    commit ??= ctx.commit;
   } catch { /* fail-soft */ }
 
   const pg = await tryGetPg();
@@ -786,7 +800,7 @@ export function computeIsScratchConfig(ctx: Pick<Vitest, 'vite'>): boolean {
   }
 }
 
-type PendingTestRunRow = Omit<TestRunRow, 'worktreeDirty'>;
+type PendingTestRunRow = Omit<TestRunRow, 'worktreeDirty' | 'commitSha'>;
 
 export default class AdminTestRunsReporter implements Reporter {
   private pending: PendingTestRunRow[] = [];
@@ -854,10 +868,12 @@ export default class AdminTestRunsReporter implements Reporter {
     if (this.pending.length === 0) return;
 
     let worktreeDirty = true;
+    let commitSha: string | null = null;
     try {
       const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot();
       const after = await this.readWorktreeSnapshot();
       worktreeDirty = computeWorktreeDirty(before, after);
+      commitSha = after.commit;
     } catch {
       // D-007: missing proof of stability is dirty, never a false clean.
       worktreeDirty = true;
@@ -865,7 +881,7 @@ export default class AdminTestRunsReporter implements Reporter {
 
     const rows = this.pending.splice(0);
     await Promise.race([
-      Promise.allSettled(rows.map((row) => this.writeRow({ ...row, worktreeDirty }))),
+      Promise.allSettled(rows.map((row) => this.writeRow({ ...row, worktreeDirty, commitSha }))),
       new Promise((r) => setTimeout(r, 5000)),
     ]);
   }
