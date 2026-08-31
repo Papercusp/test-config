@@ -93,8 +93,6 @@ describe('withConnectRetry', () => {
 });
 
 describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
-  const DROP_DATABASE_PREFIX = ['DROP', 'DATABASE'].join(' ');
-
   it('serializes the forced drop and always releases the advisory lock', async () => {
     const queries: string[] = [];
     const result = await dropDatabaseWithLock({
@@ -124,7 +122,7 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
         unsafe: async (query) => {
           queries.push(query);
           if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
-          if (query.startsWith(DROP_DATABASE_PREFIX)) throw failure;
+          if (query.startsWith('DROP DATABASE')) throw failure;
           return [];
         },
       }, 'it_guarded'),
@@ -144,7 +142,7 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
     }, 'it_guarded');
 
     expect(result).toBe('deferred');
-    expect(queries.some((query) => query.startsWith(DROP_DATABASE_PREFIX))).toBe(false);
+    expect(queries.some((query) => query.startsWith('DROP DATABASE'))).toBe(false);
     expect(queries.some((query) => query.includes('pg_advisory_unlock'))).toBe(false);
     expect(queries).toContain(`COMMENT ON DATABASE "it_guarded" IS '${TEST_DB_DEFERRED_MARKER}'`);
   });
@@ -158,7 +156,7 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
       unsafe: async (query) => {
         queries.push(query);
         if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
-        if (query.startsWith(DROP_DATABASE_PREFIX)) throw statementTimeout;
+        if (query.startsWith('DROP DATABASE')) throw statementTimeout;
         return [];
       },
     }, 'it_guarded');

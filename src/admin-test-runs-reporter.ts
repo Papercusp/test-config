@@ -72,7 +72,16 @@ export function classifyGitEntry(dir: string): 'root' | 'skip' | 'none' {
     if (!m) return 'skip';
     // Normalise separators so the marker test is platform-agnostic.
     const gitdir = m[1].trim().split('\\').join('/');
-    if (gitdir.includes('/worktrees/')) return 'root';
+    // A submodule checked out inside a linked superproject worktree points at
+    // `<worktree>/.git/worktrees/<name>/modules/<path>`. It contains both
+    // markers, but the submodule is still not the monorepo root.
+    const worktreeMarker = /(?:^|\/)\.git\/worktrees\//;
+    const worktreeMatch = worktreeMarker.exec(gitdir);
+    if (worktreeMatch) {
+      const worktreeTarget = gitdir.slice(worktreeMatch.index + worktreeMatch[0].length);
+      return /(?:^|\/)modules\//.test(worktreeTarget) ? 'skip' : 'root';
+    }
+    if (/(?:^|\/)\.git\/modules\//.test(gitdir)) return 'skip';
     return 'skip'; // `/modules/` (submodule) and every unrecognised shape
   } catch {
     return 'skip';

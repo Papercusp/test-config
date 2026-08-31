@@ -462,6 +462,18 @@ describe('classifyGitEntry (worktree vs submodule vs plain repo root)', () => {
     expect(classifyGitEntry(d)).toBe('skip');
   });
 
+  it('a submodule gitlink nested inside a linked worktree is still skipped', () => {
+    const d = tree();
+    writeFileSync(join(d, '.git'), 'gitdir: /repo/.git/worktrees/checkout/modules/libs/test-config\n');
+    expect(classifyGitEntry(d)).toBe('skip');
+  });
+
+  it('does not treat a repository path segment named modules as a submodule', () => {
+    const d = tree();
+    writeFileSync(join(d, '.git'), 'gitdir: /repo/modules/project/.git/worktrees/checkout\n');
+    expect(classifyGitEntry(d)).toBe('root');
+  });
+
   it('no `.git` entry at all reports none', () => {
     expect(classifyGitEntry(tree())).toBe('none');
   });
