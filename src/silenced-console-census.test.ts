@@ -151,5 +151,27 @@ describe('silenced-console census (EI-21253580842180372)', () => {
       resetSilencedConsoleCensus();
       expect(readSilencedConsoleExemplars()).toEqual({});
     });
+
+    /**
+     * END-TO-END through the REAL console hook, not the module seam. Every other
+     * test here calls `recordSilencedMessage` directly, which cannot detect the
+     * failure that would matter most: `setup-fail-on-console.ts` no longer
+     * routing suppressions into the census, leaving it a confident permanent
+     * zero — the exact defect it was built to end.
+     *
+     * This test is self-falsifying in BOTH directions, which is what makes it
+     * worth its cost. `shouldFailOnWarn: true` means an un-silenced
+     * `console.warn` FAILS this test outright, so reaching the assertions at all
+     * proves the allowlist matched the WRAPPED text (the item's core claim: a
+     * fail-soft handler silences its own wrapper log). And the assertions then
+     * prove the silenced message was counted rather than merely swallowed.
+     */
+    it('a real console.warn of a WRAPPED rail message is silenced AND censused', () => {
+      console.warn(WRAPPED_RAIL_MESSAGE);
+      expect(readSilencedConsoleCensus()['real-pg-blocked']).toBe(1);
+      expect(readSilencedConsoleExemplars()['real-pg-blocked']?.[0]).toContain(
+        '[inbox-wake] idle-probe roster read failed',
+      );
+    });
   });
 });
