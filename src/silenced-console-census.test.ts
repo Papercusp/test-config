@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { isSilencedConsoleMessage } from './console-noise-filter.ts';
 import {
   readSilencedConsoleCensus,
+  readSilencedConsoleExemplars,
   recordSilencedMessage,
   resetSilencedConsoleCensus,
   summariseSilencedConsole,
@@ -12,6 +13,16 @@ const RAIL_MESSAGE =
   'A UNIT test tried to open a REAL Postgres connection (pool "orgPg" → postgres://<redacted>@127.0.0.1:5432/papercusp). ' +
   'Unit tests must not touch a live database — inject the module\'s own seam double, or ' +
   'rename the file *.integration.test.ts to run it against a testcontainer. [EI-19311807188719573]';
+
+/**
+ * The same rail text as a FAIL-SOFT WRAPPER actually logs it, which is the shape
+ * that reaches the console hook in practice. `assertRealPgAllowed` THROWS and never
+ * writes to console itself; `inbox-wake.ts` catches that throw and logs its own
+ * message with `${e.message}` interpolated — so the subsystem prefix LEADS and the
+ * rail's text trails.
+ */
+const WRAPPED_RAIL_MESSAGE =
+  '[inbox-wake] idle-probe roster read failed, reporting no idle recipients: ' + RAIL_MESSAGE;
 
 describe('silenced-console census (EI-21253580842180372)', () => {
   beforeEach(() => {
@@ -80,5 +91,65 @@ describe('silenced-console census (EI-21253580842180372)', () => {
   it('does not bucket an unrelated message as a rail violation', () => {
     recordSilencedMessage('some unrelated failure text');
     expect(readSilencedConsoleCensus()['real-pg-blocked']).toBeUndefined();
+  });
+
+  /**
+   * EI-19417655142979569 — the count says the rail FIRED; these say WHICH
+   * subsystem degraded. The wrapper's own prefix is interpolated into the string
+   * the console hook receives, and the census used to discard it at the exact
+   * moment it held it.
+   */
+  describe('exemplars', () => {
+    it('retains the fail-soft wrapper prefix, which a count alone cannot express', () => {
+      // The precise loss behind this item: an agent seeing only a count still
+      // cannot tell that the ROSTER READ was the path that degraded.
+      recordSilencedMessage(WRAPPED_RAIL_MESSAGE);
+      expect(summariseSilencedConsole()).toContain(
+        '[inbox-wake] idle-probe roster read failed',
+      );
+      expect(readSilencedConsoleExemplars()['real-pg-blocked']).toHaveLength(1);
+    });
+
+    it('dedupes repeats of one wrapper but keeps DISTINCT wrappers apart', () => {
+      recordSilencedMessage(WRAPPED_RAIL_MESSAGE);
+      recordSilencedMessage(WRAPPED_RAIL_MESSAGE);
+      recordSilencedMessage(`[hive-rekey] boot deps fail-open: ${RAIL_MESSAGE}`);
+      expect(readSilencedConsoleExemplars()['real-pg-blocked']).toHaveLength(2);
+      // The tally still counts EVERY occurrence — exemplars bound the retained
+      // TEXT, never the count. A fix that traded the count away would fail here.
+      expect(readSilencedConsoleCensus()['real-pg-blocked']).toBe(3);
+    });
+
+    it('caps retained texts so a hot path cannot reintroduce per-occurrence noise', () => {
+      for (let i = 0; i < 25; i += 1) {
+        recordSilencedMessage(`[wrapper-${i}] read failed: ${RAIL_MESSAGE}`);
+      }
+      expect(readSilencedConsoleExemplars()['real-pg-blocked']).toHaveLength(3);
+      expect(readSilencedConsoleCensus()['real-pg-blocked']).toBe(25);
+    });
+
+    it('truncates from the TAIL, keeping the leading subsystem prefix', () => {
+      recordSilencedMessage(WRAPPED_RAIL_MESSAGE);
+      const [sample] = readSilencedConsoleExemplars()['real-pg-blocked'];
+      // The prefix is the diagnostic; the rail's boilerplate trails and is the
+      // half worth dropping.
+      expect(sample.startsWith('[inbox-wake] idle-probe roster read failed')).toBe(true);
+      expect(sample.length).toBeLessThanOrEqual(241);
+      expect(WRAPPED_RAIL_MESSAGE.length).toBeGreaterThan(241);
+    });
+
+    it('keeps no exemplars for ordinary allowlisted noise', () => {
+      // Same reason the summary stays null for `other`: expected noise in a
+      // healthy run, and quoting it back is the noise the allowlist removes.
+      recordSilencedMessage('Warning: something was not wrapped in act(...).');
+      expect(readSilencedConsoleExemplars().other).toBeUndefined();
+      expect(summariseSilencedConsole()).toBeNull();
+    });
+
+    it('clears exemplars on reset, so a reused worker cannot leak an earlier file text', () => {
+      recordSilencedMessage(WRAPPED_RAIL_MESSAGE);
+      resetSilencedConsoleCensus();
+      expect(readSilencedConsoleExemplars()).toEqual({});
+    });
   });
 });

@@ -72,6 +72,15 @@ export function isSilencedConsoleMessage(msg: unknown): boolean {
   // and the same wording, as the exhaustion/unreachable entries: a real regression on a
   // best-effort path surfaces as a thrown error or a failed assertion, never as this
   // incidental log line.
+  // THAT ARGUMENT IS ABOUT THE VERDICT, NOT DIAGNOSABILITY, and the gap was real: a
+  // test can fail correctly and unexplainably, which cost two agents ~1h on
+  // deliver-and-wake.test.ts (EI-19417655142979569). Note this entry cannot match the
+  // rail's OWN output — assertRealPgAllowed THROWS and never writes to console — so
+  // every message it silences is a fail-soft WRAPPER quoting ${e.message}, which is
+  // also why narrowing this predicate to the rail's text alone would silence nothing
+  // and re-pin WI-6869. The diagnosis is preserved out of band instead:
+  // silenced-console-census.ts counts each suppression and quotes up to 3 distinct
+  // wrapper texts to stdout per file.
   if (msg.includes('A UNIT test tried to open a REAL Postgres connection')) return true;
   // implement-worker-exit.test.ts's "getPayload failure" test deliberately spies
   // console.warn (vi.spyOn(...).mockImplementation) around the ONE intentional,

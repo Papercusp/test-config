@@ -70,6 +70,40 @@ const census = pinModuleState(
   () => new Map<string, number>(),
 );
 
+/** Shared by every line this module emits, so the whole block greps as one unit. */
+const SUMMARY_PREFIX = '[silenced-console-census]';
+
+/**
+ * Distinct exemplar texts retained per NOTABLE bucket, and the cap on each one.
+ *
+ * WHY EXEMPLARS AND NOT JUST A COUNT (EI-19417655142979569). The count above
+ * answers "did the rail fire, and how often" — which is what stops the wrong
+ * hypothesis the rail's silence used to invite ("the fail-soft branch never
+ * executed"). It does NOT answer "which subsystem degraded", and that is the
+ * half that cost two agents ~1h on deliver-and-wake.test.ts: the roster read in
+ * `reportIdleRecipients` fell back to EMPTY_IDLE_REPORT, and nothing said so.
+ *
+ * The text that names the subsystem is ALREADY HERE. Fail-soft handlers log
+ * `[inbox-wake] idle-probe roster read failed, reporting no idle recipients:
+ * ${e.message}`, so the wrapper's own prefix is interpolated INTO the string
+ * `recordSilencedMessage` receives — and the previous version discarded it at
+ * the exact moment it held it. Retaining a few DISTINCT ones costs a bounded
+ * handful of lines per file, not the hundreds of per-occurrence lines the
+ * allowlist rightly suppresses, so the module's founding trade-off is intact.
+ *
+ * Deduped on the TRUNCATED text: two messages that differ only past the cap
+ * share the diagnostic prefix, which is the part worth reading, so collapsing
+ * them is the intended behaviour rather than a lossy accident. Truncation keeps
+ * the HEAD because the wrapper prefix leads and the rail's boilerplate trails.
+ */
+const EXEMPLAR_CAP = 3;
+const EXEMPLAR_MAX_CHARS = 240;
+
+const exemplars = pinModuleState(
+  '@papercusp/test-config.silenced-console-census.exemplars',
+  () => new Map<string, Set<string>>(),
+);
+
 /**
  * Record one suppressed message. Call ONLY when `isSilencedConsoleMessage`
  * returned true — this module counts suppressions, not candidates.
@@ -83,9 +117,25 @@ export function recordSilencedMessage(msg: unknown): void {
     const bucket = CENSUS_BUCKETS.find((b) => msg.includes(b.match));
     const key = bucket ? bucket.key : OTHER_BUCKET;
     census.set(key, (census.get(key) ?? 0) + 1);
+    // Only NOTABLE buckets keep exemplars. `other` is expected noise in a healthy
+    // run — the same reason `summariseSilencedConsole` stays silent for it.
+    if (bucket) recordExemplar(bucket.key, msg);
   } catch {
     // A census is strictly an observation. It may never affect a verdict.
   }
+}
+
+/** Retain up to `EXEMPLAR_CAP` distinct, truncated texts for one bucket. */
+function recordExemplar(key: string, msg: string): void {
+  let seen = exemplars.get(key);
+  if (!seen) {
+    seen = new Set<string>();
+    exemplars.set(key, seen);
+  }
+  if (seen.size >= EXEMPLAR_CAP) return;
+  seen.add(
+    msg.length > EXEMPLAR_MAX_CHARS ? `${msg.slice(0, EXEMPLAR_MAX_CHARS)}…` : msg,
+  );
 }
 
 /** Current counts, as a plain object. Test seam + programmatic readers. */
@@ -93,23 +143,40 @@ export function readSilencedConsoleCensus(): Record<string, number> {
   return Object.fromEntries(census);
 }
 
+/** Retained exemplar texts per notable bucket. Test seam + programmatic readers. */
+export function readSilencedConsoleExemplars(): Record<string, string[]> {
+  return Object.fromEntries([...exemplars].map(([key, texts]) => [key, [...texts]]));
+}
+
 /** Drop all counts. For unit tests of this module; not used in the hot path. */
 export function resetSilencedConsoleCensus(): void {
   census.clear();
+  exemplars.clear();
 }
 
 /**
- * One line naming every NOTABLE bucket, or `null` when there is nothing worth
- * saying. Returns null when only `other` accumulated: ordinary allowlisted
- * noise is expected in a healthy run and a line per file reporting it would be
- * the very noise the allowlist removes.
+ * A count line naming every NOTABLE bucket, followed by up to `EXEMPLAR_CAP`
+ * `↳` lines per bucket carrying the DISTINCT suppressed texts — the count says
+ * the rail fired, the exemplars say which subsystem degraded
+ * (EI-19417655142979569). Returns `null` when there is nothing worth saying:
+ * when only `other` accumulated, ordinary allowlisted noise is expected in a
+ * healthy run and a line per file reporting it would be the very noise the
+ * allowlist removes.
+ *
+ * Every line carries the same prefix so the block greps as one unit even when
+ * vitest interleaves it with other workers' stdout.
  */
 export function summariseSilencedConsole(): string | null {
   const parts: string[] = [];
+  const detail: string[] = [];
   for (const bucket of CENSUS_BUCKETS) {
     const n = census.get(bucket.key) ?? 0;
-    if (n > 0) parts.push(`${n} ${bucket.label}`);
+    if (n === 0) continue;
+    parts.push(`${n} ${bucket.label}`);
+    for (const sample of exemplars.get(bucket.key) ?? []) {
+      detail.push(`${SUMMARY_PREFIX}   ↳ ${sample}`);
+    }
   }
   if (parts.length === 0) return null;
-  return `[silenced-console-census] ${parts.join('; ')}`;
+  return [`${SUMMARY_PREFIX} ${parts.join('; ')}`, ...detail].join('\n');
 }
