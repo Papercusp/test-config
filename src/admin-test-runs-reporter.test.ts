@@ -340,6 +340,99 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   });
 
+  it('EI-22137062583459326: a beforeAll collection crash (no test cases ever registered) surfaces its real error in the sidecar under "(file failed to collect)", not silently as nothing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'papercusp-reporter-collection-failure-'));
+    const detailsPath = join(dir, 'failure-details.json');
+    const previous = process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+    process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = detailsPath;
+    try {
+      const reporter = new AdminTestRunsReporter(
+        async () => ({ commit: 'abc', porcelain: '' }),
+        async () => undefined,
+      );
+      reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      // A pure beforeAll throw: the module state is 'failed', testModule.errors()
+      // carries the real thrown error (the same source buildOutputTail already
+      // reads), and children.allTests() is EMPTY — collection never got far
+      // enough to discover any test case, so the pre-existing per-test walk
+      // above finds nothing.
+      const collectionCrashModule = {
+        moduleId: join(TEST_CONFIG_ROOT, 'src/dead-suite.integration.test.ts'),
+        state: () => 'failed',
+        diagnostic: () => ({ duration: 3 }),
+        errors: () => [{ message: 'PostgresError: relation "plan_item_assignments" already exists' }],
+        children: { allTests: () => [] },
+      };
+      reporter.onTestModuleEnd(collectionCrashModule as never);
+      await reporter.onTestRunEnd();
+
+      const payload = JSON.parse(readFileSync(detailsPath, 'utf8')) as {
+        failures: Array<{ file: string; test: string; message?: string }>;
+      };
+      expect(payload.failures).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: expect.stringMatching(/(?:^|\/)src\/dead-suite\.integration\.test\.ts$/),
+          test: '(file failed to collect)',
+          message: 'PostgresError: relation "plan_item_assignments" already exists',
+        }),
+      ]));
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+      else process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('EI-22137062583459326: a module with a real per-test failure does NOT also get a spurious "(file failed to collect)" entry', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'papercusp-reporter-no-spurious-collection-'));
+    const detailsPath = join(dir, 'failure-details.json');
+    const previous = process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+    process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = detailsPath;
+    try {
+      const reporter = new AdminTestRunsReporter(
+        async () => ({ commit: 'abc', porcelain: '' }),
+        async () => undefined,
+      );
+      reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      // A module that collected fine and ran a real assertion with a
+      // structured actual/expected diff (so the pre-existing narrow filter
+      // records it) — errors() is ALSO non-empty (Vitest often still reports
+      // module-level noise alongside a real per-test failure) but there IS a
+      // real per-test failure, so the collection-failure fallback must stay
+      // silent and must not add a second, spurious entry alongside it.
+      const assertionFailureModule = {
+        moduleId: join(TEST_CONFIG_ROOT, 'src/normal.test.ts'),
+        state: () => 'failed',
+        diagnostic: () => ({ duration: 2 }),
+        errors: () => [{ message: 'unrelated module-level noise' }],
+        children: {
+          allTests: () => [
+            {
+              fullName: 'suite > fails',
+              result: () => ({
+                state: 'failed',
+                errors: [{ message: 'expected 1 to be 2', actual: '1', expected: '2' }],
+              }),
+            },
+          ],
+        },
+      };
+      reporter.onTestModuleEnd(assertionFailureModule as never);
+      await reporter.onTestRunEnd();
+
+      const payload = JSON.parse(readFileSync(detailsPath, 'utf8')) as {
+        failures: Array<{ file: string; test: string; message?: string }>;
+      };
+      expect(payload.failures).toHaveLength(1);
+      expect(payload.failures[0]?.test).toBe('suite > fails');
+      expect(payload.failures.some((f) => f.test === '(file failed to collect)')).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+      else process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('buildOutputTail prefers module-level errors and stays null for passing modules', () => {
     const withModuleErr = {
       errors: () => [{ message: 'import boom' }],
