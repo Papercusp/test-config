@@ -158,7 +158,7 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
       unsafe: async (query) => {
         queries.push(query);
         if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
-        if (query.startsWith('DROP DATABASE')) throw statementTimeout;
+        if (/^DROP\s+DATABASE\b/.test(query)) throw statementTimeout;
         return [];
       },
     }, 'it_guarded');
