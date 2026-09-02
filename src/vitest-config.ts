@@ -501,19 +501,25 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // `npx vitest run --coverage src/mock-sql.test.ts` in this workspace,
       // which wrote ./coverage/{coverage-final.json,lcov.info,index.html}.
       //
-      // ⚠ NOTHING AUTOMATED PASSES `--coverage`. This block runs only when a
-      // human or agent types the flag. Do NOT read the config's existence as
-      // evidence that coverage is collected anywhere — it is not, and has never
-      // been. Two structural reasons, both pinned by
-      // packages/operator-core/lib/doc-claims/coverage-wiring.test.ts:
-      //   • scripts/affected-tests.mjs has no Vitest-flag passthrough (it says
-      //     so itself) and HARD-REJECTS unrecognized flags, so the nightly's
-      //     `affected-tests.mjs --all --integration` step cannot be fixed by
-      //     appending `--coverage` — that would fail the step outright.
-      //   • Nothing aggregates the per-workspace ./coverage dirs into a report.
-      // Collecting coverage for real means adding BOTH a runner passthrough and
-      // a merge step. Deliberately not built: nothing consumes coverage today,
-      // and affected-tests.mjs is what the green-checkpoint gate runs.
+      // WHERE THE REPORT LANDS, and who asks for it (P-009, decision D-028 —
+      // both halves pinned by lib/doc-claims/coverage-wiring.test.ts):
+      //   • `scripts/affected-tests.mjs --coverage` forwards the flag to every
+      //     task whose script invokes vitest DIRECTLY (a composite script and a
+      //     repo-wide lint guard are excluded, and the run prints a
+      //     COVERAGE_PASSTHROUGH line naming what it skipped).
+      //   • each instrumented workspace writes ./coverage/lcov.info, per
+      //     `reportsDirectory` below — relative to the VITEST ROOT, so the `SF:`
+      //     paths are workspace-relative and collide across workspaces until
+      //     re-anchored.
+      //   • `npm run coverage:merge` (scripts/merge-coverage.ts) re-anchors and
+      //     merges them into one repo-root-relative coverage/lcov.info.
+      //   • `npm run gate:patch-coverage` (scripts/patch-coverage.ts) judges the
+      //     lines the current diff ADDS against that report.
+      // Still inert unless someone passes the flag: no scheduled job instruments
+      // by default, so an ordinary `test:affected` pays nothing for this block.
+      // ⚠ Do NOT re-add a CI coverage-upload step without a producer in the same
+      // change — that arrangement (each end documenting the other, nothing in the
+      // middle) is the exact trap coverage-wiring.test.ts was written to catch.
       coverage: {
         provider: 'v8',
         reporter: ['text-summary', 'json', 'html', 'lcov'],
