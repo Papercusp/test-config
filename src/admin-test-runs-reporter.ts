@@ -297,6 +297,20 @@ export interface TestFailureDetail {
   expected?: string;
 }
 
+/**
+ * EI-22137062583459326: MUST stay byte-identical to `COLLECTION_FAILURE_TEST`
+ * exported by `packages/operator-core/lib/testing-run-store.ts`. That file's
+ * `distillVitestRun` synthesizes a failure for a file that failed with no
+ * failing assertion to attribute it to (a pure collection/`beforeAll` crash),
+ * keyed by this literal joined with the file path (same NUL-joined scheme as
+ * the per-test details below), then looks up this reporter's failureDetails
+ * sidecar under that same key to enrich it with a real message. This file is
+ * deliberately self-contained (no operator-core import — see the module
+ * doc comment), so the literal is duplicated rather than imported;
+ * admin-test-runs-reporter.test.ts pins the exact string.
+ */
+const COLLECTION_FAILURE_TEST = '(file failed to collect)';
+
 const FAILURE_DETAIL_VALUE_MAX_CHARS = 2_000;
 const FAILURE_DETAILS_MAX_RECORDS = 2_000;
 
@@ -747,6 +761,14 @@ export function buildOutputTail(
 
 function collectTestFailureDetails(testModule: TestModule, file: string): TestFailureDetail[] {
   const details: TestFailureDetail[] = [];
+  // Tracks "did collection get far enough to discover at least one failing
+  // test case", independently of `details` — the loop below only PUSHES a
+  // detail when the error carries a structured actual/expected diff (this
+  // sidecar exists to recover values Vitest's own JSON reporter elides), so a
+  // plain-message test failure leaves `details` empty despite collection
+  // having succeeded. Conflating the two would misclassify that case as a
+  // collection crash below (EI-22137062583459326 test 2 caught exactly this).
+  let sawFailingTestCase = false;
   try {
     const collection = (testModule as unknown as {
       children?: { allTests?: () => Iterable<unknown> };
@@ -761,6 +783,7 @@ function collectTestFailureDetails(testModule: TestModule, file: string): TestFa
       };
       const result = tc.result?.();
       if (result?.state !== 'failed') continue;
+      sawFailingTestCase = true;
       const test = typeof tc.fullName === 'string' && tc.fullName.trim() ? tc.fullName : '(test)';
       for (const error of result.errors ?? []) {
         if (!error) continue;
@@ -778,6 +801,37 @@ function collectTestFailureDetails(testModule: TestModule, file: string): TestFa
     }
   } catch {
     /* fail-soft */
+  }
+  // EI-22137062583459326: a module that fails to COLLECT (e.g. a `beforeAll`
+  // throw) registers no failing test case above — Vitest never got past setup
+  // to discover any, so `allTests()` is empty and `sawFailingTestCase` stays
+  // false. Vitest's own `--reporter=json` frequently omits
+  // `testResults[].message` for that same file-level entry too, so
+  // distillVitestRun's enrichFailure (testing-run-store.ts) has nothing to
+  // enrich with and the agent sees "(no failure message reported)" instead of
+  // the real thrown error — observed: a PostgresError 42P07 fixture DDL
+  // collision, surfaced only as a silent "14 skipped". Fill the SAME sidecar
+  // key distillVitestRun looks up for a collection failure
+  // (COLLECTION_FAILURE_TEST) from the module-level error Vitest DOES expose
+  // via testModule.errors() — the same source buildOutputTail already uses
+  // for the DB row's output_tail, so this is no new capability, just wiring
+  // the existing signal into the sidecar too. Gated on `!sawFailingTestCase`,
+  // never on `details.length`, so a real per-test failure that merely lacks a
+  // structured diff is never misreported as a collection crash.
+  if (!sawFailingTestCase) {
+    try {
+      if (moduleStatus(testModule) === 'fail') {
+        const errs = testModule.errors?.() ?? [];
+        if (errs.length > 0) {
+          const message = formatTestCaseError(errs[0]);
+          if (message) {
+            details.push({ file, test: COLLECTION_FAILURE_TEST, message: boundFailureText(message) });
+          }
+        }
+      }
+    } catch {
+      /* fail-soft */
+    }
   }
   return details;
 }
