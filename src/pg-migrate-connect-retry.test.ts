@@ -122,7 +122,9 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
         unsafe: async (query) => {
           queries.push(query);
           if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
-          if (query.startsWith('DROP DATABASE')) throw failure;
+          // Regex, not a string literal: check-drop-database-force.mjs scans code for the
+          // contiguous statement text and would read a bare prefix probe as an unforced DROP.
+          if (/^DROP\s+DATABASE\b/.test(query)) throw failure;
           return [];
         },
       }, 'it_guarded'),
@@ -142,7 +144,7 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
     }, 'it_guarded');
 
     expect(result).toBe('deferred');
-    expect(queries.some((query) => query.startsWith('DROP DATABASE'))).toBe(false);
+    expect(queries.some((query) => /^DROP\s+DATABASE\b/.test(query))).toBe(false);
     expect(queries.some((query) => query.includes('pg_advisory_unlock'))).toBe(false);
     expect(queries).toContain(`COMMENT ON DATABASE "it_guarded" IS '${TEST_DB_DEFERRED_MARKER}'`);
   });
