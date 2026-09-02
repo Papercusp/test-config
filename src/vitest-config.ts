@@ -495,9 +495,25 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // per worker); unit retry=0; E2E (Playwright config) handles its own retries.
       retry: 0,
       // Coverage is TRACKED, not gated (testing-spec §1.13) — no thresholds here.
-      // Inert unless `--coverage` is passed (e.g. the nightly full run), so this
-      // never slows routine `test:affected`. Each workspace writes its own
-      // ./coverage; the nightly job aggregates them into one report.
+      // Inert unless `--coverage` is passed, so it never slows routine
+      // `test:affected`. The block below is complete AND functional: verified
+      // 2026-09-02 (P-007, design-to-code-coverage-seam-2026-09-02) by running
+      // `npx vitest run --coverage src/mock-sql.test.ts` in this workspace,
+      // which wrote ./coverage/{coverage-final.json,lcov.info,index.html}.
+      //
+      // ⚠ NOTHING AUTOMATED PASSES `--coverage`. This block runs only when a
+      // human or agent types the flag. Do NOT read the config's existence as
+      // evidence that coverage is collected anywhere — it is not, and has never
+      // been. Two structural reasons, both pinned by
+      // packages/operator-core/lib/doc-claims/coverage-wiring.test.ts:
+      //   • scripts/affected-tests.mjs has no Vitest-flag passthrough (it says
+      //     so itself) and HARD-REJECTS unrecognized flags, so the nightly's
+      //     `affected-tests.mjs --all --integration` step cannot be fixed by
+      //     appending `--coverage` — that would fail the step outright.
+      //   • Nothing aggregates the per-workspace ./coverage dirs into a report.
+      // Collecting coverage for real means adding BOTH a runner passthrough and
+      // a merge step. Deliberately not built: nothing consumes coverage today,
+      // and affected-tests.mjs is what the green-checkpoint gate runs.
       coverage: {
         provider: 'v8',
         reporter: ['text-summary', 'json', 'html', 'lcov'],
