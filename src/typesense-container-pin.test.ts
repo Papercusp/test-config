@@ -17,8 +17,15 @@ import { TEST_TYPESENSE_IMAGE } from './typesense-container.ts';
  * the prose beside it drifted, which is the exact failure being fixed.
  */
 
-const SOURCE_URL = new URL('./typesense-container.ts', import.meta.url);
-const source = readFileSync(SOURCE_URL, 'utf8');
+/**
+ * Subject path is overridable so falsifiability can be proven against a COPY
+ * outside the repo, never by mutating this shared tree (a git-sync sweep would
+ * happily commit the mutant mid-probe).
+ *   TYPESENSE_PIN_SUBJECT=/tmp/mutant.ts npm run test:file -- <this file>
+ */
+const SOURCE_PATH =
+  process.env.TYPESENSE_PIN_SUBJECT ?? new URL('./typesense-container.ts', import.meta.url);
+const source = readFileSync(SOURCE_PATH, 'utf8');
 
 /** Any `typesense/typesense:<tag>` occurrence, wherever it appears. */
 const IMAGE_TAG_PATTERN = /typesense\/typesense:[\w.-]+/g;
