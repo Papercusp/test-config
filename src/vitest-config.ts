@@ -546,25 +546,24 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         // is what proved `include` alone carries the behaviour.
         //
         // MEASURED 2026-09-03 on apps/operator-vite (a real product workspace, 187
-        // tests / 263 source files), complete runs both sides, same 7054 covered lines:
-        //   all:false → 175/263 files in lcov ⇒ 36.9% of the population UNJUDGEABLE
-        //   all:true  → 263/263 files in lcov ⇒  0.0%  (all 97 converted, 0 junk swept)
+        // tests / 263 source files), complete runs each side, same 7054 covered lines:
+        //   no include → 175/263 files in lcov ⇒ 36.9% of the population UNJUDGEABLE
+        //   include    → 263/263 files in lcov ⇒  0.0%  (all 97 converted, 0 junk swept)
         // Corroborates the 33.3% P-012 measured on libs/test-config; product code came
         // out slightly worse, so the ~1/3 figure is not a test-helper-lib artifact.
         //
-        // ⚠ THE RUNTIME COST IS UNMEASURED — deliberately not quoted here. The three
-        // runs came in at 1m24.7s (all:false), 1m48.5s (all:true) and 1m24.7s→2m19.2s
-        // for a REPEAT of the same all:false baseline. The baseline moved more between
-        // two identical runs (+64%) than all:true moved from it, so on a box this
-        // heavily shared the difference is not separable from load at n=1, and the
-        // tempting "+28%" is noise, not a measurement. If the cost ever needs a number,
-        // it needs repeated interleaved runs, not another single pair.
+        // ⚠ THE RUNTIME COST IS UNMEASURED — deliberately not quoted here. Four runs of
+        // this same suite came in at 1m24.7s and 2m19.2s for the UNCHANGED baseline and
+        // 1m48.5s / 1m58.5s with the include. The baseline moved more between two
+        // identical runs (+64%) than the include moved from it, so on a box this heavily
+        // shared the difference is not separable from load at n=1 — the tempting "+28%"
+        // is noise, not a measurement. A real number needs repeated interleaved runs.
         // packages/operator-core is ~21x the files and infeasible to measure at all
         // (5354 test files), so its instrumented cost is likewise unknown.
         // What IS certain is the blast radius: this stays inert unless someone passes
         // `--coverage`, and no scheduled job does, so ordinary `test:affected` pays
         // nothing for any of it.
-        all: true,
+        //
         // One uniform rule, not a per-workspace source-root list: layouts genuinely
         // vary (`src/` in most, `lib/` in operator-core, `app/` in apps/operator,
         // `packages/`+`libs/`+`plugins/` in libs/papercusp) and a hand-maintained
