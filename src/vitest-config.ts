@@ -539,14 +539,21 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         // tests / 263 source files), complete runs both sides, same 7054 covered lines:
         //   all:false → 175/263 files in lcov ⇒ 36.9% of the population UNJUDGEABLE
         //   all:true  → 263/263 files in lcov ⇒  0.0%  (all 97 converted, 0 junk swept)
-        //   cost      → 1m24.7s → 1m48.5s (+28%), and ONLY on an instrumented run.
         // Corroborates the 33.3% P-012 measured on libs/test-config; product code came
         // out slightly worse, so the ~1/3 figure is not a test-helper-lib artifact.
-        // ⚠ That +28% is measured on operator-vite ONLY. packages/operator-core has
-        // ~21x the files and a full-suite run there is infeasible to measure (5354 test
-        // files), so its instrumented cost is UNKNOWN — do not quote +28% for it. This
-        // stays inert unless someone passes `--coverage`, and no scheduled job does, so
-        // an ordinary `test:affected` still pays nothing for any of it.
+        //
+        // ⚠ THE RUNTIME COST IS UNMEASURED — deliberately not quoted here. The three
+        // runs came in at 1m24.7s (all:false), 1m48.5s (all:true) and 1m24.7s→2m19.2s
+        // for a REPEAT of the same all:false baseline. The baseline moved more between
+        // two identical runs (+64%) than all:true moved from it, so on a box this
+        // heavily shared the difference is not separable from load at n=1, and the
+        // tempting "+28%" is noise, not a measurement. If the cost ever needs a number,
+        // it needs repeated interleaved runs, not another single pair.
+        // packages/operator-core is ~21x the files and infeasible to measure at all
+        // (5354 test files), so its instrumented cost is likewise unknown.
+        // What IS certain is the blast radius: this stays inert unless someone passes
+        // `--coverage`, and no scheduled job does, so ordinary `test:affected` pays
+        // nothing for any of it.
         all: true,
         // One uniform rule, not a per-workspace source-root list: layouts genuinely
         // vary (`src/` in most, `lib/` in operator-core, `app/` in apps/operator,
