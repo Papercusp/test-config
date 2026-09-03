@@ -524,6 +524,37 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         provider: 'v8',
         reporter: ['text-summary', 'json', 'html', 'lcov'],
         reportsDirectory: './coverage',
+        // `all` + `include` — WI-2142887. v8 reports only the files a run actually
+        // LOADED, so a source file that no test imports gets NO lcov record at all,
+        // and `scripts/patch-coverage.ts` must then answer `undetermined` (exit 2)
+        // for it: resolving a missing record to 100% is the vacuous pass D-028 exists
+        // to prevent, and resolving it to 0% would be a false RED for a file nothing
+        // instruments. That is the honest answer to a question the report cannot
+        // answer — but it is not a useful gate verdict, and it fires on exactly the
+        // files a coverage gate most wants to judge. `all: true` retires the question
+        // instead of answering it: every included file is instrumented, so a changed
+        // file with no test is reported at 0 hits and the gate FAILS it honestly.
+        //
+        // MEASURED 2026-09-03 on apps/operator-vite (a real product workspace, 187
+        // tests / 263 source files), complete runs both sides, same 7054 covered lines:
+        //   all:false → 175/263 files in lcov ⇒ 36.9% of the population UNJUDGEABLE
+        //   all:true  → 263/263 files in lcov ⇒  0.0%  (all 97 converted, 0 junk swept)
+        //   cost      → 1m24.7s → 1m48.5s (+28%), and ONLY on an instrumented run.
+        // Corroborates the 33.3% P-012 measured on libs/test-config; product code came
+        // out slightly worse, so the ~1/3 figure is not a test-helper-lib artifact.
+        // ⚠ That +28% is measured on operator-vite ONLY. packages/operator-core has
+        // ~21x the files and a full-suite run there is infeasible to measure (5354 test
+        // files), so its instrumented cost is UNKNOWN — do not quote +28% for it. This
+        // stays inert unless someone passes `--coverage`, and no scheduled job does, so
+        // an ordinary `test:affected` still pays nothing for any of it.
+        all: true,
+        // One uniform rule, not a per-workspace source-root list: layouts genuinely
+        // vary (`src/` in most, `lib/` in operator-core, `app/` in apps/operator,
+        // `packages/`+`libs/`+`plugins/` in libs/papercusp) and a hand-maintained
+        // registry of those roots is exactly the code-describing metadata that drifts.
+        // Measured tree-wide, this include plus the excludes below sweeps in 0
+        // unintended files in operator-core, operator-vite and libs/papercusp.
+        include: ['**/*.{ts,tsx}'],
         exclude: [
           ...baseExclude,
           '**/*.test.*',
@@ -535,6 +566,17 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
           '**/e2e/**',
           '**/__tests__/**',
           '**/__mocks__/**',
+          // Build/tooling/story/example code — not product code. `all: true` is what
+          // makes these visible at all (without it they were simply never loaded), so
+          // they are excluded in the same change that introduces it: 78 files
+          // tree-wide, 56 of them in apps/operator. This is what keeps `all: true`
+          // from depressing the number with things nobody intends to test — the
+          // specific cost WI-2142887 named as the reason to measure before changing.
+          '**/bin/**',
+          '**/scripts/**',
+          '**/.storybook/**',
+          '**/examples/**',
+          '**/vitest-shims/**',
         ],
       },
     },
