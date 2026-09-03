@@ -524,16 +524,26 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         provider: 'v8',
         reporter: ['text-summary', 'json', 'html', 'lcov'],
         reportsDirectory: './coverage',
-        // `all` + `include` — WI-2142887. v8 reports only the files a run actually
-        // LOADED, so a source file that no test imports gets NO lcov record at all,
+        // `include` — WI-2142887. By DEFAULT v8 reports only the files a run actually
+        // loaded, so a source file that no test imports gets NO lcov record at all,
         // and `scripts/patch-coverage.ts` must then answer `undetermined` (exit 2)
         // for it: resolving a missing record to 100% is the vacuous pass D-028 exists
         // to prevent, and resolving it to 0% would be a false RED for a file nothing
         // instruments. That is the honest answer to a question the report cannot
         // answer — but it is not a useful gate verdict, and it fires on exactly the
-        // files a coverage gate most wants to judge. `all: true` retires the question
-        // instead of answering it: every included file is instrumented, so a changed
-        // file with no test is reported at 0 hits and the gate FAILS it honestly.
+        // files a coverage gate most wants to judge. An explicit `include` retires the
+        // question instead of answering it: every MATCHING file is instrumented, not
+        // just the loaded ones, so a changed file with no test is reported at 0 hits
+        // and the gate FAILS it honestly.
+        //
+        // ⛔ Do NOT "restore" a `coverage.all: true` beside this. `all` was REMOVED in
+        // Vitest 4 (this repo is on 4.1.8) — `include` absorbed its job, per the
+        // option's own doc comment: "List of files included in coverage as glob
+        // patterns. By default only files covered by tests are included." Setting
+        // `all` here is not merely redundant, it is an unknown key: it type-errors
+        // (TS2769) and does nothing at runtime. It was written that way in the first
+        // draft of this change and the identical 263-file result with and without it
+        // is what proved `include` alone carries the behaviour.
         //
         // MEASURED 2026-09-03 on apps/operator-vite (a real product workspace, 187
         // tests / 263 source files), complete runs both sides, same 7054 covered lines:
