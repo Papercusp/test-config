@@ -213,6 +213,13 @@ export function sharedHostWorkerCap(pool: 'forks' | 'threads' = 'forks'): {
 export const PC_TEST_LANE_ENV = 'PC_TEST_LANE';
 
 /**
+ * Default deadline for a unit test under the shared Papercusp Vitest contract.
+ * Exported so the repository-root direct-file fallback can use the same value
+ * instead of silently falling back to Vitest's 5-second default.
+ */
+export const DEFAULT_UNIT_TEST_TIMEOUT_MS = 60_000;
+
+/**
  * An `include` entry that matches nothing, used when a lane is legitimately EMPTY.
  *
  * Passing `[]` instead would be a silent catastrophe: vitest treats an empty `include` as
@@ -429,7 +436,7 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // the gate; correctness over box weather, as before.
       testTimeout:
         layer === 'unit'
-          ? Number(process.env.VITEST_UNIT_TIMEOUT_MS) || 60_000
+          ? Number(process.env.VITEST_UNIT_TIMEOUT_MS) || DEFAULT_UNIT_TEST_TIMEOUT_MS
           : layer === 'integration'
             ? 90_000
             : 120_000,
