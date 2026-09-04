@@ -190,6 +190,14 @@ describe("getTestPg no-docker escape hatch (EI-10533)", () => {
   });
 });
 
+describe("getTestPg acquisition failure framing (EI-21904002928882606)", () => {
+  it("rethrows the breaker diagnosis before the persistent-outage latch trips", () => {
+    expect(SOURCE).toMatch(
+      /throw\s+substrateBreaker\.recordFailure\(e\)\s*;/,
+    );
+  });
+});
+
 describe("withContainerRecoveryReResolution", () => {
   it("retires a retryable failed candidate and resolves a fresh one", async () => {
     const resolved = ["wedged", "fresh"];
