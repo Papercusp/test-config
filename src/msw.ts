@@ -1,7 +1,7 @@
-import { setupServer, type SetupServerApi } from 'msw/node';
+import { setupServer, type SetupServer } from 'msw/node';
 import { afterAll, afterEach, beforeAll } from 'vitest';
 
-export const msw: SetupServerApi = setupServer();
+export const msw: SetupServer = setupServer();
 
 export function setupMsw(): void {
   beforeAll(() => msw.listen({ onUnhandledRequest: 'error' }));
