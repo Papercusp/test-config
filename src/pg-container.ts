@@ -380,9 +380,10 @@ export async function getTestPg(): Promise<string> {
         containerPromise = null;
         // Count this distinct acquisition failure toward the fail-fast breaker
         // (EI-11530). Runs once per rejected promise — concurrent awaiters share
-        // this single outcome, so the streak isn't inflated by fan-out.
-        substrateBreaker.recordFailure(e);
-        throw e;
+        // this single outcome, so the streak isn't inflated by fan-out. Re-throw
+        // the breaker's diagnosis even before it latches, so a focused one-file
+        // run gets the same environmental framing instead of a raw PG error.
+        throw substrateBreaker.recordFailure(e);
       });
   }
   const container = await containerPromise;

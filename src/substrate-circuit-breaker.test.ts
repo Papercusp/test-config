@@ -10,12 +10,16 @@ const mk = (threshold = 3) => {
 describe('SubstrateCircuitBreaker (EI-11530)', () => {
   it('stays closed and check() is a no-op below the threshold', () => {
     const { breaker, banners } = mk(3);
-    breaker.recordFailure(new Error('in recovery mode'));
+    const firstFailure = breaker.recordFailure(new Error('in recovery mode'));
     breaker.recordFailure(new Error('in recovery mode'));
     expect(breaker.tripped).toBe(false);
     expect(breaker.failureCount).toBe(2);
     expect(() => breaker.check()).not.toThrow();
     expect(banners).toHaveLength(0);
+    expect(firstFailure.message).toContain('TEST SUBSTRATE DOWN');
+    expect(firstFailure.message).toContain('NOT a code regression');
+    expect(firstFailure.message).toContain('1 consecutive failure');
+    expect(firstFailure.message).toContain('did not reach the persistent-outage latch');
   });
 
   it('latches on the Nth consecutive failure and check() then fails fast', () => {

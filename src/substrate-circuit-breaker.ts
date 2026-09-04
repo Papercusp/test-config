@@ -104,26 +104,46 @@ export class SubstrateCircuitBreaker {
     this.consecutiveFailures = 0;
   }
 
+  /** Build the environmental diagnosis for a fully exhausted acquisition. */
+  private buildFailureError(cause: unknown): Error {
+    const causeMsg = cause instanceof Error ? cause.message : String(cause);
+    if (this.consecutiveFailures < this.threshold) {
+      return new Error(
+        `TEST SUBSTRATE DOWN: ${this.label} acquisition exhausted its bounded retries ` +
+          `after ${this.consecutiveFailures} consecutive failure${this.consecutiveFailures === 1 ? "" : "s"} — ` +
+          `the shared test substrate is unavailable, NOT a code regression. ` +
+          `This attempt did not reach the persistent-outage latch (` +
+          `${this.threshold} failures), so other callers may still retry. ` +
+          `Re-run once the substrate is healthy. Last cause: ${causeMsg}`,
+      );
+    }
+
+    return new Error(
+      `TEST SUBSTRATE DOWN: ${this.label} failed ${this.consecutiveFailures} times in a row ` +
+        `(each after its own bounded retries) — the shared test substrate is persistently ` +
+        `unavailable, NOT a code regression. Failing fast so this run reports a substrate outage ` +
+        `instead of grinding through every remaining file and emitting a junk pass/fail verdict. ` +
+        `Re-run once the substrate is healthy. Last cause: ${causeMsg}`,
+    );
+  }
+
   /**
    * A guarded operation failed (after its own bounded retries). Counts toward
    * the streak; latches the breaker once the threshold is reached and emits a
-   * single banner. Idempotent after latching. Call this EXACTLY ONCE per
-   * distinct acquisition attempt — not once per concurrent awaiter of the same
-   * failed attempt — or the streak inflates.
+   * single banner. Returns the same environmental diagnosis even before the
+   * latch, so focused runs do not surface a raw substrate error. Idempotent
+   * after latching. Call this EXACTLY ONCE per distinct acquisition attempt —
+   * not once per concurrent awaiter of the same failed attempt — or the streak
+   * inflates.
    */
-  recordFailure(cause: unknown): void {
-    if (this.trippedError) return; // already latched — don't keep counting/re-bannering
+  recordFailure(cause: unknown): Error {
+    if (this.trippedError) return this.trippedError; // already latched — don't keep counting/re-bannering
     this.consecutiveFailures += 1;
-    if (this.consecutiveFailures < this.threshold) return;
+    const failureError = this.buildFailureError(cause);
+    if (this.consecutiveFailures < this.threshold) return failureError;
 
-    const causeMsg = cause instanceof Error ? cause.message : String(cause);
-    const message =
-      `TEST SUBSTRATE DOWN: ${this.label} failed ${this.consecutiveFailures} times in a row ` +
-      `(each after its own bounded retries) — the shared test substrate is persistently ` +
-      `unavailable, NOT a code regression. Failing fast so this run reports a substrate outage ` +
-      `instead of grinding through every remaining file and emitting a junk pass/fail verdict. ` +
-      `Re-run once the substrate is healthy. Last cause: ${causeMsg}`;
-    this.trippedError = new Error(message);
-    this.banner(message);
+    this.trippedError = failureError;
+    this.banner(failureError.message);
+    return failureError;
   }
 }
