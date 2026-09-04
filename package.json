@@ -15,14 +15,51 @@
       "types": "./src/nest-test-app.ts",
       "import": "./src/nest-test-app.ts",
       "default": "./src/nest-test-app.ts"
+    },
+    "./nuqs-mock": {
+      "types": "./src/nuqs-mock.ts",
+      "import": "./src/nuqs-mock.ts",
+      "default": "./src/nuqs-mock.ts"
+    },
+    "./mock-sql": {
+      "types": "./src/mock-sql.ts",
+      "import": "./src/mock-sql.ts",
+      "default": "./src/mock-sql.ts"
+    },
+    "./vitest-config": {
+      "types": "./src/vitest-config.ts",
+      "import": "./src/vitest-config.ts",
+      "default": "./src/vitest-config.ts"
+    },
+    "./lane-split": {
+      "types": "./src/lane-split.ts",
+      "import": "./src/lane-split.ts",
+      "default": "./src/lane-split.ts"
+    },
+    "./pg": {
+      "types": "./src/pg.ts",
+      "import": "./src/pg.ts",
+      "default": "./src/pg.ts"
+    },
+    "./tmpdir-guard": {
+      "types": "./src/tmpdir-guard.ts",
+      "import": "./src/tmpdir-guard.ts",
+      "default": "./src/tmpdir-guard.ts"
+    },
+    "./admin-test-runs-reporter": {
+      "types": "./src/admin-test-runs-reporter.ts",
+      "import": "./src/admin-test-runs-reporter.ts",
+      "default": "./src/admin-test-runs-reporter.ts"
     }
   },
   "scripts": {
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:integration": "vitest run --config vitest.integration.config.ts --passWithNoTests"
   },
   "dependencies": {
     "@nestjs/testing": "^11.0.0",
+    "@papercusp/module-singleton": "*",
     "@testcontainers/postgresql": "^11.0.0",
     "drizzle-orm": "^0.45.2",
     "msw": "^2.7.0",
@@ -32,7 +69,8 @@
     "vitest-fail-on-console": "^0.7.1"
   },
   "devDependencies": {
-    "@types/supertest": "^6.0.0"
+    "@types/supertest": "^6.0.0",
+    "nuqs": "^2.8.9"
   },
   "peerDependencies": {
     "@nestjs/common": "^11.0.0",

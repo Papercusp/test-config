@@ -1,4 +1,5 @@
 import { GenericContainer, type StartedTestContainer } from 'testcontainers';
+import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 
 /**
  * Shared Redis container for integration tests (RateLimitGuard sorted-set limits,
@@ -12,10 +13,12 @@ let redisPromise: Promise<StartedTestContainer> | null = null;
 
 export async function getTestRedis(): Promise<string> {
   if (!redisPromise) {
-    redisPromise = new GenericContainer('redis:7-alpine')
-      .withExposedPorts(6379)
-      .withReuse()
-      .start();
+    redisPromise = withTestcontainerStartLock('shared-docker-testcontainers-start', () =>
+      new GenericContainer('redis:7-alpine')
+        .withExposedPorts(6379)
+        .withReuse()
+        .start(),
+    );
   }
   const container = await redisPromise;
   return `redis://${container.getHost()}:${container.getMappedPort(6379)}`;
