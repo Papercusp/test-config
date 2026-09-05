@@ -65,6 +65,7 @@ import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
+import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
 import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 
 /**
