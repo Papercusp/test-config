@@ -27,7 +27,10 @@
  */
 import { describe, expect, it } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from "./pg-container.ts";
 import { withContainerRecoveryReResolution } from "./pg-container.ts";
 
 const SOURCE = readFileSync(
@@ -100,24 +103,161 @@ describe("getTestPg container healthcheck (EI-21116464706451765)", () => {
     // recovery: its nonzero child exit makes Postgres restart recovery again.
     // A harmless Docker liveness bit is sufficient because getTestPg performs
     // the authoritative SQL readiness probe from the host immediately after.
-    expect(SOURCE).toMatch(
-      /\.withHealthCheck\(\{[\s\S]*?test:\s*\[["']CMD-SHELL["'],\s*["']exit 0["']\]/,
+    //
+    // Asserted against the EXPORTED CONSTANT rather than this file's source
+    // text (EI-21340200136336953). The old form regexed SOURCE for an inline
+    // `.withHealthCheck({ test: [...] })` object literal, which meant the guard
+    // was coupled to one file's FORMATTING: hoisting the value into a shared
+    // constant — the fix that lets sibling call sites stop drifting — broke the
+    // guard, even though the shipped behaviour was unchanged and better.
+    expect(NON_DESTRUCTIVE_PG_HEALTHCHECK.test).toEqual(["CMD-SHELL", "exit 0"]);
+    expect(JSON.stringify(NON_DESTRUCTIVE_PG_HEALTHCHECK)).not.toContain(
+      "pg_isready",
     );
-    const healthcheckBlock =
-      SOURCE.match(/\.withHealthCheck\(\{[\s\S]*?\}\)/)?.[0] ?? "";
-    expect(healthcheckBlock).not.toContain("pg_isready");
+    // and the container actually uses it, rather than re-inlining its own.
+    expect(SOURCE).toMatch(
+      /\.withHealthCheck\(\{\s*\.\.\.NON_DESTRUCTIVE_PG_HEALTHCHECK\s*\}\)/,
+    );
   });
 
   it("keeps host-side SQL readiness after the non-destructive Docker healthcheck", () => {
-    const healthcheckIdx = SOURCE.search(
-      /test:\s*\[["']CMD-SHELL["'],\s*["']exit 0["']\]/,
-    );
+    // The override REMOVES a startup gate: PostgreSqlContainer waits on
+    // Wait.forAll([forHealthCheck(), forListeningPorts()]), so `exit 0` leaves
+    // only "TCP port published" — which is not "Postgres accepts SQL". The
+    // host-side probe is what makes the override safe, so it must come after.
+    const healthcheckIdx = SOURCE.search(/\.withHealthCheck\(/);
     const hostProbeIdx = SOURCE.search(
       /postgres\(\s*container\.getConnectionUri\(\)/,
     );
     expect(healthcheckIdx).toBeGreaterThan(-1);
     expect(hostProbeIdx).toBeGreaterThan(healthcheckIdx);
     expect(SOURCE).toMatch(/admin\.unsafe\(FRAMEWORK_ROLES_DDL\)/);
+  });
+});
+
+/**
+ * EI-21340200136336953 — the CLASS-level guard, mirroring EI-9497.
+ *
+ * The constant above being correct is NOT enough, and the repo has already paid
+ * to learn this once for the sibling PG-IMAGE constant: WI-2942 bumped the image
+ * at ONE call site and four siblings kept a literal string, so those cycles
+ * provisioned on the wrong PG major regardless of the constant's own test
+ * passing (EI-9497). `gym-provision-image.test.ts` closed that by enumerating
+ * every call site instead of pinning one file's text.
+ *
+ * The HEALTHCHECK never got that guard, and sat in exactly the pre-EI-9497
+ * state: measured 2026-09-05, of 8 `new PostgreSqlContainer(...)` sites in this
+ * repo, ONE set the non-destructive healthcheck and 7 took the stock destructive
+ * one — two of those (`baseline-schema-global-setup.ts`, `gym/smoke.ts`) being
+ * `.withReuse()`d and therefore long-lived BY DESIGN. `docker inspect` on the
+ * live containers that day: 3 of 4 running pgvector containers carried the
+ * retired `pg_isready` @250ms/1000-retries config, one of them created that
+ * morning. So this was an incomplete rollout still MINTING destructive
+ * containers, not merely historical drift.
+ *
+ * ALLOWLIST SEMANTICS — SHRINK-ONLY, like KNOWN_DARK_FLAGS and the inline-JSON
+ * ratchet. Adopting the constant is not always safe: it removes a startup gate
+ * and is only correct where the site performs a host-side SQL readiness wait
+ * after `.start()`. Sites that lack one are listed here WITH THAT REASON rather
+ * than converted blind, which would trade a rare crash-recovery bug for a common
+ * startup race. Convert a site, then DELETE its entry. Never add one to make a
+ * new call site pass.
+ */
+const HEALTHCHECK_EXEMPT: Record<string, string> = {
+  // Gym runtime cycles: each goes straight from `.start()` to provisioning /
+  // querying with no host-side readiness retry, so the override is not yet safe
+  // here. Converting these means ALSO giving them a readiness wait.
+  "packages/operator-core/lib/gym/ab-run.ts": "no host-side readiness probe",
+  "packages/operator-core/lib/gym/autoloop-cycle.ts": "no host-side readiness probe",
+  "packages/operator-core/lib/gym/blueprint-cycle.ts": "no host-side readiness probe",
+  "packages/operator-core/lib/gym/smoke.ts":
+    "no host-side readiness probe (and .withReuse() — convert first)",
+  "packages/operator-core/lib/gym/wake-mode.ts": "no host-side readiness probe",
+  // One-shot CLI verifier; ephemeral container, not reused across runs.
+  "packages/operator-core/lib/db-tools/verify-baseline.ts":
+    "ephemeral one-shot container, not reused",
+};
+
+describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () => {
+  const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+
+  /**
+   * Every non-node_modules .ts file constructing a PostgreSqlContainer.
+   *
+   * `grep -rl` (one line per FILE) deliberately, not `-rn` piped through a line
+   * cap: this list drives a NEGATIVE conclusion ("no unguarded site exists"),
+   * and a positional truncation is exactly what manufactures a false clean here.
+   * A no-match grep exits 1, which would throw out of execFileSync as an opaque
+   * error — caught and returned as [] so the vacuity guard below reports it as
+   * the broken walk it is, rather than an unreadable stack.
+   */
+  function containerCallSites(): string[] {
+    let out = "";
+    try {
+      out = execFileSync(
+        "grep",
+        [
+          "-rl",
+          "--include=*.ts",
+          "--exclude-dir=node_modules",
+          "--exclude-dir=.git",
+          "new PostgreSqlContainer",
+          ".",
+        ],
+        { cwd: REPO_ROOT, encoding: "utf8" },
+      );
+    } catch {
+      return [];
+    }
+    return out
+      .split("\n")
+      .map((l) => l.trim().replace(/^\.\//, ""))
+      .filter((l) => l.length > 0 && !l.endsWith(".test.ts"))
+      .sort();
+  }
+
+  it("discovers the call sites at all (guards a broken discovery walk)", () => {
+    // A discovery guard whose walk silently matches nothing passes vacuously and
+    // is indistinguishable from a clean repo — the failure mode this whole file
+    // exists to prevent, one level up.
+    expect(containerCallSites().length).toBeGreaterThan(1);
+  });
+
+  it("every call site uses NON_DESTRUCTIVE_PG_HEALTHCHECK, or is allowlisted with a reason", () => {
+    const offenders: string[] = [];
+    for (const file of containerCallSites()) {
+      if (file in HEALTHCHECK_EXEMPT) continue;
+      const src = readFileSync(join(REPO_ROOT, file), "utf8");
+      if (!src.includes("NON_DESTRUCTIVE_PG_HEALTHCHECK")) offenders.push(file);
+    }
+    expect(
+      offenders,
+      `these files construct a PostgreSqlContainer without the shared ` +
+        `NON_DESTRUCTIVE_PG_HEALTHCHECK, so they take @testcontainers/postgresql's ` +
+        `stock pg_isready healthcheck — destructive during crash recovery ` +
+        `(EI-21116464706451765). Import the constant from @papercusp/test-config ` +
+        `AND give the site a host-side SQL readiness wait after .start(); the ` +
+        `healthcheck override removes a startup gate and is unsafe without one. ` +
+        `If it genuinely cannot adopt it, add it to HEALTHCHECK_EXEMPT with a reason.`,
+    ).toEqual([]);
+  });
+
+  it("the allowlist is shrink-only: every entry still exists and still needs the exemption", () => {
+    // A stale entry silently re-permits a site that has since been converted (or
+    // deleted), which is how a shrink-only list quietly stops shrinking.
+    const sites = new Set(containerCallSites());
+    const stale = Object.keys(HEALTHCHECK_EXEMPT).filter((f) => {
+      if (!sites.has(f)) return true;
+      return readFileSync(join(REPO_ROOT, f), "utf8").includes(
+        "NON_DESTRUCTIVE_PG_HEALTHCHECK",
+      );
+    });
+    expect(
+      stale,
+      "these HEALTHCHECK_EXEMPT entries are stale — the file no longer " +
+        "constructs a PostgreSqlContainer, or it now uses the shared constant. " +
+        "Delete them; the allowlist only ever shrinks.",
+    ).toEqual([]);
   });
 });
 

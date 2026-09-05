@@ -109,6 +109,43 @@ export async function withContainerRecoveryReResolution<T>(
  */
 export const TEST_PG_IMAGE = "pgvector/pgvector:pg18";
 
+/**
+ * The NON-DESTRUCTIVE Docker health bit for a pgvector test container
+ * (EI-21116464706451765).
+ *
+ * @testcontainers/postgresql's stock healthcheck runs `pg_isready` INSIDE the
+ * PID-1-postmaster container. During crash recovery it exits 2 as an unknown
+ * postmaster child, which makes Postgres terminate every server process and
+ * restart recovery; the stock 250ms interval then repeats the crash
+ * indefinitely. This replaces it with a harmless liveness bit.
+ *
+ * ⚠ THIS CONSTANT IS ONLY SAFE WITH A HOST-SIDE SQL READINESS PROBE, and that
+ * is why it is a shared constant rather than something each site inlines.
+ * `PostgreSqlContainer` gates startup on
+ * `Wait.forAll([Wait.forHealthCheck(), Wait.forListeningPorts()])`
+ * (@testcontainers/postgresql/build/postgresql-container.js). Overriding the
+ * healthcheck to `exit 0` therefore REMOVES a real startup gate — what remains
+ * is only "the TCP port is published", which is NOT "Postgres accepts SQL"
+ * (it can still be in crash recovery). Every site using this MUST perform its
+ * own host-side readiness wait immediately after `.start()`:
+ *   - `getTestPg` below     -> the FRAMEWORK_ROLES_DDL retry loop
+ *   - baseline-schema-global-setup -> `isBaselineContainerHealthy` + reprovision
+ * A site with no such probe must NOT adopt this constant until it grows one;
+ * doing so trades a rare crash-recovery bug for a common startup race.
+ *
+ * EI-21340200136336953: kept as ONE exported constant, and enforced across call
+ * sites by `pg-container.test.ts`'s class-level discovery guard, because the
+ * sibling PG-IMAGE constant learned this the expensive way — WI-2942 fixed the
+ * image at a single call site and four siblings silently kept a literal string
+ * (EI-9497). A per-site inline healthcheck object is the same trap.
+ */
+export const NON_DESTRUCTIVE_PG_HEALTHCHECK = {
+  test: ["CMD-SHELL", "exit 0"],
+  interval: 1000,
+  timeout: 1000,
+  retries: 1,
+} as const;
+
 // Framework roles, ensured CREATE-OR-FIX (login + fixed privilege attributes +
 // correct password) once per container.
 // The container is shared + REUSED, and roles are cluster-global. Some tests historically
@@ -257,12 +294,7 @@ export async function getTestPg(): Promise<string> {
               // FRAMEWORK_ROLES_DDL loop below own real SQL readiness. The sibling
               // listening-port wait still prevents returning before the TCP port is
               // published, and the host loop refuses until Postgres is writable.
-              .withHealthCheck({
-                test: ["CMD-SHELL", "exit 0"],
-                interval: 1000,
-                timeout: 1000,
-                retries: 1,
-              })
+              .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
               .withReuse()
               .start(),
           async (container) => {
