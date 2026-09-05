@@ -178,6 +178,31 @@ const HEALTHCHECK_EXEMPT: Record<string, string> = {
     "ephemeral one-shot container, not reused",
 };
 
+/**
+ * The offender rule, as a PURE function of (call sites, source reader, allowlist)
+ * so it can be exercised against deliberately-wrong inputs.
+ *
+ * Extracted deliberately: a guard that has never failed is a guard nobody has
+ * tested, and the honest way to prove THIS one fires is a permanent control
+ * (see the describe below), not a temporary mutation of the shared checkout —
+ * git-sync sweeps the whole tree on a schedule, so a probe that edits a tracked
+ * file can have its mutant committed even when nothing goes wrong.
+ */
+export function findHealthcheckOffenders(
+  files: string[],
+  readSource: (file: string) => string,
+  exempt: Record<string, string>,
+): string[] {
+  const offenders: string[] = [];
+  for (const file of files) {
+    if (file in exempt) continue;
+    if (!readSource(file).includes("NON_DESTRUCTIVE_PG_HEALTHCHECK")) {
+      offenders.push(file);
+    }
+  }
+  return offenders;
+}
+
 describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () => {
   const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -239,6 +264,37 @@ describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () =>
         `healthcheck override removes a startup gate and is unsafe without one. ` +
         `If it genuinely cannot adopt it, add it to HEALTHCHECK_EXEMPT with a reason.`,
     ).toEqual([]);
+  });
+
+  /**
+   * FALSIFIABILITY CONTROLS — permanent, in-file, zero tree mutation.
+   *
+   * The three cases above all currently PASS, and a guard whose walk silently
+   * matched nothing would pass identically. These fix that: the first proves the
+   * rule FIRES on an unguarded site, and the other two are the controls that must
+   * SURVIVE it — without them, a rule that simply flagged everything (or nothing)
+   * would look just as green.
+   */
+  const FIXTURE = {
+    "fake/unguarded.ts": "new PostgreSqlContainer(IMG).withReuse().start()",
+    "fake/guarded.ts":
+      "new PostgreSqlContainer(IMG).withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })",
+    "fake/allowlisted.ts": "new PostgreSqlContainer(IMG).start()",
+  } as const;
+  const readFixture = (f: string) => FIXTURE[f as keyof typeof FIXTURE] ?? "";
+
+  it("CONTROL: reports a call site that omits the shared healthcheck", () => {
+    expect(
+      findHealthcheckOffenders(["fake/unguarded.ts"], readFixture, {}),
+    ).toEqual(["fake/unguarded.ts"]);
+  });
+
+  it("CONTROL: does NOT report a site that uses the constant, nor an allowlisted one", () => {
+    expect(
+      findHealthcheckOffenders(Object.keys(FIXTURE), readFixture, {
+        "fake/allowlisted.ts": "control: exempt with a reason",
+      }),
+    ).toEqual(["fake/unguarded.ts"]);
   });
 
   it("the allowlist is shrink-only: every entry still exists and still needs the exemption", () => {

@@ -140,11 +140,14 @@ export const TEST_PG_IMAGE = "pgvector/pgvector:pg18";
  * (EI-9497). A per-site inline healthcheck object is the same trap.
  */
 export const NON_DESTRUCTIVE_PG_HEALTHCHECK = {
-  test: ["CMD-SHELL", "exit 0"],
+  // Annotated as a MUTABLE tuple rather than written `as const`: testcontainers'
+  // `HealthCheck.test` is `["CMD-SHELL", string] | ["CMD", ...string[]]`, so a
+  // readonly `as const` array is not assignable to it (TS2345).
+  test: ["CMD-SHELL", "exit 0"] as ["CMD-SHELL", string],
   interval: 1000,
   timeout: 1000,
   retries: 1,
-} as const;
+};
 
 // Framework roles, ensured CREATE-OR-FIX (login + fixed privilege attributes +
 // correct password) once per container.
