@@ -224,12 +224,11 @@ describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () =>
   });
 
   it("every call site uses NON_DESTRUCTIVE_PG_HEALTHCHECK, or is allowlisted with a reason", () => {
-    const offenders: string[] = [];
-    for (const file of containerCallSites()) {
-      if (file in HEALTHCHECK_EXEMPT) continue;
-      const src = readFileSync(join(REPO_ROOT, file), "utf8");
-      if (!src.includes("NON_DESTRUCTIVE_PG_HEALTHCHECK")) offenders.push(file);
-    }
+    const offenders = findHealthcheckOffenders(
+      containerCallSites(),
+      (f) => readFileSync(join(REPO_ROOT, f), "utf8"),
+      HEALTHCHECK_EXEMPT,
+    );
     expect(
       offenders,
       `these files construct a PostgreSqlContainer without the shared ` +

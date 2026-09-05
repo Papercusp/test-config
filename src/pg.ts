@@ -15,7 +15,13 @@
 // (mirrors the same fresh-node-process check used for `./vitest-config.ts`).
 //
 // Prefer this subpath over the full barrel for any test that only needs PG helpers.
-export { getTestPg, teardownTestPg, withTestSchema, TEST_PG_IMAGE } from './pg-container.ts';
+export {
+  getTestPg,
+  teardownTestPg,
+  withTestSchema,
+  TEST_PG_IMAGE,
+  NON_DESTRUCTIVE_PG_HEALTHCHECK,
+} from './pg-container.ts';
 export type { TestSchemaHandle } from './pg-container.ts';
 export { TESTCONTAINER_START_LOCK_TIMEOUT_MS } from './testcontainer-start-lock.ts';
 export { createFreshTestDb, createMigratedTestDb, provisionRestartTestDb, getOrBuildTemplate } from './pg-migrate.ts';

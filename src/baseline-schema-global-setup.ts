@@ -450,6 +450,24 @@ export default async function setup({ provide }: TestProject) {
         .withDatabase('papercusp_it')
         .withUsername('it_admin')
         .withPassword('it_admin')
+        // EI-21116464706451765 / EI-21340200136336953: the stock
+        // @testcontainers/postgresql healthcheck runs `pg_isready` INSIDE this
+        // PID-1-postmaster container; during crash recovery its nonzero exit
+        // makes Postgres kill every server process and restart recovery, and
+        // the stock 250ms interval then repeats that crash indefinitely. This
+        // container is `.withReuse()`d and therefore long-lived by design, so it
+        // was one of the worst places to leave the destructive default — a
+        // `docker inspect` on 2026-09-05 found this exact container (papercusp_it,
+        // created 08-24) still running `pg_isready` @250ms/1000-retries, eleven
+        // days after the fix landed at the sibling call site.
+        //
+        // Safe HERE specifically because the override removes a startup gate
+        // (PostgreSqlContainer waits on forHealthCheck + forListeningPorts) and
+        // this site already performs the required host-side SQL readiness check
+        // immediately after start: `isBaselineContainerHealthy` below validates
+        // the (possibly reused) container and reprovisions a fresh one if it is
+        // not actually serving papercusp_it.
+        .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
         // Reuse the baseline container across Vitest processes. The previous
         // ephemeral container replayed ~476 migrations for every focused file;
         // under checkpoint concurrency that startup alone could consume the test's
