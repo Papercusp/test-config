@@ -4,6 +4,7 @@
 import { defineConfig, type ViteUserConfig as UserConfig } from 'vitest/config';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { availableParallelism } from 'node:os';
 // Node's native TypeScript config loader requires the real `.ts` runtime
@@ -229,6 +230,111 @@ export const DEFAULT_UNIT_TEST_TIMEOUT_MS = 60_000;
  */
 const EMPTY_LANE_INCLUDE = '__pc-empty-lane__/matches-nothing.test.ts';
 
+// ── FILTER-LIST CHANNEL (plan gate-latency-selection-and-retry-policy-2026-09-06, P-001) ────
+// `scripts/affected-tests.mjs --related` used to hand its per-file selection to vitest as
+// positional filters. That cannot carry a large selection: `npm run … -- <files>` folds the
+// arguments into ONE `sh -c` string, which Linux caps at 128 KiB (MAX_ARG_STRLEN), and a
+// 3,849-file operator-core selection is ~180 KB. The selection now arrives as a JSON array of
+// workspace-relative test paths in the file named by this env var, and is applied to `include`
+// below with the SAME semantics the positional form had: a file runs iff the layer/lane would
+// have run it AND it is listed.
+//
+// Every failure mode here runs MORE tests, never fewer (the related-tests.mjs principle): an
+// unreadable list, or an `include` shape this cannot narrow safely, falls back to the wide
+// include and says so on stderr. An EMPTY intersection must NOT become `[]` — vitest reads an
+// empty include as "the default include", i.e. the whole suite — so it becomes the same
+// matches-nothing sentinel the empty lane uses.
+export const PC_TEST_FILTER_LIST_ENV = 'PC_TEST_FILTER_LIST';
+
+export type FilterListDecision =
+  | { applied: true; include: string[]; selected: number; listed: number }
+  | { applied: false; reason: string; include: string[] };
+
+const normalizeRel = (p: string): string => p.replaceAll('\\', '/').replace(/^\.\//, '');
+
+/** The only glob shape the layer includes use; anything else declines narrowing. */
+const SUFFIX_GLOB_RE = /^\*\*\/\*(\.[A-Za-z0-9.]+)$/;
+
+/**
+ * Narrow `include` to the listed files. PURE — exported so the rule is unit-testable without
+ * spawning vitest. `explicitFiles:true` means `include` is already an explicit file list (a
+ * lane); otherwise it is the layer's globs.
+ */
+export function applyFilterList(
+  include: string[],
+  listed: string[],
+  opts: { explicitFiles: boolean },
+): FilterListDecision {
+  const wanted = new Set(listed.map(normalizeRel));
+  if (opts.explicitFiles) {
+    const kept = include.filter((f) => wanted.has(normalizeRel(f)));
+    return {
+      applied: true,
+      include: kept.length > 0 ? kept : [EMPTY_LANE_INCLUDE],
+      selected: kept.length,
+      listed: wanted.size,
+    };
+  }
+  const suffixes: string[] = [];
+  for (const glob of include) {
+    const m = SUFFIX_GLOB_RE.exec(glob);
+    if (!m) {
+      return { applied: false, reason: `unsupported include pattern "${glob}"`, include };
+    }
+    suffixes.push(m[1]);
+  }
+  const kept = [...wanted].filter((f) => suffixes.some((s) => f.endsWith(s))).sort();
+  return {
+    applied: true,
+    include: kept.length > 0 ? kept : [EMPTY_LANE_INCLUDE],
+    selected: kept.length,
+    listed: wanted.size,
+  };
+}
+
+/** Read the env-named list; `null` when the channel is not in use. Throws on a malformed list. */
+export function readFilterList(env: NodeJS.ProcessEnv = process.env): { path: string; files: string[] } | null {
+  const listPath = env[PC_TEST_FILTER_LIST_ENV]?.trim();
+  if (!listPath) return null;
+  const parsed: unknown = JSON.parse(readFileSync(listPath, 'utf8'));
+  if (!Array.isArray(parsed) || !parsed.every((entry) => typeof entry === 'string')) {
+    throw new Error(`${PC_TEST_FILTER_LIST_ENV}=${listPath} must contain a JSON array of test paths.`);
+  }
+  return { path: listPath, files: parsed };
+}
+
+/**
+ * Resolve the final `include` for a run: the layer/lane include, narrowed by the filter list
+ * when one is present and applicable. Fail-soft toward the WIDE include.
+ */
+function resolveIncludeWithFilterList(
+  baseInclude: string[],
+  explicitFiles: boolean,
+  log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
+): string[] {
+  let list: { path: string; files: string[] } | null;
+  try {
+    list = readFilterList();
+  } catch (error) {
+    log(
+      `[filter-list] UNREADABLE (${error instanceof Error ? error.message : String(error)}) — ` +
+        `running the wide include instead (more tests, never fewer)`,
+    );
+    return baseInclude;
+  }
+  if (!list) return baseInclude;
+  const decision = applyFilterList(baseInclude, list.files, { explicitFiles });
+  if (!decision.applied) {
+    log(`[filter-list] DECLINED: ${decision.reason} — running the wide include instead`);
+    return baseInclude;
+  }
+  log(
+    `[filter-list] applied ${decision.selected}/${decision.listed} listed file(s) ` +
+      `(${explicitFiles ? 'lane' : 'layer'} include, root=${process.cwd()}) from ${list.path}`,
+  );
+  return decision.include;
+}
+
 /**
  * Which lane (if any) this invocation should run.
  *
@@ -374,8 +480,12 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
     server: { fs: { allow: [MONOREPO_ROOT] } },
     test: {
       // A lane run enumerates its files EXPLICITLY (content-derived membership); everything
-      // else keeps the layer's globs, byte-for-byte as before.
-      include: lane ? (laneInclude ?? [EMPTY_LANE_INCLUDE]) : layerInclude,
+      // else keeps the layer's globs, byte-for-byte as before. P-001: either form is then
+      // narrowed by the PC_TEST_FILTER_LIST selection when the runner provides one.
+      include: resolveIncludeWithFilterList(
+        lane ? (laneInclude ?? [EMPTY_LANE_INCLUDE]) : layerInclude,
+        lane != null,
+      ),
       // TOP-LEVEL `isolate` — `poolOptions.forks.isolate` was REMOVED in vitest 4 and is
       // ignored SILENTLY (D-029), which would make the split look like it does nothing.
       // Spread conditionally so a non-lane run's config is untouched, not merely undefined.
