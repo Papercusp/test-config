@@ -102,6 +102,49 @@ const ADMIN_TEST_RUNS_REPORTER = resolve(__dirname, 'admin-test-runs-reporter.ts
 const adminReporter: string[] =
   process.env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' ? [] : [ADMIN_TEST_RUNS_REPORTER];
 
+// ── EXECUTED-SOURCE MAP (gate-latency-selection-and-retry-policy-2026-09-06, P-002) ──────
+// A second reporter that records, per test FILE, the modules vitest actually executed, into
+// harness_shared.test_executed_sources — the observation scripts/lib/related-tests.mjs uses to
+// prune hub-fan-out over-selection from the static import closure. Armed ONLY when the runner
+// (scripts/affected-tests.mjs) names the workspace via PC_EXECUTED_SOURCE_MAP_WORKSPACE; an
+// ordinary `vitest run` records nothing and pays nothing.
+//
+// ⚠ vitest reports `TestModule.diagnostic().importDurations` only up to
+// `experimental.importDurations.limit`, and that limit DEFAULTS TO 0 unless the breakdown is
+// printed (vitest 4.1.8: `limit = shouldCollect ? 10 : 0`, coverage chunk). So arming the
+// reporter alone yields an EMPTY map every time; the config below raises the limit past any
+// real module count in the same decision, and the reporter's own test pins that both halves
+// travel together.
+export const PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV = 'PC_EXECUTED_SOURCE_MAP_WORKSPACE';
+export const PC_EXECUTED_SOURCE_MAP_OUT_ENV = 'PC_EXECUTED_SOURCE_MAP_OUT';
+export const EXECUTED_SOURCE_MAP_IMPORT_LIMIT = 1_000_000;
+const EXECUTED_SOURCE_MAP_REPORTER = resolve(__dirname, 'executed-source-map-reporter.ts');
+
+/** The arming decision, PURE over an env — `null` when the runner did not ask for a map. */
+export function executedSourceMapArmed(
+  env: NodeJS.ProcessEnv = process.env,
+): { workspaceName: string; outPath: string | null } | null {
+  const workspaceName = env[PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]?.trim();
+  if (!workspaceName) return null;
+  const outPath = env[PC_EXECUTED_SOURCE_MAP_OUT_ENV]?.trim() || null;
+  return { workspaceName, outPath };
+}
+
+/**
+ * The config fragment that makes recording possible: the reporter plus the raised limit,
+ * as one value so neither half can be wired without the other.
+ */
+export function executedSourceMapConfig(env: NodeJS.ProcessEnv = process.env): {
+  reporters: string[];
+  experimental: { importDurations: { limit: number; print: false } } | undefined;
+} {
+  if (!executedSourceMapArmed(env)) return { reporters: [], experimental: undefined };
+  return {
+    reporters: [EXECUTED_SOURCE_MAP_REPORTER],
+    experimental: { importDurations: { limit: EXECUTED_SOURCE_MAP_IMPORT_LIMIT, print: false } },
+  };
+}
+
 // Public path constants, re-exported here (not just from the heavy `index.ts` barrel)
 // so a vitest.config.ts that only needs `defineVitestConfig` + these two path strings
 // can import from the LIGHTWEIGHT `@papercusp/test-config/vitest-config` subpath and
@@ -423,6 +466,9 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         ...setupFiles,
       ];
 
+  // P-002: the executed-source-map reporter + the raised importDurations limit, or nothing.
+  const executedSourceMap = executedSourceMapConfig();
+
   const layerInclude =
     include ??
     (layer === 'integration'
@@ -606,8 +652,11 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       setupFiles: finalSetup,
       globalSetup,
       reporters: process.env.CI
-        ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }], ...adminReporter]
-        : ['default', ...adminReporter],
+        ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }], ...adminReporter, ...executedSourceMap.reporters]
+        : ['default', ...adminReporter, ...executedSourceMap.reporters],
+      // P-002: present ONLY when the executed-source-map reporter is armed (see
+      // executedSourceMapConfig); an unarmed run keeps vitest's own default.
+      ...(executedSourceMap.experimental ? { experimental: executedSourceMap.experimental } : {}),
       // Per testing-spec §1.9: integration retry=0 (deterministic via testcontainers
       // per worker); unit retry=0; E2E (Playwright config) handles its own retries.
       retry: 0,

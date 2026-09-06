@@ -580,19 +580,21 @@ function moduleStatus(m: TestModule): TestRunRow['status'] {
 // Minimal structural type for the postgres-js client — avoids depending on the
 // package's CJS default-export typing (which needs esModuleInterop and tripped a
 // standalone tsc across the 22 workspaces that inherit this reporter).
-type PgSql = ((strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>) & {
+export type PgSql = ((strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>) & {
   end(opts?: { timeout?: number }): Promise<unknown>;
 };
-type PgHandle = { sql: PgSql } | null;
+export type PgHandle = { sql: PgSql } | null;
 
 // ONE shared pg client reused for EVERY per-file insert across the whole run,
 // memoized as a PROMISE so the fire-and-forget per-file inserts can't race into
 // creating multiple clients. A fresh client per file exhausted PG's connection
 // slots at scale (operator-core ~950 files on a box near max_connections). Closed
-// in onTestRunEnd/onExit.
+// in onTestRunEnd/onExit. EXPORTED (with closeSharedPg) for the sibling
+// executed-source-map reporter (P-002, gate-latency-selection-and-retry-policy-2026-09-06),
+// which flushes through this same handle instead of opening a second client per run.
 let _pgPromise: Promise<PgHandle> | undefined;
 
-function tryGetPg(): Promise<PgHandle> {
+export function tryGetPg(): Promise<PgHandle> {
   if (_pgPromise) return _pgPromise;
   _pgPromise = (async (): Promise<PgHandle> => {
     try {
