@@ -218,10 +218,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
         return;
       }
       // A NON-ISOLATED file (the pure lane, isolate:false — see vitest-config.ts) shares a
-      // fork's module registry with the files before it, so a module it imports that an earlier
-      // file already evaluated is NOT re-executed and may be missing from its record. That is an
-      // UNDER-estimate — the one direction the selector must never see — so such a file gets no
-      // row and stays in the static selection.
+      // fork's module registry with the files before it, so its record describes the FORK,
+      // not the file. MEASURED 2026-09-06 (vitest 4.1.8, forks, --isolate=false, three files
+      // in one fork): the record ACCUMULATES — the third file's set contained the first two
+      // TEST files — so it is a superset (safe to prune on, but it prunes almost nothing) and,
+      // should vitest ever reset it per file instead, an UNDER-estimate. Neither is a map of
+      // this file: such a file gets no row and stays in the static selection.
       if (!moduleIsIsolated(testModule)) {
         this.skipped += 1;
         return;
