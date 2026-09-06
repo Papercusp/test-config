@@ -92,7 +92,7 @@ export function classifyGitEntry(dir: string): 'root' | 'skip' | 'none' {
 // ── inlined: inferWorkspaceRoot — find the true SUPERPROJECT root so recorded
 //    file paths are monorepo-relative (the tab's registry globs expect that). ──
 let _cachedRoot: string | null = null;
-function inferWorkspaceRoot(from = process.cwd()): string {
+export function inferWorkspaceRoot(from = process.cwd()): string {
   if (_cachedRoot) return _cachedRoot;
   // Walk up to the first ancestor that {@link classifyGitEntry} calls a repo
   // root — a `.git` DIRECTORY, or a linked-WORKTREE gitlink. CRITICAL: a git
@@ -261,7 +261,7 @@ async function resolveGitContext(): Promise<GitContext> {
  * row. The fail-safe null handling in computeWorktreeDirty makes git timeout
  * or failure visible as dirty instead of silently restoring the old default.
  */
-async function captureWorktreeSnapshot(): Promise<WorktreeGitSnapshot> {
+export async function captureWorktreeSnapshot(): Promise<WorktreeGitSnapshot> {
   const root = inferWorkspaceRoot();
   const [commit, porcelain] = await Promise.all([
     runGit('git rev-parse HEAD', root, 2_000),
@@ -619,7 +619,7 @@ function tryGetPg(): Promise<PgHandle> {
   return _pgPromise;
 }
 
-async function closeSharedPg(): Promise<void> {
+export async function closeSharedPg(): Promise<void> {
   const p = _pgPromise;
   _pgPromise = undefined;
   if (!p) return;
