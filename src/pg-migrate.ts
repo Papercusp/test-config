@@ -284,8 +284,9 @@ export interface CreateFreshTestDbOptions {
     provision: (url: string) => Promise<void>;
     /**
      * Maximum time to wait for another process to finish building this template.
-     * The default stays below Vitest's common 120s beforeAll budget so callers get
-     * a stage-labelled infrastructure error instead of an opaque hook timeout.
+     * Omit this to wait until the builder finishes (or its backend dies and releases
+     * the advisory lock). Pass a positive value only when a caller deliberately wants
+     * a bounded, stage-labelled failure instead of waiting for the shared builder.
      */
     lockTimeoutMs?: number;
   };
@@ -304,9 +305,13 @@ const templateBuilds = new Map<string, Promise<string>>();
  *  template under the final name, and the bare `pg_database` existence check
  *  then served it to EVERY later clone — a whole-section mass-fail). */
 const TEMPLATE_READY_MARK = 'pc-template-ready';
-const DEFAULT_TEMPLATE_LOCK_TIMEOUT_MS = 75_000;
+// A valid parallel integration suite must join the process already building this
+// shared template. A fixed default turned slow-but-progressing builds into 55P03
+// failures (EI-22047290364644498); the explicit option remains available to tests
+// that need a deliberately bounded lock diagnostic.
+const DEFAULT_TEMPLATE_LOCK_TIMEOUT_MS: number | null = null;
 
-function templateLockTimeoutMs(value?: number): number {
+function templateLockTimeoutMs(value?: number): number | null {
   if (value === undefined) return DEFAULT_TEMPLATE_LOCK_TIMEOUT_MS;
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`getOrBuildTemplate: lockTimeoutMs must be a positive finite number (received ${value})`);
@@ -349,15 +354,16 @@ async function buildTemplate(
     try {
       // Serialize concurrent forks racing to build the SAME template on the shared
       // container (mirrors the framework-roles advisory lock). Held across provision.
-      // Bound ONLY the acquisition statement: an unbounded wait used to consume the
-      // caller's entire beforeAll budget and surface as a context-free Vitest hook
-      // timeout. Once acquired, restore the session default so real migration/DDL
-      // failures keep their own diagnostics instead of being mislabeled as lock waits.
-      await a.unsafe(`SET lock_timeout = '${lockTimeoutMs}ms'`);
+      // The normal path waits for the current builder: PostgreSQL releases this
+      // session-level advisory lock when that backend exits, including a crash. A
+      // caller that supplies lockTimeoutMs gets a bounded acquisition instead.
+      await a.unsafe(
+        lockTimeoutMs === null ? `SET lock_timeout = '0'` : `SET lock_timeout = '${lockTimeoutMs}ms'`,
+      );
       try {
         await a.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
       } catch (e) {
-        if (isLockTimeout(e)) {
+        if (lockTimeoutMs !== null && isLockTimeout(e)) {
           throw new Error(
             `getOrBuildTemplate: stage=template-lock-acquire timed out after ${lockTimeoutMs}ms ` +
               `(key=${key}, template=${name}, lock=${lock}); another test process is still building this migration set`,

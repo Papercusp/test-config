@@ -169,6 +169,41 @@ describe('buildTemplate hardening (WI-1992)', () => {
     expect(await templateState(holder, name)).toBe('ready');
   });
 
+  it('default lock acquisition waits for a concurrent builder and reuses its template', async () => {
+    const key = freshKey();
+    const name = `tmpl_${key}`;
+    const lock = `pc-test-template-${key}`;
+    cleanupDbs.push(name);
+    const holder = await adminClient();
+
+    await holder.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
+    let releaseTimer: ReturnType<typeof setTimeout> | undefined;
+    const startedAt = Date.now();
+    try {
+      // Simulate another Vitest process that is making steady progress through
+      // its migration provision. The default path must join it, not reject after
+      // an arbitrary fixed window.
+      releaseTimer = setTimeout(() => {
+        void holder.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`).catch(() => {});
+      }, 250);
+
+      const built = await getOrBuildTemplate(key, async (url) => {
+        const c = postgres(url, { max: 1, onnotice: () => {} });
+        try {
+          await c.unsafe(`CREATE TABLE waited_builder_ok (id int)`);
+        } finally {
+          await c.end({ timeout: 5 });
+        }
+      });
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(150);
+      expect(built).toBe(name);
+      expect(await templateState(holder, name)).toBe('ready');
+    } finally {
+      if (releaseTimer) clearTimeout(releaseTimer);
+      await holder.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`).catch(() => {});
+    }
+  });
+
   it('a pre-hardening PARTIAL template (final name, no mark) is dropped and rebuilt, not served', async () => {
     const key = freshKey();
     const name = `tmpl_${key}`;
