@@ -207,7 +207,10 @@ describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () =>
   const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
   /**
-   * Every non-node_modules .ts file constructing a PostgreSqlContainer.
+   * Every canonical, non-node_modules .ts file constructing a
+   * PostgreSqlContainer. `.papercusp/worktrees` contains isolated release
+   * snapshots that are not part of the source corpus under test; walking them
+   * makes this negative guard report stale call sites from another checkout.
    *
    * `grep -rl` (one line per FILE) deliberately, not `-rn` piped through a line
    * cap: this list drives a NEGATIVE conclusion ("no unguarded site exists"),
@@ -226,6 +229,7 @@ describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () =>
           "--include=*.ts",
           "--exclude-dir=node_modules",
           "--exclude-dir=.git",
+          "--exclude-dir=.papercusp",
           "new PostgreSqlContainer",
           ".",
         ],
