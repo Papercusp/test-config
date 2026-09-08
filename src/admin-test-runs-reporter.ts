@@ -6,8 +6,9 @@
  * Plan: admin-testing-tab-restructure-2026-05-24, P-010. Lifted into
  * @papercusp/test-config and AUTO-WIRED by defineVitestConfig (2026-06-08) so EVERY
  * workspace records — not just apps/operator + operator-core. Self-contained on
- * purpose (only node: builtins + a LAZY postgres import) so it can never fail to
- * LOAD in a lib that lacks operator-core; the 3 helpers it used to import
+ * purpose (node: builtins, a LAZY postgres import, and the dependency-free
+ * @papercusp/module-singleton pin — see the root-state block below) so it can never
+ * fail to LOAD in a lib that lacks operator-core; the 3 helpers it used to import
  * (resolveGitContext / inferWorkspaceRoot / resolveTestRunSource) are inlined below.
  *
  * D-007 fail-soft contract — LOAD-BEARING:
@@ -25,6 +26,7 @@
  */
 
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
+import { pinModuleState } from '@papercusp/module-singleton';
 import { exec } from 'node:child_process';
 import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
@@ -91,31 +93,128 @@ export function classifyGitEntry(dir: string): 'root' | 'skip' | 'none' {
 
 // ── inlined: inferWorkspaceRoot — find the true SUPERPROJECT root so recorded
 //    file paths are monorepo-relative (the tab's registry globs expect that). ──
-let _cachedRoot: string | null = null;
-export function inferWorkspaceRoot(from = process.cwd()): string {
-  if (_cachedRoot) return _cachedRoot;
-  // Walk up to the first ancestor that {@link classifyGitEntry} calls a repo
-  // root — a `.git` DIRECTORY, or a linked-WORKTREE gitlink. CRITICAL: a git
-  // SUBMODULE also carries a `.git` FILE (a gitlink) and must be SKIPPED. The
-  // original `existsSync('.git')` check stopped at the submodule, so a submodule
-  // workspace recorded SUBMODULE-relative paths (e.g. `packages/orchestrator/…`
-  // or `grid-core/src/…`) instead of the monorepo-relative
-  // `libs/papercusp/packages/orchestrator/…` / `libs/generic/papergrid/grid-core/src/…`
-  // the tab globs match → those rows were invisible in the tab. The fix for THAT
-  // (skip every `.git` file) then over-corrected into the worktree bug described
-  // on classifyGitEntry, which is why the two cases are now told apart explicitly.
+
+/**
+ * WI-10000776 — the reporter's root state, PINNED to the realm instead of held in
+ * plain module scope.
+ *
+ * Both fields are read by {@link resolveRecordRoot}, and `file_path` derived from
+ * that root is HALF A JOIN KEY: `coverage_evidence` joins `test_runs` on
+ * `(run_group_id, file_path)`, and the two sides reach this module by DIFFERENT
+ * specifiers — the reporter is loaded by absolute path (ADMIN_TEST_RUNS_REPORTER_PATH),
+ * while the coverage-census attribution setup does
+ * `import('@papercusp/test-config/admin-test-runs-reporter')`. That is textbook
+ * module-record duplication (bare specifier vs path, plus a `node_modules/@papercusp/*`
+ * symlink), which would give each side its OWN root and break the join with nothing
+ * failing. Pinning makes both sides share one root; `pinModuleState` also COUNTS
+ * evaluations, so a genuine split is reported by `listModuleDuplications()` rather
+ * than rediscovered from a contradictory reading.
+ */
+const _rootState = pinModuleState('@papercusp/test-config.admin-test-runs-reporter.root', () => ({
+  /** Lazily-computed process root (from `process.cwd()`), the pre-WI-10000776 behaviour. */
+  cachedRoot: null as string | null,
+  /** The CHECKOUT UNDER TEST for this run, set once in `onInit`. Null ⇒ fall back. */
+  runRoot: null as string | null,
+}));
+
+/**
+ * The root walk itself, WITHOUT the cache — so a caller that knows which checkout it
+ * means (see {@link setRunRoot}) actually gets an answer about THAT directory.
+ * {@link inferWorkspaceRoot} short-circuits on its cache and therefore ignores its own
+ * `from` argument once warm; that is fine for its cwd-derived use, and wrong for ours.
+ *
+ * Walk up to the first ancestor that {@link classifyGitEntry} calls a repo
+ * root — a `.git` DIRECTORY, or a linked-WORKTREE gitlink. CRITICAL: a git
+ * SUBMODULE also carries a `.git` FILE (a gitlink) and must be SKIPPED. The
+ * original `existsSync('.git')` check stopped at the submodule, so a submodule
+ * workspace recorded SUBMODULE-relative paths (e.g. `packages/orchestrator/…`
+ * or `grid-core/src/…`) instead of the monorepo-relative
+ * `libs/papercusp/packages/orchestrator/…` / `libs/generic/papergrid/grid-core/src/…`
+ * the tab globs match → those rows were invisible in the tab. The fix for THAT
+ * (skip every `.git` file) then over-corrected into the worktree bug described
+ * on classifyGitEntry, which is why the two cases are now told apart explicitly.
+ *
+ * Pure (modulo fs) + exported for unit testing.
+ */
+export function computeWorkspaceRootFrom(from: string): string {
   let dir = resolve(from);
   while (true) {
-    if (classifyGitEntry(dir) === 'root') {
-      _cachedRoot = dir;
-      return dir;
-    }
+    if (classifyGitEntry(dir) === 'root') return dir;
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
-  _cachedRoot = from;
   return from;
+}
+
+export function inferWorkspaceRoot(from = process.cwd()): string {
+  if (_rootState.cachedRoot) return _rootState.cachedRoot;
+  const root = computeWorkspaceRootFrom(from);
+  _rootState.cachedRoot = root;
+  return root;
+}
+
+/**
+ * WI-10000776 — pin this RUN's root to the checkout Vitest is actually testing.
+ *
+ * The bug: every recorded path was relativized against the root inferred from
+ * `process.cwd()`, i.e. the PAPERCUSP tree, whichever checkout the suite belonged to.
+ * A sibling checkout (e.g. `~/papercupai-workspace/portal`) therefore produced
+ * `../…/portal/tests/x.test.ts`, and {@link shouldRecordTestRunPath} DROPS anything
+ * starting `../` — so its rows were silently discarded, no `test_run_id` was ever
+ * minted, and `plans:bind-spec-evidence` (which needs a non-null one) could not carry
+ * `test`-kind evidence for any plan in that checkout. The tests ran, passed, and left
+ * no trace.
+ *
+ * The fix is the ROOT, not the guard. `configRoot` goes through
+ * {@link computeWorkspaceRootFrom} rather than being used raw, so a run rooted inside a
+ * git SUBMODULE still resolves to that checkout's true superproject — otherwise this
+ * would reintroduce the submodule-relative-path bug described above. With the root
+ * correct, `/tmp/fake.test.ts` STILL relativizes outside it and is STILL rejected by the
+ * same `../` test, so WI-5183's fixture guard survives intact rather than being loosened.
+ *
+ * Fail-soft per the D-007 contract: any failure leaves the run root unset, which is
+ * exactly the pre-WI-10000776 behaviour. Returns the root it pinned, for tests.
+ */
+export function setRunRoot(configRoot: string | null | undefined): string | null {
+  try {
+    if (!configRoot || typeof configRoot !== 'string') {
+      _rootState.runRoot = null;
+      return null;
+    }
+    _rootState.runRoot = computeWorkspaceRootFrom(configRoot);
+    return _rootState.runRoot;
+  } catch {
+    _rootState.runRoot = null;
+    return null;
+  }
+}
+
+/**
+ * WI-10000776 — read Vitest's resolved root for this run, fail-soft. `ctx.config.root`
+ * is the Vitest ResolvedConfig root; `ctx.vite.config.root` is the underlying Vite
+ * server's, used as the fallback. A ctx that carries neither (every pre-existing unit
+ * test constructs one) yields `null`, i.e. today's cwd-derived behaviour. Exported so
+ * the extraction is testable without reaching into the reporter's private state.
+ */
+export function readRunConfigRoot(ctx: unknown): string | null {
+  const pick = (holder: unknown): string | null => {
+    const root = (holder as { config?: { root?: unknown } } | null | undefined)?.config?.root;
+    return typeof root === 'string' && root.length > 0 ? root : null;
+  };
+  try {
+    return pick(ctx) ?? pick((ctx as { vite?: unknown } | null | undefined)?.vite);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The ONE root every recorded path and git read resolves against: this run's checkout
+ * when {@link setRunRoot} identified one, else the cwd-derived workspace root.
+ */
+export function resolveRecordRoot(): string {
+  return _rootState.runRoot ?? inferWorkspaceRoot();
 }
 
 /**
@@ -241,7 +340,9 @@ function runGit(cmd: string, cwd: string, timeoutMs: number): Promise<string | n
 async function resolveGitContext(): Promise<GitContext> {
   const now = Date.now();
   if (_gitCache && _gitCache.expiresAt > now) return _gitCache.value;
-  const root = inferWorkspaceRoot();
+  // WI-10000776: the branch/commit stamped on a row must describe the checkout the
+  // tests came from, not whichever tree the process happened to start in.
+  const root = resolveRecordRoot();
   const [branchRaw, commitRaw] = await Promise.all([
     runGit('git rev-parse --abbrev-ref HEAD', root, 200),
     runGit('git rev-parse HEAD', root, 200),
@@ -262,7 +363,7 @@ async function resolveGitContext(): Promise<GitContext> {
  * or failure visible as dirty instead of silently restoring the old default.
  */
 export async function captureWorktreeSnapshot(): Promise<WorktreeGitSnapshot> {
-  const root = inferWorkspaceRoot();
+  const root = resolveRecordRoot();
   const [commit, porcelain] = await Promise.all([
     runGit('git rev-parse HEAD', root, 2_000),
     runGit('git status --porcelain --untracked-files=all', root, 2_000),
@@ -513,7 +614,7 @@ export function captureReporterSaturationSnapshot(): { loopLagP95Ms: number | nu
  * becomes unattributable with nothing failing.
  */
 export function toWorkspaceRel(absPath: string): string {
-  const root = inferWorkspaceRoot();
+  const root = resolveRecordRoot();
   return relative(root, absPath).split(/[/\\]/).join(posix.sep);
 }
 
@@ -535,6 +636,12 @@ export function shouldRecordTestRunPath(filePath: string): boolean {
   // "test" to quarantine (nonsensical: there is no real file/glob to quarantine).
   // General fix (not a one-off path literal): reject ANY moduleId that normalizes
   // outside the workspace root, not just this specific fixture path.
+  //
+  // WI-10000776: the root this is measured against is now the CHECKOUT UNDER TEST
+  // (see setRunRoot), not whichever tree the process started in. That is what makes
+  // this guard mean what it says: a sibling checkout's own tests are INSIDE its root
+  // and record, while `/tmp/fake.test.ts` is outside EVERY checkout and is still
+  // rejected here. The guard did not need loosening — the root was wrong.
   if (filePath.startsWith('../') || filePath.startsWith('..\\')) return false;
   if (filePath.startsWith('_retired/') || filePath.includes('/_retired/')) return false;
   if (filePath.startsWith('.papercusp/scratch/tdg-') || filePath.includes('/.papercusp/scratch/tdg-')) return false;
@@ -850,7 +957,7 @@ function collectTestFailureDetails(testModule: TestModule, file: string): TestFa
  */
 export function computeIsScratchConfig(ctx: Pick<Vitest, 'vite'>): boolean {
   try {
-    return isScratchConfigFile(ctx.vite.config.configFile, inferWorkspaceRoot());
+    return isScratchConfigFile(ctx.vite.config.configFile, resolveRecordRoot());
   } catch {
     return false;
   }
@@ -887,6 +994,12 @@ export default class AdminTestRunsReporter implements Reporter {
   private readonly writeRow: TestRunRowWriter;
 
   onInit(ctx: Vitest): void {
+    // WI-10000776 — FIRST, before anything reads a root. Vitest calls onInit before it
+    // executes any test module, so this is the one moment the checkout under test is
+    // known and nothing has been relativized yet. Both statements below resolve a root
+    // (computeIsScratchConfig → resolveRecordRoot; the snapshot → git in that root), so
+    // ordering here is load-bearing, not stylistic.
+    setRunRoot(readRunConfigRoot(ctx));
     this.isScratchConfig = computeIsScratchConfig(ctx);
     this.worktreeBefore = this.readWorktreeSnapshot();
     this.flushed = false;
