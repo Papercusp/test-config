@@ -18,8 +18,13 @@ import AdminTestRunsReporter, {
   buildOutputTail,
   captureReporterSaturationSnapshot,
   classifyGitEntry,
+  computeWorkspaceRootFrom,
   computeWorktreeDirty,
   computeIsScratchConfig,
+  inferWorkspaceRoot,
+  readRunConfigRoot,
+  setRunRoot,
+  toWorkspaceRel,
   formatTestCaseError,
   isScratchConfigFile,
   isMutationProbeRun,
@@ -758,5 +763,129 @@ describe('resolveTestRunHarnessSlug / resolveTestRunWorkspaceId (WI-6583)', () =
     process.env.PAPERCUSP_WORKSPACE_ID = 'ws-id';
     process.env.PAPERCUSP_WORKSPACE = 'ws-legacy';
     expect(resolveTestRunWorkspaceId()).toBe('ws-id');
+  });
+});
+
+/**
+ * WI-10000776 — every recorded path used to be relativized against the root inferred
+ * from `process.cwd()`, i.e. the PAPERCUSP tree, whatever checkout the suite belonged
+ * to. A sibling checkout therefore produced `../…/tests/x.test.ts`, and
+ * {@link shouldRecordTestRunPath} DROPS anything starting `../` — so its rows were
+ * silently discarded, no `test_run_id` was ever minted, and `plans:bind-spec-evidence`
+ * (which requires a non-null one) could not carry `test`-kind evidence for any plan in
+ * that checkout. The tests ran green and left no trace.
+ *
+ * These build REAL fixture checkouts on disk (a `.git` DIRECTORY is a repo root per
+ * classifyGitEntry) rather than mocking the walk, because the defect lives precisely in
+ * WHICH directory the walk was asked about.
+ */
+describe('WI-10000776 — the recorded root is the CHECKOUT UNDER TEST, not the process cwd', () => {
+  const made: string[] = [];
+  function checkout(name: string): string {
+    const d = mkdtempSync(join(tmpdir(), `pc-${name}-`));
+    made.push(d);
+    mkdirSync(join(d, '.git'));
+    mkdirSync(join(d, 'tests'));
+    return d;
+  }
+  afterEach(() => {
+    setRunRoot(null); // realm-pinned state — never leak a run root into a sibling test
+    while (made.length) {
+      try { rmSync(made.pop() as string, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
+  it('THE BUG: with no run root, a sibling checkout normalizes to ../ and is dropped', () => {
+    const sibling = checkout('sibling');
+    const rel = toWorkspaceRel(join(sibling, 'tests', 'a.test.ts'));
+    expect(rel.startsWith('../')).toBe(true);
+    expect(shouldRecordTestRunPath(rel)).toBe(false);
+  });
+
+  it('THE FIX: pinned to that checkout, the same file records as tests/a.test.ts', () => {
+    const sibling = checkout('sibling');
+    expect(setRunRoot(sibling)).toBe(sibling);
+    expect(toWorkspaceRel(join(sibling, 'tests', 'a.test.ts'))).toBe('tests/a.test.ts');
+    expect(shouldRecordTestRunPath('tests/a.test.ts')).toBe(true);
+  });
+
+  it('WI-5183 SURVIVES: a /tmp fixture is outside EVERY checkout and is still rejected', () => {
+    // The guard never needed loosening — the root was wrong. Fixing the root makes this
+    // guard mean what it says instead of weakening it.
+    setRunRoot(checkout('sibling'));
+    const rel = toWorkspaceRel('/tmp/fake.test.ts');
+    expect(rel.startsWith('../')).toBe(true);
+    expect(shouldRecordTestRunPath(rel)).toBe(false);
+  });
+
+  it('a run rooted inside a SUBMODULE resolves to that checkout’s SUPERPROJECT', () => {
+    // Routing through computeWorkspaceRootFrom rather than using the config root raw is
+    // what prevents reintroducing the submodule-relative-path bug inferWorkspaceRoot
+    // already had to fix once.
+    const superproject = checkout('super');
+    const sub = join(superproject, 'libs', 'sub');
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(sub, '.git'), 'gitdir: /repo/.git/modules/libs/sub\n');
+    expect(setRunRoot(sub)).toBe(superproject);
+    expect(toWorkspaceRel(join(sub, 'x.test.ts'))).toBe('libs/sub/x.test.ts');
+  });
+
+  it('computeWorkspaceRootFrom answers about the directory it was ASKED about', () => {
+    // Why the walk had to be split from the cache: inferWorkspaceRoot short-circuits on
+    // its cached process root and silently ignores its own `from` once warm, so calling
+    // it with the config root would have returned the papercusp tree anyway.
+    const sibling = checkout('uncached');
+    const processRoot = inferWorkspaceRoot(); // warm the cache
+    expect(computeWorkspaceRootFrom(sibling)).toBe(sibling);
+    expect(inferWorkspaceRoot(sibling)).toBe(processRoot);
+  });
+
+  it('readRunConfigRoot prefers ctx.config.root, falls back to vite, never throws', () => {
+    expect(readRunConfigRoot({ config: { root: '/a' }, vite: { config: { root: '/b' } } })).toBe('/a');
+    expect(readRunConfigRoot({ vite: { config: { root: '/b' } } })).toBe('/b');
+    expect(readRunConfigRoot({ vite: { config: { configFile: '/x/vitest.config.ts' } } })).toBeNull();
+    expect(readRunConfigRoot({ config: { root: '' } })).toBeNull();
+    expect(readRunConfigRoot({})).toBeNull();
+    expect(readRunConfigRoot(null)).toBeNull();
+    expect(readRunConfigRoot(undefined)).toBeNull();
+  });
+
+  it('onInit pins the run root BEFORE anything else in it reads a root', () => {
+    const sibling = checkout('oninit');
+    const r = new AdminTestRunsReporter();
+    r.onInit({
+      config: { root: sibling },
+      vite: { config: { configFile: join(sibling, 'vitest.config.ts') } },
+    } as never);
+    expect(toWorkspaceRel(join(sibling, 'tests', 'b.test.ts'))).toBe('tests/b.test.ts');
+  });
+
+  it('fail-soft: a ctx carrying no root clears the run root, restoring cwd behaviour', () => {
+    const sibling = checkout('nofix');
+    setRunRoot(sibling);
+    const r = new AdminTestRunsReporter();
+    expect(() => r.onInit({ vite: { config: { configFile: 'x' } } } as never)).not.toThrow();
+    expect(toWorkspaceRel(join(sibling, 'tests', 'c.test.ts')).startsWith('../')).toBe(true);
+    expect(() => r.onInit(null as never)).not.toThrow();
+  });
+
+  it('a sibling checkout’s OWN vitest.config.ts stops being misread as a scratch config', () => {
+    // The second, quieter half of the same defect: measured against the papercusp tree, a
+    // legitimate external config resolved outside it and was stamped is_scratch_config.
+    const sibling = checkout('scratch');
+    const ctx = {
+      config: { root: sibling },
+      vite: { config: { configFile: join(sibling, 'vitest.config.ts') } },
+    } as never;
+    expect(computeIsScratchConfig(ctx)).toBe(true);
+    setRunRoot(sibling);
+    expect(computeIsScratchConfig(ctx)).toBe(false);
+  });
+
+  it('a genuine scratch config is STILL flagged once the run root is correct', () => {
+    setRunRoot(checkout('scratch-neg'));
+    expect(
+      computeIsScratchConfig({ vite: { config: { configFile: '/tmp/mutant-xyz/vitest.mutant.config.ts' } } } as never),
+    ).toBe(true);
   });
 });
