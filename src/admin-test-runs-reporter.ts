@@ -387,6 +387,42 @@ export interface TestRunRow {
   /** The post-run snapshot's commit. Reuse the same 2s integrity probe rather
    * than re-running a 200ms best-effort lookup once per persisted file. */
   commitSha: string | null;
+  /** Measured per-file proof; absent/NULL is unknown, never zero skipped tests. */
+  executionDetails?: {
+    schemaVersion: 1;
+    root: string;
+    filePath: string;
+    runGroupId: string | null;
+    workspaceId: string | null;
+    harnessSlug: string | null;
+    testNamePattern: string | null;
+    passed: number;
+    failed: number;
+    skipped: number;
+    collectionFailed: boolean;
+  } | null;
+}
+
+/** Read Vitest's completed cases, not module status or a truncated stdout tail. */
+export function collectModuleExecution(testModule: TestModule): Pick<
+  NonNullable<TestRunRow['executionDetails']>, 'passed' | 'failed' | 'skipped' | 'collectionFailed'
+> | null {
+  try {
+    const status = moduleStatus(testModule);
+    if (status === 'error' || typeof testModule.children?.allTests !== 'function') return null;
+    let passed = 0, failed = 0, skipped = 0;
+    for (const test of testModule.children.allTests()) {
+      switch (test.result().state) {
+        case 'passed': passed++; break;
+        case 'failed': failed++; break;
+        case 'skipped': skipped++; break;
+        default: return null; // pending/unreadable is not a completed measurement
+      }
+    }
+    return { passed, failed, skipped, collectionFailed: status === 'fail' && failed === 0 };
+  } catch {
+    return null;
+  }
 }
 
 /** A structured assertion detail captured from Vitest's TestCase result. */
@@ -806,10 +842,11 @@ async function insertRow(row: TestRunRow): Promise<void> {
     await Promise.race([
       pg.sql`
         INSERT INTO harness_shared.test_runs
-          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha, harness_slug, workspace_id, loop_lag_p95_ms, rss_mb, is_scratch_config, worktree_dirty)
+          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha, harness_slug, workspace_id, loop_lag_p95_ms, rss_mb, is_scratch_config, worktree_dirty, execution_details)
         VALUES
           (${row.filePath}, 'vitest', ${row.status}, ${row.durationMs}, ${row.startedAt},
-           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit}, ${harnessSlug}, ${workspaceId}, ${loopLagP95Ms}, ${rssMb}, ${row.isScratchConfig}, ${row.worktreeDirty})
+           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit}, ${harnessSlug}, ${workspaceId}, ${loopLagP95Ms}, ${rssMb}, ${row.isScratchConfig}, ${row.worktreeDirty},
+           ${row.executionDetails ? JSON.stringify(row.executionDetails) : null}::text::jsonb)
       `,
       new Promise((_, reject) => setTimeout(() => reject(new Error('pg_insert_timeout')), 1000)),
     ]).catch(() => {
@@ -977,6 +1014,8 @@ export default class AdminTestRunsReporter implements Reporter {
   /** Optional structured assertion values for testing:run's private sidecar. */
   private failureDetails: TestFailureDetail[] = [];
   private failureDetailsFlushed = false;
+  private executionContext: Omit<NonNullable<TestRunRow['executionDetails']>,
+    'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed'> | null = null;
 
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
@@ -1005,6 +1044,14 @@ export default class AdminTestRunsReporter implements Reporter {
     this.flushed = false;
     this.failureDetails = [];
     this.failureDetailsFlushed = false;
+    this.executionContext = {
+      schemaVersion: 1,
+      root: resolveRecordRoot(),
+      runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+      workspaceId: resolveTestRunWorkspaceId(),
+      harnessSlug: resolveTestRunHarnessSlug(),
+      testNamePattern: ctx?.config?.testNamePattern?.source ?? null,
+    };
   }
 
   /** Per-module hook — queue the row until the end snapshot is available. */
@@ -1025,7 +1072,11 @@ export default class AdminTestRunsReporter implements Reporter {
       const outputTail = buildOutputTail(testModule, status);
       this.failureDetails.push(...collectTestFailureDetails(testModule, filePath));
 
-      this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail, isScratchConfig: this.isScratchConfig });
+      const counts = collectModuleExecution(testModule);
+      const executionDetails = counts && this.executionContext
+        ? { ...this.executionContext, filePath, ...counts } : null;
+      this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail,
+        isScratchConfig: this.isScratchConfig, executionDetails });
     } catch {
       /* swallow — D-007 */
     }
