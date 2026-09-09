@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import AdminTestRunsReporter, {
   buildOutputTail,
+  collectModuleExecution,
   captureReporterSaturationSnapshot,
   classifyGitEntry,
   computeWorkspaceRootFrom,
@@ -38,6 +39,53 @@ import AdminTestRunsReporter, {
 } from './admin-test-runs-reporter';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+
+describe('durable module execution measurement', () => {
+  const module = (states: string[], state = 'passed') => ({
+    state: () => state,
+    children: { allTests: () => states.map(s => ({ result: () => ({ state: s }) })) },
+  }) as unknown as Parameters<typeof collectModuleExecution>[0];
+
+  it('counts all cases, including mixed skips and failures', () => {
+    expect(collectModuleExecution(module(['passed', 'passed', 'skipped', 'failed'], 'failed')))
+      .toEqual({ passed: 2, failed: 1, skipped: 1, collectionFailed: false });
+  });
+  it('retains a failed collection even without a failed assertion', () => {
+    expect(collectModuleExecution(module(['skipped'], 'failed')))
+      .toEqual({ passed: 0, failed: 0, skipped: 1, collectionFailed: true });
+  });
+  it('does not invent measurements for pending or unreadable cases', () => {
+    expect(collectModuleExecution(module(['passed', 'pending']))).toBeNull();
+    expect(collectModuleExecution({ state: () => 'passed' } as never)).toBeNull();
+    expect(collectModuleExecution(module(['passed'], 'pending'))).toBeNull();
+  });
+  it('writes the captured run scope and counts on the same terminal row', async () => {
+    vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'ca5fce52-7c67-4d38-8c26-96a952f6a2a2');
+    vi.stubEnv('PAPERCUSP_WORKSPACE_ID', 'ws-count-proof');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_HARNESS', 'count-proof');
+    const rows: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+      async row => { rows.push(row); });
+    try {
+      reporter.onInit({ config: { root: TEST_CONFIG_ROOT, testNamePattern: /selected case/ },
+        vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
+      reporter.onTestModuleEnd({ ...module(['passed', 'skipped']),
+        moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+        diagnostic: () => ({ duration: 1 }), errors: () => [],
+      } as never);
+      await reporter.onTestRunEnd();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].executionDetails).toMatchObject({ schemaVersion: 1,
+        workspaceId: 'ws-count-proof', harnessSlug: 'count-proof',
+        runGroupId: 'ca5fce52-7c67-4d38-8c26-96a952f6a2a2',
+        filePath: rows[0].filePath, testNamePattern: 'selected case',
+        passed: 1, failed: 0, skipped: 1, collectionFailed: false });
+      expect(rows[0].executionDetails?.root).toBeTruthy();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
