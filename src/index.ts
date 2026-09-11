@@ -45,6 +45,12 @@ export type { TestSchemaHandle } from './pg-container.ts';
 export { createFreshTestDb, createMigratedTestDb, provisionRestartTestDb, getOrBuildTemplate } from './pg-migrate.ts';
 export type { MigratedTestDb, CreateFreshTestDbOptions } from './pg-migrate.ts';
 export { probePgReachable, assertPgReachable } from './pg-reachability.ts';
+export {
+  acquireBaselineSchemaMutex,
+  releaseBaselineSchemaMutex,
+  BASELINE_SCHEMA_MUTEX_NAME,
+} from './baseline-schema-mutex.ts';
+export type { AcquireBaselineSchemaMutexOptions } from './baseline-schema-mutex.ts';
 export type { PgReachabilityResult } from './pg-reachability.ts';
 export { getTestRedis, teardownTestRedis } from './redis-container.ts';
 export { getTestTypesense, teardownTestTypesense } from './typesense-container.ts';

@@ -41,6 +41,11 @@
       "import": "./src/pg.ts",
       "default": "./src/pg.ts"
     },
+    "./baseline-schema-mutex": {
+      "types": "./src/baseline-schema-mutex.ts",
+      "import": "./src/baseline-schema-mutex.ts",
+      "default": "./src/baseline-schema-mutex.ts"
+    },
     "./tmpdir-guard": {
       "types": "./src/tmpdir-guard.ts",
       "import": "./src/tmpdir-guard.ts",
