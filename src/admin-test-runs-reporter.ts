@@ -33,7 +33,7 @@ import { exec } from 'node:child_process';
 import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import type { TestRunExecutionDetails } from './execution-details.ts';
+import { TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, type TestRunExecutionDetails } from './execution-details.ts';
 
 /**
  * EI-19307211919650123: classify the `.git` entry at `dir` for the root walk.
@@ -1045,7 +1045,7 @@ export default class AdminTestRunsReporter implements Reporter {
     this.failureDetails = [];
     this.failureDetailsFlushed = false;
     this.executionContext = {
-      schemaVersion: 1,
+      schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
       root: resolveRecordRoot(),
       runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
       workspaceId: resolveTestRunWorkspaceId(),
