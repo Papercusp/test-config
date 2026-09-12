@@ -19,7 +19,7 @@
  * never collide with the real migration-hash templates; every DB this file
  * creates is dropped in cleanup.
  */
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import postgres from 'postgres';
 import { createFreshTestDb, getOrBuildTemplate } from './pg-migrate.ts';
@@ -33,6 +33,17 @@ function freshKey(): string {
 
 const cleanupDbs: string[] = [];
 const cleanupClients: postgres.Sql[] = [];
+
+// buildTemplate intentionally emits stage diagnostics on stderr. Suppress those
+// expected lines in this fail-on-console suite; the lock test below still asserts
+// that the build-stage diagnostic was emitted.
+beforeEach(() => {
+  vi.spyOn(console, 'error').mockImplementation(() => {});
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 async function adminClient(): Promise<postgres.Sql> {
   const uri = await getTestPg();
@@ -166,6 +177,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
       }
     });
     expect(built).toBe(name);
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('stage=template-build'));
     expect(await templateState(holder, name)).toBe('ready');
   });
 
