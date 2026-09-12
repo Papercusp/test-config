@@ -28,6 +28,7 @@ export {
   BASELINE_SCHEMA_GLOBAL_SETUP_PATH,
 } from './vitest-config.ts';
 export type { TestLayer, DefineVitestConfigOptions } from './vitest-config.ts';
+export type { TestRunExecutionDetails } from './execution-details.ts';
 
 // getTestPg/withTestSchema/createFreshTestDb/… (re-exported below, identical values) are
 // ALSO available from the lightweight `@papercusp/test-config/pg` subpath, which does NOT

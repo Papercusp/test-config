@@ -33,6 +33,7 @@ import { exec } from 'node:child_process';
 import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import type { TestRunExecutionDetails } from './execution-details.ts';
 
 /**
  * EI-19307211919650123: classify the `.git` entry at `dir` for the root walk.
@@ -399,20 +400,7 @@ export interface TestRunRow {
    * than re-running a 200ms best-effort lookup once per persisted file. */
   commitSha: string | null;
   /** Measured per-file proof; absent/NULL is unknown, never zero skipped tests. */
-  executionDetails?: {
-    schemaVersion: 1;
-    root: string;
-    filePath: string;
-    runGroupId: string | null;
-    workspaceId: string | null;
-    harnessSlug: string | null;
-    testNamePattern: string | null;
-    passed: number;
-    failed: number;
-    skipped: number;
-    collectionFailed: boolean;
-    mutationPhase: string | null;
-  } | null;
+  executionDetails?: TestRunExecutionDetails | null;
 }
 
 /** Read Vitest's completed cases, not module status or a truncated stdout tail. */

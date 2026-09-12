@@ -55,6 +55,11 @@
       "types": "./src/admin-test-runs-reporter.ts",
       "import": "./src/admin-test-runs-reporter.ts",
       "default": "./src/admin-test-runs-reporter.ts"
+    },
+    "./execution-details": {
+      "types": "./src/execution-details.ts",
+      "import": "./src/execution-details.ts",
+      "default": "./src/execution-details.ts"
     }
   },
   "scripts": {
