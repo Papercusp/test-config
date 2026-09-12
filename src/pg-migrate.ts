@@ -281,7 +281,7 @@ export interface CreateFreshTestDbOptions {
    */
   template?: {
     key: string;
-    provision: (url: string) => Promise<void>;
+    provision: (url: string) => Promise<TemplateProvisionResult | void>;
     /**
      * Maximum time to wait for another process to finish building this template.
      * Omit this to wait until the builder finishes (or its backend dies and releases
@@ -290,6 +290,11 @@ export interface CreateFreshTestDbOptions {
      */
     lockTimeoutMs?: number;
   };
+}
+
+/** Optional metadata returned by a template provisioner for diagnostic logging. */
+export interface TemplateProvisionResult {
+  migrationCount?: number;
 }
 
 // Per-process cache: a template is built at most once per fork for a given key.
@@ -360,9 +365,17 @@ async function buildTemplate(
       await a.unsafe(
         lockTimeoutMs === null ? `SET lock_timeout = '0'` : `SET lock_timeout = '${lockTimeoutMs}ms'`,
       );
+      const lockWaitStartedAt = Date.now();
       try {
         await a.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
       } catch (e) {
+        const lockWaitMs = Date.now() - lockWaitStartedAt;
+        if (lockWaitMs > 5_000) {
+          // eslint-disable-next-line no-console
+          console.error(
+            `[getOrBuildTemplate] stage=template-lock-wait key=${key} elapsedMs=${lockWaitMs}`,
+          );
+        }
         if (lockTimeoutMs !== null && isLockTimeout(e)) {
           throw new Error(
             `getOrBuildTemplate: stage=template-lock-acquire timed out after ${lockTimeoutMs}ms ` +
@@ -371,6 +384,11 @@ async function buildTemplate(
           );
         }
         throw e;
+      }
+      const lockWaitMs = Date.now() - lockWaitStartedAt;
+      if (lockWaitMs > 5_000) {
+        // eslint-disable-next-line no-console
+        console.error(`[getOrBuildTemplate] stage=template-lock-wait key=${key} elapsedMs=${lockWaitMs}`);
       }
       await a.unsafe(`SET lock_timeout = '0'`);
       return a;
@@ -414,8 +432,15 @@ async function buildTemplate(
         // final name is only ever a COMPLETE schema (rename is atomic in PG).
         const bld = `tmpl_bld_${key}_${randomBytes(4).toString('hex')}`;
         await admin.unsafe(`CREATE DATABASE "${bld}"`);
+        const buildStartedAt = Date.now();
         try {
-          await provision(swapDbName(adminUri, bld)); // opens + CLOSES its own client ⇒ no lingering conn ⇒ renameable
+          const provisionResult = await provision(swapDbName(adminUri, bld)); // opens + CLOSES its own client ⇒ no lingering conn ⇒ renameable
+          const buildElapsedMs = Date.now() - buildStartedAt;
+          // eslint-disable-next-line no-console
+          console.error(
+            `[getOrBuildTemplate] stage=template-build key=${key} ` +
+              `migrations=${provisionResult?.migrationCount ?? 'unknown'} elapsedMs=${buildElapsedMs}`,
+          );
         } catch (err) {
           // Best-effort drop; a survivor under tmpl_bld_* is HARMLESS (never looked
           // up as a template) and the sweep above collects it next build.
@@ -444,7 +469,7 @@ async function buildTemplate(
  */
 export async function getOrBuildTemplate(
   key: string,
-  provision: (url: string) => Promise<void>,
+  provision: (url: string) => Promise<TemplateProvisionResult | void>,
   opts: { lockTimeoutMs?: number } = {},
 ): Promise<string> {
   let p = templateBuilds.get(key);
