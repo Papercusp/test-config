@@ -342,7 +342,7 @@ async function terminateBackends(admin: postgres.Sql, dbName: string): Promise<v
 
 async function buildTemplate(
   key: string,
-  provision: (url: string) => Promise<void>,
+  provision: (url: string) => Promise<TemplateProvisionResult | void>,
   opts: { lockTimeoutMs?: number } = {},
 ): Promise<string> {
   const adminUri = await getTestPg();
@@ -436,10 +436,12 @@ async function buildTemplate(
         try {
           const provisionResult = await provision(swapDbName(adminUri, bld)); // opens + CLOSES its own client ⇒ no lingering conn ⇒ renameable
           const buildElapsedMs = Date.now() - buildStartedAt;
+          const migrationCount =
+            provisionResult && typeof provisionResult === 'object' ? provisionResult.migrationCount : undefined;
           // eslint-disable-next-line no-console
           console.error(
             `[getOrBuildTemplate] stage=template-build key=${key} ` +
-              `migrations=${provisionResult?.migrationCount ?? 'unknown'} elapsedMs=${buildElapsedMs}`,
+              `migrations=${migrationCount ?? 'unknown'} elapsedMs=${buildElapsedMs}`,
           );
         } catch (err) {
           // Best-effort drop; a survivor under tmpl_bld_* is HARMLESS (never looked
