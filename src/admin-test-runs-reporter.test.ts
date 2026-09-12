@@ -29,6 +29,7 @@ import AdminTestRunsReporter, {
   formatTestCaseError,
   isScratchConfigFile,
   isMutationProbeRun,
+  resolveMutationProbePhase,
   resolveRecordedTestRunSource,
   resolveReporterHostLoopLag,
   resolveTestRunCommit,
@@ -186,21 +187,32 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
   });
 
-  it('skips mutation-probe modules before inspecting or queueing a test-run row', () => {
-    const previous = process.env.PAPERCUSP_MUTATION_PROBE;
+  it('records mutation-probe modules with their explicit phase metadata', async () => {
+    const previousProbe = process.env.PAPERCUSP_MUTATION_PROBE;
+    const previousPhase = process.env.PAPERCUSP_MUTATION_PHASE;
     process.env.PAPERCUSP_MUTATION_PROBE = '1';
+    process.env.PAPERCUSP_MUTATION_PHASE = 'mutant';
+    const rows: TestRunRow[] = [];
     try {
-      const r = new AdminTestRunsReporter();
+      const r = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+        async row => { rows.push(row); });
       const fakeModule = {
-        moduleId: '/tmp/mutation-probe.test.ts',
-        state: () => {
-          throw new Error('mutation-probe modules must be skipped before inspection');
-        },
+        state: () => 'failed',
+        children: { allTests: () => [{ result: () => ({ state: 'failed' }) }] },
+        moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+        diagnostic: () => ({ duration: 1 }), errors: () => [],
       } as unknown as Parameters<typeof r.onTestModuleEnd>[0];
+      r.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
       expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
+      await r.onTestRunEnd();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].executionDetails).toMatchObject({ mutationPhase: 'mutant', failed: 1 });
+      expect(resolveMutationProbePhase()).toBe('mutant');
     } finally {
-      if (previous === undefined) delete process.env.PAPERCUSP_MUTATION_PROBE;
-      else process.env.PAPERCUSP_MUTATION_PROBE = previous;
+      if (previousProbe === undefined) delete process.env.PAPERCUSP_MUTATION_PROBE;
+      else process.env.PAPERCUSP_MUTATION_PROBE = previousProbe;
+      if (previousPhase === undefined) delete process.env.PAPERCUSP_MUTATION_PHASE;
+      else process.env.PAPERCUSP_MUTATION_PHASE = previousPhase;
     }
   });
 

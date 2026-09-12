@@ -18,8 +18,10 @@
  *
  * Opt-out via PAPERCUSP_DISABLE_TEST_RUNS_REPORTER=1 (defineVitestConfig drops it).
  * Mutation probes set PAPERCUSP_MUTATION_PROBE=1; those deliberate baseline and
- * mutant outcomes are falsifiability evidence, not repository-health evidence,
- * so this reporter skips them entirely.
+ * mutant outcomes are falsifiability evidence, not repository-health evidence.
+ * They are recorded with source='mutation-probe' and their explicit phase so
+ * adequacy evidence can bind to a real test_runs id; health/gate readers exclude
+ * that source explicitly.
  *
  * Vitest 4 API: onTestModuleEnd (per file) + onTestRunEnd (flush). Older
  * onFinished/onTaskUpdate names from Vitest 1-3 are NOT called.
@@ -236,9 +238,10 @@ export function isScratchConfigFile(configFile: string | false | undefined, repo
 }
 
 // ── inlined: resolveTestRunSource (was testing-run-source.ts). ──
-type TestRunSource = 'ci' | 'local' | 'admin-ui';
-const VALID_SOURCES: ReadonlySet<TestRunSource> = new Set(['ci', 'local', 'admin-ui']);
+type TestRunSource = 'ci' | 'local' | 'admin-ui' | 'mutation-probe';
+const VALID_SOURCES: ReadonlySet<TestRunSource> = new Set(['ci', 'local', 'admin-ui', 'mutation-probe']);
 function resolveTestRunSource(): TestRunSource {
+  if (process.env.PAPERCUSP_MUTATION_PROBE === '1') return 'mutation-probe';
   const override = process.env.PAPERCUSP_TEST_RUN_SOURCE;
   if (override && VALID_SOURCES.has(override as TestRunSource)) return override as TestRunSource;
   return process.env.CI ? 'ci' : 'local';
@@ -290,12 +293,20 @@ export function resolveTestRunCommit(inferred: string | null): string | null {
 /**
  * Mutation-probe runs deliberately produce a baseline and usually a failing
  * mutant result. Neither is a repository-health measurement, so the reporter
- * must not enqueue either row for harness_shared.test_runs.
+ * records the row with source='mutation-probe' and leaves filtering to readers.
  *
  * Exported so the marker contract is unit-testable without connecting to PG.
  */
 export function isMutationProbeRun(): boolean {
   return process.env.PAPERCUSP_MUTATION_PROBE === '1';
+}
+
+/** The probe wrapper exports `baseline` or `mutant`; preserve the marker on
+ * every per-file row without inventing a phase when the environment is absent. */
+export function resolveMutationProbePhase(): string | null {
+  if (!isMutationProbeRun()) return null;
+  const phase = process.env.PAPERCUSP_MUTATION_PHASE?.trim();
+  return phase || null;
 }
 
 // ── inlined: resolveGitContext (was testing-branch-resolve.ts). 200ms timeout,
@@ -400,6 +411,7 @@ export interface TestRunRow {
     failed: number;
     skipped: number;
     collectionFailed: boolean;
+    mutationPhase: string | null;
   } | null;
 }
 
@@ -1051,13 +1063,13 @@ export default class AdminTestRunsReporter implements Reporter {
       workspaceId: resolveTestRunWorkspaceId(),
       harnessSlug: resolveTestRunHarnessSlug(),
       testNamePattern: ctx?.config?.testNamePattern?.source ?? null,
+      mutationPhase: resolveMutationProbePhase(),
     };
   }
 
   /** Per-module hook — queue the row until the end snapshot is available. */
   onTestModuleEnd(testModule: TestModule): void {
     try {
-      if (isMutationProbeRun()) return;
       const filePath = toWorkspaceRel(testModule.moduleId);
       if (!shouldRecordTestRunPath(filePath)) return;
       const status = moduleStatus(testModule);
