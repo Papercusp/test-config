@@ -62,6 +62,13 @@
  * the isolated lane. This moves 4 of operator-core's 4,126 enrolled unit files, rather than
  * classifying all 838 tests that happen to use a dynamic import as stateful.
  *
+ * A SIXTH residual then materialised in `native-provider-trace.test.ts`: an earlier co-resident
+ * file assigned `globalThis.fetch = vi.fn()` and reset the mock without restoring the original
+ * global. The later real-HTTP test therefore received `undefined` from `fetch()` and failed on
+ * `response.body`; the same two files pass or fail solely with their shared-fork order. Direct
+ * `globalThis` / Node `global` mutation is the same process-wide class as `vi.stubGlobal`, so
+ * assignments, deletions, and the common reflective mutation forms belong in the isolated lane.
+ *
  * ERR TOWARD STATEFUL, ALWAYS. Misclassifying a stateful file as pure costs correctness (a
  * polluted co-execution the gate is designed to refuse — D-009); misclassifying a pure file as
  * stateful costs only some speed. So the matcher deliberately does NOT strip comments or
@@ -191,6 +198,12 @@ export const STATEFUL_PATTERNS = [
   /\bdelete\s+process\.env(?:\.[A-Za-z_$][\w$]*|\[[^\]\n]+\])/,
   // Bulk mutation bypasses the property-assignment pattern but has identical shared-fork scope.
   /\b(?:Object\.assign|Reflect\.set)\s*\(\s*process\.env\b/,
+  // Direct process-global mutation is the non-Vitest spelling of vi.stubGlobal. A file can be
+  // perfectly disciplined about restoring its own write and still inherit a stale value before
+  // its first hook; a file that forgets the restore poisons every later co-resident outright.
+  /\b(?:globalThis|global)(?:\.[A-Za-z_$][\w$]*|\[[^\]\n]+\])\s*(?:\?\?=|\|\|=|&&=|[+\-*/%&|^]?=(?!=)|\+\+|--)/,
+  /\bdelete\s+(?:globalThis|global)(?:\.[A-Za-z_$][\w$]*|\[[^\]\n]+\])/,
+  /\b(?:Object\.assign|Object\.defineProperty|Reflect\.set|Reflect\.deleteProperty)\s*\(\s*(?:globalThis|global)\b/,
 ] as const;
 
 /**

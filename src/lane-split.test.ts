@@ -107,6 +107,16 @@ it('starts without window', () => expect(typeof window).toBe('undefined'));
 it('uses a browser location', () => vi.stubGlobal('window', { location: {} }));
 `;
 
+// post-card-response.test.ts reduced to the direct process-global mutation that poisoned
+// native-provider-trace.test.ts in the reused pure-lane fork. Resetting the mock is not a
+// restore: fetch remains the empty vi.fn(), so a later real-HTTP caller receives undefined.
+const DIRECT_GLOBAL_MUTATION_SOURCE = `
+import { afterEach, beforeEach, vi } from 'vitest';
+const fetchSpy = vi.fn();
+beforeEach(() => { globalThis.fetch = fetchSpy; });
+afterEach(() => { fetchSpy.mockReset(); });
+`;
+
 // The fake-timer polluter shape behind the 2026-08-13 gate reds (candidate 65b3fbd1 and
 // siblings). Note the afterEach restore: this file is WELL-BEHAVED and still poisons the fork,
 // because a co-resident file scheduled between the install and the restore — or simply running
@@ -199,6 +209,9 @@ describe("isStatefulTestSource", () => {
       `process.env.HOME = '/tmp/test-home';`,
       `delete process.env[key];`,
       `Object.assign(process.env, { TZ: 'UTC' });`,
+      `globalThis.fetch = vi.fn();`,
+      `delete global['fetch'];`,
+      `Object.defineProperty(globalThis, 'window', { value: {} });`,
     ];
     expect(STATEFUL_PATTERNS).toHaveLength(samples.length);
     for (const [index, pattern] of STATEFUL_PATTERNS.entries()) {
@@ -265,6 +278,23 @@ describe("isStatefulTestSource", () => {
     // An afterEach cleanup cannot erase a polluted global inherited before the first test.
     expect(viMockOnlyMatcher(VITEST_GLOBAL_MUTATION_SOURCE)).toBe(false);
     expect(isStatefulTestSource(VITEST_GLOBAL_MUTATION_SOURCE)).toBe(true);
+  });
+
+  it("CONTROL C: classifies direct process-global mutation as stateful", () => {
+    // Exact polluter behind candidate 710a0813's native-provider-trace failure. The classifier
+    // previously caught vi.stubGlobal but missed its direct-assignment equivalent.
+    expect(viMockOnlyMatcher(DIRECT_GLOBAL_MUTATION_SOURCE)).toBe(false);
+    expect(isStatefulTestSource(DIRECT_GLOBAL_MUTATION_SOURCE)).toBe(true);
+  });
+
+  it("classifies direct global writes/deletes without mistaking reads for writes", () => {
+    expect(isStatefulTestSource(`globalThis.fetch ?? nativeFetch;`)).toBe(false);
+    expect(isStatefulTestSource(`global.fetch === nativeFetch;`)).toBe(false);
+    expect(isStatefulTestSource(`globalThis.fetch = fakeFetch;`)).toBe(true);
+    expect(isStatefulTestSource(`global['fetch'] ||= fakeFetch;`)).toBe(true);
+    expect(isStatefulTestSource(`delete globalThis.window;`)).toBe(true);
+    expect(isStatefulTestSource(`Reflect.set(global, key, value);`)).toBe(true);
+    expect(isStatefulTestSource(`Reflect.deleteProperty(globalThis, key);`)).toBe(true);
   });
 
   it("CONTROL C: classifies fake-timer installs as stateful", () => {
