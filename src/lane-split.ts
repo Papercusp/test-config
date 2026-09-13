@@ -80,6 +80,17 @@
  * isolated lane. This moves the class, not five memorised paths, so the next equivalent test is
  * isolated before it can become another rotating gate red.
  *
+ * AN EIGHTH residual then materialised on P-011 head `cbfb461d`: a real native-addon smoke test
+ * and a registration-on-import test both failed in the shared pure lane, while the same two files
+ * passed together in an isolated current-HEAD run. The first builds a CommonJS loader with
+ * `createRequire` and exercises a process-native binding; the second discards the result of a
+ * standalone `await import(...)` because module evaluation and its registry side effect are the
+ * subject. Both shapes use process-wide module state, but neither matched the earlier
+ * expectation-wrapped dynamic-import marker. CommonJS loader construction and standalone
+ * side-effect dynamic imports therefore belong in the isolated lane. Binding a dynamic import's
+ * result remains pure-eligible because it is ordinary code splitting rather than evidence that
+ * module evaluation itself is the assertion subject.
+ *
  * ERR TOWARD STATEFUL, ALWAYS. Misclassifying a stateful file as pure costs correctness (a
  * polluted co-execution the gate is designed to refuse — D-009); misclassifying a pure file as
  * stateful costs only some speed. So the matcher deliberately does NOT strip comments or
@@ -147,6 +158,10 @@ export const STATEFUL_MARKERS = [
   // non-isolated worker while observing host-wide git/filesystem/process state. `child_process`
   // matches both Node spellings (`node:child_process` and the legacy bare module name).
   "child_process",
+  // `createRequire` enters Node's process-wide CommonJS loader/cache and is also the supported
+  // route to native bindings from ESM. A loader-based test can inherit a co-resident module or
+  // native-addon state even though it contains no Vitest mock primitive of its own.
+  "createRequire(",
 ] as const;
 
 /**
@@ -211,6 +226,11 @@ export const STATEFUL_PATTERNS = [
   // the transition it claims to guard. Keep ordinary `const mod = await import(...)` callers in
   // the pure lane; this intentionally targets the narrow load-as-subject shape.
   /\bexpect\s*\(\s*import\s*\(/,
+  // A discarded dynamic-import result is the asynchronous equivalent of the bare side-effect
+  // import above: the only observable under test is module evaluation. Under isolate:false the
+  // module may already be cached, so that transition cannot be established. Keep assigned or
+  // returned dynamic imports pure-eligible; their loaded value, not evaluation itself, is used.
+  /^\s*await\s+import\s*\([^\n]+\)\s*;?\s*(?:\/\/.*|\/\*.*)?$/m,
   // Direct env assignment. The bracket arm deliberately admits a dynamic key (`process.env[k]`)
   // as well as a string literal: both mutate the same fork-wide object. Equality reads (`===`,
   // `!==`) do not match. Compound/nullish/logical assignment and ++/-- do.

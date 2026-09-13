@@ -207,6 +207,7 @@ describe("isStatefulTestSource", () => {
       `beforeEach(() => resetGovernorRegistry());`,
       `import './register-things';\n`,
       `await expect(import('./wire-things')).resolves.toBeDefined();`,
+      `await import('./register-async-things');`,
       `process.env.HOME = '/tmp/test-home';`,
       `delete process.env[key];`,
       `Object.assign(process.env, { TZ: 'UTC' });`,
@@ -293,6 +294,41 @@ describe("isStatefulTestSource", () => {
       isStatefulTestSource(
         `const mod = await import('./calculator');\nexpect(mod.add(1, 2)).toBe(3);`,
       ),
+    ).toBe(false);
+  });
+
+  it("classifies a standalone side-effect dynamic import without catching a bound import", () => {
+    // Exact structural miss behind coverage-census/action-registered.test.ts: the imported
+    // production boundary installs into a module-global registry, and the test deliberately
+    // discards the module value because evaluation is the operation under test.
+    expect(
+      isStatefulTestSource(`await import('../dbos/ephemeral-executor');`),
+    ).toBe(true);
+    expect(
+      isStatefulTestSource(
+        `await import('./wire-things'); // registers the action\n`,
+      ),
+    ).toBe(true);
+
+    // Calibration: using the loaded value is ordinary lazy loading, not by itself proof that
+    // the test depends on a once-per-process registration transition.
+    expect(
+      isStatefulTestSource(
+        `const mod = await import('./calculator');\nexpect(mod.add(1, 2)).toBe(3);`,
+      ),
+    ).toBe(false);
+  });
+
+  it("classifies CommonJS loader construction as stateful", () => {
+    // Exact structural miss behind native-addon-preflight.test.ts. createRequire enters Node's
+    // shared CJS/native loader from an ESM test even though no vi.mock marker appears locally.
+    expect(
+      isStatefulTestSource(`const requireFromHere = createRequire(import.meta.url);`),
+    ).toBe(true);
+
+    // Ordinary ESM binding imports stay eligible for the fast lane.
+    expect(
+      isStatefulTestSource(`import { createHash } from 'node:crypto';`),
     ).toBe(false);
   });
 
