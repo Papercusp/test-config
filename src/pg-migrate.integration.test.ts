@@ -24,6 +24,7 @@ import { randomBytes } from 'node:crypto';
 import postgres from 'postgres';
 import { createFreshTestDb, getOrBuildTemplate } from './pg-migrate.ts';
 import { getTestPg } from './pg-container.ts';
+import { acquireBaselineMigrationLock } from './baseline-schema-global-setup.ts';
 
 const READY_MARK = 'pc-template-ready';
 
@@ -284,5 +285,25 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const db = await createFreshTestDb({ prefix: 'zzhard', template: { key, provision: async () => {} } });
     cleanupDbs.push(db.name);
     await db.drop();
+  });
+});
+
+describe('baseline globalSetup migration lock deadline (EI-23130560676394847)', () => {
+  it('cancels the PostgreSQL backend wait and reports the exact stage under contention', async () => {
+    const uri = await getTestPg();
+    const holder = postgres(uri, { max: 1, onnotice: () => {} });
+    const contender = postgres(uri, { max: 1, onnotice: () => {} });
+    const lockName = `baseline-global-setup-deadline-${randomBytes(8).toString('hex')}`;
+
+    await holder.unsafe('SELECT pg_advisory_lock(hashtext($1))', [lockName]);
+    const startedAt = Date.now();
+    try {
+      await expect(acquireBaselineMigrationLock(contender, { timeoutMs: 100, lockName })).rejects.toThrow(`stage=migration-lock-acquire timed out after 100ms waiting for advisory lock ${lockName}`);
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+    } finally {
+      await holder.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [lockName]).catch(() => {});
+      await contender.end({ timeout: 5 }).catch(() => {});
+      await holder.end({ timeout: 5 }).catch(() => {});
+    }
   });
 });

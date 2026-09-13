@@ -77,6 +77,83 @@ import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 export const BASELINE_SCHEMA_CONTAINER_START_LOCK = 'baseline-schema-container-start';
 
 /**
+ * The reusable baseline database has two independent serialization lanes:
+ * Testcontainers startup above, then migration replay here. The latter used to
+ * call blocking `pg_advisory_lock` with PostgreSQL's unlimited lock timeout, so
+ * a dead/convoyed holder left Vitest showing only its RUN banner indefinitely.
+ */
+export const BASELINE_SCHEMA_MIGRATION_LOCK_NAME = 'papercusp-baseline-schema-migrations';
+export const BASELINE_SCHEMA_MIGRATION_LOCK_TIMEOUT_MS = 120_000;
+export const BASELINE_SCHEMA_STATEMENT_TIMEOUT_MS = 180_000;
+export const BASELINE_SCHEMA_PROBE_STATEMENT_TIMEOUT_MS = 30_000;
+const BASELINE_SCHEMA_SLOW_STAGE_MS = 5_000;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Emit a breadcrumb only when a globalSetup stage is actually slow. A stuck
+ * process therefore names the exact outstanding phase after five seconds,
+ * while the normal warm path stays quiet.
+ */
+async function runBaselineSetupStage<T>(stage: string, action: () => Promise<T>): Promise<T> {
+  const startedAt = Date.now();
+  let reportedWaiting = false;
+  const slowTimer = setTimeout(() => {
+    reportedWaiting = true;
+    process.stderr.write(`[baseline-schema-global-setup] stage=${stage} status=waiting elapsedMs>=${BASELINE_SCHEMA_SLOW_STAGE_MS}\n`);
+  }, BASELINE_SCHEMA_SLOW_STAGE_MS);
+  slowTimer.unref?.();
+  try {
+    const result = await action();
+    if (reportedWaiting) {
+      process.stderr.write(`[baseline-schema-global-setup] stage=${stage} status=done elapsedMs=${Date.now() - startedAt}\n`);
+    }
+    return result;
+  } catch (error) {
+    const elapsedMs = Date.now() - startedAt;
+    process.stderr.write(`[baseline-schema-global-setup] stage=${stage} status=failed elapsedMs=${elapsedMs} error=${errorMessage(error)}\n`);
+    throw new Error(`baseline-schema-global-setup: stage=${stage} failed after ${elapsedMs}ms: ${errorMessage(error)}`, { cause: error });
+  } finally {
+    clearTimeout(slowTimer);
+  }
+}
+
+function isPgLockTimeout(error: unknown): boolean {
+  const candidate = error as { code?: unknown; message?: unknown } | null;
+  return candidate?.code === '55P03' || /lock timeout/i.test(String(candidate?.message ?? ''));
+}
+
+export interface AcquireBaselineMigrationLockOptions {
+  timeoutMs?: number;
+  /** Test-only override; production callers share the exported canonical name. */
+  lockName?: string;
+}
+
+/**
+ * Acquire the migration replay lock with a DATABASE-enforced timeout. A JS
+ * Promise race would only reject the waiter while leaving its PostgreSQL query
+ * alive; `lock_timeout` cancels the actual backend wait.
+ */
+export async function acquireBaselineMigrationLock(sql: postgres.Sql, opts: AcquireBaselineMigrationLockOptions = {}): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? BASELINE_SCHEMA_MIGRATION_LOCK_TIMEOUT_MS;
+  const lockName = opts.lockName ?? BASELINE_SCHEMA_MIGRATION_LOCK_NAME;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError(`baseline migration lock timeout must be a positive integer; got ${timeoutMs}`);
+  }
+  await sql.unsafe(`SET lock_timeout = '${timeoutMs}ms'`);
+  try {
+    await sql.unsafe('SELECT pg_advisory_lock(hashtext($1))', [lockName]);
+  } catch (error) {
+    if (isPgLockTimeout(error)) {
+      throw new Error(`stage=migration-lock-acquire timed out after ${timeoutMs}ms waiting for advisory lock ${lockName}`, { cause: error });
+    }
+    throw error;
+  }
+}
+
+/**
  * EI-18748424931934157 — the schema this file seeds to stand in for a real per-harness
  * schema (`harness_<slug>`), so that migrations are replayed against a schema graph that
  * resembles a live operator instead of a bare `harness_shared`.
@@ -300,8 +377,12 @@ async function findLedgerSchemaDivergence(
   dsn: string,
   sqlDir: string,
 ): Promise<LedgerSchemaDivergence[]> {
-  const sql = postgres(dsn, { max: 1, onnotice: () => {} });
+  const sql = postgres(dsn, { max: 1, connect_timeout: 5, onnotice: () => {} });
   try {
+    // This probe runs before the main setup client installs its broader
+    // deadlines. Bound it independently so a reused container's catalog query
+    // cannot strand globalSetup inside the otherwise-coarse container phase.
+    await sql.unsafe(`SET statement_timeout = '${BASELINE_SCHEMA_PROBE_STATEMENT_TIMEOUT_MS}ms'`);
     const [ledger] = await sql<{ present: boolean }[]>`
       SELECT to_regclass('harness_shared.schema_migrations') IS NOT NULL AS present`;
     if (!ledger?.present) return []; // fresh container — nothing recorded yet
@@ -474,81 +555,102 @@ export default async function setup({ provide }: TestProject) {
         // entire 90s budget. The advisory lock below makes warm migrations safe.
         .withReuse()
         .start();
-    const container = await withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, async () => {
-      let c = await startBaselineContainer();
-      // EI-2433: validate the (possibly reused) container's DB before trusting it.
-      // A reused-but-stale container matches on config alone; stopping it here
-      // means testcontainers' reuse lookup (which only matches RUNNING containers)
-      // can't find it again, so the retry below provisions a genuinely fresh one.
-      if (!(await isBaselineContainerHealthy(c.getConnectionUri()))) {
-        console.error(
-          '[baseline-schema-global-setup] reused container failed health-check (stale/missing papercusp_it) — stopping + reprovisioning fresh',
-        );
-        await c.stop().catch(() => {});
-        c = await startBaselineContainer();
-      }
-      // EI-18779962385972529: reachable is not the same as CORRECT. A reused
-      // container whose ledger claims a migration whose objects are absent will
-      // skip that file for ever and fail every dependent migration on every run,
-      // with no self-heal — so treat divergence exactly like the staleness above:
-      // stop it (which un-registers it from testcontainers' reuse lookup, since
-      // that only matches RUNNING containers) and provision a genuinely fresh one.
-      // Fail-soft: a probe that cannot run must never block the tier it protects.
-      try {
-        const divergence = await findLedgerSchemaDivergence(c.getConnectionUri(), SQL_DIR);
-        if (divergence.length > 0) {
-          const detail = divergence
-            .slice(0, 5)
-            .map((d) => `${d.migration} → schema "${d.schema}"`)
-            .join(', ');
+    const container = await runBaselineSetupStage('container-resolve', () =>
+      withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, async () => {
+        let c = await runBaselineSetupStage('container-start', startBaselineContainer);
+        // EI-2433: validate the (possibly reused) container's DB before trusting it.
+        // A reused-but-stale container matches on config alone; stopping it here
+        // means testcontainers' reuse lookup (which only matches RUNNING containers)
+        // can't find it again, so the retry below provisions a genuinely fresh one.
+        if (!(await runBaselineSetupStage('container-health-check', () =>
+          isBaselineContainerHealthy(c.getConnectionUri()),
+        ))) {
           console.error(
-            `[baseline-schema-global-setup] reused container is DIVERGED: schema_migrations records ` +
-              `${divergence.length} migration/schema pair(s) whose schema does NOT exist (${detail}` +
-              `${divergence.length > 5 ? ', …' : ''}). The runner skips any migration already in the ` +
-              `ledger, so this never self-heals and would surface as an unrelated "schema does not ` +
-              `exist" error during COLLECT of some innocent test — stopping + reprovisioning fresh ` +
-              `(EI-18779962385972529).`,
+            '[baseline-schema-global-setup] reused container failed health-check (stale/missing papercusp_it) — stopping + reprovisioning fresh',
           );
           await c.stop().catch(() => {});
-          c = await startBaselineContainer();
+          c = await runBaselineSetupStage('container-reprovision-after-health', startBaselineContainer);
         }
-      } catch (e) {
-        console.error(
-          '[baseline-schema-global-setup] ledger/schema divergence probe failed (continuing — the ' +
-            'probe is a guard, never a gate):',
-          e,
-        );
-      }
-      return c;
-    });
+        // EI-18779962385972529: reachable is not the same as CORRECT. A reused
+        // container whose ledger claims a migration whose objects are absent will
+        // skip that file for ever and fail every dependent migration on every run,
+        // with no self-heal — so treat divergence exactly like the staleness above:
+        // stop it (which un-registers it from testcontainers' reuse lookup, since
+        // that only matches RUNNING containers) and provision a genuinely fresh one.
+        // Fail-soft: a probe that cannot run must never block the tier it protects.
+        try {
+          const divergence = await runBaselineSetupStage('ledger-schema-divergence-probe', () =>
+            findLedgerSchemaDivergence(c.getConnectionUri(), SQL_DIR),
+          );
+          if (divergence.length > 0) {
+            const detail = divergence
+              .slice(0, 5)
+              .map((d) => `${d.migration} → schema "${d.schema}"`)
+              .join(', ');
+            console.error(
+              `[baseline-schema-global-setup] reused container is DIVERGED: schema_migrations records ` +
+                `${divergence.length} migration/schema pair(s) whose schema does NOT exist (${detail}` +
+                `${divergence.length > 5 ? ', …' : ''}). The runner skips any migration already in the ` +
+                `ledger, so this never self-heals and would surface as an unrelated "schema does not ` +
+                `exist" error during COLLECT of some innocent test — stopping + reprovisioning fresh ` +
+                `(EI-18779962385972529).`,
+            );
+            await c.stop().catch(() => {});
+            c = await runBaselineSetupStage('container-reprovision-after-divergence', startBaselineContainer);
+          }
+        } catch (e) {
+          console.error(
+            '[baseline-schema-global-setup] ledger/schema divergence probe failed (continuing — the ' +
+              'probe is a guard, never a gate):',
+            e,
+          );
+        }
+        return c;
+      }),
+    );
     dsn = container.getConnectionUri();
   }
 
   // Exercise the real boot-path migration runner (resolved from the discovered
   // repo root rather than a brittle relative path so this file is location-agnostic).
-  const { applyPendingMigrations } = (await import(pathToFileURL(MIGRATION_RUNNER).href)) as {
-    applyPendingMigrations: (opts: {
-      client: postgres.Sql;
-      sqlDir: string;
-      }) => Promise<{ appliedCount: number; totalKnown: number; failed?: Array<unknown> }>;
+  const { applyPendingMigrations } = (await runBaselineSetupStage('migration-module-import', () => import(pathToFileURL(MIGRATION_RUNNER).href))) as {
+    applyPendingMigrations: (opts: { client: postgres.Sql; sqlDir: string; migrationStatementTimeoutMs?: number }) => Promise<{
+      appliedCount: number;
+      totalKnown: number;
+      failed?: Array<unknown>;
+    }>;
   };
 
   // max:1 — the runner applies each migration in an explicit BEGIN/COMMIT block.
   const sql = postgres(dsn, { max: 1, onnotice: () => {} });
   try {
+    // Bound every non-transaction statement in this setup. The runner receives
+    // the same budget explicitly below because its production default is the
+    // deliberate unbounded migration opt-out (`SET LOCAL statement_timeout=0`).
+    await runBaselineSetupStage('database-deadlines', () => sql.unsafe(`SET statement_timeout = '${BASELINE_SCHEMA_STATEMENT_TIMEOUT_MS}ms'`).then(() => undefined));
     // Multiple Vitest processes can attach to the reusable baseline container at
     // once. Serialize the migration runner itself, not just Docker startup:
     // otherwise two fresh readers can both observe the same pending file and race
     // on its DDL/ledger insert.
-    await sql.unsafe(`SELECT pg_advisory_lock(hashtext('papercusp-baseline-schema-migrations'))`);
+    await runBaselineSetupStage('migration-lock-acquire', () => acquireBaselineMigrationLock(sql));
     try {
-      await sql.unsafe(BOOT_PREREQS_DDL);
+      await runBaselineSetupStage('boot-prereqs', () => sql.unsafe(BOOT_PREREQS_DDL).then(() => undefined));
       // EI-18748424931934157: seed the dependent-view probe BEFORE the runner, so pending
       // migrations are applied against a REALISTIC schema graph rather than a bare
       // harness_shared. See seedDependentViewProbe — this is the half that actually catches
       // a 678-class regression.
-      await seedDependentViewProbe(sql);
-      const { appliedCount, totalKnown, failed = [] } = await applyPendingMigrations({ client: sql, sqlDir: SQL_DIR });
+      await runBaselineSetupStage('dependent-view-probe-before', () => seedDependentViewProbe(sql));
+      const {
+        appliedCount,
+        totalKnown,
+        failed = [],
+      } = await runBaselineSetupStage('migration-apply', () =>
+        applyPendingMigrations({
+          client: sql,
+          sqlDir: SQL_DIR,
+          migrationStatementTimeoutMs: BASELINE_SCHEMA_STATEMENT_TIMEOUT_MS,
+        }),
+      );
       if (failed.length > 0) {
         throw new Error(
           `baseline globalSetup: ${failed.length} migration(s) failed (${appliedCount}/${totalKnown} applied). ` +
@@ -562,9 +664,9 @@ export default async function setup({ provide }: TestProject) {
       // relation did not exist yet above, so the probe could not be created. Seeding it
       // here means the container is guarded from its NEXT run onward — which is when new
       // migrations actually land, since this container is reused across runs.
-      await seedDependentViewProbe(sql);
+      await runBaselineSetupStage('dependent-view-probe-after', () => seedDependentViewProbe(sql));
     } finally {
-      await sql.unsafe(`SELECT pg_advisory_unlock(hashtext('papercusp-baseline-schema-migrations'))`).catch(() => {});
+      await sql.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [BASELINE_SCHEMA_MIGRATION_LOCK_NAME]).catch(() => {});
     }
   } finally {
     await sql.end({ timeout: 5 });
