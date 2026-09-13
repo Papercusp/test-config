@@ -83,7 +83,7 @@ describe('lane split — active', () => {
     // This file restores PC_TEST_LANE through process.env and therefore belongs in the
     // stateful lane. Use a genuinely pure sibling as the calibration case so an
     // empty/degenerate list still cannot pass this test.
-    expect(include).toContain(laneEntryFor('vitest-config-lightweight-subpath.test.ts'));
+    expect(include).toContain(laneEntryFor('vitest-config-filter-list.test.ts'));
   });
 
   it('stateful lane keeps isolation and selects the complement', () => {
