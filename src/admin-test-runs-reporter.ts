@@ -1101,7 +1101,13 @@ export function computeIsScratchConfig(ctx: Pick<Vitest, 'vite'>): boolean {
   }
 }
 
-type PendingTestRunRow = Omit<TestRunRow, 'worktreeDirty' | 'commitSha'>;
+type PendingExecutionDetails = Omit<
+  NonNullable<TestRunRow['executionDetails']>,
+  'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'commitSha' | 'worktreeDirty'
+> & Pick<NonNullable<TestRunRow['executionDetails']>, 'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed'>;
+type PendingTestRunRow = Omit<TestRunRow, 'worktreeDirty' | 'commitSha' | 'executionDetails'> & {
+  executionDetails?: PendingExecutionDetails | null;
+};
 
 export default class AdminTestRunsReporter implements Reporter {
   private pending: PendingTestRunRow[] = [];
@@ -1116,7 +1122,7 @@ export default class AdminTestRunsReporter implements Reporter {
   private failureDetails: TestFailureDetail[] = [];
   private failureDetailsFlushed = false;
   private executionContext: Omit<NonNullable<TestRunRow['executionDetails']>,
-    'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed'> | null = null;
+    'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'commitSha' | 'worktreeDirty'> | null = null;
 
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
@@ -1207,7 +1213,14 @@ export default class AdminTestRunsReporter implements Reporter {
       worktreeDirty = true;
     }
 
-    const rows = this.pending.splice(0);
+    const rows = this.pending.splice(0).map((row) => ({
+      ...row,
+      worktreeDirty,
+      commitSha,
+      executionDetails: row.executionDetails
+        ? { ...row.executionDetails, worktreeDirty, commitSha }
+        : null,
+    }));
     await Promise.race([
       this.writeRows(rows.map((row) => ({ ...row, worktreeDirty, commitSha }))),
       new Promise((r) => setTimeout(r, 5000)),
