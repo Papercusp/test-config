@@ -275,7 +275,10 @@ describe('buildTemplate hardening (WI-1992)', () => {
     uri.pathname = `/${buildName}`;
     const activeBuild = postgres(uri.toString(), { max: 1, onnotice: () => {} });
     cleanupClients.push(activeBuild);
-    const progress = activeBuild.unsafe(`SELECT pg_sleep(0.5)`);
+    // Stay active across at least two one-second waiter polls. A sub-poll sleep
+    // could let this test pass without ever exercising the database-progress
+    // suppression branch.
+    const progress = activeBuild.unsafe(`SELECT pg_sleep(2.5)`);
     const release = (async () => {
       await progress;
       // The separate build DB query is proof of progress even though the
@@ -297,6 +300,9 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const holderPidAfter = (await holder.unsafe(`SELECT pg_backend_pid() AS pid`)) as Array<{ pid: number }>;
     expect(holderPidAfter[0]?.pid).toBe(holderPid[0]?.pid);
     expect(built).toBe(name);
+    expect(console.error).not.toHaveBeenCalledWith(
+      expect.stringContaining(`stage=template-lock-recovery key=${key}`),
+    );
     expect(await templateState(await adminClient(), name)).toBe('ready');
   });
 
