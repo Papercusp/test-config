@@ -13,6 +13,7 @@
  *
  * D-007 fail-soft contract — LOAD-BEARING:
  *   - 1s connect timeout; ONE shared pg client reused for the whole run
+ *   - rows flush in bounded bulk inserts, never one queued query per test file
  *   - swallow every PG / git / fs error; never throw out of any hook
  *   - never taint test output; never affect the process exit code
  *
@@ -567,6 +568,7 @@ function writeFailureDetails(details: TestFailureDetail[]): void {
 
 export type WorktreeSnapshotReader = () => Promise<WorktreeGitSnapshot>;
 export type TestRunRowWriter = (row: TestRunRow) => Promise<void>;
+export type TestRunRowsWriter = (rows: readonly TestRunRow[]) => Promise<void>;
 
 /**
  * Resolve a host-level loop-lag value from the resource-governor snapshot.
@@ -723,7 +725,9 @@ function moduleStatus(m: TestModule): TestRunRow['status'] {
 // Minimal structural type for the postgres-js client — avoids depending on the
 // package's CJS default-export typing (which needs esModuleInterop and tripped a
 // standalone tsc across the 22 workspaces that inherit this reporter).
-export type PgSql = ((strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>) & {
+export type PgSql = {
+  (strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown>;
+  (rows: readonly Record<string, unknown>[], ...columns: string[]): unknown;
   end(opts?: { timeout?: number }): Promise<unknown>;
 };
 export type PgHandle = { sql: PgSql } | null;
@@ -817,40 +821,137 @@ export function resolveTestRunWorkspaceId(): string | null {
   return process.env.PAPERCUSP_WORKSPACE_ID || process.env.PAPERCUSP_WORKSPACE || null;
 }
 
-async function insertRow(row: TestRunRow): Promise<void> {
+const TEST_RUN_INSERT_COLUMNS = [
+  'file_path',
+  'framework',
+  'status',
+  'duration_ms',
+  'started_at',
+  'finished_at',
+  'output_tail',
+  'run_group_id',
+  'source',
+  'branch',
+  'commit_sha',
+  'harness_slug',
+  'workspace_id',
+  'loop_lag_p95_ms',
+  'rss_mb',
+  'is_scratch_config',
+  'worktree_dirty',
+  'execution_details',
+] as const;
+
+// 500 rows × 18 columns = 9,000 bind parameters, comfortably below Postgres's
+// 65,535-parameter ceiling even for a full unsharded workspace run.
+export const TEST_RUN_INSERT_BATCH_SIZE = 500;
+const TEST_RUN_INSERT_TIMEOUT_MS = 1_000;
+const TEST_RUN_TOTAL_FLUSH_TIMEOUT_MS = 4_500;
+
+type TestRunInsertContext = {
+  branch: string | null;
+  inferredCommit: string | null;
+  declaredSource: TestRunSource;
+  runGroupId: string | null;
+  harnessSlug: string | null;
+  workspaceId: string | null;
+  loopLagP95Ms: number | null;
+  rssMb: number | null;
+};
+
+function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolveP) => {
+    let settled = false;
+    const finish = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveP(result);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    promise.then(() => finish(true), () => finish(false));
+  });
+}
+
+/**
+ * Persist a completed run through a bounded number of sequential bulk statements.
+ *
+ * The old implementation launched one Postgres.js query per file concurrently and
+ * raced only the JavaScript waiters. A timed-out waiter does NOT cancel its queued
+ * query, so a 674-file shard left hundreds of queries behind a two-connection client;
+ * Vitest then spent 34 seconds draining that hidden queue after printing its terminal
+ * summary. One sequential bulk query may still time out, but there can never be more
+ * than that single in-flight query for closeSharedPg() to destroy.
+ */
+export async function insertTestRunRowsWithSql(
+  sql: PgSql,
+  rows: readonly TestRunRow[],
+  context: TestRunInsertContext,
+): Promise<void> {
+  const deadline = Date.now() + TEST_RUN_TOTAL_FLUSH_TIMEOUT_MS;
+  for (let offset = 0; offset < rows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return;
+    const batch = rows
+      .slice(offset, offset + TEST_RUN_INSERT_BATCH_SIZE)
+      .map((row) => ({
+        file_path: row.filePath,
+        framework: 'vitest',
+        status: row.status,
+        duration_ms: row.durationMs,
+        // postgres-js's multi-row helper rejects Date objects. ISO strings retain
+        // the same timestamptz value while keeping the helper's type inference valid.
+        started_at: row.startedAt.toISOString(),
+        finished_at: row.finishedAt.toISOString(),
+        output_tail: row.outputTail,
+        run_group_id: context.runGroupId,
+        source: resolveRecordedTestRunSource(context.declaredSource, row.worktreeDirty),
+        branch: context.branch,
+        commit_sha: resolveTestRunCommit(row.commitSha ?? context.inferredCommit),
+        harness_slug: context.harnessSlug,
+        workspace_id: context.workspaceId,
+        loop_lag_p95_ms: context.loopLagP95Ms,
+        rss_mb: context.rssMb,
+        is_scratch_config: row.isScratchConfig,
+        worktree_dirty: row.worktreeDirty,
+        execution_details: row.executionDetails ? JSON.stringify(row.executionDetails) : null,
+      }));
+    const query = sql`
+      INSERT INTO harness_shared.test_runs
+        ${sql(batch, ...TEST_RUN_INSERT_COLUMNS)}
+    `;
+    const completed = await settleWithin(
+      query,
+      Math.min(TEST_RUN_INSERT_TIMEOUT_MS, remainingMs),
+    );
+    if (!completed) return;
+  }
+}
+
+async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
+  if (rows.length === 0) return;
   let branch: string | null = null;
-  let commit: string | null = row.commitSha;
+  let inferredCommit: string | null = null;
   try {
     const ctx = await resolveGitContext();
     branch = ctx.branch;
-    commit ??= ctx.commit;
+    inferredCommit = ctx.commit;
   } catch { /* fail-soft */ }
 
   const pg = await tryGetPg();
   if (!pg) return;
 
-  // WI-1702898: both of these are the difference between a row that can answer
-  // "what is failing on the candidate" and one that silently cannot.
-  const source = resolveRecordedTestRunSource(resolveTestRunSource(), row.worktreeDirty);
-  commit = resolveTestRunCommit(commit);
-  const runGroupId = process.env.PAPERCUSP_TEST_RUN_GROUP ?? null;
-  const harnessSlug = resolveTestRunHarnessSlug();
-  const workspaceId = resolveTestRunWorkspaceId();
   const { loopLagP95Ms, rssMb } = captureReporterSaturationSnapshot();
-
   try {
-    await Promise.race([
-      pg.sql`
-        INSERT INTO harness_shared.test_runs
-          (file_path, framework, status, duration_ms, started_at, finished_at, output_tail, run_group_id, source, branch, commit_sha, harness_slug, workspace_id, loop_lag_p95_ms, rss_mb, is_scratch_config, worktree_dirty, execution_details)
-        VALUES
-          (${row.filePath}, 'vitest', ${row.status}, ${row.durationMs}, ${row.startedAt},
-           ${row.finishedAt}, ${row.outputTail}, ${runGroupId}, ${source}, ${branch}, ${commit}, ${harnessSlug}, ${workspaceId}, ${loopLagP95Ms}, ${rssMb}, ${row.isScratchConfig}, ${row.worktreeDirty},
-           ${row.executionDetails ? JSON.stringify(row.executionDetails) : null}::text::jsonb)
-      `,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('pg_insert_timeout')), 1000)),
-    ]).catch(() => {
-      /* swallow — D-007 */
+    await insertTestRunRowsWithSql(pg.sql, rows, {
+      branch,
+      inferredCommit,
+      declaredSource: resolveTestRunSource(),
+      runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+      harnessSlug: resolveTestRunHarnessSlug(),
+      workspaceId: resolveTestRunWorkspaceId(),
+      loopLagP95Ms,
+      rssMb,
     });
   } catch {
     /* swallow — D-007 */
@@ -1020,17 +1121,24 @@ export default class AdminTestRunsReporter implements Reporter {
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
     writeRow?: TestRunRowWriter,
+    writeRows?: TestRunRowsWriter,
   ) {
     // Vitest constructs reporters with its options object. Keep that runtime
     // contract intact while allowing the unit suite to inject deterministic
     // snapshot/writer seams.
     this.readWorktreeSnapshot =
       typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
-    this.writeRow = writeRow ?? insertRow;
+    this.writeRows =
+      writeRows ??
+      (writeRow
+        ? async (rows) => {
+            await Promise.allSettled(rows.map((row) => writeRow(row)));
+          }
+        : insertRows);
   }
 
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
-  private readonly writeRow: TestRunRowWriter;
+  private readonly writeRows: TestRunRowsWriter;
 
   onInit(ctx: Vitest): void {
     // WI-10000776 — FIRST, before anything reads a root. Vitest calls onInit before it
@@ -1101,7 +1209,7 @@ export default class AdminTestRunsReporter implements Reporter {
 
     const rows = this.pending.splice(0);
     await Promise.race([
-      Promise.allSettled(rows.map((row) => this.writeRow({ ...row, worktreeDirty, commitSha }))),
+      this.writeRows(rows.map((row) => ({ ...row, worktreeDirty, commitSha }))),
       new Promise((r) => setTimeout(r, 5000)),
     ]);
   }

@@ -23,6 +23,7 @@ import AdminTestRunsReporter, {
   computeWorktreeDirty,
   computeIsScratchConfig,
   inferWorkspaceRoot,
+  insertTestRunRowsWithSql,
   readRunConfigRoot,
   setRunRoot,
   toWorkspaceRel,
@@ -36,6 +37,8 @@ import AdminTestRunsReporter, {
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
   shouldRecordTestRunPath,
+  TEST_RUN_INSERT_BATCH_SIZE,
+  type PgSql,
   type TestRunRow,
 } from './admin-test-runs-reporter';
 
@@ -185,6 +188,79 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       errors: () => [],
     } as unknown as Parameters<typeof r.onTestModuleEnd>[0];
     expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
+  });
+
+  it('flushes a 674-file pure-lane shard through one reporter batch, never 674 writes', async () => {
+    const batches: ReadonlyArray<TestRunRow>[] = [];
+    const r = new AdminTestRunsReporter(
+      async () => ({ commit: 'abc', porcelain: '' }),
+      undefined,
+      async (rows) => { batches.push(rows); },
+    );
+    r.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    for (let i = 0; i < 674; i += 1) {
+      r.onTestModuleEnd({
+        moduleId: join(TEST_CONFIG_ROOT, `src/shard-${i}.test.ts`),
+        state: () => 'passed',
+        diagnostic: () => ({ duration: 1 }),
+        errors: () => [],
+        children: { allTests: () => [{ result: () => ({ state: 'passed' }) }] },
+      } as never);
+    }
+
+    await r.onTestRunEnd();
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toHaveLength(674);
+  });
+
+  it('persists a 674-file shard in two bounded bulk statements with ISO timestamps', async () => {
+    const helperCalls: Array<{ rows: ReadonlyArray<Record<string, unknown>>; columns: unknown[] }> = [];
+    let statementCalls = 0;
+    const sql = ((first: unknown, ...values: unknown[]) => {
+      if (Array.isArray(first) && !('raw' in (first as object))) {
+        helperCalls.push({ rows: first as ReadonlyArray<Record<string, unknown>>, columns: values });
+        return { kind: 'bulk-values' };
+      }
+      statementCalls += 1;
+      return Promise.resolve([]);
+    }) as PgSql;
+    sql.end = async () => undefined;
+    const startedAt = new Date('2026-09-13T13:57:41.000Z');
+    const finishedAt = new Date('2026-09-13T13:58:32.000Z');
+    const rows = Array.from({ length: 674 }, (_, i): TestRunRow => ({
+      filePath: `packages/operator-core/lib/shard-${i}.test.ts`,
+      status: 'pass',
+      durationMs: 1,
+      startedAt,
+      finishedAt,
+      outputTail: null,
+      isScratchConfig: false,
+      worktreeDirty: false,
+      commitSha: 'abc123',
+      executionDetails: null,
+    }));
+
+    await insertTestRunRowsWithSql(sql, rows, {
+      branch: 'staging',
+      inferredCommit: 'fallback',
+      declaredSource: 'local',
+      runGroupId: 'pure-shard',
+      harnessSlug: 'papercusp',
+      workspaceId: 'papercusp-workspace',
+      loopLagP95Ms: 2,
+      rssMb: 100,
+    });
+
+    expect(TEST_RUN_INSERT_BATCH_SIZE).toBe(500);
+    expect(statementCalls).toBe(2);
+    expect(helperCalls.map((call) => call.rows.length)).toEqual([500, 174]);
+    expect(helperCalls[0].rows[0]).toMatchObject({
+      started_at: startedAt.toISOString(),
+      finished_at: finishedAt.toISOString(),
+      execution_details: null,
+    });
+    expect(helperCalls[0].columns).toContain('execution_details');
   });
 
   it('records mutation-probe modules with their explicit phase metadata', async () => {
