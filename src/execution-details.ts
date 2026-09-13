@@ -23,11 +23,16 @@ export interface TestRunExecutionDetails {
   skipped: number;
   collectionFailed: boolean;
   mutationPhase: string | null;
+  /** The commit observed after the run; null means runtime identity is unproven. */
+  commitSha: string | null;
+  /** True unless the whole worktree was proven stable around the run. */
+  worktreeDirty: boolean;
 }
 
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
+  'commitSha', 'worktreeDirty',
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,7 +59,8 @@ export function parseTestRunExecutionDetails(value: unknown): TestRunExecutionDe
     || !isNullableString(value.harnessSlug) || !isNullableString(value.testNamePattern)
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
-    || !isNullableString(value.mutationPhase)) {
+    || !isNullableString(value.mutationPhase) || !isNullableString(value.commitSha)
+    || typeof value.worktreeDirty !== 'boolean') {
     return undefined;
   }
   return value as unknown as TestRunExecutionDetails;
