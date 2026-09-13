@@ -276,9 +276,21 @@ const SKIP_DIRS = new Set([
 const UNIT_TEST_FILE = /\.test\.tsx?$/;
 /** Kept deliberately WIDER than {@link UNIT_TEST_FILE}: this one only ever EXCLUDES. */
 const LAYERED_TEST_FILE = /\.(integration|browser)\.test\.[cm]?[jt]sx?$/;
+/**
+ * Legacy testing:run integration fixtures were created inside operator-core/lib, then removed
+ * after their nested run. A concurrent lane census could freeze that transient path into its
+ * explicit include list and later fail collection with ENOENT. The producer now uses a checked-in
+ * env-gated fixture, but excluding the reserved legacy name keeps older live runners from
+ * poisoning a current lane while they drain.
+ */
+const EPHEMERAL_TESTING_RUN_SIDECAR = /(?:^|[/\\])__testing-run-sidecar-[^/\\]+\.test\.tsx?$/;
 
 export function isUnitTestFile(relPath: string): boolean {
-  return UNIT_TEST_FILE.test(relPath) && !LAYERED_TEST_FILE.test(relPath);
+  return (
+    UNIT_TEST_FILE.test(relPath) &&
+    !LAYERED_TEST_FILE.test(relPath) &&
+    !EPHEMERAL_TESTING_RUN_SIDECAR.test(relPath)
+  );
 }
 
 /**

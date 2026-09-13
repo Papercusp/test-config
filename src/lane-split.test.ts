@@ -398,6 +398,9 @@ describe("isUnitTestFile", () => {
     expect(isUnitTestFile("lib/a.test.tsx")).toBe(true);
     expect(isUnitTestFile("lib/a.integration.test.ts")).toBe(false);
     expect(isUnitTestFile("lib/a.browser.test.ts")).toBe(false);
+    expect(
+      isUnitTestFile("lib/__testing-run-sidecar-85e84ecc-5efe-47bb-a40a-19de4a267b8d.test.ts"),
+    ).toBe(false);
     expect(isUnitTestFile("lib/a.ts")).toBe(false);
   });
 
@@ -425,6 +428,7 @@ describe("listUnitTestFiles", () => {
       "lib/c.integration.test.ts": PURE_SOURCE,
       "lib/d.browser.test.ts": PURE_SOURCE,
       "lib/notatest.ts": PURE_SOURCE,
+      "lib/__testing-run-sidecar-draining-peer.test.ts": PURE_SOURCE,
       "node_modules/pkg/e.test.ts": PURE_SOURCE,
       "dist/f.test.ts": PURE_SOURCE,
       ".papercusp/g.test.ts": PURE_SOURCE,
