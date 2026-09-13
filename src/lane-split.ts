@@ -69,6 +69,17 @@
  * `globalThis` / Node `global` mutation is the same process-wide class as `vi.stubGlobal`, so
  * assignments, deletions, and the common reflective mutation forms belong in the isolated lane.
  *
+ * A SEVENTH residual then materialised on frozen repair head `326a3c39`: four files that launch
+ * real child processes and one real-timer load rig that resets a public process-global registry
+ * all passed together under the isolated focused-test route (45/45), but failed in the shared
+ * non-isolated pure lane under the gate's full co-resident load. The child-process consumers
+ * timed out or returned incomplete live-host observations; the load rig's exact upstream-429
+ * tally varied across its retry. A subprocess crosses the Vitest fork boundary, and a public
+ * `reset…Registry()` helper announces the same persistent registry dependency as the existing
+ * underscored test-only reset conventions. Both structural signals therefore belong in the
+ * isolated lane. This moves the class, not five memorised paths, so the next equivalent test is
+ * isolated before it can become another rotating gate red.
+ *
  * ERR TOWARD STATEFUL, ALWAYS. Misclassifying a stateful file as pure costs correctness (a
  * polluted co-execution the gate is designed to refuse — D-009); misclassifying a pure file as
  * stateful costs only some speed. So the matcher deliberately does NOT strip comments or
@@ -132,6 +143,10 @@ export const STATEFUL_MARKERS = [
   "vi.useFakeTimers(",
   "vi.useRealTimers(",
   "vi.setSystemTime(",
+  // A real child process crosses the Vitest fork boundary and can block or outlive the shared
+  // non-isolated worker while observing host-wide git/filesystem/process state. `child_process`
+  // matches both Node spellings (`node:child_process` and the legacy bare module name).
+  "child_process",
 ] as const;
 
 /**
@@ -176,6 +191,12 @@ export const STATEFUL_PATTERNS = [
   // file in an `isolate:false` fork. Missing this spelling let one co-resident test
   // erase the built-in rubric registration underneath rubric-template.test.ts.
   /\b_reset[A-Za-z0-9_]*ForTests\s*\(/,
+  // Public production helpers can expose the same module-global registry reset without this
+  // repo's underscored test-only naming convention. `resetGovernorRegistry()` was the measured
+  // miss: the gateway load rig explicitly clears a process singleton between cases, yet the old
+  // classifier left it in the reused pure fork. Keep this narrow to Registry-named helpers so an
+  // ordinary local `resetForm()` does not exile an otherwise pure test.
+  /\b(?:reset|clear)[A-Za-z0-9_$]*Registry[A-Za-z0-9_$]*\s*\(/,
   // ⚠ The trailing-comment branch is LOAD-BEARING, not tidiness. The first version of this
   // pattern ended at `;?\s*$` and therefore missed
   //     import './reconcile-rule'; // registers plan-item-reconcile:done into the global engine

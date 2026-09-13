@@ -204,6 +204,7 @@ describe("isStatefulTestSource", () => {
     const samples = [
       `afterEach(() => __resetThingForTests());`,
       `beforeEach(() => _resetPlanTemplateRegistryForTests());`,
+      `beforeEach(() => resetGovernorRegistry());`,
       `import './register-things';\n`,
       `await expect(import('./wire-things')).resolves.toBeDefined();`,
       `process.env.HOME = '/tmp/test-home';`,
@@ -237,6 +238,35 @@ describe("isStatefulTestSource", () => {
       isStatefulTestSource(`beforeEach(() => _resetPlanTemplateRegistryForTests());`),
     ).toBe(true);
     expect(isStatefulTestSource(`_resetHandleMapForTests();`)).toBe(true);
+  });
+
+  it("classifies public registry-reset helpers without catching ordinary local resets", () => {
+    // Exact structural miss behind the real-timer gateway load rig on repair head 326a3c39.
+    // The imported production helper clears a process singleton but carries neither of the
+    // underscored test-only spellings above.
+    expect(isStatefulTestSource(`beforeEach(() => resetGovernorRegistry());`)).toBe(true);
+    expect(isStatefulTestSource(`clearAuthorityOpRegistry();`)).toBe(true);
+
+    // Calibration: the Registry suffix is load-bearing. Treating every reset helper as global
+    // would move routine component/form setup out of the fast lane with no shared-state evidence.
+    expect(isStatefulTestSource(`beforeEach(() => resetForm());`)).toBe(false);
+  });
+
+  it("classifies child-process consumers in both supported Node import spellings", () => {
+    // Four exact 326a failures launched git/node/qemu work from the shared non-isolated fork.
+    // Matching the module boundary is more durable than enumerating call forms such as
+    // spawnSync/execFileSync/execFile, and errs stateful for aliased or wrapper-based callers.
+    expect(
+      isStatefulTestSource(`import { spawnSync } from 'node:child_process';`),
+    ).toBe(true);
+    expect(
+      isStatefulTestSource(`const cp = require('child_process');`),
+    ).toBe(true);
+
+    // Calibration: ordinary in-process async work remains eligible for the pure lane.
+    expect(
+      isStatefulTestSource(`await Promise.resolve(runCalculation());`),
+    ).toBe(false);
   });
 
   it("CONTROL C: beats the vi.mock-only matcher on a bare side-effect import", () => {
