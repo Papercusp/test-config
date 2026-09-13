@@ -22,7 +22,12 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import postgres from 'postgres';
-import { createFreshTestDb, getOrBuildTemplate } from './pg-migrate.ts';
+import {
+  createFreshTestDb,
+  getOrBuildTemplate,
+  TEMPLATE_BUILDER_HEARTBEAT_STALE_MS,
+  templateBuilderApplicationName,
+} from './pg-migrate.ts';
 import { getTestPg } from './pg-container.ts';
 import { acquireBaselineMigrationLock } from './baseline-schema-global-setup.ts';
 
@@ -215,6 +220,84 @@ describe('buildTemplate hardening (WI-1992)', () => {
       if (releaseTimer) clearTimeout(releaseTimer);
       await holder.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`).catch(() => {});
     }
+  });
+
+  it('recovers an unchanged stale builder heartbeat without imposing a fixed deadline on live builders', async () => {
+    const key = freshKey();
+    const name = `tmpl_${key}`;
+    const lock = `pc-test-template-${key}`;
+    cleanupDbs.push(name);
+    const holder = await adminClient();
+    const staleApplicationName = templateBuilderApplicationName(
+      key,
+      Date.now() - TEMPLATE_BUILDER_HEARTBEAT_STALE_MS - 5_000,
+      4242,
+    );
+
+    await holder.unsafe(`SELECT set_config('application_name', $1, false)`, [staleApplicationName]);
+    await holder.unsafe(`SELECT pg_advisory_lock(hashtext($1::text))`, [lock]);
+    const startedAt = Date.now();
+    try {
+      const built = await getOrBuildTemplate(key, async (url) => {
+        const c = postgres(url, { max: 1, onnotice: () => {} });
+        try {
+          await c.unsafe(`CREATE TABLE recovered_stale_builder_ok (id int)`);
+        } finally {
+          await c.end({ timeout: 5 });
+        }
+      });
+      expect(built).toBe(name);
+      expect(Date.now() - startedAt).toBeLessThan(15_000);
+      expect(console.error).toHaveBeenCalledWith(expect.stringContaining('stage=template-lock-recovery'));
+      expect(await templateState(await adminClient(), name)).toBe('ready');
+    } finally {
+      // The recovery path terminates the original backend. postgres-js can
+      // reconnect here, so an unlock returning false is expected and harmless.
+      await holder.unsafe(`SELECT pg_advisory_unlock(hashtext($1::text))`, [lock]).catch(() => {});
+    }
+  });
+
+  it('does not recover a stale JS heartbeat while the build database is still making progress', async () => {
+    const key = freshKey();
+    const name = `tmpl_${key}`;
+    const buildName = `tmpl_bld_${key}_progress`;
+    const lock = `pc-test-template-${key}`;
+    cleanupDbs.push(name, buildName);
+    const holder = await adminClient();
+    const holderPid = (await holder.unsafe(`SELECT pg_backend_pid() AS pid`)) as Array<{ pid: number }>;
+    await holder.unsafe(`SELECT set_config('application_name', $1, false)`, [
+      templateBuilderApplicationName(key, Date.now() - TEMPLATE_BUILDER_HEARTBEAT_STALE_MS - 5_000, 4242),
+    ]);
+    await holder.unsafe(`SELECT pg_advisory_lock(hashtext($1::text))`, [lock]);
+    await holder.unsafe(`CREATE DATABASE "${buildName}"`);
+
+    const uri = new URL(await getTestPg());
+    uri.pathname = `/${buildName}`;
+    const activeBuild = postgres(uri.toString(), { max: 1, onnotice: () => {} });
+    cleanupClients.push(activeBuild);
+    const progress = activeBuild.unsafe(`SELECT pg_sleep(0.5)`);
+    const release = (async () => {
+      await progress;
+      // The separate build DB query is proof of progress even though the
+      // simulated JS heartbeat began stale. Refresh + release as a live builder
+      // would; a false recovery would have terminated and changed holderPid.
+      await holder.unsafe(`SELECT set_config('application_name', $1, false)`, [templateBuilderApplicationName(key)]);
+      await holder.unsafe(`SELECT pg_advisory_unlock(hashtext($1::text))`, [lock]);
+    })();
+
+    const built = await getOrBuildTemplate(key, async (url) => {
+      const c = postgres(url, { max: 1, onnotice: () => {} });
+      try {
+        await c.unsafe(`CREATE TABLE progressed_builder_ok (id int)`);
+      } finally {
+        await c.end({ timeout: 5 });
+      }
+    });
+    await release;
+    const holderPidAfter = (await holder.unsafe(`SELECT pg_backend_pid() AS pid`)) as Array<{ pid: number }>;
+    expect(holderPidAfter[0]?.pid).toBe(holderPid[0]?.pid);
+    expect(built).toBe(name);
+    expect(await templateState(await adminClient(), name)).toBe('ready');
   });
 
   it('a pre-hardening PARTIAL template (final name, no mark) is dropped and rebuilt, not served', async () => {

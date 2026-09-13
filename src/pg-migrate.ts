@@ -312,9 +312,17 @@ const templateBuilds = new Map<string, Promise<string>>();
 const TEMPLATE_READY_MARK = 'pc-template-ready';
 // A valid parallel integration suite must join the process already building this
 // shared template. A fixed default turned slow-but-progressing builds into 55P03
-// failures (EI-22047290364644498); the explicit option remains available to tests
-// that need a deliberately bounded lock diagnostic.
+// failures (EI-22047290364644498), so the default remains deadline-free. The
+// builder now publishes a heartbeat on the lock-owning backend, however: a
+// stopped/dead JS process can leave that backend alive indefinitely (for example
+// when its process group is frozen after a migration statement finishes). A
+// waiter may recover only an unchanged heartbeat older than this generous stale
+// window; a progressing builder is still joined for as long as it needs.
 const DEFAULT_TEMPLATE_LOCK_TIMEOUT_MS: number | null = null;
+export const TEMPLATE_BUILDER_APPLICATION_PREFIX = 'pc-template-build';
+export const TEMPLATE_BUILDER_HEARTBEAT_INTERVAL_MS = 2_000;
+export const TEMPLATE_BUILDER_HEARTBEAT_STALE_MS = 60_000;
+const TEMPLATE_LOCK_POLL_INTERVAL_MS = 1_000;
 
 function templateLockTimeoutMs(value?: number): number | null {
   if (value === undefined) return DEFAULT_TEMPLATE_LOCK_TIMEOUT_MS;
@@ -324,9 +332,192 @@ function templateLockTimeoutMs(value?: number): number | null {
   return Math.ceil(value);
 }
 
-function isLockTimeout(e: unknown): boolean {
-  const x = e as { code?: string; message?: string } | null;
-  return x?.code === '55P03' || /lock timeout/i.test(x?.message ?? '');
+function templateBuilderKeyToken(key: string): string {
+  return key.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 20);
+}
+
+export function templateBuilderApplicationName(
+  key: string,
+  heartbeatAt = Date.now(),
+  pid = process.pid,
+): string {
+  return `${TEMPLATE_BUILDER_APPLICATION_PREFIX}:${templateBuilderKeyToken(key)}:${pid}:${Math.floor(heartbeatAt)}`;
+}
+
+function templateHeartbeatAt(key: string, applicationName: string): number | null {
+  const prefix = `${TEMPLATE_BUILDER_APPLICATION_PREFIX}:${templateBuilderKeyToken(key)}:`;
+  if (!applicationName.startsWith(prefix)) return null;
+  const heartbeatAt = Number(applicationName.slice(applicationName.lastIndexOf(':') + 1));
+  return Number.isFinite(heartbeatAt) && heartbeatAt > 0 ? heartbeatAt : null;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+async function templateLockHolder(
+  admin: postgres.Sql,
+  lock: string,
+): Promise<{ pid: number; application_name: string; state: string } | null> {
+  const rows = (await admin.unsafe(
+    `WITH lock_key AS (SELECT hashtext($1::text)::bigint AS value)
+     SELECT a.pid, a.application_name, a.state
+       FROM pg_locks l
+       JOIN pg_stat_activity a USING (pid)
+       CROSS JOIN lock_key k
+      WHERE l.locktype = 'advisory'
+        AND l.granted
+        AND l.objsubid = 1
+        AND l.classid::bigint = ((k.value >> 32) & 4294967295)
+        AND l.objid::bigint = (k.value & 4294967295)
+      LIMIT 1`,
+    [lock],
+  )) as Array<{ pid: number; application_name: string; state: string }>;
+  return rows[0] ?? null;
+}
+
+async function templateBuildRecentlyActive(admin: postgres.Sql, key: string): Promise<boolean> {
+  const prefix = `tmpl_bld_${key}_`;
+  const rows = (await admin.unsafe(
+    `SELECT EXISTS (
+       SELECT 1
+         FROM pg_stat_activity
+        WHERE left(datname, length($1::text)) = $1
+          AND (
+            state <> 'idle'
+            OR state_change > clock_timestamp() - ($2::bigint * interval '1 millisecond')
+          )
+     ) AS active`,
+    [prefix, TEMPLATE_BUILDER_HEARTBEAT_STALE_MS],
+  )) as Array<{ active: boolean }>;
+  return rows[0]?.active === true;
+}
+
+async function recoverStaleTemplateBuilder(
+  admin: postgres.Sql,
+  key: string,
+  lock: string,
+): Promise<boolean> {
+  const holder = await templateLockHolder(admin, lock);
+  if (!holder) return false;
+  const heartbeatAt = templateHeartbeatAt(key, holder.application_name);
+  if (
+    heartbeatAt === null ||
+    holder.state !== 'idle' ||
+    Date.now() - heartbeatAt <= TEMPLATE_BUILDER_HEARTBEAT_STALE_MS ||
+    await templateBuildRecentlyActive(admin, key)
+  ) return false;
+
+  // Compare the exact observed application_name in the terminating statement.
+  // A heartbeat that lands between observation and action changes that value,
+  // making this a no-op instead of killing a builder that just resumed.
+  const rows = (await admin.unsafe(
+    `SELECT pg_terminate_backend(a.pid) AS terminated
+       FROM pg_stat_activity a
+      WHERE a.pid = $1
+        AND a.application_name = $2
+        AND a.state = 'idle'
+        AND NOT EXISTS (
+          SELECT 1
+            FROM pg_stat_activity build
+           WHERE left(build.datname, length($3::text)) = $3
+             AND (
+               build.state <> 'idle'
+               OR build.state_change > clock_timestamp() - ($4::bigint * interval '1 millisecond')
+             )
+        )`,
+    [holder.pid, holder.application_name, `tmpl_bld_${key}_`, TEMPLATE_BUILDER_HEARTBEAT_STALE_MS],
+  )) as Array<{ terminated: boolean }>;
+  const terminated = rows[0]?.terminated === true;
+  if (terminated) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[getOrBuildTemplate] stage=template-lock-recovery key=${key} ` +
+        `holderPid=${holder.pid} staleHeartbeatMs=${Date.now() - heartbeatAt}`,
+    );
+  }
+  return terminated;
+}
+
+async function acquireTemplateLock(
+  admin: postgres.Sql,
+  key: string,
+  lock: string,
+  lockTimeoutMs: number | null,
+): Promise<number> {
+  const startedAt = Date.now();
+  for (;;) {
+    const rows = (await admin.unsafe(
+      `SELECT pg_try_advisory_lock(hashtext($1::text)) AS acquired`,
+      [lock],
+    )) as Array<{ acquired: boolean }>;
+    if (rows[0]?.acquired === true) return Date.now() - startedAt;
+
+    // Explicit diagnostic deadlines preserve their historical fail-fast
+    // contract and never terminate another builder. The normal/default path is
+    // progress-aware instead: only our own stale heartbeat is recoverable.
+    if (lockTimeoutMs === null) await recoverStaleTemplateBuilder(admin, key, lock);
+
+    const elapsedMs = Date.now() - startedAt;
+    if (lockTimeoutMs !== null && elapsedMs >= lockTimeoutMs) {
+      throw new Error(
+        `getOrBuildTemplate: stage=template-lock-acquire timed out after ${lockTimeoutMs}ms ` +
+          `(key=${key}, template=tmpl_${key}, lock=${lock}); another test process is still building this migration set`,
+      );
+    }
+    const remainingMs = lockTimeoutMs === null ? TEMPLATE_LOCK_POLL_INTERVAL_MS : lockTimeoutMs - elapsedMs;
+    await sleep(Math.max(1, Math.min(TEMPLATE_LOCK_POLL_INTERVAL_MS, remainingMs)));
+  }
+}
+
+async function setTemplateBuilderHeartbeat(admin: postgres.Sql, key: string): Promise<void> {
+  await admin.unsafe(`SELECT set_config('application_name', $1, false)`, [templateBuilderApplicationName(key)]);
+}
+
+async function startTemplateBuilderHeartbeat(admin: postgres.Sql, key: string): Promise<() => Promise<void>> {
+  await setTemplateBuilderHeartbeat(admin, key);
+  let stopped = false;
+  let inFlight: Promise<void> | null = null;
+  const beat = () => {
+    if (stopped || inFlight) return;
+    inFlight = setTemplateBuilderHeartbeat(admin, key)
+      .catch(() => {
+        // A recovery waiter may terminate this backend. Publication below must
+        // independently prove the advisory lease still belongs to this session.
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+  };
+  const timer = setInterval(beat, TEMPLATE_BUILDER_HEARTBEAT_INTERVAL_MS);
+  timer.unref?.();
+  return async () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    await inFlight;
+  };
+}
+
+async function assertTemplateLockHeld(admin: postgres.Sql, lock: string): Promise<void> {
+  const rows = (await admin.unsafe(
+    `WITH lock_key AS (SELECT hashtext($1::text)::bigint AS value)
+     SELECT EXISTS (
+       SELECT 1
+         FROM pg_locks l
+         CROSS JOIN lock_key k
+        WHERE l.pid = pg_backend_pid()
+          AND l.locktype = 'advisory'
+          AND l.granted
+          AND l.objsubid = 1
+          AND l.classid::bigint = ((k.value >> 32) & 4294967295)
+          AND l.objid::bigint = (k.value & 4294967295)
+     ) AS held`,
+    [lock],
+  )) as Array<{ held: boolean }>;
+  if (rows[0]?.held !== true) {
+    throw new Error(`getOrBuildTemplate: stage=template-publish lease lost for advisory lock ${lock}`);
+  }
 }
 
 function isStatementTimeout(e: unknown): boolean {
@@ -362,35 +553,11 @@ async function buildTemplate(
       // The normal path waits for the current builder: PostgreSQL releases this
       // session-level advisory lock when that backend exits, including a crash. A
       // caller that supplies lockTimeoutMs gets a bounded acquisition instead.
-      await a.unsafe(
-        lockTimeoutMs === null ? `SET lock_timeout = '0'` : `SET lock_timeout = '${lockTimeoutMs}ms'`,
-      );
-      const lockWaitStartedAt = Date.now();
-      try {
-        await a.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
-      } catch (e) {
-        const lockWaitMs = Date.now() - lockWaitStartedAt;
-        if (lockWaitMs > 5_000) {
-          // eslint-disable-next-line no-console
-          console.error(
-            `[getOrBuildTemplate] stage=template-lock-wait key=${key} elapsedMs=${lockWaitMs}`,
-          );
-        }
-        if (lockTimeoutMs !== null && isLockTimeout(e)) {
-          throw new Error(
-            `getOrBuildTemplate: stage=template-lock-acquire timed out after ${lockTimeoutMs}ms ` +
-              `(key=${key}, template=${name}, lock=${lock}); another test process is still building this migration set`,
-            { cause: e },
-          );
-        }
-        throw e;
-      }
-      const lockWaitMs = Date.now() - lockWaitStartedAt;
+      const lockWaitMs = await acquireTemplateLock(a, key, lock, lockTimeoutMs);
       if (lockWaitMs > 5_000) {
         // eslint-disable-next-line no-console
         console.error(`[getOrBuildTemplate] stage=template-lock-wait key=${key} elapsedMs=${lockWaitMs}`);
       }
-      await a.unsafe(`SET lock_timeout = '0'`);
       return a;
     } catch (e) {
       await a.end({ timeout: 5 }).catch(() => {});
@@ -398,7 +565,12 @@ async function buildTemplate(
     }
   });
   try {
+    let stopHeartbeat: (() => Promise<void>) | null = null;
     try {
+      // Cover the ENTIRE lease-held critical section, not just provision: a
+      // stall while inspecting/dropping partials or creating the build database
+      // must be recoverable by later waiters too.
+      stopHeartbeat = await startTemplateBuilderHeartbeat(admin, key);
       // A template is only servable when it carries the readiness mark — stamped
       // strictly AFTER provision + rename succeeded, so a partial build can never
       // satisfy this check.
@@ -443,6 +615,15 @@ async function buildTemplate(
             `[getOrBuildTemplate] stage=template-build key=${key} ` +
               `migrations=${migrationCount ?? 'unknown'} elapsedMs=${buildElapsedMs}`,
           );
+          // A stale-holder recovery terminates the lock-owning backend. postgres-js
+          // may transparently reconnect, so successful provision alone is not
+          // publication authority: the current backend must still own the lease.
+          await assertTemplateLockHeld(admin, lock);
+          // Paranoia: a backend the provision leaked would block the rename.
+          await terminateBackends(admin, bld);
+          await assertTemplateLockHeld(admin, lock);
+          await admin.unsafe(`ALTER DATABASE "${bld}" RENAME TO "${name}"`);
+          await admin.unsafe(`COMMENT ON DATABASE "${name}" IS '${TEMPLATE_READY_MARK}'`);
         } catch (err) {
           // Best-effort drop; a survivor under tmpl_bld_* is HARMLESS (never looked
           // up as a template) and the sweep above collects it next build.
@@ -450,12 +631,9 @@ async function buildTemplate(
           await admin.unsafe(`DROP DATABASE IF EXISTS "${bld}" WITH (FORCE)`).catch(() => {});
           throw err;
         }
-        // Paranoia: a backend the provision leaked would block the rename.
-        await terminateBackends(admin, bld);
-        await admin.unsafe(`ALTER DATABASE "${bld}" RENAME TO "${name}"`);
-        await admin.unsafe(`COMMENT ON DATABASE "${name}" IS '${TEMPLATE_READY_MARK}'`);
       }
     } finally {
+      await stopHeartbeat?.();
       await admin.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`);
     }
   } finally {
