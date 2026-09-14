@@ -586,9 +586,19 @@ async function buildTemplate(
         // the old `.catch(() => {})` silent-drop is exactly how partials survived).
         const exists = (await admin.unsafe(`SELECT 1 FROM pg_database WHERE datname = '${name}'`)) as unknown[];
         if (exists.length > 0) {
-          await terminateBackends(admin, name);
-          // WI-4311: WITH (FORCE) closes the terminate-then-drop race (see makeDrop).
-          await admin.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+          // Template cleanup shares the same bounded, cluster-wide lane as every
+          // ordinary test-database teardown. A raw DROP here once sat in IO/WalSync
+          // for minutes while this connection kept the per-template advisory lock,
+          // stranding every integration globalSetup behind it. The final name must
+          // actually disappear before publication can continue, so a deferred drop
+          // is a loud, retryable build failure rather than permission to proceed.
+          const dropResult = await dropDatabaseWithLock(admin, name);
+          if (dropResult !== 'dropped') {
+            throw new Error(
+              `getOrBuildTemplate: stage=template-cleanup-deferred ` +
+                `(key=${key}, template=${name}); retry after the shared database-drop lane drains`,
+            );
+          }
         }
         // Sweep leftovers of OUR key's crashed builds (safe: the advisory lock means
         // no live fork is building this key right now). Other keys' builds are
@@ -597,8 +607,10 @@ async function buildTemplate(
           `SELECT datname FROM pg_database WHERE datname LIKE 'tmpl_bld_${key}_%'`,
         )) as Array<{ datname: string }>;
         for (const s of stale) {
-          await terminateBackends(admin, s.datname);
-          await admin.unsafe(`DROP DATABASE IF EXISTS "${s.datname}" WITH (FORCE)`).catch(() => {});
+          // A leftover build database is never servable, so deferral is safe: the
+          // marker lets a later bounded sweep collect it while this builder moves
+          // on under a fresh random name.
+          await dropDatabaseWithLock(admin, s.datname).catch(() => {});
         }
         // Build under a TEMP name and rename into place only on success — the
         // final name is only ever a COMPLETE schema (rename is atomic in PG).
@@ -627,8 +639,7 @@ async function buildTemplate(
         } catch (err) {
           // Best-effort drop; a survivor under tmpl_bld_* is HARMLESS (never looked
           // up as a template) and the sweep above collects it next build.
-          await terminateBackends(admin, bld).catch(() => {});
-          await admin.unsafe(`DROP DATABASE IF EXISTS "${bld}" WITH (FORCE)`).catch(() => {});
+          await dropDatabaseWithLock(admin, bld).catch(() => {});
           throw err;
         }
       }

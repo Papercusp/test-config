@@ -24,7 +24,9 @@ import { randomBytes } from 'node:crypto';
 import postgres from 'postgres';
 import {
   createFreshTestDb,
+  dropDatabaseWithLock,
   getOrBuildTemplate,
+  TEST_DB_DROP_LOCK_KEY,
   TEMPLATE_BUILDER_HEARTBEAT_STALE_MS,
   templateBuilderApplicationName,
 } from './pg-migrate.ts';
@@ -62,15 +64,7 @@ afterAll(async () => {
   const admin = postgres(await getTestPg(), { max: 1, onnotice: () => {} });
   try {
     for (const name of cleanupDbs) {
-      await admin
-        .unsafe(
-          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${name}' AND pid <> pg_backend_pid()`,
-        )
-        .catch(() => {});
-      // WI-4311: WITH (FORCE) — pg_terminate_backend above only SIGNALS; a plain
-      // DROP can still block on a not-yet-closed backend (parked 6s-267s+ under
-      // fleet load). Mirrors makeDrop() in ./pg-migrate.ts.
-      await admin.unsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => {});
+      await dropDatabaseWithLock(admin, name).catch(() => {});
     }
   } finally {
     await admin.end({ timeout: 5 });
@@ -149,6 +143,42 @@ describe('buildTemplate hardening (WI-1992)', () => {
     });
     expect(built).toBe(name);
     expect(await templateState(admin, name)).toBe('ready');
+  });
+
+  it('defers an unready-template drop without pinning the template lock', async () => {
+    const key = freshKey();
+    const name = `tmpl_${key}`;
+    const templateLock = `pc-test-template-${key}`;
+    const dropLockHolder = await adminClient();
+    cleanupDbs.push(name);
+    await dropLockHolder.unsafe(`SELECT pg_advisory_lock(hashtext($1::text))`, [TEST_DB_DROP_LOCK_KEY]);
+    await dropLockHolder.unsafe(`CREATE DATABASE "${name}"`);
+
+    const startedAt = Date.now();
+    try {
+      await expect(getOrBuildTemplate(key, async () => {})).rejects.toThrow(
+        `getOrBuildTemplate: stage=template-cleanup-deferred (key=${key}, template=${name})`,
+      );
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+    } finally {
+      await dropLockHolder
+        .unsafe(`SELECT pg_advisory_unlock(hashtext($1::text))`, [TEST_DB_DROP_LOCK_KEY])
+        .catch(() => {});
+    }
+
+    // The failure must release the per-template lease immediately. Retrying the
+    // whole build here would incorrectly require the shared filesystem to finish
+    // a second DROP inside a fixed wall-clock budget; under real I/O pressure it
+    // may safely defer again. Rejected-promise retryability is covered above by
+    // the failed-provision case, while this probe pins the new cleanup branch's
+    // load-bearing liveness property directly.
+    const lockProbe = await adminClient();
+    const [{ acquired }] = (await lockProbe.unsafe(
+      `SELECT pg_try_advisory_lock(hashtext($1::text)) AS acquired`,
+      [templateLock],
+    )) as Array<{ acquired: boolean }>;
+    expect(acquired).toBe(true);
+    await lockProbe.unsafe(`SELECT pg_advisory_unlock(hashtext($1::text))`, [templateLock]);
   });
 
   it('bounds a contended template lock with stage-labelled diagnostics and retries cleanly', async () => {
