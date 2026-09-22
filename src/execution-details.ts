@@ -47,8 +47,29 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+/**
+ * The reporter persists this contract through postgres-js's multi-row insert
+ * helper, which stores a pre-serialized value as a jsonb STRING scalar rather
+ * than a jsonb object — and every existing ledger row is shaped that way. A
+ * reader handed the raw column therefore sees a string. Decoding it HERE, in
+ * the one shared parser, is what keeps each reader from having to know that:
+ * detached evidence recovery once called this parser on the raw column and
+ * rejected every row, so no integration file past the foreground cap could ever
+ * settle its spec evidence (WI-10002465). A string that does not decode to the
+ * exact contract is still unproven.
+ */
+function decodeStoredDetails(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
 /** Parse the exact persisted contract; malformed or extended rows are unproven. */
-export function parseTestRunExecutionDetails(value: unknown): TestRunExecutionDetails | undefined {
+export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionDetails | undefined {
+  const value = decodeStoredDetails(stored);
   if (!isRecord(value) || Object.keys(value).some(key => !executionDetailsKeys.has(key as keyof TestRunExecutionDetails))) {
     return undefined;
   }
