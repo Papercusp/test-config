@@ -27,6 +27,7 @@ import {
   dropDatabaseWithLock,
   getOrBuildTemplate,
   TEST_DB_DROP_LOCK_KEY,
+  TEST_DB_MANAGED_MARKER,
   TEMPLATE_BUILDER_HEARTBEAT_STALE_MS,
   templateBuilderApplicationName,
 } from './pg-migrate.ts';
@@ -104,6 +105,10 @@ describe('buildTemplate hardening (WI-1992)', () => {
     // And it clones: the clone carries the provisioned schema.
     const db = await createFreshTestDb({ prefix: 'zzhard', template: { key, provision: async () => {} } });
     cleanupDbs.push(db.name);
+    const cloneMark = await admin.unsafe(
+      `SELECT shobj_description(oid, 'pg_database') AS description FROM pg_database WHERE datname = '${db.name}'`,
+    ) as Array<{ description: string | null }>;
+    expect(cloneMark[0]?.description).toMatch(/^papercusp-test-db:[0-9]{13}$/);
     const c = postgres(db.url, { max: 1, onnotice: () => {} });
     try {
       const rows = (await c.unsafe(`SELECT 1 FROM information_schema.tables WHERE table_name = 'provisioned_ok'`)) as unknown[];
@@ -404,6 +409,34 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const db = await createFreshTestDb({ prefix: 'zzhard', template: { key, provision: async () => {} } });
     cleanupDbs.push(db.name);
     await db.drop();
+  });
+});
+
+describe('managed test database lifecycle (WI-10003219)', () => {
+  it('marks a fresh database so later cleanup can identify an orphan', async () => {
+    const db = await createFreshTestDb({ prefix: 'zzmanaged' });
+    cleanupDbs.push(db.name);
+    const admin = await adminClient();
+    const rows = await admin.unsafe(
+      `SELECT shobj_description(oid, 'pg_database') AS description FROM pg_database WHERE datname = '${db.name}'`,
+    ) as Array<{ description: string | null }>;
+    expect(rows[0]?.description).toMatch(new RegExp(`^${TEST_DB_MANAGED_MARKER}[0-9]{13}$`));
+    await db.drop();
+  });
+
+  it('reaps an old marked database during a later drop', async () => {
+    const orphan = await createFreshTestDb({ prefix: 'zzorphan' });
+    const trigger = await createFreshTestDb({ prefix: 'zztrigger' });
+    cleanupDbs.push(orphan.name, trigger.name);
+    const admin = await adminClient();
+    await admin.unsafe(
+      `COMMENT ON DATABASE "${orphan.name}" IS '${TEST_DB_MANAGED_MARKER}${Date.now() - 2 * 24 * 60 * 60 * 1000}'`,
+    );
+    await trigger.drop();
+    const rows = await admin.unsafe(
+      `SELECT datname FROM pg_database WHERE datname = '${orphan.name}'`,
+    ) as Array<{ datname: string }>;
+    expect(rows).toEqual([]);
   });
 });
 

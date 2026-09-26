@@ -12,9 +12,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   TEST_DB_DEFERRED_MARKER,
+  TEST_DB_MANAGED_MARKER,
+  TEST_DB_ORPHAN_MIN_AGE_MS,
   TEST_DB_DEFERRED_SWEEP_LIMIT,
   TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS,
   dropDatabaseWithLock,
+  markManagedTestDatabase,
   isConnectTimeout,
   TEST_DB_DROP_LOCK_KEY,
   TEST_DB_DROP_STATEMENT_TIMEOUT_MS,
@@ -109,6 +112,7 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
       `SET statement_timeout = '${TEST_DB_DROP_STATEMENT_TIMEOUT_MS}ms'`,
       'DROP DATABASE IF EXISTS "it_guarded" WITH (FORCE)',
       expect.stringContaining(`WHERE c.description = '${TEST_DB_DEFERRED_MARKER}'`),
+      expect.stringContaining(`c.description ~ '^${TEST_DB_MANAGED_MARKER}[0-9]{13}$'`),
       `SET statement_timeout = '0'`,
       `SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`,
     ]);
@@ -177,7 +181,9 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
       unsafe: async (query) => {
         queries.push(query);
         if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
-        if (query.includes('FROM pg_database d')) return deferred.slice(0, TEST_DB_DEFERRED_SWEEP_LIMIT);
+        if (query.includes(`c.description = '${TEST_DB_DEFERRED_MARKER}'`)) {
+          return deferred.slice(0, TEST_DB_DEFERRED_SWEEP_LIMIT);
+        }
         return [];
       },
     }, 'it_guarded');
@@ -187,5 +193,32 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
     expect(sweptDrops).toHaveLength(TEST_DB_DEFERRED_SWEEP_LIMIT);
     expect(queries.filter((query) => query === `SET statement_timeout = '${TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS}ms'`))
       .toHaveLength(TEST_DB_DEFERRED_SWEEP_LIMIT);
+  });
+});
+
+describe('abandoned test database cleanup (WI-10003219)', () => {
+  it('marks a new database with a creation time', async () => {
+    const queries: string[] = [];
+    await markManagedTestDatabase({ unsafe: async (query) => { queries.push(query); return []; } }, 'org_abc');
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toMatch(/^COMMENT ON DATABASE "org_abc" IS 'papercusp-test-db:[0-9]{13}'$/);
+  });
+
+  it('reaps only old, inactive, explicitly marked databases through the existing drop lock', async () => {
+    const queries: string[] = [];
+    const result = await dropDatabaseWithLock({
+      unsafe: async (query) => {
+        queries.push(query);
+        if (query.includes('pg_try_advisory_lock')) return [{ acquired: true }];
+        if (query.includes(`c.description ~ '^${TEST_DB_MANAGED_MARKER}`)) return [{ datname: 'org_abandoned' }];
+        return [];
+      },
+    }, 'org_current');
+    expect(result).toBe('dropped');
+    expect(queries).toContain('DROP DATABASE IF EXISTS "org_abandoned" WITH (FORCE)');
+    expect(queries.find((query) => query.includes(`c.description ~ '^${TEST_DB_MANAGED_MARKER}`)))
+      .toContain('NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)');
+    expect(queries.find((query) => query.includes(`c.description ~ '^${TEST_DB_MANAGED_MARKER}`)))
+      .toContain(String(TEST_DB_ORPHAN_MIN_AGE_MS));
   });
 });

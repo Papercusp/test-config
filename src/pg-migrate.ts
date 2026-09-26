@@ -102,6 +102,7 @@ async function createFreshDb(prefix = 'it'): Promise<{ url: string; name: string
       await admin.end({ timeout: 5 });
     }
   });
+  await markOrDropUntrackedDatabase(adminUri, name);
   return { url: swapDbName(adminUri, name), name, adminUri };
 }
 
@@ -117,6 +118,8 @@ export const TEST_DB_DROP_STATEMENT_TIMEOUT_MS = 20_000;
 export const TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS = 5_000;
 export const TEST_DB_DEFERRED_SWEEP_LIMIT = 3;
 export const TEST_DB_DEFERRED_MARKER = 'papercusp-test-db-drop-deferred';
+export const TEST_DB_MANAGED_MARKER = 'papercusp-test-db:';
+export const TEST_DB_ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 
 const TEST_DB_DEFER_MARK_TIMEOUT_MS = 2_000;
 
@@ -130,6 +133,35 @@ function quoteIdentifier(value: string): string {
 
 function quoteLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
+}
+
+export async function markManagedTestDatabase(admin: SqlExecutor, name: string): Promise<void> {
+  await admin.unsafe(
+    `COMMENT ON DATABASE ${quoteIdentifier(name)} IS ${quoteLiteral(`${TEST_DB_MANAGED_MARKER}${Date.now()}`)}`,
+  );
+}
+
+async function markOrDropUntrackedDatabase(adminUri: string, name: string): Promise<void> {
+  try {
+    // A connect timeout after CREATE must retry only the COMMENT, never CREATE.
+    await withConnectRetry(async () => {
+      const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
+      try {
+        await markManagedTestDatabase(admin, name);
+      } finally {
+        await admin.end({ timeout: 5 });
+      }
+    });
+  } catch (error) {
+    const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
+    try {
+      // No successful mark means the orphan sweep cannot find this database.
+      await dropDatabaseWithLock(admin, name).catch(() => {});
+    } finally {
+      await admin.end({ timeout: 5 }).catch(() => {});
+    }
+    throw error;
+  }
 }
 
 async function markDatabaseDropDeferred(admin: SqlExecutor, name: string): Promise<void> {
@@ -176,6 +208,37 @@ async function sweepDeferredDatabaseDrops(admin: SqlExecutor): Promise<void> {
   }
 }
 
+/** Reap test processes' abandoned databases without touching active or unmarked databases. */
+async function sweepOrphanedTestDatabases(admin: SqlExecutor): Promise<void> {
+  let rows: Array<{ datname: string }>;
+  try {
+    rows = (await admin.unsafe(
+      `SELECT d.datname
+         FROM pg_database d
+         JOIN pg_shdescription c
+           ON c.objoid = d.oid
+          AND c.classoid = 'pg_database'::regclass
+        WHERE c.description ~ '^${TEST_DB_MANAGED_MARKER}[0-9]{13}$'
+          AND split_part(c.description, ':', 2)::bigint <=
+              (extract(epoch from clock_timestamp()) * 1000)::bigint - ${TEST_DB_ORPHAN_MIN_AGE_MS}
+          AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)
+        ORDER BY d.datname
+        LIMIT ${TEST_DB_DEFERRED_SWEEP_LIMIT}`,
+    )) as Array<{ datname: string }>;
+  } catch {
+    return;
+  }
+
+  for (const row of rows) {
+    try {
+      await admin.unsafe(`SET statement_timeout = '${TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS}ms'`);
+      await admin.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(row.datname)} WITH (FORCE)`);
+    } catch {
+      break;
+    }
+  }
+}
+
 /** Execute or safely defer one forced database drop on the cluster-wide lane. */
 export async function dropDatabaseWithLock(admin: SqlExecutor, name: string): Promise<TestDbDropResult> {
   let lockHeld = false;
@@ -203,6 +266,7 @@ export async function dropDatabaseWithLock(admin: SqlExecutor, name: string): Pr
     }
 
     await sweepDeferredDatabaseDrops(admin);
+    await sweepOrphanedTestDatabases(admin);
     return 'dropped';
   } finally {
     if (lockHeld) {
@@ -693,6 +757,7 @@ async function createDbFromTemplate(prefix: string, template: string): Promise<{
       await admin.end({ timeout: 5 });
     }
   });
+  await markOrDropUntrackedDatabase(adminUri, name);
   return { url: swapDbName(adminUri, name), name, adminUri };
 }
 
