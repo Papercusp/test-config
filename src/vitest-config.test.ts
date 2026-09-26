@@ -31,6 +31,11 @@ function withArgv(...tokens: string[]): void {
 }
 
 describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
+  it.each(['unit', 'integration', 'browser'] as const)('publishes the registered %s layer for runtime attribution', (layer) => {
+    withArgv();
+    expect(defineVitestConfig({ layer }).test?.provide).toEqual({ papercuspTestLayer: layer });
+  });
+
   it('routes an *.integration.test.ts remediation through the repository test router', () => {
     withArgv('lib/foo.integration.test.ts');
     expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(/integration test/i);

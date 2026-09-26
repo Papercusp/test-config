@@ -18,6 +18,8 @@ export interface TestRunExecutionDetails {
   workspaceId: string | null;
   harnessSlug: string | null;
   testNamePattern: string | null;
+  /** Observed from the executing project's registered config; absent on older rows. */
+  testLayer?: 'unit' | 'integration' | 'browser';
   passed: number;
   failed: number;
   skipped: number;
@@ -32,7 +34,7 @@ export interface TestRunExecutionDetails {
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
-  'commitSha', 'worktreeDirty',
+  'commitSha', 'worktreeDirty', 'testLayer',
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -67,6 +69,14 @@ function decodeStoredDetails(value: unknown): unknown {
   }
 }
 
+/** Read runtime layer attribution without treating a caller's adequacy label as evidence. */
+export function recordedTestLayer(stored: unknown): TestRunExecutionDetails['testLayer'] {
+  const value = decodeStoredDetails(stored);
+  if (!isRecord(value) || value.schemaVersion !== TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION) return undefined;
+  return value.testLayer === 'unit' || value.testLayer === 'integration' || value.testLayer === 'browser'
+    ? value.testLayer : undefined;
+}
+
 /** Parse the exact persisted contract; malformed or extended rows are unproven. */
 export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionDetails | undefined {
   const value = decodeStoredDetails(stored);
@@ -74,6 +84,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     return undefined;
   }
   if (value.schemaVersion !== TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION
+    || (value.testLayer !== undefined && recordedTestLayer(value) === undefined)
     || typeof value.root !== 'string' || value.root.length === 0
     || typeof value.filePath !== 'string' || value.filePath.length === 0
     || !isNullableString(value.runGroupId) || !isNullableString(value.workspaceId)

@@ -34,7 +34,7 @@ import { exec } from 'node:child_process';
 import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, type TestRunExecutionDetails } from './execution-details.ts';
+import { TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, type TestRunExecutionDetails } from './execution-details.ts';
 
 /**
  * EI-19307211919650123: classify the `.git` entry at `dir` for the root walk.
@@ -1165,6 +1165,8 @@ export default class AdminTestRunsReporter implements Reporter {
       workspaceId: resolveTestRunWorkspaceId(),
       harnessSlug: resolveTestRunHarnessSlug(),
       testNamePattern: ctx?.config?.testNamePattern?.source ?? null,
+      testLayer: recordedTestLayer({ schemaVersion: 1,
+        testLayer: (ctx?.config?.provide as Record<string, unknown> | undefined)?.papercuspTestLayer }),
       mutationPhase: resolveMutationProbePhase(),
     };
   }
@@ -1187,8 +1189,14 @@ export default class AdminTestRunsReporter implements Reporter {
       this.failureDetails.push(...collectTestFailureDetails(testModule, filePath));
 
       const counts = collectModuleExecution(testModule);
+      // Root and project configs may differ in a multi-project run. The module's
+      // project wins; absence there stays unknown instead of inheriting a root label.
+      const testLayer = testModule.project
+        ? recordedTestLayer({ schemaVersion: 1,
+            testLayer: (testModule.project.config.provide as Record<string, unknown> | undefined)?.papercuspTestLayer })
+        : this.executionContext?.testLayer;
       const executionDetails = counts && this.executionContext
-        ? { ...this.executionContext, filePath, ...counts } : null;
+        ? { ...this.executionContext, testLayer, filePath, ...counts } : null;
       this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail,
         isScratchConfig: this.isScratchConfig, executionDetails });
     } catch {

@@ -146,6 +146,23 @@ describe('WI-1702898 — a test_runs row must be joinable to the sha it judged',
 });
 
 describe('AdminTestRunsReporter fail-soft contract', () => {
+  it.each(['unit', 'integration', undefined] as const)('records project layer %s instead of inferring it from a filename or root config', async (layer) => {
+    const rows: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+      async (row) => { rows.push(row); });
+    reporter.onInit({ config: { provide: { papercuspTestLayer: 'browser' } },
+      vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    reporter.onTestModuleEnd({
+      moduleId: join(TEST_CONFIG_ROOT, 'src/runtime-layer.test.ts'),
+      project: { config: { provide: layer ? { papercuspTestLayer: layer } : {} } },
+      state: () => 'passed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+      children: { allTests: () => [{ result: () => ({ state: 'passed' }) }] },
+    } as never);
+    await reporter.onTestRunEnd();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].executionDetails?.testLayer).toBe(layer);
+  });
+
   it('constructs without side effects', () => {
     const r = new AdminTestRunsReporter();
     expect(r).toBeDefined();
