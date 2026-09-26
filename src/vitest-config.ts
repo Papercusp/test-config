@@ -18,6 +18,12 @@ import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
+declare module 'vitest' {
+  interface ProvidedContext {
+    papercuspTestLayer?: TestLayer;
+  }
+}
+
 export interface DefineVitestConfigOptions {
   layer: TestLayer;
   setupFiles?: string[];
@@ -525,6 +531,9 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
     // instead of dying on a /@fs/ allow-list miss (see MONOREPO_ROOT above).
     server: { fs: { allow: [MONOREPO_ROOT] } },
     test: {
+      // The reporter reads the executing project's config, including when CLI
+      // reporter overrides are used. This is runtime evidence, not a caller label.
+      provide: { papercuspTestLayer: layer },
       // A lane run enumerates its files EXPLICITLY (content-derived membership); everything
       // else keeps the layer's globs, byte-for-byte as before. P-001: either form is then
       // narrowed by the PC_TEST_FILTER_LIST selection when the runner provides one.
