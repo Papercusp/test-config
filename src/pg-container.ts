@@ -149,6 +149,39 @@ export const NON_DESTRUCTIVE_PG_HEALTHCHECK = {
   retries: 1,
 };
 
+/**
+ * Docker json-file rotation for the shared, reused test container (WI-10003219).
+ *
+ * The container lives for weeks and logs every fleet test's PG ERROR/STATEMENT
+ * pair. With the daemon's default (no max-size) its log reached 45 GB by
+ * 2026-09-26 and put the root disk at 98%. About 1 GiB keeps the last several
+ * hours for `docker logs` diagnosis.
+ */
+export const TEST_PG_LOG_OPTS = { "max-size": "256m", "max-file": "4" } as const;
+
+/**
+ * Label that moves the `.withReuse()` hash when the log options change.
+ *
+ * testcontainers hashes `createOpts` only, and log options are HostConfig. A
+ * log-option change on its own would keep reusing the uncapped container
+ * forever. Labels are part of `createOpts`, so this one makes the first run
+ * after a change provision a fresh, capped container.
+ */
+export const TEST_PG_LOG_CAP_LABEL = "org.papercusp.test-pg.log-cap";
+
+/** `PostgreSqlContainer` with a capped json-file log (HostConfig is protected). */
+export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
+  withCappedJsonLog(): this {
+    this.hostConfig.LogConfig = {
+      Type: "json-file",
+      Config: { ...TEST_PG_LOG_OPTS },
+    };
+    return this.withLabels({
+      [TEST_PG_LOG_CAP_LABEL]: `json-file:${TEST_PG_LOG_OPTS["max-size"]}x${TEST_PG_LOG_OPTS["max-file"]}`,
+    });
+  }
+}
+
 // Framework roles, ensured CREATE-OR-FIX (login + fixed privilege attributes +
 // correct password) once per container.
 // The container is shared + REUSED, and roles are cluster-global. Some tests historically
@@ -258,8 +291,9 @@ export async function getTestPg(): Promise<string> {
       () =>
         withContainerRecoveryReResolution(
           () =>
-            new PostgreSqlContainer(TEST_PG_IMAGE)
+            new CappedLogPostgreSqlContainer(TEST_PG_IMAGE)
               .withDatabase("papercusp_test")
+              .withCappedJsonLog()
               // WI-4133: this ONE container is `.withReuse()`d by EVERY vitest
               // process on the box (all forks, all packages, ~30+ fleet agents at
               // once) — each opening its own client pool (createFreshPgDb: max 4;

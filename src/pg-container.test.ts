@@ -32,6 +32,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from "./pg-container.ts";
 import { withContainerRecoveryReResolution } from "./pg-container.ts";
+import {
+  CappedLogPostgreSqlContainer,
+  TEST_PG_LOG_CAP_LABEL,
+} from "./pg-container.ts";
 
 const SOURCE = readFileSync(
   fileURLToPath(new URL("./pg-container.ts", import.meta.url)),
@@ -94,6 +98,35 @@ describe("getTestPg framework-role ensure (EI-18680404964770187)", () => {
     expect(SOURCE).toMatch(/in recovery mode/);
     expect(SOURCE).toMatch(/not yet accepting connections/);
     expect(SOURCE).toMatch(/RETRYABLE_PG_STARTUP_MSG\.test\(msg\)/);
+  });
+});
+
+describe("getTestPg container log cap (WI-10003219)", () => {
+  class LogCapProbe extends CappedLogPostgreSqlContainer {
+    logConfig() {
+      return this.hostConfig.LogConfig;
+    }
+    labels() {
+      return this.createOpts.Labels;
+    }
+  }
+
+  it("rotates the json-file log and moves the reuse hash with it", () => {
+    // Constructing the builder touches no Docker; start() is never called.
+    const probe = new LogCapProbe("pgvector/pgvector:pg18").withCappedJsonLog();
+    expect(probe.logConfig()).toEqual({
+      Type: "json-file",
+      Config: { "max-size": "256m", "max-file": "4" },
+    });
+    // testcontainers hashes createOpts (not HostConfig) for `.withReuse()`, so
+    // without this label the uncapped container would keep being reused.
+    expect(probe.labels()?.[TEST_PG_LOG_CAP_LABEL]).toBe("json-file:256mx4");
+  });
+
+  it("is what getTestPg builds its shared container with", () => {
+    expect(SOURCE).toMatch(
+      /new CappedLogPostgreSqlContainer\(TEST_PG_IMAGE\)\s*\.withDatabase\("papercusp_test"\)\s*\.withCappedJsonLog\(\)/,
+    );
   });
 });
 
