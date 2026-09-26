@@ -61,10 +61,11 @@ import type { TestProject } from 'vitest/node';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import postgres from 'postgres';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
+import { testcontainerStartLockRoot, withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
 import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 
@@ -75,6 +76,44 @@ import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
  * start concurrently (EI-11788).
  */
 export const BASELINE_SCHEMA_CONTAINER_START_LOCK = 'baseline-schema-container-start';
+export const BASELINE_SCHEMA_REUSE_GENERATION_LABEL = 'org.papercusp.baseline-schema.generation';
+const BASELINE_SCHEMA_REUSE_GENERATION_FILE = 'baseline-schema-reuse-generation';
+
+/** Read under BASELINE_SCHEMA_CONTAINER_START_LOCK; absent means the first generation. */
+export async function readBaselineReuseGeneration(root = testcontainerStartLockRoot()): Promise<number> {
+  let raw: string;
+  try {
+    raw = await readFile(join(root, BASELINE_SCHEMA_REUSE_GENERATION_FILE), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+  const generation = Number(raw.trim());
+  if (!Number.isSafeInteger(generation) || generation < 0 || raw.trim() !== String(generation)) {
+    throw new Error(`invalid baseline schema reuse generation: ${raw.trim()}`);
+  }
+  return generation;
+}
+
+/** Rotate the reuse hash without stopping an old container that other tests still use. */
+export async function rotateBaselineReuseGeneration(root = testcontainerStartLockRoot()): Promise<number> {
+  const generation = (await readBaselineReuseGeneration(root)) + 1;
+  const target = join(root, BASELINE_SCHEMA_REUSE_GENERATION_FILE);
+  const temporary = `${target}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  await writeFile(temporary, `${generation}\n`);
+  await rename(temporary, target);
+  return generation;
+}
+
+/** A rejected candidate may still have live readers; only change which one new runs select. */
+export async function replaceInvalidBaselineCandidate<T>(
+  candidate: T,
+  isValid: (candidate: T) => Promise<boolean>,
+  start: (generation: number) => Promise<T>,
+  rotate: () => Promise<number>,
+): Promise<T> {
+  return (await isValid(candidate)) ? candidate : start(await rotate());
+}
 
 /**
  * The reusable baseline database has two independent serialization lanes:
@@ -526,7 +565,7 @@ export default async function setup({ provide }: TestProject) {
     // (PostgreSQL 18.3) — see libs/test-config/src/pg-container.ts for the full
     // rationale (PG16 silently allowed a DELETE PG18 rejects; WI-2914 shipped
     // uncaught because CI tested the wrong major).
-    const startBaselineContainer = () =>
+    const startBaselineContainer = (generation: number) =>
       new PostgreSqlContainer('pgvector/pgvector:pg18')
         .withDatabase('papercusp_it')
         .withUsername('it_admin')
@@ -549,6 +588,7 @@ export default async function setup({ provide }: TestProject) {
         // the (possibly reused) container and reprovisions a fresh one if it is
         // not actually serving papercusp_it.
         .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
+        .withLabels({ [BASELINE_SCHEMA_REUSE_GENERATION_LABEL]: String(generation) })
         // Reuse the baseline container across Vitest processes. The previous
         // ephemeral container replayed ~476 migrations for every focused file;
         // under checkpoint concurrency that startup alone could consume the test's
@@ -557,26 +597,26 @@ export default async function setup({ provide }: TestProject) {
         .start();
     const container = await runBaselineSetupStage('container-resolve', () =>
       withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, async () => {
-        let c = await runBaselineSetupStage('container-start', startBaselineContainer);
+        let generation = await readBaselineReuseGeneration();
+        let c = await runBaselineSetupStage('container-start', () => startBaselineContainer(generation));
         // EI-2433: validate the (possibly reused) container's DB before trusting it.
-        // A reused-but-stale container matches on config alone; stopping it here
-        // means testcontainers' reuse lookup (which only matches RUNNING containers)
-        // can't find it again, so the retry below provisions a genuinely fresh one.
-        if (!(await runBaselineSetupStage('container-health-check', () =>
-          isBaselineContainerHealthy(c.getConnectionUri()),
-        ))) {
-          console.error(
-            '[baseline-schema-global-setup] reused container failed health-check (stale/missing papercusp_it) — stopping + reprovisioning fresh',
-          );
-          await c.stop().catch(() => {});
-          c = await runBaselineSetupStage('container-reprovision-after-health', startBaselineContainer);
-        }
+        // Rotate the reuse hash under the startup lock. Other Vitest processes
+        // may already be using this container after they released that lock.
+        c = await replaceInvalidBaselineCandidate(c,
+          (candidate) => runBaselineSetupStage('container-health-check', () =>
+            isBaselineContainerHealthy(candidate.getConnectionUri())),
+          (next) => runBaselineSetupStage('container-reprovision-after-health', () => startBaselineContainer(next)),
+          async () => {
+            console.error('[baseline-schema-global-setup] reused container failed health-check — rotating reuse generation');
+            generation = await rotateBaselineReuseGeneration();
+            return generation;
+          });
         // EI-18779962385972529: reachable is not the same as CORRECT. A reused
         // container whose ledger claims a migration whose objects are absent will
         // skip that file for ever and fail every dependent migration on every run,
         // with no self-heal — so treat divergence exactly like the staleness above:
-        // stop it (which un-registers it from testcontainers' reuse lookup, since
-        // that only matches RUNNING containers) and provision a genuinely fresh one.
+        // rotate the reuse hash and provision a fresh one, leaving existing
+        // readers on the old container undisturbed.
         // Fail-soft: a probe that cannot run must never block the tier it protects.
         try {
           const divergence = await runBaselineSetupStage('ledger-schema-divergence-probe', () =>
@@ -592,11 +632,11 @@ export default async function setup({ provide }: TestProject) {
                 `${divergence.length} migration/schema pair(s) whose schema does NOT exist (${detail}` +
                 `${divergence.length > 5 ? ', …' : ''}). The runner skips any migration already in the ` +
                 `ledger, so this never self-heals and would surface as an unrelated "schema does not ` +
-                `exist" error during COLLECT of some innocent test — stopping + reprovisioning fresh ` +
+                `exist" error during COLLECT of some innocent test — rotating reuse generation ` +
                 `(EI-18779962385972529).`,
             );
-            await c.stop().catch(() => {});
-            c = await runBaselineSetupStage('container-reprovision-after-divergence', startBaselineContainer);
+            generation = await rotateBaselineReuseGeneration();
+            c = await runBaselineSetupStage('container-reprovision-after-divergence', () => startBaselineContainer(generation));
           }
         } catch (e) {
           console.error(

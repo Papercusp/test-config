@@ -74,11 +74,15 @@ describe('withTestcontainerStartLock', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('removes an abandoned stale lock before timing out', async () => {
+  it('removes an abandoned lock before timing out', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'pc-testcontainers-lock-'));
     process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR = dir;
     const lockDir = join(dir, 'shared-docker-testcontainers-start.lock');
     await mkdir(lockDir, { recursive: true });
+    await writeFile(
+      join(lockDir, 'owner.json'),
+      JSON.stringify({ pid: 2_147_483_647, host: hostname(), startedAt: new Date().toISOString(), name: 'x' }),
+    );
     const old = new Date(Date.now() - 60_000);
     await utimes(lockDir, old, old);
 
@@ -127,7 +131,7 @@ describe('withTestcontainerStartLock', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('does NOT reclaim a lock owned by a live pid on this host, even if age-stale-immune', async () => {
+  it('does NOT reclaim a lock owned by a live pid on this host, even when older than staleMs', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'pc-testcontainers-lock-'));
     process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR = dir;
     const lockDir = join(dir, 'shared-docker-testcontainers-start.lock');
@@ -137,11 +141,13 @@ describe('withTestcontainerStartLock', () => {
       join(lockDir, 'owner.json'),
       JSON.stringify({ pid: process.pid, host: hostname(), startedAt: new Date().toISOString(), name: 'x' }),
     );
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lockDir, old, old);
 
     await expect(
       withTestcontainerStartLock('shared-docker-testcontainers-start', async () => 'started', {
         timeoutMs: 300,
-        staleMs: 10 * 60_000,
+        staleMs: 1,
         retryMs: 20,
       }),
     ).rejects.toThrow(/Timed out after 300ms/);

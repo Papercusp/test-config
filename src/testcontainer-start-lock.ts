@@ -1,6 +1,6 @@
 import { hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 
 /**
  * The default wait budget is part of the test-fixture contract: callers that
@@ -8,7 +8,6 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
  * lock's diagnostic to be reported instead of having Vitest cancel first.
  */
 export const TESTCONTAINER_START_LOCK_TIMEOUT_MS = 180_000;
-const DEFAULT_STALE_MS = 10 * 60_000;
 const DEFAULT_RETRY_MS = 250;
 
 function intEnv(name: string, fallback: number): number {
@@ -32,7 +31,7 @@ function sleep(ms: number): Promise<void> {
 // perfectly writable. Deriving from tmpdir() (which honors TMPDIR/TMP/TEMP)
 // keeps this in sync with whatever writable tmp the rest of the test harness
 // already resolved, instead of re-guessing a second time.
-function lockRoot(): string {
+export function testcontainerStartLockRoot(): string {
   return resolve(process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR ?? join(tmpdir(), 'pcv', 'testcontainers-locks'));
 }
 
@@ -103,13 +102,12 @@ export async function withTestcontainerStartLock<T>(
     return start();
   }
 
-  const root = lockRoot();
+  const root = testcontainerStartLockRoot();
   const lockDir = join(root, `${safeName(name)}.lock`);
   const timeoutMs = opts.timeoutMs ?? intEnv(
     'PAPERCUSP_TESTCONTAINERS_START_LOCK_TIMEOUT_MS',
     TESTCONTAINER_START_LOCK_TIMEOUT_MS,
   );
-  const staleMs = opts.staleMs ?? intEnv('PAPERCUSP_TESTCONTAINERS_START_LOCK_STALE_MS', DEFAULT_STALE_MS);
   const retryMs = opts.retryMs ?? intEnv('PAPERCUSP_TESTCONTAINERS_START_LOCK_RETRY_MS', DEFAULT_RETRY_MS);
   const startedAt = Date.now();
   const owner = {
@@ -131,25 +129,9 @@ export async function withTestcontainerStartLock<T>(
       if (code !== 'EEXIST') throw error;
 
       const elapsed = Date.now() - startedAt;
-      const lockAgeMs = await stat(lockDir)
-        .then((s) => Date.now() - s.mtimeMs)
-        .catch(() => 0);
-      if (lockAgeMs > staleMs) {
-        await rm(lockDir, { recursive: true, force: true });
-        continue;
-      }
-
-      // EI-7818: age-based staleness (above) can NEVER fire under the DEFAULT
-      // config, because TESTCONTAINER_START_LOCK_TIMEOUT_MS (180s) is smaller than DEFAULT_STALE_MS
-      // (600s) — a caller always hits its own `elapsed > timeoutMs` throw below
-      // long before the lock is old enough to be judged stale, so a crashed
-      // holder's lock wedges EVERY subsequent caller for a full timeoutMs, FOREVER
-      // (reproduced live 2026-07-05: a dead pid's lock, ~9 min old, had already
-      // failed two separate 180s/400s-wrapped waits without ever reclaiming).
-      // Reclaim immediately, independent of age, the moment we can POSITIVELY
-      // confirm the recorded owner process no longer exists (same host + ESRCH) —
-      // this closes the gap the timing race leaves open without needing to guess
-      // at timeout/stale constant tuning.
+      // A live startup can exceed ten minutes. Age alone must never take its
+      // lock away: a second process would then enter the same critical section.
+      // Reclaim only with positive same-host dead-process evidence.
       if (await isOwnerProcessConfirmedDead(lockDir)) {
         await rm(lockDir, { recursive: true, force: true });
         continue;
