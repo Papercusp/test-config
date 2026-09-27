@@ -27,7 +27,9 @@
  */
 import { describe, expect, it } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from "./pg-container.ts";
@@ -35,6 +37,9 @@ import { withContainerRecoveryReResolution } from "./pg-container.ts";
 import {
   CappedLogPostgreSqlContainer,
   TEST_PG_LOG_CAP_LABEL,
+  TEST_PG_REUSE_GENERATION_LABEL,
+  readTestPgReuseGeneration,
+  rotateTestPgReuseGeneration,
 } from "./pg-container.ts";
 
 const SOURCE = readFileSync(
@@ -431,6 +436,28 @@ describe("getTestPg acquisition failure framing (EI-21904002928882606)", () => {
 });
 
 describe("withContainerRecoveryReResolution", () => {
+  it("names a slow resolution stage while it is still pending and when it completes", async () => {
+    const events: Array<{ stage: string; resolution: number; status: string }> = [];
+    const result = await withContainerRecoveryReResolution(
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return "ready";
+      },
+      async () => {},
+      async () => {},
+      {
+        slowStageMs: 5,
+        onStage: ({ stage, resolution, status }) => events.push({ stage, resolution, status }),
+      },
+    );
+
+    expect(result).toBe("ready");
+    expect(events).toEqual([
+      { stage: "resolve", resolution: 1, status: "waiting" },
+      { stage: "resolve", resolution: 1, status: "done" },
+    ]);
+  });
+
   it("retires a retryable failed candidate and resolves a fresh one", async () => {
     const resolved = ["wedged", "fresh"];
     const ensured: string[] = [];
@@ -519,14 +546,32 @@ describe("withContainerRecoveryReResolution", () => {
   });
 });
 
+describe("shared test-PG reuse generation", () => {
+  it("rotates the reuse hash without stopping a container peers may still use", async () => {
+    const root = await mkdtemp(join(tmpdir(), "test-pg-generation-"));
+    try {
+      expect(await readTestPgReuseGeneration(root)).toBe(0);
+      expect(await rotateTestPgReuseGeneration(root)).toBe(1);
+      expect(await readTestPgReuseGeneration(root)).toBe(1);
+      expect(await rotateTestPgReuseGeneration(root)).toBe(2);
+      expect(SOURCE).toContain(TEST_PG_REUSE_GENERATION_LABEL);
+      expect(SOURCE).not.toMatch(/await container\.stop\(\)/);
+      await writeFile(join(root, "test-pg-reuse-generation"), "not-a-generation\n");
+      await expect(readTestPgReuseGeneration(root)).rejects.toThrow("invalid shared test-PG reuse generation");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("getTestPg reused-container recovery re-resolution", () => {
-  it("serializes start, readiness ensure, retirement, and re-resolution", () => {
+  it("serializes start, readiness ensure, reuse generation rotation, and re-resolution", () => {
     expect(SOURCE).toMatch(
       /withTestcontainerStartLock\(\s*['"]shared-docker-testcontainers-start['"][\s\S]*withContainerRecoveryReResolution\(/,
     );
     expect(SOURCE).toMatch(
       /withContainerRecoveryReResolution\([\s\S]*async \(container\) => \{/,
     );
-    expect(SOURCE).toMatch(/await container\.stop\(\)/);
+    expect(SOURCE).toMatch(/await rotateTestPgReuseGeneration\(\)/);
   });
 });

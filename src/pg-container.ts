@@ -4,7 +4,9 @@ import {
 } from "@testcontainers/postgresql";
 import postgres from "postgres";
 import { randomBytes } from "node:crypto";
-import { withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
+import { readFile, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { testcontainerStartLockRoot, withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
 import { SubstrateCircuitBreaker } from "./substrate-circuit-breaker.ts";
 import {
   RETRYABLE_PG_STARTUP_MSG,
@@ -61,16 +63,26 @@ function describeContainer(container: StartedPostgreSqlContainer): string {
  *
  * `withReuse()` resolves by configuration hash, not by database readiness. A
  * running-but-wedged container therefore keeps being returned to every caller;
- * waiting longer only makes the same dead endpoint fail more slowly. Retiring
- * the candidate first makes the next resolve skip it and provision a fresh
- * container. The caller owns the bounded retry inside `ensure` and only calls
- * this helper after that retry has actually exhausted.
+ * waiting longer only makes the same dead endpoint fail more slowly. Rotating
+ * the reuse generation makes the next resolve provision a fresh container
+ * without stopping the old one underneath concurrent readers. The caller owns
+ * the bounded retry inside `ensure` and only calls this helper after that retry
+ * has actually exhausted.
  */
 export async function withContainerRecoveryReResolution<T>(
   resolve: () => Promise<T>,
   ensure: (container: T) => Promise<void>,
   retire: (container: T) => Promise<void>,
-  options: { maxResolutions?: number } = {},
+  options: {
+    maxResolutions?: number;
+    slowStageMs?: number;
+    onStage?: (event: {
+      stage: "resolve" | "ensure" | "retire";
+      resolution: number;
+      status: "waiting" | "done" | "failed";
+      elapsedMs: number;
+    }) => void;
+  } = {},
 ): Promise<T> {
   const maxResolutions = options.maxResolutions ?? 2;
   if (!Number.isInteger(maxResolutions) || maxResolutions < 1) {
@@ -79,10 +91,36 @@ export async function withContainerRecoveryReResolution<T>(
     );
   }
 
-  let container = await resolve();
+  const runStage = async <R>(
+    stage: "resolve" | "ensure" | "retire",
+    resolution: number,
+    action: () => Promise<R>,
+  ): Promise<R> => {
+    const startedAt = Date.now();
+    let reportedWaiting = false;
+    const timer = setTimeout(() => {
+      reportedWaiting = true;
+      options.onStage?.({ stage, resolution, status: "waiting", elapsedMs: Date.now() - startedAt });
+    }, options.slowStageMs ?? 5_000);
+    timer.unref?.();
+    try {
+      const result = await action();
+      if (reportedWaiting) {
+        options.onStage?.({ stage, resolution, status: "done", elapsedMs: Date.now() - startedAt });
+      }
+      return result;
+    } catch (error) {
+      options.onStage?.({ stage, resolution, status: "failed", elapsedMs: Date.now() - startedAt });
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  let container = await runStage("resolve", 1, resolve);
   for (let resolution = 1; ; resolution++) {
     try {
-      await ensure(container);
+      await runStage("ensure", resolution, () => ensure(container));
       return container;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -92,8 +130,8 @@ export async function withContainerRecoveryReResolution<T>(
       ) {
         throw error;
       }
-      await retire(container);
-      container = await resolve();
+      await runStage("retire", resolution, () => retire(container));
+      container = await runStage("resolve", resolution + 1, resolve);
     }
   }
 }
@@ -168,6 +206,34 @@ export const TEST_PG_LOG_OPTS = { "max-size": "256m", "max-file": "4" } as const
  * after a change provision a fresh, capped container.
  */
 export const TEST_PG_LOG_CAP_LABEL = "org.papercusp.test-pg.log-cap";
+export const TEST_PG_REUSE_GENERATION_LABEL = "org.papercusp.test-pg.generation";
+const TEST_PG_REUSE_GENERATION_FILE = "test-pg-reuse-generation";
+
+/** Called under the shared test-PG startup lock so every process picks one generation. */
+export async function readTestPgReuseGeneration(root = testcontainerStartLockRoot()): Promise<number> {
+  let raw: string;
+  try {
+    raw = await readFile(join(root, TEST_PG_REUSE_GENERATION_FILE), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  const generation = Number(raw.trim());
+  if (!Number.isSafeInteger(generation) || generation < 0 || raw.trim() !== String(generation)) {
+    throw new Error(`invalid shared test-PG reuse generation: ${raw.trim()}`);
+  }
+  return generation;
+}
+
+/** Retire a failed reuse candidate without stopping a container peers may still use. */
+export async function rotateTestPgReuseGeneration(root = testcontainerStartLockRoot()): Promise<number> {
+  const generation = (await readTestPgReuseGeneration(root)) + 1;
+  const target = join(root, TEST_PG_REUSE_GENERATION_FILE);
+  const temporary = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  await writeFile(temporary, `${generation}\n`);
+  await rename(temporary, target);
+  return generation;
+}
 
 /** `PostgreSqlContainer` with a capped json-file log (HostConfig is protected). */
 export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
@@ -290,10 +356,11 @@ export async function getTestPg(): Promise<string> {
       "shared-docker-testcontainers-start",
       () =>
         withContainerRecoveryReResolution(
-          () =>
+          async () =>
             new CappedLogPostgreSqlContainer(TEST_PG_IMAGE)
               .withDatabase("papercusp_test")
               .withCappedJsonLog()
+              .withLabels({ [TEST_PG_REUSE_GENERATION_LABEL]: String(await readTestPgReuseGeneration()) })
               // WI-4133: this ONE container is `.withReuse()`d by EVERY vitest
               // process on the box (all forks, all packages, ~30+ fleet agents at
               // once) — each opening its own client pool (createFreshPgDb: max 4;
@@ -427,11 +494,17 @@ export async function getTestPg(): Promise<string> {
               );
             }
           },
-          async (container) => {
-            // The reusable-container lookup only considers RUNNING containers. Stop
-            // the exhausted candidate before the next resolve so it cannot be
-            // selected again by the reuse hash.
-            await container.stop();
+          async () => {
+            // A reused container may still serve other test processes. Change
+            // the reuse hash instead of stopping their database underneath them.
+            await rotateTestPgReuseGeneration();
+          },
+          {
+            onStage: ({ stage, resolution, status, elapsedMs }) => {
+              process.stderr.write(
+                `[getTestPg] stage=${stage} resolution=${resolution} status=${status} elapsedMs=${elapsedMs}\n`,
+              );
+            },
           },
         ),
     )
