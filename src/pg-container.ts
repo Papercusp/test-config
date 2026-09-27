@@ -125,7 +125,7 @@ export async function withContainerRecoveryReResolution<T>(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (
-        !RETRYABLE_PG_STARTUP_MSG.test(message) ||
+        !isReprovisionableSharedTestPgFailure(message) ||
         resolution >= maxResolutions
       ) {
         throw error;
@@ -146,6 +146,36 @@ export async function withContainerRecoveryReResolution<T>(
  * (EI-8784); gym-provision-image.test.ts asserts they stay in lockstep.
  */
 export const TEST_PG_IMAGE = "pgvector/pgvector:pg18";
+
+/**
+ * Test-only initdb mode for the shared, reused Postgres container.
+ *
+ * The official image performs a final filesystem-wide sync before creating
+ * POSTGRES_DB and appending remote-access pg_hba entries. Under host I/O
+ * pressure that sync can exceed testcontainers' startup budget. A timed-out
+ * start then leaves PG_VERSION behind but not the database/HBA setup, and a
+ * later reuse skips initialization permanently. This database is disposable
+ * test infrastructure, so avoiding initdb's redundant pre-start sync removes
+ * the interruption window without weakening production durability.
+ */
+export const TEST_PG_INITDB_ARGS = "--no-sync";
+
+/**
+ * Failures for which a reused shared-test container cannot heal in place.
+ *
+ * Transient startup errors already belonged here. The two additional messages
+ * are the fingerprints of an official-image initialization interrupted after
+ * initdb wrote PG_VERSION but before docker-entrypoint created POSTGRES_DB and
+ * widened pg_hba.conf. Retrying that same reuse candidate can never work; move
+ * the generation so the next resolution gets a fresh data volume.
+ */
+function isReprovisionableSharedTestPgFailure(message: string): boolean {
+  return (
+    RETRYABLE_PG_STARTUP_MSG.test(message) ||
+    /no pg_hba\.conf entry/i.test(message) ||
+    /database ["']?papercusp_test["']? does not exist/i.test(message)
+  );
+}
 
 /**
  * The NON-DESTRUCTIVE Docker health bit for a pgvector test container
@@ -359,6 +389,7 @@ export async function getTestPg(): Promise<string> {
           async () =>
             new CappedLogPostgreSqlContainer(TEST_PG_IMAGE)
               .withDatabase("papercusp_test")
+              .withEnvironment({ POSTGRES_INITDB_ARGS: TEST_PG_INITDB_ARGS })
               .withCappedJsonLog()
               .withLabels({ [TEST_PG_REUSE_GENERATION_LABEL]: String(await readTestPgReuseGeneration()) })
               // WI-4133: this ONE container is `.withReuse()`d by EVERY vitest

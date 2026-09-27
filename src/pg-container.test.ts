@@ -36,6 +36,7 @@ import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from "./pg-container.ts";
 import { withContainerRecoveryReResolution } from "./pg-container.ts";
 import {
   CappedLogPostgreSqlContainer,
+  TEST_PG_INITDB_ARGS,
   TEST_PG_LOG_CAP_LABEL,
   TEST_PG_REUSE_GENERATION_LABEL,
   readTestPgReuseGeneration,
@@ -130,8 +131,38 @@ describe("getTestPg container log cap (WI-10003219)", () => {
 
   it("is what getTestPg builds its shared container with", () => {
     expect(SOURCE).toMatch(
-      /new CappedLogPostgreSqlContainer\(TEST_PG_IMAGE\)\s*\.withDatabase\("papercusp_test"\)\s*\.withCappedJsonLog\(\)/,
+      /new CappedLogPostgreSqlContainer\(TEST_PG_IMAGE\)\s*\.withDatabase\("papercusp_test"\)\s*\.withEnvironment\(\{\s*POSTGRES_INITDB_ARGS:\s*TEST_PG_INITDB_ARGS\s*\}\)\s*\.withCappedJsonLog\(\)/,
     );
+  });
+});
+
+describe("getTestPg interrupted initdb recovery (EI-24382496457946425)", () => {
+  it("uses disposable no-sync initialization before starting the reused container", () => {
+    expect(TEST_PG_INITDB_ARGS).toBe("--no-sync");
+    expect(SOURCE).toMatch(
+      /\.withDatabase\("papercusp_test"\)\s*\.withEnvironment\(\{\s*POSTGRES_INITDB_ARGS:\s*TEST_PG_INITDB_ARGS\s*\}\)/,
+    );
+  });
+
+  it.each([
+    'no pg_hba.conf entry for host "172.17.0.1", user "test", database "papercusp_test", no encryption',
+    'database "papercusp_test" does not exist',
+  ])("retires an incompletely initialized reuse candidate: %s", async (message) => {
+    const resolved = ["partial-init", "fresh"];
+    const retired: string[] = [];
+
+    const result = await withContainerRecoveryReResolution(
+      async () => resolved.shift()!,
+      async (container) => {
+        if (container === "partial-init") throw new Error(message);
+      },
+      async (container) => {
+        retired.push(container);
+      },
+    );
+
+    expect(result).toBe("fresh");
+    expect(retired).toEqual(["partial-init"]);
   });
 });
 
