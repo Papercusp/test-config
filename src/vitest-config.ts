@@ -4,9 +4,9 @@
 import { defineConfig, type ViteUserConfig as UserConfig } from 'vitest/config';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { availableParallelism } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 // Node's native TypeScript config loader requires the real `.ts` runtime
 // specifier; neither extensionless nor `.js` resolves here.
 import { resolveLaneInclude, type TestLane } from './lane-split.ts';
@@ -150,12 +150,35 @@ export function executedSourceMapArmed(
 export function executedSourceMapConfig(env: NodeJS.ProcessEnv = process.env): {
   reporters: string[];
   experimental: { importDurations: { limit: number; print: false } } | undefined;
+  setupFiles: string[];
 } {
-  if (!executedSourceMapArmed(env)) return { reporters: [], experimental: undefined };
+  if (!executedSourceMapArmed(env)) return { reporters: [], experimental: undefined, setupFiles: [] };
   return {
     reporters: [EXECUTED_SOURCE_MAP_REPORTER],
     experimental: { importDurations: { limit: EXECUTED_SOURCE_MAP_IMPORT_LIMIT, print: false } },
+    setupFiles: armExecutedInputsCapture(env) ? [EXECUTED_INPUTS_CAPTURE_SETUP] : [],
   };
+}
+
+// P-009 (gate-file-level-test-reuse-2026-09-27): the runtime input capture that makes a recorded
+// pass REUSABLE. The worker-side setup writes one inputs record per test file into this
+// directory; the reporter reads it. One directory per vitest main process, created at config
+// evaluation (before any worker exists) and inherited by every worker through the env. When it
+// cannot be created, nothing is captured and every recorded row stays non-reusable.
+export const PC_EXECUTED_INPUTS_DIR_ENV = 'PC_EXECUTED_INPUTS_DIR';
+const EXECUTED_INPUTS_CAPTURE_SETUP = resolve(__dirname, 'executed-inputs-capture-setup.ts');
+
+/** Ensure the hand-off directory exists and is named in `env`; false when unavailable. */
+export function armExecutedInputsCapture(env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    const existing = env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim();
+    const dir = existing || resolve(tmpdir(), `pc-executed-inputs-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    env[PC_EXECUTED_INPUTS_DIR_ENV] = dir;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Public path constants, re-exported here (not just from the heavy `index.ts` barrel)
@@ -468,9 +491,15 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   // its whole premise — resources surviving in a REUSED NODE WORKER — does not apply
   // to a browser context in the first place.
   const leakSetup = layer === 'browser' ? [] : [HANDLE_LEAK_SETUP];
+  // P-002: the executed-source-map reporter + the raised importDurations limit, or nothing.
+  // P-009: its input-capture setup runs FIRST so every later setup file's reads are attributed
+  // too; node-only (it patches node:fs), so never in the browser layer.
+  const executedSourceMap = executedSourceMapConfig();
+  const inputsCaptureSetup = layer === 'browser' ? [] : executedSourceMap.setupFiles;
   const finalSetup = allowConsoleNoise
-    ? [...layerSetup, ...leakSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
+    ? [...inputsCaptureSetup, ...layerSetup, ...leakSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
     : [
+        ...inputsCaptureSetup,
         ...layerSetup,
         ...leakSetup,
         HERMETIC_ENV_SETUP,
@@ -478,9 +507,6 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         TESTING_LIBRARY_TIMEOUT_SETUP,
         ...setupFiles,
       ];
-
-  // P-002: the executed-source-map reporter + the raised importDurations limit, or nothing.
-  const executedSourceMap = executedSourceMapConfig();
 
   const layerInclude =
     include ??
