@@ -16,6 +16,7 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defineVitestConfig, isWritableDir } from './vitest-config.ts';
+import { recordedTestLayer } from './execution-details.ts';
 
 let savedArgv: string[];
 beforeEach(() => {
@@ -31,9 +32,30 @@ function withArgv(...tokens: string[]): void {
 }
 
 describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
-  it.each(['unit', 'integration', 'browser'] as const)('publishes the registered %s layer for runtime attribution', (layer) => {
+  it.each(['unit', 'integration', 'e2e', 'browser'] as const)('publishes the registered %s layer for runtime attribution', (layer) => {
     withArgv();
     expect(defineVitestConfig({ layer }).test?.provide).toEqual({ papercuspTestLayer: layer });
+  });
+
+  // EI-24442044145393058: every Vitest layer must be a layer the recorder can store, or a run
+  // under it records no layer and cannot bind to a BAR clause requiring it.
+  it('every Vitest layer is a recordable test layer', () => {
+    withArgv();
+    for (const layer of ['unit', 'integration', 'e2e', 'browser'] as const) {
+      const provided = defineVitestConfig({ layer }).test?.provide?.papercuspTestLayer;
+      expect(recordedTestLayer({ schemaVersion: 1, testLayer: provided })).toBe(layer);
+    }
+  });
+
+  it('the e2e layer collects only *.e2e.test.* files, serially, without the unit real-PG rail', () => {
+    withArgv();
+    const test = defineVitestConfig({ layer: 'e2e' }).test;
+    expect(test?.include).toEqual(['**/*.e2e.test.ts', '**/*.e2e.test.tsx']);
+    expect(test?.fileParallelism).toBe(false);
+    const unitSetup = defineVitestConfig({ layer: 'unit' }).test?.setupFiles as string[];
+    const e2eSetup = test?.setupFiles as string[];
+    const rail = unitSetup.find((f) => !e2eSetup.includes(f));
+    expect(rail, 'the unit layer arms one setup file the e2e layer omits (the real-PG rail)').toMatch(/pg/i);
   });
 
   it('routes an *.integration.test.ts remediation through the repository test router', () => {
