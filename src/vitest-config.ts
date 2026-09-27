@@ -18,7 +18,12 @@ import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
 // gate-file-level-test-reuse-2026-09-27 P-008: per-file pass reuse (PC_TEST_REUSE_SKIP_LIST).
 import { resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
 
-export type TestLayer = 'unit' | 'integration' | 'browser';
+// 'e2e' (EI-24442044145393058): a live, end-to-end run against a real running system (a
+// serving operator, the real database, real git). Its only runtime difference from 'unit' is
+// that the unit layer's real-Postgres rail is not armed and files run serially. It exists so
+// the recorded layer of a `*.e2e.test.*` run is 'e2e' — the recorder reads this runtime label,
+// never the filename — which is what acceptance BAR clauses requiring the e2e layer bind to.
+export type TestLayer = 'unit' | 'integration' | 'e2e' | 'browser';
 
 // A `declare module` augmentation does NOT add its target to the program — only a real import
 // does. A consumer program that reaches this file only through `vitest/config` (the portal's
@@ -516,6 +521,8 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       ? ['**/*.integration.test.ts', '**/*.integration.test.tsx']
       : layer === 'browser'
       ? ['**/*.browser.test.ts', '**/*.browser.test.tsx']
+      : layer === 'e2e'
+      ? ['**/*.e2e.test.ts', '**/*.e2e.test.tsx']
       : ['**/*.test.ts', '**/*.test.tsx']);
 
   // ── PURE/STATEFUL LANE SPLIT (plan gate-suite-speedup-2026-08-12) ──────────────────────
@@ -603,7 +610,8 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       pool: layer === 'browser' ? 'threads' : 'forks',
       // Integration tests share real PG schemas (e.g. harness_shared) — running
       // files in parallel races their `DROP SCHEMA CASCADE` teardown. Serialise.
-      fileParallelism: layer === 'integration' ? false : undefined,
+      // e2e files drive one shared live system (serving operator + real DB), so they serialise too.
+      fileParallelism: layer === 'integration' || layer === 'e2e' ? false : undefined,
       // EI-2590 + WI-4300: the shared-host worker cap — env wins (the checkpoint's 8
       // / the affected gate's 32), explicit '0' = uncapped escape hatch, ABSENT ⇒ a
       // host-sane default (unset must never mean ~127 forks on the shared box). Full
