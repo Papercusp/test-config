@@ -68,6 +68,17 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
 import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
+import { dropDatabaseWithLock } from './pg-migrate.ts';
+
+/** Keep escape-hatch teardown on the same bounded cleanup lane as test fixtures. */
+export async function dropBaselineDatabase(
+  cleanup: Parameters<typeof dropDatabaseWithLock>[0],
+  dbName: string,
+): Promise<void> {
+  if (await dropDatabaseWithLock(cleanup, dbName) === 'deferred') {
+    console.warn(`[baseline-schema-global-setup] database cleanup deferred: ${dbName}`);
+  }
+}
 
 /**
  * The baseline schema owns a dedicated container, so its Docker handshake must
@@ -553,9 +564,9 @@ export default async function setup({ provide }: TestProject) {
     dropDb = async () => {
       const cleanup = postgres(existingAdminUrl, { max: 1, onnotice: () => {} });
       try {
-        // WITH (FORCE) (PG13+; this repo is on pg18) drops even if a lingering
-        // connection from a slow-to-close test client is still attached.
-        await cleanup.unsafe(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
+        // A DROP can wait indefinitely for a checkpoint even after every test
+        // passed. Reuse the fixture deadline, serialization and deferred sweep.
+        await dropBaselineDatabase(cleanup, dbName);
       } finally {
         await cleanup.end({ timeout: 5 });
       }
