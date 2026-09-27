@@ -2,16 +2,42 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
-import { withTestcontainerStartLock } from './testcontainer-start-lock.ts';
+import {
+  ensureTestcontainersDockerClientTimeout,
+  TESTCONTAINERS_DOCKER_CLIENT_TIMEOUT_MS,
+  withTestcontainerStartLock,
+} from './testcontainer-start-lock.ts';
 
 const originalDir = process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR;
+const originalDockerClientTimeout = process.env.DOCKER_CLIENT_TIMEOUT;
 
 afterEach(async () => {
   process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR = originalDir;
+  if (originalDockerClientTimeout === undefined) delete process.env.DOCKER_CLIENT_TIMEOUT;
+  else process.env.DOCKER_CLIENT_TIMEOUT = originalDockerClientTimeout;
   delete process.env.PAPERCUSP_DISABLE_TESTCONTAINERS_START_LOCK;
 });
 
 describe('withTestcontainerStartLock', () => {
+  it('installs a Docker response timeout before startup work can construct Dockerode', async () => {
+    delete process.env.DOCKER_CLIENT_TIMEOUT;
+    process.env.PAPERCUSP_DISABLE_TESTCONTAINERS_START_LOCK = '1';
+
+    await withTestcontainerStartLock('disabled-lock-still-bounds-docker', async () => {
+      expect(process.env.DOCKER_CLIENT_TIMEOUT).toBe(String(TESTCONTAINERS_DOCKER_CLIENT_TIMEOUT_MS));
+    });
+  });
+
+  it('preserves a valid operator timeout and repairs values Dockerode would treat as unbounded', () => {
+    const env: NodeJS.ProcessEnv = { DOCKER_CLIENT_TIMEOUT: '17000' };
+    expect(ensureTestcontainersDockerClientTimeout(env)).toBe(17_000);
+    expect(env.DOCKER_CLIENT_TIMEOUT).toBe('17000');
+
+    env.DOCKER_CLIENT_TIMEOUT = 'not-a-timeout';
+    expect(ensureTestcontainersDockerClientTimeout(env)).toBe(TESTCONTAINERS_DOCKER_CLIENT_TIMEOUT_MS);
+    expect(env.DOCKER_CLIENT_TIMEOUT).toBe(String(TESTCONTAINERS_DOCKER_CLIENT_TIMEOUT_MS));
+  });
+
   it('serializes same-host Testcontainers startup work', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'pc-testcontainers-lock-'));
     process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR = dir;

@@ -8,7 +8,23 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
  * lock's diagnostic to be reported instead of having Vitest cancel first.
  */
 export const TESTCONTAINER_START_LOCK_TIMEOUT_MS = 180_000;
+/**
+ * Keep one wedged Docker API request from outliving the cross-process startup
+ * lock. docker-modem reads DOCKER_CLIENT_TIMEOUT when it constructs its shared
+ * client and destroys a request whose response exceeds this many milliseconds.
+ * Leave one minute of headroom for the lock's own 180s diagnostic/cleanup.
+ */
+export const TESTCONTAINERS_DOCKER_CLIENT_TIMEOUT_MS = 120_000;
 const DEFAULT_RETRY_MS = 250;
+
+export function ensureTestcontainersDockerClientTimeout(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const configured = Number(env.DOCKER_CLIENT_TIMEOUT);
+  if (Number.isSafeInteger(configured) && configured > 0) return configured;
+  env.DOCKER_CLIENT_TIMEOUT = String(TESTCONTAINERS_DOCKER_CLIENT_TIMEOUT_MS);
+  return TESTCONTAINERS_DOCKER_CLIENT_TIMEOUT_MS;
+}
 
 function intEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -98,6 +114,10 @@ export async function withTestcontainerStartLock<T>(
   start: () => Promise<T>,
   opts: TestcontainerStartLockOptions = {},
 ): Promise<T> {
+  // Set this before `start` can construct Testcontainers' process-wide
+  // Dockerode client. Without it, docker-modem has no response timeout: a
+  // single fetch/create/start request can hold this fleet-wide lock forever.
+  ensureTestcontainersDockerClientTimeout();
   if (process.env.PAPERCUSP_DISABLE_TESTCONTAINERS_START_LOCK === '1') {
     return start();
   }
