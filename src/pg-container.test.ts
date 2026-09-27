@@ -257,6 +257,19 @@ const HEALTHCHECK_EXEMPT: Record<string, string> = {
  * git-sync sweeps the whole tree on a schedule, so a probe that edits a tracked
  * file can have its mutant committed even when nothing goes wrong.
  */
+/** This guard's own file: its fixtures spell the constructor inside strings. */
+const GUARD_SELF = "libs/test-config/src/pg-container.test.ts";
+
+/**
+ * True when `src` CONSTRUCTS a PostgreSqlContainer in code — not when it only
+ * mentions one in a comment (gym-provision-image.test.ts cites the constructor
+ * in prose). Pure so its controls below prove it can say both yes and no.
+ */
+export function constructsPgContainer(src: string): boolean {
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+  return /new PostgreSqlContainer\s*\(/.test(code);
+}
+
 export function findHealthcheckOffenders(
   files: string[],
   readSource: (file: string) => string,
@@ -307,10 +320,15 @@ describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () =>
     } catch {
       return [];
     }
+    // Test files ARE call sites (2026-09-27): excluding every `.test.ts` let four
+    // P-013 rig suites construct long-lived dedicated clusters with the stock
+    // healthcheck, and one crash-restarted mid-run. Only this guard's own
+    // fixture file and prose-only mentions are excluded.
     return out
       .split("\n")
       .map((l) => l.trim().replace(/^\.\//, ""))
-      .filter((l) => l.length > 0 && !l.endsWith(".test.ts"))
+      .filter((l) => l.length > 0 && l !== GUARD_SELF)
+      .filter((l) => constructsPgContainer(readFileSync(join(REPO_ROOT, l), "utf8")))
       .sort();
   }
 
@@ -360,6 +378,13 @@ describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () =>
     expect(
       findHealthcheckOffenders(["fake/unguarded.ts"], readFixture, {}),
     ).toEqual(["fake/unguarded.ts"]);
+  });
+
+  it("CONTROL: a construction in code counts as a call site; a prose mention does not", () => {
+    expect(constructsPgContainer("dedicatedPg = await new PostgreSqlContainer(IMG).start();")).toBe(true);
+    expect(constructsPgContainer("const c = new PostgreSqlContainer (IMG) // see https://x.y")).toBe(true);
+    expect(constructsPgContainer("/**\n * to `new PostgreSqlContainer(...)` instead\n */\nconst x = 1;")).toBe(false);
+    expect(constructsPgContainer("// new PostgreSqlContainer(IMG) was the old way\nconst x = 1;")).toBe(false);
   });
 
   it("CONTROL: does NOT report a site that uses the constant, nor an allowlisted one", () => {
