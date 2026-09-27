@@ -49,8 +49,14 @@ export {
   provisionRestartTestDb,
   getOrBuildTemplate,
   dropDatabaseWithLock,
+  dropDatabaseOnDedicatedConnection,
 } from './pg-migrate.ts';
-export type { MigratedTestDb, CreateFreshTestDbOptions, TestDbDropResult } from './pg-migrate.ts';
+export type {
+  MigratedTestDb,
+  CreateFreshTestDbOptions,
+  TestDbDropResult,
+  DropDatabaseWithLockOptions,
+} from './pg-migrate.ts';
 export { probePgReachable, assertPgReachable } from './pg-reachability.ts';
 export {
   acquireBaselineSchemaMutex,

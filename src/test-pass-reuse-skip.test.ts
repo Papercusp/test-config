@@ -75,4 +75,20 @@ describe('resolveReuseSkipExclude', () => {
     expect(executedSourceRunContext({ GREEN_CHECKPOINT: '1' })).toBe('green-checkpoint');
     expect(executedSourceRunContext({})).toBe('clean-local');
   });
+
+  // P-011 (gate-file-level-test-reuse-2026-09-27): a pass proof recorded by the gate's narrowed
+  // selective phase must be reusable by its full phase, so the run context may depend ONLY on
+  // GREEN_CHECKPOINT. Folding a phase-specific value (the related filter list, the skip list, the
+  // run or proof group) into it would silently turn every same-sha proof into otherContext.
+  it('stamps one run context for every phase of a gate run', () => {
+    const full = { GREEN_CHECKPOINT: '1', PAPERCUSP_TEST_RUN_GROUP: 'gate-run-1' };
+    const selective = {
+      ...full,
+      PC_TEST_FILTER_LIST: '/tmp/related-files.txt',
+      PC_TEST_REUSE_SKIP_LIST: '/tmp/reuse-skip.json',
+      AFFECTED_TASK_VERDICT_PROOF_GROUP: 'frozen-repair-1',
+    };
+    expect(executedSourceRunContext(selective)).toBe(executedSourceRunContext(full));
+    expect(executedSourceRunContext({ ...full, PAPERCUSP_TEST_RUN_GROUP: 'gate-run-2' })).toBe('green-checkpoint');
+  });
 });

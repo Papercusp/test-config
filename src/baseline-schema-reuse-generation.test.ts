@@ -8,7 +8,7 @@ import {
   replaceInvalidBaselineCandidate,
   rotateBaselineReuseGeneration,
 } from './baseline-schema-global-setup.ts';
-import { TEST_DB_DEFERRED_MARKER, TEST_DB_DROP_STATEMENT_TIMEOUT_MS } from './pg-migrate.ts';
+import { TEST_DB_DEFERRED_MARKER } from './pg-migrate.ts';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -16,35 +16,55 @@ afterEach(async () => {
 });
 
 describe('baseline escape-hatch database cleanup', () => {
-  function database(lockAvailable = true, dropTimeout = false) {
+  type DropMode = 'fast' | 'slow' | 'cancelled';
+  function database(lockAvailable = true, dropMode: DropMode = 'fast') {
     const queries: string[] = [];
-    let bounded = false;
-    const unsafe = async (query: string): Promise<unknown> => {
+    let statementTimeout = '0';
+    const unsafe = (query: string): Promise<unknown> => {
       queries.push(query);
-      if (query.includes('pg_try_advisory_lock')) return [{ acquired: lockAvailable }];
-      if (query === `SET statement_timeout = '${TEST_DB_DROP_STATEMENT_TIMEOUT_MS}ms'`) bounded = true;
+      if (query.includes('pg_try_advisory_lock')) return Promise.resolve([{ acquired: lockAvailable }]);
+      const set = /^SET statement_timeout = '([^']*)'$/.exec(query);
+      if (set) statementTimeout = set[1];
       if (query.startsWith('DROP DATABASE')) {
-        if (!bounded) throw new Error('unbounded database drop');
-        if (dropTimeout) throw Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+        // WI-10003479: a server-side timeout can cancel a started drop AFTER
+        // PostgreSQL has marked the database invalid — the leak itself.
+        if (statementTimeout !== '0') return Promise.reject(new Error('cancellable database drop'));
+        if (dropMode === 'slow') return new Promise(() => {});
+        if (dropMode === 'cancelled') {
+          return Promise.reject(Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' }));
+        }
       }
-      return [];
+      return Promise.resolve([]);
     };
     return { unsafe, queries };
   }
 
-  it('bounds the real cleanup and detects the original unbounded implementation', async () => {
+  it('never runs the drop under a cancellable timeout, and detects the original 20s-timeout implementation', async () => {
     const current = database();
     await expect(dropBaselineDatabase(current, 'papercusp_it_baseline_probe')).resolves.toBeUndefined();
     expect(current.queries).toContain('DROP DATABASE IF EXISTS "papercusp_it_baseline_probe" WITH (FORCE)');
     const legacy = database();
+    await legacy.unsafe(`SET statement_timeout = '20000ms'`);
     await expect(legacy.unsafe('DROP DATABASE IF EXISTS "papercusp_it_baseline_probe" WITH (FORCE)'))
-      .rejects.toThrow('unbounded database drop');
+      .rejects.toThrow('cancellable database drop');
   });
 
-  it.each(['busy', 'timeout'] as const)('records deferred cleanup after %s instead of hanging a green run', async (reason) => {
+  it('bounds the caller wait on a slow drop by detaching it, not cancelling it', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      const cleanup = database(reason !== 'busy', reason === 'timeout');
+      const cleanup = database(true, 'slow');
+      await expect(dropBaselineDatabase(cleanup, 'papercusp_it_baseline_probe', { waitMs: 5 })).resolves.toBeUndefined();
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining('database cleanup detached: papercusp_it_baseline_probe'));
+      expect(cleanup.queries.at(-1)).toBe('DROP DATABASE IF EXISTS "papercusp_it_baseline_probe" WITH (FORCE)');
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it.each(['busy', 'cancelled'] as const)('records deferred cleanup after %s instead of hanging a green run', async (reason) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const cleanup = database(reason !== 'busy', reason === 'cancelled' ? 'cancelled' : 'fast');
       await expect(dropBaselineDatabase(cleanup, 'papercusp_it_baseline_probe')).resolves.toBeUndefined();
       expect(cleanup.queries.some((query) => query.includes(TEST_DB_DEFERRED_MARKER))).toBe(true);
       expect(warning).toHaveBeenCalledWith(expect.stringContaining('database cleanup deferred: papercusp_it_baseline_probe'));

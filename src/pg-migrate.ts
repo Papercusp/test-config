@@ -114,9 +114,24 @@ async function createFreshDb(prefix = 'it'): Promise<{ url: string; name: string
  * slow holder, and later holders drain a bounded batch of explicitly-deferred DBs.
  */
 export const TEST_DB_DROP_LOCK_KEY = 'papercusp-test-drop-database';
-export const TEST_DB_DROP_STATEMENT_TIMEOUT_MS = 20_000;
-export const TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS = 5_000;
+/**
+ * WI-10003479 / WI-10003482: a started DROP DATABASE must NEVER be cancelled.
+ * PostgreSQL >= 15 commits the database's invalid mark (datconnlimit = -2)
+ * before its slow checkpoint/barrier/file-removal phase, so a statement_timeout
+ * (or pg_cancel) that fires in that phase leaves an INVALID database behind —
+ * unconnectable, skipped by pg_dump, and never reaped (18 such databases on
+ * 2026-09-27, each from exactly one 20s-cancelled teardown drop). The drop
+ * therefore runs with statement_timeout = 0; these values bound only how long
+ * the CALLER waits. On expiry the statement is DETACHED: it keeps running on
+ * the server (client_connection_check_interval = 0 means a closed client socket
+ * does not interrupt it), and the session-level advisory lock is released when
+ * that backend exits after the drop completes.
+ */
+export const TEST_DB_DROP_WAIT_MS = 20_000;
+export const TEST_DB_DEFERRED_SWEEP_BUDGET_MS = 5_000;
 export const TEST_DB_DEFERRED_SWEEP_LIMIT = 3;
+/** pg_database.datconnlimit value PostgreSQL uses for a partially-dropped (invalid) database. */
+export const PG_INVALID_DATABASE_CONNLIMIT = -2;
 export const TEST_DB_DEFERRED_MARKER = 'papercusp-test-db-drop-deferred';
 export const TEST_DB_MANAGED_MARKER = 'papercusp-test-db:';
 export const TEST_DB_ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000;
@@ -125,7 +140,7 @@ const TEST_DB_DEFER_MARK_TIMEOUT_MS = 2_000;
 
 type SqlExecutor = { unsafe: (query: string) => Promise<unknown> };
 
-export type TestDbDropResult = 'dropped' | 'deferred';
+export type TestDbDropResult = 'dropped' | 'deferred' | 'detached';
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
@@ -153,13 +168,8 @@ async function markOrDropUntrackedDatabase(adminUri: string, name: string): Prom
       }
     });
   } catch (error) {
-    const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
-    try {
-      // No successful mark means the orphan sweep cannot find this database.
-      await dropDatabaseWithLock(admin, name).catch(() => {});
-    } finally {
-      await admin.end({ timeout: 5 }).catch(() => {});
-    }
+    // No successful mark means the orphan sweep cannot find this database.
+    await dropDatabaseOnDedicatedConnection(adminUri, name).catch(() => {});
     throw error;
   }
 }
@@ -179,7 +189,49 @@ async function markDatabaseDropDeferred(admin: SqlExecutor, name: string): Promi
   }
 }
 
-async function sweepDeferredDatabaseDrops(admin: SqlExecutor): Promise<void> {
+type UncancellableDropOutcome = 'dropped' | 'detached';
+
+/**
+ * Issue one forced DROP that no timeout on THIS side can cancel (see
+ * TEST_DB_DROP_WAIT_MS). Resolves 'dropped' when it completes within `waitMs`,
+ * 'detached' when the caller's wait budget runs out first — the statement is
+ * still executing and will finish server-side, but the connection is now busy
+ * and must not be issued any further query (it would queue behind the drop).
+ * Rejects with the drop's own error when it fails inside the wait.
+ */
+async function runUncancellableDrop(
+  admin: SqlExecutor,
+  name: string,
+  waitMs: number,
+): Promise<UncancellableDropOutcome> {
+  await admin.unsafe(`SET statement_timeout = '0'`);
+  // Default is already 0; pin it so a cluster/role override that makes the backend
+  // poll for a closed client socket cannot abort a detached drop mid-flight.
+  await admin.unsafe(`SET client_connection_check_interval = '0'`).catch(() => {});
+  const drop = admin.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(name)} WITH (FORCE)`);
+  // A detached drop's promise rejects later (CONNECTION_DESTROYED when the caller
+  // closes the client); that is expected and must never surface as unhandled.
+  drop.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<'detached'>((resolve) => {
+    timer = setTimeout(() => resolve('detached'), Math.max(0, waitMs));
+  });
+  try {
+    return await Promise.race([drop.then(() => 'dropped' as const), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Drain a bounded batch of test databases whose earlier drop did not finish:
+ * explicitly-deferred ones and INVALID (partially-dropped) ones carrying a
+ * papercusp test marker. Invalid ones sort first — they are the leak. Only
+ * marker-bearing databases are ever selected; a valid, unmarked database is
+ * never touched. Stops at the first detach or failure.
+ * @returns false when a drop detached (the connection is busy — stop issuing queries).
+ */
+async function sweepDeferredDatabaseDrops(admin: SqlExecutor, deadline: number): Promise<boolean> {
   let rows: Array<{ datname: string }>;
   try {
     rows = (await admin.unsafe(
@@ -189,27 +241,38 @@ async function sweepDeferredDatabaseDrops(admin: SqlExecutor): Promise<void> {
            ON c.objoid = d.oid
           AND c.classoid = 'pg_database'::regclass
         WHERE c.description = ${quoteLiteral(TEST_DB_DEFERRED_MARKER)}
-        ORDER BY d.datname
+           OR (d.datconnlimit = ${PG_INVALID_DATABASE_CONNLIMIT}
+               AND c.description ~ '^${TEST_DB_MANAGED_MARKER}[0-9]{13}$')
+        ORDER BY (d.datconnlimit = ${PG_INVALID_DATABASE_CONNLIMIT}) DESC, d.datname
         LIMIT ${TEST_DB_DEFERRED_SWEEP_LIMIT}`,
     )) as Array<{ datname: string }>;
   } catch {
-    return;
+    return true;
   }
+  return sweepRows(admin, rows, deadline);
+}
 
+async function sweepRows(
+  admin: SqlExecutor,
+  rows: Array<{ datname: string }>,
+  deadline: number,
+): Promise<boolean> {
   for (const row of rows) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     try {
-      await admin.unsafe(`SET statement_timeout = '${TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS}ms'`);
-      await admin.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(row.datname)} WITH (FORCE)`);
+      if (await runUncancellableDrop(admin, row.datname, remaining) === 'detached') return false;
     } catch {
-      // Keep its marker for the next holder. Stop after the first slow/failing
+      // Keep its marker for the next holder. Stop after the first failing
       // survivor so a janitor sweep cannot consume the caller's hook budget.
       break;
     }
   }
+  return true;
 }
 
 /** Reap test processes' abandoned databases without touching active or unmarked databases. */
-async function sweepOrphanedTestDatabases(admin: SqlExecutor): Promise<void> {
+async function sweepOrphanedTestDatabases(admin: SqlExecutor, deadline: number): Promise<boolean> {
   let rows: Array<{ datname: string }>;
   try {
     rows = (await admin.unsafe(
@@ -226,22 +289,37 @@ async function sweepOrphanedTestDatabases(admin: SqlExecutor): Promise<void> {
         LIMIT ${TEST_DB_DEFERRED_SWEEP_LIMIT}`,
     )) as Array<{ datname: string }>;
   } catch {
-    return;
+    return true;
   }
-
-  for (const row of rows) {
-    try {
-      await admin.unsafe(`SET statement_timeout = '${TEST_DB_DEFERRED_SWEEP_TIMEOUT_MS}ms'`);
-      await admin.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(row.datname)} WITH (FORCE)`);
-    } catch {
-      break;
-    }
-  }
+  return sweepRows(admin, rows, deadline);
 }
 
-/** Execute or safely defer one forced database drop on the cluster-wide lane. */
-export async function dropDatabaseWithLock(admin: SqlExecutor, name: string): Promise<TestDbDropResult> {
+export interface DropDatabaseWithLockOptions {
+  /** How long the caller waits for its own drop before detaching it. */
+  waitMs?: number;
+  /** Total caller wait spent on the janitor sweeps after a completed drop. */
+  sweepBudgetMs?: number;
+}
+
+/**
+ * Execute or safely defer one forced database drop on the cluster-wide lane.
+ *
+ * - 'dropped'  — the drop completed; the lock is released.
+ * - 'deferred' — another process holds the lane; the database is marked for a later sweep.
+ * - 'detached' — the drop is still executing server-side past the wait budget.
+ *   The connection is BUSY: the caller must not issue further queries on it and
+ *   should close it (closing does not cancel the drop). Use
+ *   dropDatabaseOnDedicatedConnection() unless the connection is disposable.
+ */
+export async function dropDatabaseWithLock(
+  admin: SqlExecutor,
+  name: string,
+  opts: DropDatabaseWithLockOptions = {},
+): Promise<TestDbDropResult> {
+  const waitMs = opts.waitMs ?? TEST_DB_DROP_WAIT_MS;
+  const sweepBudgetMs = opts.sweepBudgetMs ?? TEST_DB_DEFERRED_SWEEP_BUDGET_MS;
   let lockHeld = false;
+  let connectionBusy = false;
   try {
     const rows = (await admin.unsafe(
       `SELECT pg_try_advisory_lock(hashtext('${TEST_DB_DROP_LOCK_KEY}')) AS acquired`,
@@ -252,24 +330,34 @@ export async function dropDatabaseWithLock(admin: SqlExecutor, name: string): Pr
     }
     lockHeld = true;
 
-    await admin.unsafe(`SET statement_timeout = '${TEST_DB_DROP_STATEMENT_TIMEOUT_MS}ms'`);
     // WITH (FORCE) terminates lingering sessions as part of the same statement,
     // closing the old pg_terminate_backend -> DROP race (WI-4311). A pathological
-    // filesystem cleanup is cancelled and marked for a later bounded sweep rather
-    // than pinning this holder (and every contender) past the Vitest hook budget.
+    // filesystem cleanup is DETACHED (never cancelled — cancelling it is what left
+    // invalid databases behind, WI-10003479) rather than pinning this holder past
+    // the Vitest hook budget; contenders keep deferring until it completes.
     try {
-      await admin.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(name)} WITH (FORCE)`);
+      if (await runUncancellableDrop(admin, name, waitMs) === 'detached') {
+        connectionBusy = true;
+        return 'detached';
+      }
     } catch (e) {
+      // Only reachable if something outside this session cancelled it; the
+      // database may now be invalid, so make sure the sweep can find it.
       if (!isStatementTimeout(e)) throw e;
       await markDatabaseDropDeferred(admin, name);
       return 'deferred';
     }
 
-    await sweepDeferredDatabaseDrops(admin);
-    await sweepOrphanedTestDatabases(admin);
+    const sweepDeadline = Date.now() + sweepBudgetMs;
+    if (!await sweepDeferredDatabaseDrops(admin, sweepDeadline)
+      || !await sweepOrphanedTestDatabases(admin, sweepDeadline)) {
+      connectionBusy = true;
+    }
     return 'dropped';
   } finally {
-    if (lockHeld) {
+    // A detached drop still occupies this connection; any query now would queue
+    // behind it. Its backend releases the session advisory lock when it exits.
+    if (lockHeld && !connectionBusy) {
       // The caller closes this connection immediately afterwards; never mask the
       // original drop error with a best-effort unlock failure.
       await admin.unsafe(`SET statement_timeout = '0'`).catch(() => {});
@@ -287,14 +375,32 @@ function makeDrop(adminUri: string, name: string): () => Promise<void> {
     // whole block (fresh client each attempt) is safe. dropDatabaseWithLock()
     // serializes the I/O-heavy destructive statement across Vitest processes
     // (WI-42514).
-    withConnectRetry(async () => {
-      const a = postgres(adminUri, { max: 1, onnotice: () => {} });
-      try {
-        await dropDatabaseWithLock(a, name);
-      } finally {
-        await a.end({ timeout: 5 });
-      }
-    });
+    dropDatabaseOnDedicatedConnection(adminUri, name).then(() => {});
+}
+
+/**
+ * dropDatabaseWithLock() on a fresh single-connection client that is closed
+ * afterwards — the only safe shape when the drop may DETACH, because a detached
+ * drop leaves its connection busy (closing it does not cancel the drop; see
+ * TEST_DB_DROP_WAIT_MS). Idempotent, so connect timeouts retry the whole block.
+ */
+export async function dropDatabaseOnDedicatedConnection(
+  adminUri: string,
+  name: string,
+  opts: DropDatabaseWithLockOptions = {},
+): Promise<TestDbDropResult> {
+  return withConnectRetry(async () => {
+    const a = postgres(adminUri, { max: 1, onnotice: () => {} });
+    let result: TestDbDropResult | undefined;
+    try {
+      result = await dropDatabaseWithLock(a, name, opts);
+      return result;
+    } finally {
+      // Closing a connection with a detached drop in flight only destroys the
+      // client socket (postgres-js sends no CancelRequest); don't wait on it.
+      await a.end({ timeout: result === 'detached' ? 0 : 5 }).catch(() => {});
+    }
+  });
 }
 
 /** Split a .sql file into individually-runnable statements on drizzle's breakpoint marker. */
@@ -656,7 +762,9 @@ async function buildTemplate(
           // stranding every integration globalSetup behind it. The final name must
           // actually disappear before publication can continue, so a deferred drop
           // is a loud, retryable build failure rather than permission to proceed.
-          const dropResult = await dropDatabaseWithLock(admin, name);
+          // Dedicated connection: a DETACHED drop would otherwise occupy `admin`,
+          // queueing this build's per-template unlock behind it (WI-10003479).
+          const dropResult = await dropDatabaseOnDedicatedConnection(adminUri, name);
           if (dropResult !== 'dropped') {
             throw new Error(
               `getOrBuildTemplate: stage=template-cleanup-deferred ` +
@@ -674,7 +782,7 @@ async function buildTemplate(
           // A leftover build database is never servable, so deferral is safe: the
           // marker lets a later bounded sweep collect it while this builder moves
           // on under a fresh random name.
-          await dropDatabaseWithLock(admin, s.datname).catch(() => {});
+          await dropDatabaseOnDedicatedConnection(adminUri, s.datname).catch(() => {});
         }
         // Build under a TEMP name and rename into place only on success — the
         // final name is only ever a COMPLETE schema (rename is atomic in PG).
@@ -703,7 +811,7 @@ async function buildTemplate(
         } catch (err) {
           // Best-effort drop; a survivor under tmpl_bld_* is HARMLESS (never looked
           // up as a template) and the sweep above collects it next build.
-          await dropDatabaseWithLock(admin, bld).catch(() => {});
+          await dropDatabaseOnDedicatedConnection(adminUri, bld).catch(() => {});
           throw err;
         }
       }

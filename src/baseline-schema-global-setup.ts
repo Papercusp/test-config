@@ -68,15 +68,19 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
 import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
-import { dropDatabaseWithLock } from './pg-migrate.ts';
+import { dropDatabaseWithLock, type DropDatabaseWithLockOptions } from './pg-migrate.ts';
 
 /** Keep escape-hatch teardown on the same bounded cleanup lane as test fixtures. */
 export async function dropBaselineDatabase(
   cleanup: Parameters<typeof dropDatabaseWithLock>[0],
   dbName: string,
+  opts: DropDatabaseWithLockOptions = {},
 ): Promise<void> {
-  if (await dropDatabaseWithLock(cleanup, dbName) === 'deferred') {
-    console.warn(`[baseline-schema-global-setup] database cleanup deferred: ${dbName}`);
+  const result = await dropDatabaseWithLock(cleanup, dbName, opts);
+  if (result !== 'dropped') {
+    // 'detached' leaves `cleanup` busy with the in-flight drop; the caller only
+    // closes it afterwards, which does not cancel the drop (WI-10003479).
+    console.warn(`[baseline-schema-global-setup] database cleanup ${result}: ${dbName}`);
   }
 }
 
