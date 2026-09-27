@@ -15,6 +15,8 @@ import { resolveLaneInclude, type TestLane } from './lane-split.ts';
 // relocate Vitest's module-cache root. See that file's header for the ordering bug; the call below
 // is kept because it still governs every mkdtemp() a test performs at runtime.
 import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
+// gate-file-level-test-reuse-2026-09-27 P-008: per-file pass reuse (PC_TEST_REUSE_SKIP_LIST).
+import { resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
@@ -584,6 +586,10 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         ...(layer === 'unit'
           ? ['**/*.integration.test.*', '**/*.browser.test.*']
           : []),
+        // P-008: files whose clean-run pass proof is still valid at the judged sha. Only the
+        // unit layer: affected-tests arms the channel for unit vitest tasks alone, and the
+        // reader re-checks run context + runner identity (declines => every file runs).
+        ...(layer === 'unit' ? resolveReuseSkipExclude() : []),
       ],
       // Use process-forked workers (vitest's own default), NOT worker_threads,
       // for the unit + integration layers. The `threads` pool core-dumps

@@ -5,8 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { TestModule } from 'vitest/node';
 
 import { inferWorkspaceRoot } from './admin-test-runs-reporter';
+import { PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
   collectExecutedModules,
+  executedSourceRunContext,
+  executedSourceRunnerIdentity,
   isolatedByConfig,
   normalizeExecutedKey,
   shouldRecordModule,
@@ -86,7 +89,7 @@ describe('executedSourceMapConfig — the reporter and the raised limit travel t
   it('is nothing at all when the runner did not name a workspace', () => {
     expect(executedSourceMapArmed({})).toBeNull();
     expect(executedSourceMapArmed({ [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]: '  ' })).toBeNull();
-    expect(executedSourceMapConfig({})).toEqual({ reporters: [], experimental: undefined });
+    expect(executedSourceMapConfig({})).toEqual({ reporters: [], experimental: undefined, setupFiles: [] });
   });
 
   it('arms the reporter AND raises experimental.importDurations.limit in one value', () => {
@@ -135,9 +138,11 @@ describe('ExecutedSourceMapReporter', () => {
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), 'esm-reporter-'));
-    for (const k of [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV, PC_EXECUTED_SOURCE_MAP_OUT_ENV, 'PAPERCUSP_TEST_RUN_GROUP']) {
+    for (const k of [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV, PC_EXECUTED_SOURCE_MAP_OUT_ENV, 'PAPERCUSP_TEST_RUN_GROUP', PC_EXECUTED_INPUTS_DIR_ENV]) {
       savedEnv[k] = process.env[k];
     }
+    // Hermetic against an outer armed run (the gate arms input capture for its own vitest).
+    delete process.env[PC_EXECUTED_INPUTS_DIR_ENV];
     process.env[PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV] = '@papercusp/test-config';
     process.env[PC_EXECUTED_SOURCE_MAP_OUT_ENV] = join(tmp, 'out.json');
     process.env.PAPERCUSP_TEST_RUN_GROUP = 'grp-1';
@@ -161,11 +166,19 @@ describe('ExecutedSourceMapReporter', () => {
     expect(flushes[0]).toEqual({
       recordedSha: clean.commit,
       runGroupId: 'grp-1',
+      workspaceName: '@papercusp/test-config',
+      retiredFiles: [],
+      runContext: executedSourceRunContext(),
+      runnerIdentity: executedSourceRunnerIdentity(),
       rows: [
         {
           workspaceName: '@papercusp/test-config',
           testFile: 'libs/test-config/src/__fake__/thing.test.ts',
           executedModules: ['libs/test-config/src/__fake__/thing.test.ts', 'libs/test-config/src/__fake__/thing.ts'],
+          // No input record for this module (capture not armed) => never reusable (D-004 rule 2).
+          inputsCaptured: false,
+          readPaths: [],
+          opaqueReasons: [],
         },
       ],
     });
@@ -184,7 +197,19 @@ describe('ExecutedSourceMapReporter', () => {
     r.onTestModuleEnd(fakeModule({ imports: 'throw' }));
     r.onTestModuleEnd(fakeModule({ moduleId: '/tmp/outside.test.ts' }));
     await r.onTestRunEnd();
-    expect(flushes).toEqual([]);
+    // No pass row — but the FAILED module retires that file's older pass proofs (D-004 rule 5),
+    // so an earlier pass can never mask a failure observed since.
+    expect(flushes).toEqual([
+      {
+        recordedSha: clean.commit,
+        runGroupId: 'grp-1',
+        workspaceName: '@papercusp/test-config',
+        retiredFiles: ['libs/test-config/src/__fake__/thing.test.ts'],
+        runContext: executedSourceRunContext(),
+        runnerIdentity: executedSourceRunnerIdentity(),
+        rows: [],
+      },
+    ]);
     const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
     expect(out.rows).toEqual([]);
     expect(out.skipped).toBe(5);

@@ -36,6 +36,11 @@
       "import": "./src/lane-split.ts",
       "default": "./src/lane-split.ts"
     },
+    "./test-pass-reuse-skip": {
+      "types": "./src/test-pass-reuse-skip.ts",
+      "import": "./src/test-pass-reuse-skip.ts",
+      "default": "./src/test-pass-reuse-skip.ts"
+    },
     "./pg": {
       "types": "./src/pg.ts",
       "import": "./src/pg.ts",

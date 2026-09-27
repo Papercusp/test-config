@@ -70,15 +70,11 @@ export interface ExecutedSourceFlush {
   runnerIdentity?: string | null;
 }
 
-/** The runner class a row belongs to; reuse only consumes its own context (D-004 rule 1). */
-export function executedSourceRunContext(env: NodeJS.ProcessEnv = process.env): string {
-  return env.GREEN_CHECKPOINT === '1' ? 'green-checkpoint' : 'clean-local';
-}
-
-/** node version + platform + arch of the recording process (D-004 rule 6). */
-export function executedSourceRunnerIdentity(): string {
-  return `${process.version} ${process.platform} ${process.arch}`;
-}
+// The run context + runner identity a row is stamped with. ONE definition, shared with the
+// consumer side (test-pass-reuse-skip.ts re-checks both before skipping a file), so the value
+// recorded and the value compared can never drift apart (D-004 rules 1 and 6).
+import { executedSourceRunContext, executedSourceRunnerIdentity } from './test-pass-reuse-skip';
+export { executedSourceRunContext, executedSourceRunnerIdentity };
 
 /** Cap on how many untracked read paths an opaque reason names (the rest are counted). */
 const UNTRACKED_REASON_CAP = 5;
@@ -274,11 +270,15 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
             runner_identity = EXCLUDED.runner_identity,
             recorded_at = now()
     `;
+    // Scoped to this run context (plus legacy pre-1236 NULL rows): a clean-local recording must
+    // not erase the green-checkpoint's pass proof for the same file, since reuse only ever
+    // consumes a proof from its own context (gate-file-level-test-reuse-2026-09-27 D-004 rule 1).
     await sql`
       DELETE FROM harness_shared.test_executed_sources
        WHERE workspace_name = ${workspaceName}
          AND test_file = ANY(${files}::text[])
          AND recorded_sha <> ${flush.recordedSha}
+         AND (run_context IS NULL OR run_context IS NOT DISTINCT FROM ${flush.runContext ?? null}::text)
     `;
   }
   // D-004 rule 5: a failure on this clean run retires EVERY pass proof for that file.
