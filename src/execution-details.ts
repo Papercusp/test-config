@@ -10,6 +10,25 @@
 
 export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
 
+/**
+ * THE test-layer taxonomy (EI-24434635346407728). One vocabulary for what a ledger row
+ * may RECORD and what an acceptance BAR may REQUIRE: operator-core's
+ * `CheckFileTestLayer` is this type, so a clause can never demand a layer the recorder
+ * is unable to write. Before this, the recorder knew only unit|integration|browser
+ * while BARs required e2e|llm too, which made those clauses unsatisfiable.
+ *
+ * The recorded value is a RUNTIME fact, stamped by the process that executed the file
+ * (a Vitest project's `provide.papercuspTestLayer`, the Playwright reporter, the live
+ * llm-test runner) — never inferred from a path, so a replay of recorded model output
+ * that runs under the unit config records `unit`, not `llm`.
+ */
+export const RECORDED_TEST_LAYERS = ['unit', 'integration', 'e2e', 'llm', 'browser'] as const;
+export type RecordedTestLayer = (typeof RECORDED_TEST_LAYERS)[number];
+
+export function isRecordedTestLayer(value: unknown): value is RecordedTestLayer {
+  return typeof value === 'string' && (RECORDED_TEST_LAYERS as readonly string[]).includes(value);
+}
+
 export interface TestRunExecutionDetails {
   schemaVersion: typeof TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION;
   root: string;
@@ -19,7 +38,7 @@ export interface TestRunExecutionDetails {
   harnessSlug: string | null;
   testNamePattern: string | null;
   /** Observed from the executing project's registered config; absent on older rows. */
-  testLayer?: 'unit' | 'integration' | 'browser';
+  testLayer?: RecordedTestLayer;
   passed: number;
   failed: number;
   skipped: number;
@@ -73,8 +92,7 @@ function decodeStoredDetails(value: unknown): unknown {
 export function recordedTestLayer(stored: unknown): TestRunExecutionDetails['testLayer'] {
   const value = decodeStoredDetails(stored);
   if (!isRecord(value) || value.schemaVersion !== TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION) return undefined;
-  return value.testLayer === 'unit' || value.testLayer === 'integration' || value.testLayer === 'browser'
-    ? value.testLayer : undefined;
+  return isRecordedTestLayer(value.testLayer) ? value.testLayer : undefined;
 }
 
 /** Parse the exact persisted contract; malformed or extended rows are unproven. */
