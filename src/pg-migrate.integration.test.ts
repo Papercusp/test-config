@@ -27,12 +27,13 @@ import {
   dropDatabaseWithLock,
   getOrBuildTemplate,
   TEST_DB_DROP_LOCK_KEY,
+  TEST_DB_DEFERRED_MARKER,
   TEST_DB_MANAGED_MARKER,
   TEMPLATE_BUILDER_HEARTBEAT_STALE_MS,
   templateBuilderApplicationName,
 } from './pg-migrate.ts';
 import { getTestPg } from './pg-container.ts';
-import { acquireBaselineMigrationLock } from './baseline-schema-global-setup.ts';
+import { acquireBaselineMigrationLock, dropBaselineDatabase } from './baseline-schema-global-setup.ts';
 
 const READY_MARK = 'pc-template-ready';
 
@@ -441,6 +442,28 @@ describe('managed test database lifecycle (WI-10003219)', () => {
 });
 
 describe('baseline globalSetup migration lock deadline (EI-23130560676394847)', () => {
+  it('baseline escape-hatch cleanup defers a busy drop and preserves it for the existing sweeper', async () => {
+    const holder = await adminClient();
+    const contender = await adminClient();
+    const name = `papercusp_it_baseline_${randomBytes(6).toString('hex')}`;
+    await holder.unsafe(`CREATE DATABASE "${name}"`);
+    cleanupDbs.push(name);
+    await holder.unsafe('SELECT pg_advisory_lock(hashtext($1))', [TEST_DB_DROP_LOCK_KEY]);
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await dropBaselineDatabase(contender, name);
+      const rows = await contender.unsafe(
+        'SELECT shobj_description(oid, \'pg_database\') AS marker FROM pg_database WHERE datname = $1', [name],
+      );
+      expect(rows).toEqual([{ marker: TEST_DB_DEFERRED_MARKER }]);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(`database cleanup deferred: ${name}`));
+    } finally {
+      await holder.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [TEST_DB_DROP_LOCK_KEY]);
+    }
+    await dropBaselineDatabase(contender, name);
+    expect(await contender.unsafe('SELECT datname FROM pg_database WHERE datname = $1', [name])).toEqual([]);
+  });
+
   it('cancels the PostgreSQL backend wait and reports the exact stage under contention', async () => {
     const uri = await getTestPg();
     const holder = postgres(uri, { max: 1, onnotice: () => {} });
