@@ -18,6 +18,13 @@ import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
 
 export type TestLayer = 'unit' | 'integration' | 'browser';
 
+// A `declare module` augmentation does NOT add its target to the program — only a real import
+// does. A consumer program that reaches this file only through `vitest/config` (the portal's
+// `next build` typecheck, via ADMIN_TEST_RUNS_REPORTER_PATH) never loads 'vitest' itself, so the
+// augmentation below failed there with TS2664 "module 'vitest' cannot be found" (WI-10003268).
+// Type-only, so it is erased at runtime and the config loader never imports the test runner.
+import type {} from 'vitest';
+
 declare module 'vitest' {
   interface ProvidedContext {
     papercuspTestLayer?: TestLayer;
