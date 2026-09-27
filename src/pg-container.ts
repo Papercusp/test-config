@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
 import { SubstrateCircuitBreaker } from "./substrate-circuit-breaker.ts";
 import {
+  probePgReachable,
   RETRYABLE_PG_STARTUP_MSG,
   withPgStartupRetry,
 } from "./pg-reachability.ts";
@@ -216,6 +217,42 @@ export const NON_DESTRUCTIVE_PG_HEALTHCHECK = {
   timeout: 1000,
   retries: 1,
 };
+
+/**
+ * A DEDICATED, per-run Postgres cluster — for a suite that must own its whole
+ * cluster (e.g. the P-013 benchmark rigs, whose WAL/fsync counters are
+ * cluster-wide). NOT the shared reused container (`getTestPg`).
+ *
+ * Why this exists instead of `new PostgreSqlContainer(...).start()` at each site
+ * (measured 2026-09-27, P-013 workload A, EI-21116464706451765 class): the stock
+ * testcontainers healthcheck runs `sh -c 'pg_isready …'` every 250 ms with a 1 s
+ * timeout for the container's WHOLE life. Under host load Docker kills the timed-
+ * out `sh`, orphaning `pg_isready` to PID 1 — which is postgres. PG treats an
+ * untracked child's non-zero exit as a backend crash: the dedicated cluster's own
+ * log shows `untracked child process (PID 11810) exited with exit code 2` and, at
+ * the same millisecond, `terminating any other active server processes`, after
+ * which every rig connection died `write CONNECTION_CLOSED`. The non-destructive
+ * healthcheck removes that; because it also removes the startup gate, the host
+ * waits for a real `SELECT 1` over TCP (which the entrypoint's socket-only init
+ * server cannot answer) before returning.
+ */
+export async function startDedicatedTestPg(
+  opts: { command?: string[]; readyBudgetMs?: number } = {},
+): Promise<StartedPostgreSqlContainer> {
+  let container = new PostgreSqlContainer(TEST_PG_IMAGE)
+    .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK });
+  if (opts.command) container = container.withCommand(opts.command);
+  const started = await container.start();
+  const ready = await probePgReachable(started.getConnectionUri(), opts.readyBudgetMs ?? 120_000);
+  if (!ready.ok) {
+    await started.stop().catch(() => undefined);
+    throw new Error(
+      `startDedicatedTestPg: the dedicated cluster never answered SELECT 1 over TCP within ` +
+        `${ready.elapsedMs}ms (${ready.lastError}); the container was stopped.`,
+    );
+  }
+  return started;
+}
 
 /**
  * Docker json-file rotation for the shared, reused test container (WI-10003219).

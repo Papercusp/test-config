@@ -21,6 +21,7 @@ export {
   withTestSchema,
   TEST_PG_IMAGE,
   NON_DESTRUCTIVE_PG_HEALTHCHECK,
+  startDedicatedTestPg,
 } from './pg-container.ts';
 export type { TestSchemaHandle } from './pg-container.ts';
 export { TESTCONTAINER_START_LOCK_TIMEOUT_MS } from './testcontainer-start-lock.ts';
