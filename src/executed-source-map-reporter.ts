@@ -242,7 +242,10 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
     const modules = chunk.map((r) => JSON.stringify(r.executedModules));
     const reads = chunk.map((r) => JSON.stringify(r.readPaths ?? []));
     const opaque = chunk.map((r) => JSON.stringify(r.opaqueReasons ?? []));
-    const captured = chunk.map((r) => r.inputsCaptured === true);
+    // Sent as text[] and cast per element: postgres.js serializes a JS boolean[] parameter as a
+    // scalar `boolean`, so `${captured}::boolean[]` fails every write with "cannot cast type
+    // boolean to boolean[]" (WI-10003597 — it silently recorded zero pass proofs at the gate).
+    const captured = chunk.map((r) => (r.inputsCaptured === true ? 'true' : 'false'));
     const workspaceName = chunk[0]!.workspaceName;
     await sql`
       INSERT INTO harness_shared.test_executed_sources
@@ -253,11 +256,11 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
              jsonb_array_length(u.m::jsonb),
              ${flush.runGroupId},
              ARRAY(SELECT jsonb_array_elements_text(u.r::jsonb)),
-             u.c,
+             u.c::boolean,
              ARRAY(SELECT jsonb_array_elements_text(u.o::jsonb)),
              ${flush.runContext ?? null},
              ${flush.runnerIdentity ?? null}
-        FROM unnest(${files}::text[], ${modules}::text[], ${reads}::text[], ${captured}::boolean[], ${opaque}::text[])
+        FROM unnest(${files}::text[], ${modules}::text[], ${reads}::text[], ${captured}::text[], ${opaque}::text[])
           AS u(f, m, r, c, o)
       ON CONFLICT (workspace_name, test_file, recorded_sha) DO UPDATE
         SET executed_modules = EXCLUDED.executed_modules,
