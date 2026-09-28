@@ -60,10 +60,16 @@ export function inputsFilePath(dir: string, testFile: string): string {
 }
 
 /**
+ * The working directory a relative path resolves against: a string, or a getter consulted ONLY
+ * when the path is relative (so an absolute path never touches the process working directory).
+ */
+export type CwdSource = string | (() => string);
+
+/**
  * Normalise an fs path argument to an absolute path inside `repoRoot`, or null when it is not
  * a repo path we track (a descriptor, outside the repo, under node_modules). PURE.
  */
-export function repoPathOf(arg: unknown, repoRoot: string, cwd: string): string | null {
+export function repoPathOf(arg: unknown, repoRoot: string, cwd: CwdSource): string | null {
   let p: string | null = null;
   if (typeof arg === 'string') p = arg;
   else if (arg instanceof URL) {
@@ -71,7 +77,7 @@ export function repoPathOf(arg: unknown, repoRoot: string, cwd: string): string 
     p = fileURLToPath(arg);
   } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(arg)) p = arg.toString('utf8');
   if (p === null || p.length === 0) return null;
-  const abs = isAbsolute(p) ? resolve(p) : resolve(cwd, p);
+  const abs = isAbsolute(p) ? resolve(p) : resolve(typeof cwd === 'function' ? cwd() : cwd, p);
   const rel = relative(repoRoot, abs);
   if (rel.startsWith('..') || isAbsolute(rel)) return null;
   const parts = rel.split(sep);
@@ -80,7 +86,7 @@ export function repoPathOf(arg: unknown, repoRoot: string, cwd: string): string 
 }
 
 /** Record one fs access into the active recorder. `.git` reads are opaque, not inputs. */
-export function recordRead(rec: Recorder | null, arg: unknown, repoRoot: string, cwd: string): void {
+export function recordRead(rec: Recorder | null, arg: unknown, repoRoot: string, cwd: CwdSource): void {
   if (!rec) return;
   const abs = repoPathOf(arg, repoRoot, cwd);
   if (abs === null) return;
@@ -158,7 +164,14 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
   state.repoRoot = repoRoot;
   if (state.installed) return;
   state.installed = true;
-  const read = (args: unknown[]) => recordRead(state.current, args[0], repoRoot, process.cwd());
+  // The recorder must be INVISIBLE to the code under test. Reading the live `process.cwd`
+  // property on every intercepted fs call made it observable: a test that replaces
+  // `process.cwd` to assert nothing calls it (register-papercusp.test.ts) counted OUR calls and
+  // failed only in capture-armed gate runs. So hold the native function, and consult it only for
+  // a RELATIVE path. The native one is also the correct one: fs resolves a relative path against
+  // the real OS working directory, never against a mocked `process.cwd`.
+  const nativeCwd = process.cwd.bind(process);
+  const read = (args: unknown[]) => recordRead(state.current, args[0], repoRoot, nativeCwd);
   for (const name of FS_READ_FUNCTIONS) wrap(targets.fs, name, read);
   for (const name of FS_PROMISES_READ_FUNCTIONS) wrap(targets.fsPromises, name, read);
   const opaque = (reason: string) => () => state.current?.opaque.add(reason);
