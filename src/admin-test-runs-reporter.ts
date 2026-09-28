@@ -739,11 +739,24 @@ export type PgHandle = { sql: PgSql } | null;
 // in onTestRunEnd/onExit. EXPORTED (with closeSharedPg) for the sibling
 // executed-source-map reporter (P-002, gate-latency-selection-and-retry-policy-2026-09-06),
 // which flushes through this same handle instead of opening a second client per run.
-let _pgPromise: Promise<PgHandle> | undefined;
+//
+// WI-10003715: the handle is LEASED, never closed out from under a sibling. Vitest runs every
+// reporter's onTestRunEnd CONCURRENTLY (Vitest.report → Promise.all), and both reporters used
+// to call closeSharedPg() in their finally — so whichever finished first ended the client while
+// the other was still mid-flush (the executed-source-map writer loops chunked queries), failing
+// its next query with CONNECTION_ENDED. That silently dropped the pass proofs of the largest
+// workspaces at the first green gate that recorded any (01a67545: web, harness, operator-vite,
+// test-config). Each reporter now retainSharedPg()s in onInit and releases in onTestRunEnd/
+// onExit; only the LAST release ends the client. Pinned (not a bare `let`) so a split module
+// record cannot give the two reporters separate counts.
+const sharedPg = pinModuleState('@papercusp/test-config.shared-pg', () => ({
+  promise: undefined as Promise<PgHandle> | undefined,
+  holders: 0,
+}));
 
 export function tryGetPg(): Promise<PgHandle> {
-  if (_pgPromise) return _pgPromise;
-  _pgPromise = (async (): Promise<PgHandle> => {
+  if (sharedPg.promise) return sharedPg.promise;
+  sharedPg.promise = (async (): Promise<PgHandle> => {
     try {
       // `?? mod` handles both the ESM-default and CJS-namespace interop shapes
       // without relying on esModuleInterop in every consumer's tsconfig.
@@ -765,12 +778,35 @@ export function tryGetPg(): Promise<PgHandle> {
       return null;
     }
   })();
-  return _pgPromise;
+  return sharedPg.promise;
 }
 
+/** Hold the shared client for one reporter's run. The returned release is idempotent (a reporter
+ *  releases from both onTestRunEnd and onExit), and it ends the client only when no other holder
+ *  remains. WI-10003715. */
+export function retainSharedPg(): () => Promise<void> {
+  sharedPg.holders += 1;
+  let released = false;
+  return async () => {
+    if (!released) {
+      released = true;
+      sharedPg.holders = Math.max(0, sharedPg.holders - 1);
+    }
+    await closeSharedPgIfUnheld();
+  };
+}
+
+/** The release path for a reporter that never retained (e.g. unarmed): end the client only if
+ *  no sibling still holds it, so a bystander can never cut a live flush short. WI-10003715. */
+export async function closeSharedPgIfUnheld(): Promise<void> {
+  if (sharedPg.holders === 0) await closeSharedPg();
+}
+
+/** Unconditional end of the shared client. Reporters must NOT call this directly — use the lease
+ *  (retainSharedPg) or closeSharedPgIfUnheld; this stays exported for tests and teardown. */
 export async function closeSharedPg(): Promise<void> {
-  const p = _pgPromise;
-  _pgPromise = undefined;
+  const p = sharedPg.promise;
+  sharedPg.promise = undefined;
   if (!p) return;
   try {
     const handle = await p;
@@ -1146,8 +1182,12 @@ export default class AdminTestRunsReporter implements Reporter {
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: TestRunRowsWriter;
 
+  /** WI-10003715: this reporter's lease on the shared PG client (see retainSharedPg). */
+  private pgLease: (() => Promise<void>) | null = null;
+
   onInit(ctx: Vitest): void {
-    // WI-10000776 — FIRST, before anything reads a root. Vitest calls onInit before it
+    this.pgLease ??= retainSharedPg();
+    // WI-10000776 — FIRST (after the lease above, which reads no root), before anything reads a root. Vitest calls onInit before it
     // executes any test module, so this is the one moment the checkout under test is
     // known and nothing has been relativized yet. Both statements below resolve a root
     // (computeIsScratchConfig → resolveRecordRoot; the snapshot → git in that root), so
@@ -1249,7 +1289,7 @@ export default class AdminTestRunsReporter implements Reporter {
       /* swallow — D-007 */
     } finally {
       this.flushFailureDetails();
-      await closeSharedPg();
+      await (this.pgLease ?? closeSharedPgIfUnheld)();
     }
   }
 
@@ -1260,7 +1300,7 @@ export default class AdminTestRunsReporter implements Reporter {
       /* swallow — D-007 */
     } finally {
       this.flushFailureDetails();
-      await closeSharedPg();
+      await (this.pgLease ?? closeSharedPgIfUnheld)();
     }
   }
 }

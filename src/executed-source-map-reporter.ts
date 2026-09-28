@@ -37,8 +37,9 @@ import { fileURLToPath } from 'node:url';
 
 import {
   captureWorktreeSnapshot,
-  closeSharedPg,
+  closeSharedPgIfUnheld,
   computeWorktreeDirty,
+  retainSharedPg,
   inferWorkspaceRoot,
   isMutationProbeRun,
   tryGetPg,
@@ -370,8 +371,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.writeRows = writeRows ?? ((flush) => writeExecutedSourceRows(flush));
   }
 
+  /** WI-10003715: lease on the shared PG client, so the sibling test-runs reporter's concurrent
+   *  onTestRunEnd cannot end it while this reporter's chunked flush is still writing. */
+  private pgLease: (() => Promise<void>) | null = null;
+
   onInit(_ctx: Vitest): void {
     if (!this.armed) return;
+    this.pgLease ??= retainSharedPg();
     this.worktreeBefore = this.readWorktreeSnapshot();
     this.pending = [];
     this.retired = [];
@@ -542,7 +548,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     } catch {
       /* swallow — D-007 */
     } finally {
-      await closeSharedPg();
+      await (this.pgLease ?? closeSharedPgIfUnheld)();
     }
   }
 
@@ -552,7 +558,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     } catch {
       /* swallow — D-007 */
     } finally {
-      await closeSharedPg();
+      await (this.pgLease ?? closeSharedPgIfUnheld)();
     }
   }
 }
