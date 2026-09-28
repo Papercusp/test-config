@@ -44,7 +44,7 @@ function expectNoDropUnderStatementTimeout(queries: string[]): void {
   expect(drops.filter((drop) => drop.timeout !== '0')).toEqual([]);
 }
 
-describe('cancelled DROP DATABASE never leaks an INVALID database (WI-10003479)', () => {
+describe('a cancelled database drop never leaks an INVALID database (WI-10003479)', () => {
   it('class guard: the detector itself catches a drop issued under a cancelling timeout', () => {
     // Calibration: without this, a detector that never matched would pass vacuously.
     expect(() => expectNoDropUnderStatementTimeout([
