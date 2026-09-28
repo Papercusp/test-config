@@ -30,7 +30,7 @@ function installFakeClient() {
     if (state.ended) throw new Error('write CONNECTION_ENDED localhost:5432');
     state.queries += 1;
     return [];
-  }) as unknown as PgHandle['sql'];
+  }) as unknown as NonNullable<PgHandle>['sql'];
   (sql as unknown as { end: typeof end }).end = end;
   shared.promise = Promise.resolve({ sql } as PgHandle);
   return { state, end };
