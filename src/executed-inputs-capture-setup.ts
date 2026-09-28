@@ -40,7 +40,12 @@ if (dir) {
       inferWorkspaceRoot(),
     );
     beginFile();
-    afterAll((suite?: unknown) => {
+    // Vitest 4 hands a suite hook (context, suite) and PARSES the first parameter as a fixture
+    // pattern: anything but an object pattern throws FixtureParseError ("received \"suite\"").
+    // That failed every armed test file at teardown (green-checkpoint round 4 on eb3fa7fe,
+    // 2026-09-28: 1,713 files). Guarded by setup-hook-signature.test.ts.
+    // eslint-disable-next-line no-empty-pattern
+    afterAll(({}, suite?: unknown) => {
       try {
         const filepath =
           (suite as { filepath?: string } | undefined)?.filepath ?? expect.getState().testPath ?? null;
