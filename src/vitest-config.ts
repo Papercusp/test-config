@@ -137,17 +137,25 @@ const adminReporter: string[] =
 // travel together.
 export const PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV = 'PC_EXECUTED_SOURCE_MAP_WORKSPACE';
 export const PC_EXECUTED_SOURCE_MAP_OUT_ENV = 'PC_EXECUTED_SOURCE_MAP_OUT';
+/**
+ * WI-10003603: the runner names a file here and the reporter APPENDS one JSON line per flush
+ * saying what the flush did (`written` / `failed` / `timed-out` / `not-persisted` /
+ * `nothing-to-record`). The reporter's stderr log is discarded by the gate, so without this
+ * channel a write path that fails on every row (WI-10003597) is invisible for hours.
+ */
+export const PC_EXECUTED_SOURCE_MAP_RESULT_ENV = 'PC_EXECUTED_SOURCE_MAP_RESULT';
 export const EXECUTED_SOURCE_MAP_IMPORT_LIMIT = 1_000_000;
 const EXECUTED_SOURCE_MAP_REPORTER = resolve(__dirname, 'executed-source-map-reporter.ts');
 
 /** The arming decision, PURE over an env — `null` when the runner did not ask for a map. */
 export function executedSourceMapArmed(
   env: NodeJS.ProcessEnv = process.env,
-): { workspaceName: string; outPath: string | null } | null {
+): { workspaceName: string; outPath: string | null; resultPath: string | null } | null {
   const workspaceName = env[PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]?.trim();
   if (!workspaceName) return null;
   const outPath = env[PC_EXECUTED_SOURCE_MAP_OUT_ENV]?.trim() || null;
-  return { workspaceName, outPath };
+  const resultPath = env[PC_EXECUTED_SOURCE_MAP_RESULT_ENV]?.trim() || null;
+  return { workspaceName, outPath, resultPath };
 }
 
 /**

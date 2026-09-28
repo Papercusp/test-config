@@ -20,14 +20,17 @@
  * scripts/affected-tests.mjs on the unit vitest tasks it spawns; `defineVitestConfig` wires
  * this reporter AND raises `experimental.importDurations.limit` in the same decision, because
  * vitest reports an EMPTY `importDurations` at its default limit of 0. Optional
- * `PC_EXECUTED_SOURCE_MAP_OUT=<path>` also writes the rows as JSON for replay/inspection.
+ * `PC_EXECUTED_SOURCE_MAP_OUT=<path>` also writes the rows as JSON for replay/inspection, and
+ * optional `PC_EXECUTED_SOURCE_MAP_RESULT=<path>` receives one appended JSON line per flush
+ * saying what the flush DID (`ExecutedSourceMapResult`) — the durable, runner-readable outcome
+ * the stderr log line cannot be, since the gate discards task stderr (WI-10003603).
  *
  * Fail-soft throughout (D-007, same contract as admin-test-runs-reporter.ts): nothing here can
  * change a test outcome, and every write is bounded by a timeout.
  */
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -298,6 +301,44 @@ function log(line: string): void {
   process.stderr.write(`[executed-source-map] ${line}\n`);
 }
 
+/**
+ * What one flush did. `not-persisted` = the run was not clean (a dirty or sha-less checkout), so
+ * nothing it saw may be recorded; `nothing-to-record` = no recordable module and no retirement;
+ * `failed` / `timed-out` = the database write did not land (the WI-10003597 class).
+ */
+export type ExecutedSourceMapOutcome = 'written' | 'failed' | 'timed-out' | 'not-persisted' | 'nothing-to-record';
+
+/** One line of the `PC_EXECUTED_SOURCE_MAP_RESULT` file (JSON, newline-terminated). */
+export interface ExecutedSourceMapResult {
+  workspaceName: string;
+  outcome: ExecutedSourceMapOutcome;
+  /** Rows offered to the writer (0 unless the run was clean). */
+  rows: number;
+  /** Files whose older proofs this flush retires (D-004 rule 5). */
+  retired: number;
+  skipped: number;
+  sha: string | null;
+  dirty: boolean;
+  /** The writer's error message for `failed`; null otherwise. */
+  error: string | null;
+}
+
+const RESULT_ERROR_MAX_CHARS = 500;
+
+/** Append the flush outcome to the runner's result file. Fail-soft: a lost line is logged. */
+export function appendExecutedSourceMapResult(resultPath: string | null, result: ExecutedSourceMapResult): void {
+  if (!resultPath) return;
+  try {
+    const line: ExecutedSourceMapResult = {
+      ...result,
+      error: result.error === null ? null : result.error.slice(0, RESULT_ERROR_MAX_CHARS),
+    };
+    appendFileSync(resultPath, `${JSON.stringify(line)}\n`);
+  } catch (e) {
+    log(`result-file write failed (${e instanceof Error ? e.message : String(e)})`);
+  }
+}
+
 export default class ExecutedSourceMapReporter implements Reporter {
   private readonly armed = executedSourceMapArmed();
   private readonly repoRoot = inferWorkspaceRoot();
@@ -430,12 +471,26 @@ export default class ExecutedSourceMapReporter implements Reporter {
       }
     }
     const retiredFiles = [...new Set(this.retired.splice(0))].sort();
+    const armed = this.armed;
+    const report = (outcome: ExecutedSourceMapOutcome, error: string | null = null): void =>
+      appendExecutedSourceMapResult(armed.resultPath, {
+        workspaceName: armed.workspaceName,
+        outcome,
+        rows: rows.length,
+        retired: retiredFiles.length,
+        skipped: this.skipped,
+        sha: recordedSha,
+        dirty: worktreeDirty,
+        error,
+      });
     if (rows.length === 0 && retiredFiles.length === 0) {
       log(`nothing to record ${summary}`);
+      report('nothing-to-record');
       return;
     }
     if (worktreeDirty || !recordedSha) {
       log(`NOT persisted — dirty or sha-less checkout has no sha that describes what ran ${summary}`);
+      report('not-persisted');
       return;
     }
     // P-009: relativise each captured read and split tracked inputs from opaque untracked reads.
