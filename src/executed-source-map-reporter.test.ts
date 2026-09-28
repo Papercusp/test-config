@@ -1,12 +1,14 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TestModule } from 'vitest/node';
 
 import { inferWorkspaceRoot } from './admin-test-runs-reporter';
 import { PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
+  EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS,
+  appendExecutedSourceMapResult,
   collectExecutedModules,
   executedSourceRunContext,
   executedSourceRunnerIdentity,
@@ -14,10 +16,12 @@ import ExecutedSourceMapReporter, {
   normalizeExecutedKey,
   shouldRecordModule,
   type ExecutedSourceFlush,
+  type ExecutedSourceMapResult,
 } from './executed-source-map-reporter';
 import {
   EXECUTED_SOURCE_MAP_IMPORT_LIMIT,
   PC_EXECUTED_SOURCE_MAP_OUT_ENV,
+  PC_EXECUTED_SOURCE_MAP_RESULT_ENV,
   PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV,
   executedSourceMapArmed,
   executedSourceMapConfig,
@@ -103,7 +107,11 @@ describe('executedSourceMapConfig — the reporter and the raised limit travel t
     expect(executedSourceMapArmed({ [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]: '@x/w', [PC_EXECUTED_SOURCE_MAP_OUT_ENV]: '/tmp/o.json' })).toEqual({
       workspaceName: '@x/w',
       outPath: '/tmp/o.json',
+      resultPath: null,
     });
+    expect(
+      executedSourceMapArmed({ [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]: '@x/w', [PC_EXECUTED_SOURCE_MAP_RESULT_ENV]: ' /tmp/r.jsonl ' }),
+    ).toEqual({ workspaceName: '@x/w', outPath: null, resultPath: '/tmp/r.jsonl' });
   });
 });
 
@@ -138,17 +146,31 @@ describe('ExecutedSourceMapReporter', () => {
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), 'esm-reporter-'));
-    for (const k of [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV, PC_EXECUTED_SOURCE_MAP_OUT_ENV, 'PAPERCUSP_TEST_RUN_GROUP', PC_EXECUTED_INPUTS_DIR_ENV]) {
+    for (const k of [
+      PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV,
+      PC_EXECUTED_SOURCE_MAP_OUT_ENV,
+      PC_EXECUTED_SOURCE_MAP_RESULT_ENV,
+      'PAPERCUSP_TEST_RUN_GROUP',
+      PC_EXECUTED_INPUTS_DIR_ENV,
+    ]) {
       savedEnv[k] = process.env[k];
     }
     // Hermetic against an outer armed run (the gate arms input capture for its own vitest).
     delete process.env[PC_EXECUTED_INPUTS_DIR_ENV];
     process.env[PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV] = '@papercusp/test-config';
     process.env[PC_EXECUTED_SOURCE_MAP_OUT_ENV] = join(tmp, 'out.json');
+    process.env[PC_EXECUTED_SOURCE_MAP_RESULT_ENV] = join(tmp, 'result.jsonl');
     process.env.PAPERCUSP_TEST_RUN_GROUP = 'grp-1';
   });
 
+  const results = (): ExecutedSourceMapResult[] =>
+    readFileSync(join(tmp, 'result.jsonl'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as ExecutedSourceMapResult);
+
   afterEach(() => {
+    vi.useRealTimers();
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -249,5 +271,90 @@ describe('ExecutedSourceMapReporter', () => {
     r.onInit({} as never);
     r.onTestModuleEnd(fakeModule({}));
     await expect(r.onTestRunEnd()).resolves.toBeUndefined();
+  });
+
+  // WI-10003603: the stderr log above is discarded by the gate, so a writer that fails on EVERY
+  // row (WI-10003597 — 8h of zero pass proofs) was invisible. Each flush now leaves one durable
+  // line saying what it did, for the runner to surface.
+  describe('result file (PC_EXECUTED_SOURCE_MAP_RESULT)', () => {
+    it('reports a landed write as written, with the row count and sha', async () => {
+      const { r } = reporter();
+      r.onInit({} as never);
+      r.onTestModuleEnd(fakeModule({}));
+      await r.onTestRunEnd();
+      await r.onExit();
+      expect(results()).toEqual([
+        {
+          workspaceName: '@papercusp/test-config',
+          outcome: 'written',
+          rows: 1,
+          retired: 0,
+          skipped: 0,
+          sha: clean.commit,
+          dirty: false,
+          error: null,
+        },
+      ]);
+    });
+
+    it('reports a failing writer as failed WITH its error — the WI-10003597 signature', async () => {
+      const r = new ExecutedSourceMapReporter(snapshot(clean), async () => {
+        throw new Error('cannot cast type boolean to boolean[]');
+      });
+      r.onInit({} as never);
+      r.onTestModuleEnd(fakeModule({}));
+      await r.onTestRunEnd();
+      expect(results()).toEqual([
+        expect.objectContaining({ outcome: 'failed', rows: 1, error: 'cannot cast type boolean to boolean[]' }),
+      ]);
+    });
+
+    it('reports a writer that never settles as timed-out, and leaves no timer behind', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const r = new ExecutedSourceMapReporter(snapshot(clean), () => new Promise<void>(() => {}));
+      r.onInit({} as never);
+      r.onTestModuleEnd(fakeModule({}));
+      const done = r.onTestRunEnd();
+      await vi.advanceTimersByTimeAsync(EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS);
+      await done;
+      expect(results()).toEqual([expect.objectContaining({ outcome: 'timed-out', rows: 1, error: null })]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('reports a dirty checkout as not-persisted and an empty run as nothing-to-record', async () => {
+      const dirty = reporter(snapshot({ commit: clean.commit, porcelain: ' M libs/x.ts' }));
+      dirty.r.onInit({} as never);
+      dirty.r.onTestModuleEnd(fakeModule({}));
+      await dirty.r.onTestRunEnd();
+
+      const empty = reporter();
+      empty.r.onInit({} as never);
+      empty.r.onTestModuleEnd(fakeModule({ isolate: false }));
+      await empty.r.onTestRunEnd();
+
+      // Both flushes APPEND to the one file, so a task that runs vitest more than once keeps
+      // every outcome rather than only the last.
+      expect(results()).toEqual([
+        expect.objectContaining({ outcome: 'not-persisted', rows: 1, dirty: true }),
+        expect.objectContaining({ outcome: 'nothing-to-record', rows: 0, skipped: 1, dirty: false }),
+      ]);
+    });
+
+    it('writes nothing when the runner named no result file, and a bad path never throws', () => {
+      const line: ExecutedSourceMapResult = {
+        workspaceName: 'w',
+        outcome: 'failed',
+        rows: 0,
+        retired: 0,
+        skipped: 0,
+        sha: null,
+        dirty: false,
+        error: 'x'.repeat(2_000),
+      };
+      expect(() => appendExecutedSourceMapResult(null, line)).not.toThrow();
+      expect(() => appendExecutedSourceMapResult(join(tmp, 'missing-dir', 'r.jsonl'), line)).not.toThrow();
+      appendExecutedSourceMapResult(join(tmp, 'result.jsonl'), line);
+      expect(results()[0]!.error).toHaveLength(500);
+    });
   });
 });

@@ -510,22 +510,30 @@ export default class ExecutedSourceMapReporter implements Reporter {
       }
     }
     const runGroupId = process.env.PAPERCUSP_TEST_RUN_GROUP ?? null;
-    const outcome = await Promise.race([
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = await Promise.race<{ outcome: ExecutedSourceMapOutcome; error: string | null }>([
       this.writeRows({
         rows,
         recordedSha,
         runGroupId,
         retiredFiles,
-        workspaceName: this.armed.workspaceName,
+        workspaceName: armed.workspaceName,
         runContext: executedSourceRunContext(),
         runnerIdentity: executedSourceRunnerIdentity(),
       }).then(
-        () => 'written',
-        (e: unknown) => `failed (${e instanceof Error ? e.message : String(e)})`,
+        () => ({ outcome: 'written' as const, error: null }),
+        (e: unknown) => ({ outcome: 'failed' as const, error: e instanceof Error ? e.message : String(e) }),
       ),
-      new Promise<string>((r) => setTimeout(r, EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS, 'timed out')),
+      new Promise((r) => {
+        timer = setTimeout(r, EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS, { outcome: 'timed-out' as const, error: null });
+      }),
     ]);
-    log(`${outcome} ${summary}`);
+    if (timer) clearTimeout(timer);
+    // The stderr wording predates the result file and is kept verbatim for anyone grepping it.
+    const logged =
+      settled.outcome === 'failed' ? `failed (${settled.error})` : settled.outcome === 'timed-out' ? 'timed out' : 'written';
+    log(`${logged} ${summary}`);
+    report(settled.outcome, settled.error);
   }
 
   async onTestRunEnd(): Promise<void> {
