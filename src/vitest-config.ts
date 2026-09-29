@@ -1,7 +1,7 @@
 // Vitest 4 no longer re-exports a plain `UserConfig` symbol from 'vitest/config' (TS2305) —
 // it re-exports vite's own `UserConfig` (augmented in-module with the `test` field) under the
 // alias `ViteUserConfig`. Import that under our existing local name so nothing else here changes.
-import { defineConfig, type ViteUserConfig as UserConfig } from 'vitest/config';
+import { configDefaults, defineConfig, type ViteUserConfig as UserConfig } from 'vitest/config';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -114,13 +114,11 @@ export { isWritableDir } from './tmpdir-guard.ts';
 ensurePapercuspTmpdir();
 
 // Custom reporter that writes one row per test FILE to harness_shared.test_runs —
-// powers the /admin/testing status chips. AUTO-WIRED below so EVERY workspace using
-// defineVitestConfig records (not just apps/operator). Self-contained + fail-soft
-// (D-007): a missing DB / cold checkout never changes a test outcome. Opt-out via
+// powers the /admin/testing status chips. AUTO-WIRED (through gateOwnedParts below) so
+// EVERY workspace using defineVitestConfig or gateParticipationConfig records. Self-contained
+// + fail-soft (D-007): a missing DB / cold checkout never changes a test outcome. Opt-out via
 // PAPERCUSP_DISABLE_TEST_RUNS_REPORTER=1 (the reporter's own test sets it).
 const ADMIN_TEST_RUNS_REPORTER = resolve(__dirname, 'admin-test-runs-reporter.ts');
-const adminReporter: string[] =
-  process.env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' ? [] : [ADMIN_TEST_RUNS_REPORTER];
 
 // ── EXECUTED-SOURCE MAP (gate-latency-selection-and-retry-policy-2026-09-06, P-002) ──────
 // A second reporter that records, per test FILE, the modules vitest actually executed, into
@@ -203,6 +201,81 @@ export function armExecutedInputsCapture(env: NodeJS.ProcessEnv = process.env): 
   } catch {
     return false;
   }
+}
+
+// ── GATE PARTICIPATION (WI-10003716) ──────────────────────────────────────────────────────
+// What a vitest config must carry for the green-checkpoint gate to MEASURE and REUSE it:
+//   1. the admin test-runs reporter (the /admin/testing ledger);
+//   2. when the runner arms them, the executed-source-map reporter + raised importDurations
+//      limit (a per-file pass PROOF) and the executed-inputs capture setup that makes that
+//      proof reusable — the capture runs FIRST so every later setup file's reads are attributed;
+//   3. on the unit layer, the per-file pass-reuse skip list (PC_TEST_REUSE_SKIP_LIST).
+// Before this, only defineVitestConfig wired 2 and 3. Twelve hand-rolled `defineConfig`
+// workspaces wired only 1, so they passed the enrollment guard while recording zero proofs and
+// never reusing one (measured on round A of gate-file-level-test-reuse-2026-09-27: noReport=26
+// of 73 tasks). defineVitestConfig and gateParticipationConfig now both read THIS function, so a
+// new gate-owned piece reaches every enrolled config at once instead of drifting.
+interface GateOwnedParts {
+  /** Gate-owned reporters only — never 'default' / 'junit', which each config chooses. */
+  reporters: string[];
+  /** Setup files that must precede every other setup file. */
+  leadingSetupFiles: string[];
+  /** Exclude globs for files whose pass proof is still valid at the judged sha. */
+  reuseSkipExclude: string[];
+  experimental: { importDurations: { limit: number; print: false } } | undefined;
+}
+
+function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedParts {
+  const executedSourceMap = executedSourceMapConfig(env);
+  return {
+    reporters: [
+      ...(env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' ? [] : [ADMIN_TEST_RUNS_REPORTER]),
+      ...executedSourceMap.reporters,
+    ],
+    // The capture patches node:fs, so never in a real browser.
+    leadingSetupFiles: layer === 'browser' ? [] : executedSourceMap.setupFiles,
+    // affected-tests arms the skip channel for unit vitest tasks alone, and the reader re-checks
+    // run context + runner identity (a declined list means every file runs).
+    reuseSkipExclude: layer === 'unit' ? resolveReuseSkipExclude(env) : [],
+    experimental: executedSourceMap.experimental,
+  };
+}
+
+export interface GateParticipationOptions {
+  /** The workspace's own setup files. The gate's capture setup is placed before them. */
+  setupFiles?: string[];
+  /** The workspace's own exclude globs, merged with vitest's defaults and the reuse skip list. */
+  exclude?: string[];
+}
+
+export interface GateParticipationFragment {
+  reporters: string[];
+  setupFiles: string[];
+  exclude: string[];
+  experimental?: { importDurations: { limit: number; print: false } };
+}
+
+/**
+ * The `test` fragment a hand-rolled UNIT vitest config spreads in to take part in the gate:
+ *
+ *   export default defineConfig({ test: { ...sharedHostWorkerCap(), ...gateParticipationConfig() } });
+ *
+ * Pass the workspace's own `setupFiles` / `exclude` through the options instead of setting them
+ * beside the spread, or the spread's values are overwritten and the capture / skip list is lost.
+ * `exclude` keeps vitest's own defaults, because setting `exclude` at all replaces them.
+ * Unit layer only: an integration or browser config should use defineVitestConfig.
+ */
+export function gateParticipationConfig(
+  opts: GateParticipationOptions = {},
+  env: NodeJS.ProcessEnv = process.env,
+): GateParticipationFragment {
+  const gate = gateOwnedParts('unit', env);
+  return {
+    reporters: ['default', ...gate.reporters],
+    setupFiles: [...gate.leadingSetupFiles, ...(opts.setupFiles ?? [])],
+    exclude: [...configDefaults.exclude, ...(opts.exclude ?? []), ...gate.reuseSkipExclude],
+    ...(gate.experimental ? { experimental: gate.experimental } : {}),
+  };
 }
 
 // Public path constants, re-exported here (not just from the heavy `index.ts` barrel)
