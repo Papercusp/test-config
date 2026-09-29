@@ -125,6 +125,13 @@ describe('a cancelled database drop never leaks an INVALID database (WI-10003479
     const sweep = queries.find((query) => query.includes(`c.description = '${TEST_DB_DEFERRED_MARKER}'`));
     expect(sweep).toContain(`d.datconnlimit = ${PG_INVALID_DATABASE_CONNLIMIT}`);
     expect(sweep).toContain(`c.description ~ '^${TEST_DB_MANAGED_MARKER}[0-9]{13}$'`);
+    // The INVALID branch must live in the WHERE clause itself. The bare toContain above is
+    // also satisfied by the ORDER BY line, so without this a sweep that no longer SELECTS
+    // invalid databases (it only ranks them) would still pass.
+    const where = sweep!.slice(sweep!.indexOf('WHERE'), sweep!.indexOf('ORDER BY'));
+    expect(where).toMatch(
+      new RegExp(`\\bOR \\(d\\.datconnlimit = ${PG_INVALID_DATABASE_CONNLIMIT}\\s+AND c\\.description ~ `),
+    );
     expect(sweep).toMatch(/ORDER BY \(d\.datconnlimit = -2\) DESC/);
     // The shdescription JOIN is what restricts the sweep to marker-bearing databases.
     expect(sweep).toContain('JOIN pg_shdescription c');
