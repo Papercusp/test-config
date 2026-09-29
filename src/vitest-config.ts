@@ -278,6 +278,28 @@ export function gateParticipationConfig(
   };
 }
 
+export interface GateParticipationServerFragment {
+  fs: { allow: string[] };
+}
+
+/**
+ * The `server` block a hand-rolled config sets beside `gateParticipationConfig()` when Vite
+ * resolves a NESTED workspace root for it:
+ *
+ *   export default defineConfig({ server: gateParticipationServerConfig(), test: { ...gateParticipationConfig() } });
+ *
+ * The gate's capture setup file lives here, in libs/test-config. Vite's default `server.fs.allow`
+ * is the workspace root it finds by walking up from the config (a package.json declaring
+ * `workspaces`, or pnpm-workspace.yaml / lerna.json). For a package under a nested root such as
+ * libs/generic/papergrid or libs/papercusp, that root excludes libs/test-config. A jsdom file then
+ * cannot fetch the setup file through /@fs/ and fails to load (WI-10003808: papergrid/bloom-grid).
+ * defineVitestConfig uses this same value, so the two cannot drift, and
+ * scripts/check-vitest-config-enrollment.mjs requires it wherever Vite resolves a nested root.
+ */
+export function gateParticipationServerConfig(): GateParticipationServerFragment {
+  return { fs: { allow: [MONOREPO_ROOT] } };
+}
+
 // Public path constants, re-exported here (not just from the heavy `index.ts` barrel)
 // so a vitest.config.ts that only needs `defineVitestConfig` + these two path strings
 // can import from the LIGHTWEIGHT `@papercusp/test-config/vitest-config` subpath and
@@ -661,8 +683,9 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
     // fs.allow only WIDENS what the transform server may read — adding the
     // monorepo root never breaks a workspace-local run, it just makes a
     // `--root <pkg>` invocation able to serve the hoisted setup file + deps
-    // instead of dying on a /@fs/ allow-list miss (see MONOREPO_ROOT above).
-    server: { fs: { allow: [MONOREPO_ROOT] } },
+    // instead of dying on a /@fs/ allow-list miss (see MONOREPO_ROOT above). Shared with
+    // hand-rolled configs through gateParticipationServerConfig() (WI-10003808).
+    server: gateParticipationServerConfig(),
     test: {
       // The reporter reads the executing project's config, including when CLI
       // reporter overrides are used. This is runtime evidence, not a caller label.
