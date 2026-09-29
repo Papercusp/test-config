@@ -588,11 +588,12 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   // its whole premise — resources surviving in a REUSED NODE WORKER — does not apply
   // to a browser context in the first place.
   const leakSetup = layer === 'browser' ? [] : [HANDLE_LEAK_SETUP];
-  // P-002: the executed-source-map reporter + the raised importDurations limit, or nothing.
-  // P-009: its input-capture setup runs FIRST so every later setup file's reads are attributed
-  // too; node-only (it patches node:fs), so never in the browser layer.
-  const executedSourceMap = executedSourceMapConfig();
-  const inputsCaptureSetup = layer === 'browser' ? [] : executedSourceMap.setupFiles;
+  // The gate-owned pieces (admin + executed-source-map reporters, the input-capture setup, the
+  // reuse skip list), shared with gateParticipationConfig so the two cannot drift (WI-10003716).
+  // P-009: the input-capture setup runs FIRST so every later setup file's reads are attributed
+  // too; node-only (it patches node:fs), so gateOwnedParts omits it in the browser layer.
+  const gate = gateOwnedParts(layer, process.env);
+  const inputsCaptureSetup = gate.leadingSetupFiles;
   const finalSetup = allowConsoleNoise
     ? [...inputsCaptureSetup, ...layerSetup, ...leakSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
     : [
@@ -683,10 +684,9 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         ...(layer === 'unit'
           ? ['**/*.integration.test.*', '**/*.browser.test.*']
           : []),
-        // P-008: files whose clean-run pass proof is still valid at the judged sha. Only the
-        // unit layer: affected-tests arms the channel for unit vitest tasks alone, and the
-        // reader re-checks run context + runner identity (declines => every file runs).
-        ...(layer === 'unit' ? resolveReuseSkipExclude() : []),
+        // P-008: files whose clean-run pass proof is still valid at the judged sha (unit layer
+        // only — see gateOwnedParts).
+        ...gate.reuseSkipExclude,
       ],
       // Use process-forked workers (vitest's own default), NOT worker_threads,
       // for the unit + integration layers. The `threads` pool core-dumps
@@ -798,11 +798,11 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       setupFiles: finalSetup,
       globalSetup,
       reporters: process.env.CI
-        ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }], ...adminReporter, ...executedSourceMap.reporters]
-        : ['default', ...adminReporter, ...executedSourceMap.reporters],
+        ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }], ...gate.reporters]
+        : ['default', ...gate.reporters],
       // P-002: present ONLY when the executed-source-map reporter is armed (see
       // executedSourceMapConfig); an unarmed run keeps vitest's own default.
-      ...(executedSourceMap.experimental ? { experimental: executedSourceMap.experimental } : {}),
+      ...(gate.experimental ? { experimental: gate.experimental } : {}),
       // Per testing-spec §1.9: integration retry=0 (deterministic via testcontainers
       // per worker); unit retry=0; E2E (Playwright config) handles its own retries.
       retry: 0,
