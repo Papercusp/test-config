@@ -496,8 +496,45 @@ function findRepoRoot(): string | null {
   return null;
 }
 
+/** Env var naming an alternative migration corpus for the baseline schema. */
+export const BASELINE_SQL_DIR_OVERRIDE_ENV = 'PAPERCUSP_TEST_SQL_DIR';
+
+/**
+ * Which migration corpus the baseline applies. Default: the repo's own
+ * `libs/papercusp/libs/db/sql`.
+ *
+ * `PAPERCUSP_TEST_SQL_DIR` substitutes a copy of that corpus, so a guard whose
+ * SUBJECT is a migration can be proven falsifiable without mutating the shared
+ * tree: scripts/mutation-probe.sh's copy-out tier writes the mutant to a scratch
+ * file, and the probe's test command assembles a corpus around it.
+ *
+ * The override is refused unless `PAPERCUSP_TEST_PG_ADMIN_URL` is also set.
+ * That escape hatch mints a fresh database per setup() and drops it afterwards;
+ * the container path is REUSED across runs and records applied migrations by
+ * filename, so a mutant corpus applied there would persist into every later
+ * run on the box.
+ */
+export function resolveBaselineSqlDir(
+  env: Record<string, string | undefined>,
+  defaultDir: string | null,
+): string | null {
+  const override = env[BASELINE_SQL_DIR_OVERRIDE_ENV];
+  if (!override) return defaultDir;
+  if (!env.PAPERCUSP_TEST_PG_ADMIN_URL) {
+    throw new Error(
+      `${BASELINE_SQL_DIR_OVERRIDE_ENV} is set but PAPERCUSP_TEST_PG_ADMIN_URL is not. The override is only ` +
+        `allowed on the fresh-database escape hatch: the reusable baseline container would keep the substituted ` +
+        `schema for every later run.`,
+    );
+  }
+  if (!existsSync(override)) {
+    throw new Error(`${BASELINE_SQL_DIR_OVERRIDE_ENV}=${override} does not exist`);
+  }
+  return resolve(override);
+}
+
 const REPO_ROOT = findRepoRoot();
-const SQL_DIR = REPO_ROOT ? resolve(REPO_ROOT, 'libs/papercusp/libs/db/sql') : null;
+const SQL_DIR = REPO_ROOT ? resolveBaselineSqlDir(process.env, resolve(REPO_ROOT, 'libs/papercusp/libs/db/sql')) : null;
 const MIGRATION_RUNNER = REPO_ROOT
   ? resolve(REPO_ROOT, 'libs/papercusp/packages/embedded-postgres-server/src/migration-runner.js')
   : null;
