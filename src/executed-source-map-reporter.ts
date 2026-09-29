@@ -303,8 +303,8 @@ function log(line: string): void {
 }
 
 /**
- * What one flush did. `not-persisted` = the run was not clean (a dirty or sha-less checkout), so
- * nothing it saw may be recorded; `nothing-to-record` = no recordable module and no retirement;
+ * What one flush did. `not-persisted` = the run was not clean (a dirty or sha-less checkout) or
+ * was armed no-persist (a gate rescue rerun), so nothing it saw may be recorded; `nothing-to-record` = no recordable module and no retirement;
  * `failed` / `timed-out` = the database write did not land (the WI-10003597 class).
  */
 export type ExecutedSourceMapOutcome = 'written' | 'failed' | 'timed-out' | 'not-persisted' | 'nothing-to-record';
@@ -492,6 +492,14 @@ export default class ExecutedSourceMapReporter implements Reporter {
     if (rows.length === 0 && retiredFiles.length === 0) {
       log(`nothing to record ${summary}`);
       report('nothing-to-record');
+      return;
+    }
+    // EI-24542010215430349: a rescue rerun runs armed (so a capture-caused red reproduces there
+    // instead of passing unarmed) but is not a suite run — nothing it saw becomes a proof, and it
+    // retires nothing either. Checked before the clean/dirty verdict so a CLEAN rerun is covered.
+    if (armed.noPersist) {
+      log(`NOT persisted — no-persist (rescue rerun) ${summary}`);
+      report('not-persisted');
       return;
     }
     if (worktreeDirty || !recordedSha) {

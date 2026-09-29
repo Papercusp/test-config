@@ -144,18 +144,27 @@ export const PC_EXECUTED_SOURCE_MAP_OUT_ENV = 'PC_EXECUTED_SOURCE_MAP_OUT';
  * channel a write path that fails on every row (WI-10003597) is invisible for hours.
  */
 export const PC_EXECUTED_SOURCE_MAP_RESULT_ENV = 'PC_EXECUTED_SOURCE_MAP_RESULT';
+/**
+ * EI-24542010215430349: arm the reporter and the executed-inputs capture WITHOUT persisting a
+ * single row. The green-checkpoint's rescue reruns (load-flake isolation, co-execution and
+ * workspace reruns) set it: they must run under the SAME capture the suite ran under, or a red
+ * the capture itself causes passes unarmed and is absorbed as a load flake, but a rescue rerun
+ * is not a suite run and its passes must never become reusable proofs.
+ */
+export const PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV = 'PC_EXECUTED_SOURCE_MAP_NO_PERSIST';
 export const EXECUTED_SOURCE_MAP_IMPORT_LIMIT = 1_000_000;
 const EXECUTED_SOURCE_MAP_REPORTER = resolve(__dirname, 'executed-source-map-reporter.ts');
 
 /** The arming decision, PURE over an env — `null` when the runner did not ask for a map. */
 export function executedSourceMapArmed(
   env: NodeJS.ProcessEnv = process.env,
-): { workspaceName: string; outPath: string | null; resultPath: string | null } | null {
+): { workspaceName: string; outPath: string | null; resultPath: string | null; noPersist: boolean } | null {
   const workspaceName = env[PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]?.trim();
   if (!workspaceName) return null;
   const outPath = env[PC_EXECUTED_SOURCE_MAP_OUT_ENV]?.trim() || null;
   const resultPath = env[PC_EXECUTED_SOURCE_MAP_RESULT_ENV]?.trim() || null;
-  return { workspaceName, outPath, resultPath };
+  const noPersist = /^(1|true|yes)$/i.test(env[PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV]?.trim() ?? '');
+  return { workspaceName, outPath, resultPath, noPersist };
 }
 
 /**

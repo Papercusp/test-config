@@ -20,6 +20,7 @@ import ExecutedSourceMapReporter, {
 } from './executed-source-map-reporter';
 import {
   EXECUTED_SOURCE_MAP_IMPORT_LIMIT,
+  PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV,
   PC_EXECUTED_SOURCE_MAP_OUT_ENV,
   PC_EXECUTED_SOURCE_MAP_RESULT_ENV,
   PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV,
@@ -108,10 +109,21 @@ describe('executedSourceMapConfig — the reporter and the raised limit travel t
       workspaceName: '@x/w',
       outPath: '/tmp/o.json',
       resultPath: null,
+      noPersist: false,
     });
     expect(
       executedSourceMapArmed({ [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]: '@x/w', [PC_EXECUTED_SOURCE_MAP_RESULT_ENV]: ' /tmp/r.jsonl ' }),
-    ).toEqual({ workspaceName: '@x/w', outPath: null, resultPath: '/tmp/r.jsonl' });
+    ).toEqual({ workspaceName: '@x/w', outPath: null, resultPath: '/tmp/r.jsonl', noPersist: false });
+  });
+
+  // EI-24542010215430349: the gate's rescue reruns arm capture but must never persist.
+  it('reads no-persist as an explicit truthy flag only — anything else persists as before', () => {
+    const armedWith = (v: string | undefined) =>
+      executedSourceMapArmed({ [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]: '@x/w', [PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV]: v })?.noPersist;
+    for (const v of ['1', 'true', 'TRUE', ' yes ']) expect(armedWith(v)).toBe(true);
+    for (const v of [undefined, '', '0', 'false', 'no']) expect(armedWith(v)).toBe(false);
+    // No-persist alone arms nothing: the workspace name is still the arming switch.
+    expect(executedSourceMapArmed({ [PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV]: '1' })).toBeNull();
   });
 });
 
@@ -152,11 +164,14 @@ describe('ExecutedSourceMapReporter', () => {
       PC_EXECUTED_SOURCE_MAP_RESULT_ENV,
       'PAPERCUSP_TEST_RUN_GROUP',
       PC_EXECUTED_INPUTS_DIR_ENV,
+      PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV,
     ]) {
       savedEnv[k] = process.env[k];
     }
-    // Hermetic against an outer armed run (the gate arms input capture for its own vitest).
+    // Hermetic against an outer armed run (the gate arms input capture for its own vitest, and
+    // arms it no-persist on a rescue rerun of this very file).
     delete process.env[PC_EXECUTED_INPUTS_DIR_ENV];
+    delete process.env[PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV];
     process.env[PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV] = '@papercusp/test-config';
     process.env[PC_EXECUTED_SOURCE_MAP_OUT_ENV] = join(tmp, 'out.json');
     process.env[PC_EXECUTED_SOURCE_MAP_RESULT_ENV] = join(tmp, 'result.jsonl');
@@ -253,6 +268,23 @@ describe('ExecutedSourceMapReporter', () => {
     moved.r.onTestModuleEnd(fakeModule({}));
     await moved.r.onTestRunEnd();
     expect(moved.flushes).toEqual([]);
+  });
+
+  // EI-24542010215430349: a gate rescue rerun runs armed so a capture-caused red reproduces, but
+  // nothing it sees may become a proof — not a pass row, and not a retirement either, even from a
+  // CLEAN checkout where the ordinary path would write both.
+  it('armed no-persist: never calls the writer from a clean checkout, and reports not-persisted', async () => {
+    process.env[PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV] = '1';
+    const { r, flushes } = reporter();
+    r.onInit({} as never);
+    r.onTestModuleEnd(fakeModule({}));
+    r.onTestModuleEnd(fakeModule({ state: 'failed', moduleId: join(REPO_ROOT, 'libs/test-config/src/__fake__/other.test.ts') }));
+    await r.onTestRunEnd();
+    await r.onExit();
+    expect(flushes).toEqual([]);
+    expect(results()).toEqual([
+      { workspaceName: '@papercusp/test-config', outcome: 'not-persisted', rows: 1, retired: 1, skipped: 1, sha: clean.commit, dirty: false, error: null },
+    ]);
   });
 
   it('is inert when unarmed', async () => {
