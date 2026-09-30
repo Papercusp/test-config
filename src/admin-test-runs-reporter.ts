@@ -328,13 +328,28 @@ export interface WorktreeGitSnapshot {
   porcelain: string | null;
 }
 
+/**
+ * WI-10004076: WHY a snapshot pair fails to prove the tree stable, or null when it does.
+ * A gate lane demoted from `ci` to `local` cannot be diagnosed afterwards (the next run
+ * re-materializes the checkpoint tree), so the reason has to be named at flush time.
+ */
+export function describeWorktreeDirt(before: WorktreeGitSnapshot, after: WorktreeGitSnapshot): string | null {
+  if (!before.commit || !after.commit) {
+    return `HEAD unreadable (before=${before.commit ?? 'null'} after=${after.commit ?? 'null'})`;
+  }
+  if (before.commit !== after.commit) return `HEAD moved ${before.commit.slice(0, 12)} -> ${after.commit.slice(0, 12)}`;
+  if (before.porcelain === null || after.porcelain === null) {
+    return `git status unreadable ${before.porcelain === null ? 'before' : 'after'} the run`;
+  }
+  for (const [when, porcelain] of [['before', before.porcelain], ['after', after.porcelain]] as const) {
+    const lines = porcelain.split('\n').filter((line) => line.trim().length > 0);
+    if (lines.length > 0) return `${lines.length} porcelain line(s) ${when} the run: ${lines.slice(0, 5).join(' | ')}`;
+  }
+  return null;
+}
+
 export function computeWorktreeDirty(before: WorktreeGitSnapshot, after: WorktreeGitSnapshot): boolean {
-  if (!before.commit || !after.commit) return true;
-  if (before.commit !== after.commit) return true;
-  if (before.porcelain === null || after.porcelain === null) return true;
-  if (before.porcelain.trim().length > 0) return true;
-  if (after.porcelain.trim().length > 0) return true;
-  return false;
+  return describeWorktreeDirt(before, after) !== null;
 }
 
 let _gitCache: { value: GitContext; expiresAt: number } | null = null;
@@ -1250,15 +1265,25 @@ export default class AdminTestRunsReporter implements Reporter {
     if (this.pending.length === 0) return;
 
     let worktreeDirty = true;
+    let dirtReason: string | null = 'snapshot not taken';
     let commitSha: string | null = null;
     try {
       const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot();
       const after = await this.readWorktreeSnapshot();
-      worktreeDirty = computeWorktreeDirty(before, after);
+      dirtReason = describeWorktreeDirt(before, after);
+      worktreeDirty = dirtReason !== null;
       commitSha = after.commit;
-    } catch {
+    } catch (err) {
       // D-007: missing proof of stability is dirty, never a false clean.
       worktreeDirty = true;
+      dirtReason = `snapshot threw: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    if (worktreeDirty && resolveTestRunSource() === 'ci') {
+      // WI-10004076: the demotion erases every row of this invocation from source='ci'
+      // triage, and the tree that caused it is gone by the next run — say why, once.
+      process.stderr.write(
+        `[admin-test-runs] ${this.pending.length} row(s) recorded source=local, not ci: worktree not proven stable — ${dirtReason}\n`,
+      );
     }
 
     const rows = this.pending.splice(0).map((row) => ({

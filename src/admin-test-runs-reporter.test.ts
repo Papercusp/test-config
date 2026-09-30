@@ -21,6 +21,7 @@ import AdminTestRunsReporter, {
   classifyGitEntry,
   computeWorkspaceRootFrom,
   computeWorktreeDirty,
+  describeWorktreeDirt,
   computeIsScratchConfig,
   inferWorkspaceRoot,
   insertTestRunRowsWithSql,
@@ -727,6 +728,40 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(persisted[0].worktreeDirty).toBe(false);
     expect(persisted[0].commitSha).toBe('abc');
   });
+
+  // WI-10004076: a declared-ci run demoted to local must say why, while the tree still exists.
+  it.each([
+    { ci: '1', expectLine: true },
+    { ci: '', expectLine: false },
+  ])('names the dirt reason on stderr only for a demoted ci run (CI=$ci)', async ({ ci, expectLine }) => {
+    vi.stubEnv('CI', ci);
+    vi.stubEnv('PAPERCUSP_TEST_RUN_SOURCE', '');
+    vi.stubEnv('PAPERCUSP_MUTATION_PROBE', '');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const snapshots = [
+        { commit: 'abc', porcelain: '' },
+        { commit: 'abc', porcelain: '?? leaked-by-a-test.json' },
+      ];
+      const r = new AdminTestRunsReporter(async () => snapshots.shift()!, async () => {});
+      r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      r.onTestModuleEnd({
+        moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
+        state: () => 'passed',
+        diagnostic: () => ({ duration: 12 }),
+        errors: () => [],
+      } as unknown as Parameters<typeof r.onTestModuleEnd>[0]);
+
+      await r.onTestRunEnd();
+      const lines = stderr.mock.calls.map(([chunk]) => String(chunk)).filter((s) => s.startsWith('[admin-test-runs]'));
+      expect(lines).toEqual(expectLine
+        ? ['[admin-test-runs] 1 row(s) recorded source=local, not ci: worktree not proven stable — 1 porcelain line(s) after the run: ?? leaked-by-a-test.json\n']
+        : []);
+    } finally {
+      stderr.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 describe('computeWorktreeDirty (EI-20327093837421120)', () => {
@@ -748,6 +783,39 @@ describe('computeWorktreeDirty (EI-20327093837421120)', () => {
   it('fails safe when either snapshot cannot be read', () => {
     expect(computeWorktreeDirty({ commit: null, porcelain: '' }, clean('abc'))).toBe(true);
     expect(computeWorktreeDirty(clean('abc'), { commit: 'abc', porcelain: null })).toBe(true);
+  });
+});
+
+describe('describeWorktreeDirt (WI-10004076)', () => {
+  const clean = (commit: string) => ({ commit, porcelain: '' });
+
+  it('returns null exactly when the pair proves the tree stable', () => {
+    expect(describeWorktreeDirt(clean('abc'), clean('abc'))).toBeNull();
+  });
+
+  it('names each way a pair can fail to prove stability', () => {
+    expect(describeWorktreeDirt({ commit: null, porcelain: '' }, clean('abc'))).toBe('HEAD unreadable (before=null after=abc)');
+    expect(describeWorktreeDirt(clean('aaaaaaaaaaaaaaaa'), clean('bbbbbbbbbbbbbbbb'))).toBe('HEAD moved aaaaaaaaaaaa -> bbbbbbbbbbbb');
+    expect(describeWorktreeDirt(clean('abc'), { commit: 'abc', porcelain: null })).toBe('git status unreadable after the run');
+  });
+
+  it('names the porcelain paths, the side they were seen on, and caps the sample at five', () => {
+    const after = { commit: 'abc', porcelain: Array.from({ length: 7 }, (_, i) => `?? leak-${i}.txt`).join('\n') };
+    expect(describeWorktreeDirt(clean('abc'), after)).toBe(
+      '7 porcelain line(s) after the run: ?? leak-0.txt | ?? leak-1.txt | ?? leak-2.txt | ?? leak-3.txt | ?? leak-4.txt',
+    );
+    expect(describeWorktreeDirt({ commit: 'abc', porcelain: ' M pre.ts' }, clean('abc'))).toBe(
+      '1 porcelain line(s) before the run:  M pre.ts',
+    );
+  });
+
+  it('agrees with computeWorktreeDirty on every case', () => {
+    const snaps = [clean('abc'), clean('def'), { commit: null, porcelain: '' }, { commit: 'abc', porcelain: null }, { commit: 'abc', porcelain: '?? x' }];
+    for (const before of snaps) {
+      for (const after of snaps) {
+        expect(computeWorktreeDirty(before, after)).toBe(describeWorktreeDirt(before, after) !== null);
+      }
+    }
   });
 });
 
