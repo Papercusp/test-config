@@ -536,6 +536,41 @@ describe("withContainerRecoveryReResolution", () => {
     expect(retired).toEqual(["wedged"]);
   });
 
+  it("preserves the reuse generation when a failed candidate is healthy again", async () => {
+    const resolved = ["recovered", "recovered"];
+    const ensured: string[] = [];
+    const retirementChecks: Array<{ candidate: string; cause: string }> = [];
+    const retired: string[] = [];
+
+    const result = await withContainerRecoveryReResolution(
+      async () => resolved.shift()!,
+      async (container) => {
+        ensured.push(container);
+        if (ensured.length === 1)
+          throw new Error("FATAL: the database system is in recovery mode");
+      },
+      async (container) => {
+        retired.push(container);
+      },
+      {
+        shouldRetire: async (container, error) => {
+          retirementChecks.push({
+            candidate: container,
+            cause: error instanceof Error ? error.message : String(error),
+          });
+          return false;
+        },
+      },
+    );
+
+    expect(result).toBe("recovered");
+    expect(ensured).toEqual(["recovered", "recovered"]);
+    expect(retirementChecks).toEqual([
+      { candidate: "recovered", cause: "FATAL: the database system is in recovery mode" },
+    ]);
+    expect(retired).toEqual([]);
+  });
+
   it("does not retire or re-resolve a non-retryable ensure failure", async () => {
     let resolveCount = 0;
     const retired: string[] = [];
@@ -603,6 +638,12 @@ describe("withContainerRecoveryReResolution", () => {
 });
 
 describe("shared test-PG reuse generation", () => {
+  it("checks final SQL reachability before rotating the shared generation", () => {
+    expect(SOURCE).toMatch(/shouldRetire:\s*async \(container, error\) => \{/);
+    expect(SOURCE).toMatch(/probePgReachable\(container\.getConnectionUri\(\),\s*5_000\)/);
+    expect(SOURCE).toMatch(/return !probe\.ok;/);
+  });
+
   it("rotates the reuse hash without stopping a container peers may still use", async () => {
     const root = await mkdtemp(join(tmpdir(), "test-pg-generation-"));
     try {
