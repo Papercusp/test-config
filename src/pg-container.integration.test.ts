@@ -45,3 +45,24 @@ describe('getTestPg DSM backing (WI-41781)', () => {
     }
   });
 });
+
+describe('getTestPg durability (WI-10004084)', () => {
+  const itDockerContainer = process.env.PAPERCUSP_TEST_PG_ADMIN_URL ? it.skip : it;
+
+  // With fsync on, every DROP DATABASE on this shared cluster forced an fsync'd
+  // checkpoint across hundreds of throwaway databases and stalled every suite.
+  itDockerContainer('runs the shared throwaway cluster without crash durability', async () => {
+    const sql = postgres(await getTestPg(), { max: 1, onnotice: () => {} });
+    try {
+      const rows = await sql.unsafe<Array<{ name: string; setting: string }>>(
+        `SELECT name, setting FROM pg_settings
+          WHERE name IN ('fsync', 'synchronous_commit', 'full_page_writes') ORDER BY name`,
+      );
+      expect(Object.fromEntries(rows.map((row) => [row.name, row.setting]))).toEqual({
+        fsync: 'off', full_page_writes: 'off', synchronous_commit: 'off',
+      });
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
+});

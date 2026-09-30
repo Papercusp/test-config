@@ -149,6 +149,26 @@ export async function withContainerRecoveryReResolution<T>(
 export const TEST_PG_IMAGE = "pgvector/pgvector:pg18";
 
 /**
+ * WI-10004084: the SHARED reused test cluster runs without crash durability.
+ * It holds only throwaway per-test databases (hundreds at once), yet with the
+ * stock fsync=on every `DROP DATABASE` forces an fsync'd checkpoint across all
+ * of them. Measured 2026-09-30: six DROPs waited 1-2 h on IPC/CheckpointStart,
+ * the checkpointer sat in IO/DataFileSync, and every suite's commits stalled
+ * behind it (lock_timeout 55P03, CONNECT_TIMEOUT, a 50 s SU bootstrap).
+ * A postgres crash loses nothing here (the page cache survives it); only a host
+ * crash could, and a stopped container is never reused. Dedicated clusters
+ * that measure WAL/fsync (`startDedicatedTestPg`) do not use this.
+ */
+export const SHARED_TEST_PG_DURABILITY_OFF = [
+  "-c",
+  "fsync=off",
+  "-c",
+  "synchronous_commit=off",
+  "-c",
+  "full_page_writes=off",
+] as const;
+
+/**
  * Test-only initdb mode for the shared, reused Postgres container.
  *
  * The official image performs a final filesystem-wide sync before creating
@@ -456,6 +476,7 @@ export async function getTestPg(): Promise<string> {
                 // from the host-wide /dev/shm burst without changing production.
                 "-c",
                 "dynamic_shared_memory_type=mmap",
+                ...SHARED_TEST_PG_DURABILITY_OFF,
               ])
               // EI-21116464706451765: @testcontainers/postgresql's stock healthcheck
               // runs `pg_isready` INSIDE this PID-1-postmaster container. During
