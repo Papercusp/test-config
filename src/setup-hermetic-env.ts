@@ -87,6 +87,19 @@
  *    as PAPERCUSP_BACKGROUND_WORKERS above; they keep working unchanged, because a test
  *    that sets PORT does so in its own beforeEach/test body, after this module-level scrub.
  *
+ *  - PAPERCUSP_OPERATOR_URL / PAPERCUSP_OPERATOR_URL_PROVENANCE — the operator pin every
+ *    psu-launched shell exports (the launcher writes the pair together). psu-launcher's
+ *    resolveOperatorTarget reads it from the AMBIENT env and warns through console.warn when
+ *    the pin is :3170 and the staging proxy (:9171) answers (EI-24402391758483336), or when
+ *    the pin is :3070 and the main proxy (:9071) answers (WI-1457). vitest-fail-on-console
+ *    turns that warn into a red. Measured 2026-09-30 (WI-10004341): a scoped test:affected
+ *    run from an su shell pinned to :3170 redded 7 operator-core files (bee-tool-boundary,
+ *    launch-su, role-principal-caps, set-status.bulk, barrel-boot, action-registered,
+ *    stop-fanout-installed) that pass through testing:run, whose operator-spawned env carries
+ *    no :3170 pin. The verdict depended on the invoking shell and on whether a proxy unit was
+ *    up. Tests that exercise the pin set it themselves or pass an explicit env object, after
+ *    this module-level scrub.
+ *
  *  - PAPERCUSP_VOICE_IPC_DIR (redirected, not scrubbed) — the voice-socket state root
  *    (sockets/ + voice-ipc.json). Without a redirect, any test that (transitively)
  *    starts the local voice socket reaps the REAL ~/.papercusp/sockets — an orphaned
@@ -191,6 +204,10 @@ delete process.env.PORT;
 // loopback-default path; tests that exercise remote binding pass an explicit
 // env object or set the variable locally.
 delete process.env.PAPERCUSP_BIND_HOST;
+// WI-10004341: the psu operator pin (see the header list). Scrubbed as a pair; the
+// launcher writes both.
+delete process.env.PAPERCUSP_OPERATOR_URL;
+delete process.env.PAPERCUSP_OPERATOR_URL_PROVENANCE;
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_POT_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
