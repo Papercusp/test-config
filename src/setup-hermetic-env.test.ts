@@ -1,4 +1,9 @@
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
+
+import { stateDirNeedsRedirect } from './hermetic-tmpdir.js';
 
 /**
  * Guards the "no unsolicited outbound telemetry from a test process" invariant
@@ -57,6 +62,28 @@ describe('setup-hermetic-env: outbound telemetry is pinned off', () => {
   });
 });
 
+/** Re-run the setup module on an env carrying `values`, return those keys afterwards,
+ *  then restore them. Used by every "the setup handles an inherited value" case below. */
+async function runSetupOn(values: Record<string, string>): Promise<Record<string, string | undefined>> {
+  const keys = Object.keys(values);
+  const saved = new Map(keys.map((k) => [k, process.env[k]] as const));
+  try {
+    Object.assign(process.env, values);
+    // vitest's resetModules clears every module except its own dist (setup files included),
+    // so this import evaluates the setup module again and its module-level scrub re-runs.
+    // The import must stay a static string: vite rewrites a template-literal import into a
+    // glob helper that refuses the path ("Unknown variable dynamic import").
+    vi.resetModules();
+    await import('./setup-hermetic-env.js');
+    return Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
 /**
  * WI-10004341: a psu shell exports PAPERCUSP_OPERATOR_URL (+ its provenance marker), and
  * psu-launcher's resolveOperatorTarget reads that AMBIENT pin and console.warns when a
@@ -66,26 +93,6 @@ describe('setup-hermetic-env: outbound telemetry is pinned off', () => {
  * an env that DOES carry it and checks the result, whatever shell launched the test.
  */
 describe('setup-hermetic-env: the psu operator pin is scrubbed (WI-10004341)', () => {
-  async function runSetupOn(values: Record<string, string>): Promise<Record<string, string | undefined>> {
-    const keys = Object.keys(values);
-    const saved = new Map(keys.map((k) => [k, process.env[k]] as const));
-    try {
-      Object.assign(process.env, values);
-      // vitest's resetModules clears every module except its own dist (setup files included),
-      // so this import evaluates the setup module again and its module-level scrub re-runs.
-      // The import must stay a static string: vite rewrites a template-literal import into a
-      // glob helper that refuses the path ("Unknown variable dynamic import").
-      vi.resetModules();
-      await import('./setup-hermetic-env.js');
-      return Object.fromEntries(keys.map((k) => [k, process.env[k]]));
-    } finally {
-      for (const [k, v] of saved) {
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
-      }
-    }
-  }
-
   it('removes a :3170 operator pin and its provenance marker', async () => {
     const after = await runSetupOn({
       PAPERCUSP_OPERATOR_URL: 'http://127.0.0.1:3170',
@@ -107,5 +114,50 @@ describe('setup-hermetic-env: the psu operator pin is scrubbed (WI-10004341)', (
   it('control: a variable outside the scrub list survives the re-run', async () => {
     const after = await runSetupOn({ PAPERCUSP_HERMETIC_ENV_CONTROL_UNLISTED: 'kept' });
     expect(after.PAPERCUSP_HERMETIC_ENV_CONTROL_UNLISTED).toBe('kept');
+  });
+});
+
+/**
+ * WI-10004854: tests must never write managed-pty state (discovery records, sockets,
+ * per-owner event logs, the sender inject audit) into the live ~/.papercusp/psu-pty.
+ * Before this redirect, 193 itest event logs and 2 test sockets had accumulated
+ * there from runs that bypassed apps/operator's integration-only shim.
+ */
+describe('setup-hermetic-env: the managed-pty state dir is redirected (WI-10004854)', () => {
+  const liveDir = join(homedir(), '.papercusp', 'psu-pty');
+
+  it('gives THIS test process a PAPERCUSP_PSU_PTY_DIR that is not the live dir', () => {
+    // The real subject: fails if the redirect is removed OR the setup file stops being
+    // wired into setupFiles (the env would then be unset, or the live inherited value).
+    expect(process.env.PAPERCUSP_PSU_PTY_DIR).toBeTruthy();
+    expect(stateDirNeedsRedirect(process.env.PAPERCUSP_PSU_PTY_DIR, liveDir)).toBe(false);
+  });
+
+  it('redirects an INHERITED value that is the live dir (a psu shell leaking its own env)', async () => {
+    const after = await runSetupOn({ PAPERCUSP_PSU_PTY_DIR: liveDir });
+    expect(after.PAPERCUSP_PSU_PTY_DIR).toBeTruthy();
+    expect(resolve(after.PAPERCUSP_PSU_PTY_DIR as string)).not.toBe(liveDir);
+    expect(after.PAPERCUSP_PSU_PTY_DIR?.startsWith(tmpdir())).toBe(true);
+  });
+
+  it('keeps a deliberate non-live override (an outer isolation shim or a probe)', async () => {
+    const chosen = join(tmpdir(), `psu-pty-chosen-${process.pid}`);
+    const after = await runSetupOn({ PAPERCUSP_PSU_PTY_DIR: chosen });
+    expect(after.PAPERCUSP_PSU_PTY_DIR).toBe(chosen);
+  });
+
+  // CONTROLS for the redirect condition. If `stateDirNeedsRedirect` stopped resolving
+  // paths, a trailing-slash spelling of the live dir would be honoured and the leak
+  // would come back through it.
+  it.each([
+    ['unset', undefined, true],
+    ['empty', '', true],
+    ['the live dir', '/home/u/.papercusp/psu-pty', true],
+    ['the live dir with a trailing slash', '/home/u/.papercusp/psu-pty/', true],
+    ['the live dir spelled through ..', '/home/u/.papercusp/x/../psu-pty', true],
+    ['a sibling dir', '/home/u/.papercusp/psu-pty-other', false],
+    ['a tmp dir', '/tmp/pcv/papercusp-psu-pty-hermetic/1-abc', false],
+  ])('stateDirNeedsRedirect: %s -> %s', (_label, inherited, expected) => {
+    expect(stateDirNeedsRedirect(inherited, '/home/u/.papercusp/psu-pty')).toBe(expected);
   });
 });

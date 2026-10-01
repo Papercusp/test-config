@@ -114,10 +114,10 @@
  * Keep this list to PROVEN leak classes — broad env wipes hide real bugs.
  */
 import { rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { createHermeticDir, sweepStaleTestScratch } from './hermetic-tmpdir.js';
+import { createHermeticDir, stateDirNeedsRedirect, sweepStaleTestScratch } from './hermetic-tmpdir.js';
 
 // WI-38869: at least 17 OTHER test files each mint their own scratch dir directly
 // at the /tmp/pcv TOP LEVEL (mkdtempSync(join(tmpdir(), '<own-prefix>-'))) with no
@@ -189,6 +189,30 @@ if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
   process.on('exit', () => {
     try {
       rmSync(voiceIpcHermeticDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort — never let cleanup fail the process */
+    }
+  });
+}
+// WI-10004854: the managed-pty state root (discovery `.json`, control `.sock`,
+// per-owner `.events.jsonl`, sender-inject-audit.jsonl). Same rule as the voice-ipc
+// redirect above. Before this, only apps/operator's integration config redirected it
+// (vitest-shims/psu-pty-temp-dir.ts). Tests in other configs still wrote into the
+// live ~/.papercusp/psu-pty: unit tests in psu-pty-discovery.test.ts, and runs that
+// escaped the shim. Measured 2026-10-01: 193 itest `.events.jsonl` files plus 2
+// test sockets there, from 9 runs between 2026-08-23 and 2026-10-01, the last after the
+// shim existed. That debris inflates the ~3.5k-entry
+// directory the operator scans, and the ingest routine reads its rows as fleet
+// evidence. An inherited value that IS the live dir is
+// redirected too: it means the runner's own environment leaked in, which is the
+// same pollution class as PAPERCUSP_WORKSPACE_ID below. A test that needs a
+// specific dir sets it in its own body, after this file runs.
+if (stateDirNeedsRedirect(process.env.PAPERCUSP_PSU_PTY_DIR, join(homedir(), '.papercusp', 'psu-pty'))) {
+  const psuPtyHermeticDir = createHermeticDir(join(tmpdir(), 'papercusp-psu-pty-hermetic'));
+  process.env.PAPERCUSP_PSU_PTY_DIR = psuPtyHermeticDir;
+  process.on('exit', () => {
+    try {
+      rmSync(psuPtyHermeticDir, { recursive: true, force: true });
     } catch {
       /* best-effort — never let cleanup fail the process */
     }

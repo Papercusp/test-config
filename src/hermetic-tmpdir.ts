@@ -132,7 +132,7 @@
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
 import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 /** Never touch a dir younger than this — a peer may have just created it. */
 export const HERMETIC_SWEEP_MIN_AGE_MS = 60_000;
@@ -347,4 +347,19 @@ export function createHermeticDir(root: string, opts: SweepOptions = {}): string
   mkdirSync(root, { recursive: true });
   sweepAbandonedHermeticDirs(root, opts);
   return mkdtempSync(join(root, `${process.pid}-`));
+}
+
+/**
+ * Whether a state-dir env seam must be redirected to a hermetic dir before tests run.
+ *
+ * True when the inherited value is unset/empty, or when it resolves to `liveDir`
+ * itself. In the second case the runner's own environment has leaked into the test
+ * process (a psu-launched shell exporting the live path), and honouring it would put
+ * test debris into the live corpus. Any OTHER value was chosen deliberately (an
+ * outer isolation shim, a probe) and is kept. `resolve` makes `live/`, `live/.`
+ * and `live/../<leaf>` spellings compare equal.
+ */
+export function stateDirNeedsRedirect(inherited: string | undefined, liveDir: string): boolean {
+  if (!inherited) return true;
+  return resolve(inherited) === resolve(liveDir);
 }
