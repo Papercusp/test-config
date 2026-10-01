@@ -10,12 +10,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import AdminTestRunsReporter, {
   buildOutputTail,
+  captureWorktreeSnapshot,
   collectModuleExecution,
   captureReporterSaturationSnapshot,
   classifyGitEntry,
@@ -37,6 +39,7 @@ import AdminTestRunsReporter, {
   resolveTestRunCommit,
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
+  resolveWorktreeSnapshotRoot,
   shouldRecordTestRunPath,
   TEST_RUN_INSERT_BATCH_SIZE,
   type PgSql,
@@ -1108,5 +1111,91 @@ describe('WI-10000776 — the recorded root is the CHECKOUT UNDER TEST, not the 
     expect(
       computeIsScratchConfig({ vite: { config: { configFile: '/tmp/mutant-xyz/vitest.mutant.config.ts' } } } as never),
     ).toBe(true);
+  });
+});
+
+/**
+ * WI-10004898 — a copy-out mutation probe records from a .git-less mirror, so the
+ * snapshot that proves a run clean must come from the probe's ORIGIN checkout.
+ * These run real git against a real origin repo and a real non-git mirror: the
+ * property is "which directory does git status run in", so a stubbed reader would
+ * prove nothing.
+ */
+describe('WI-10004898 — copy-out probe rows are measured against the origin checkout', () => {
+  const made: string[] = [];
+  const saved = {
+    probe: process.env.PAPERCUSP_MUTATION_PROBE,
+    origin: process.env.PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT,
+  };
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+
+  function originRepo(): { root: string; head: string } {
+    const root = mkdtempSync(join(tmpdir(), 'pc-probe-origin-'));
+    made.push(root);
+    git(root, 'init', '-q');
+    writeFileSync(join(root, 'subject.ts'), 'export const x = 1;\n');
+    git(root, 'add', 'subject.ts');
+    git(root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
+    return { root, head: git(root, 'rev-parse', 'HEAD') };
+  }
+  function mirror(): string {
+    const d = mkdtempSync(join(tmpdir(), 'pc-probe-mirror-'));
+    made.push(d);
+    return d;
+  }
+
+  afterEach(() => {
+    setRunRoot(null);
+    for (const [key, value] of [
+      ['PAPERCUSP_MUTATION_PROBE', saved.probe],
+      ['PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT', saved.origin],
+    ] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    while (made.length) {
+      try { rmSync(made.pop() as string, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
+  it('THE BUG: a mirror record root has no .git, so the snapshot can never prove a clean run', async () => {
+    const { root } = originRepo();
+    setRunRoot(mirror());
+    delete process.env.PAPERCUSP_MUTATION_PROBE;
+    process.env.PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT = root;
+    const snap = await captureWorktreeSnapshot();
+    expect(snap.commit).toBeNull();
+    expect(computeWorktreeDirty(snap, snap)).toBe(true);
+  });
+
+  it('THE FIX: inside a probe run, a clean origin proves the run clean at its HEAD', async () => {
+    const { root, head } = originRepo();
+    setRunRoot(mirror());
+    process.env.PAPERCUSP_MUTATION_PROBE = '1';
+    process.env.PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT = root;
+    expect(resolveWorktreeSnapshotRoot()).toBe(root);
+    const snap = await captureWorktreeSnapshot();
+    expect(snap).toEqual({ commit: head, porcelain: '' });
+    expect(computeWorktreeDirty(snap, snap)).toBe(false);
+  });
+
+  it('a DIRTY origin stays dirty — the shared tree cannot launder a probe clean', async () => {
+    const { root } = originRepo();
+    writeFileSync(join(root, 'peer-edit.ts'), 'uncommitted\n');
+    setRunRoot(mirror());
+    process.env.PAPERCUSP_MUTATION_PROBE = '1';
+    process.env.PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT = root;
+    const snap = await captureWorktreeSnapshot();
+    expect(snap.porcelain).toContain('peer-edit.ts');
+    expect(computeWorktreeDirty(snap, snap)).toBe(true);
+  });
+
+  it('a relative origin is ignored and the record root stands', () => {
+    const recordRoot = mirror();
+    setRunRoot(recordRoot);
+    process.env.PAPERCUSP_MUTATION_PROBE = '1';
+    process.env.PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT = 'relative/origin';
+    expect(resolveWorktreeSnapshotRoot()).toBe(recordRoot);
   });
 });

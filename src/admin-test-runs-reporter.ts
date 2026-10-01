@@ -384,6 +384,34 @@ async function resolveGitContext(): Promise<GitContext> {
 }
 
 /**
+ * WI-10004898 — which checkout's git state proves (or disproves) a run clean.
+ *
+ * Normally the record root: the checkout the tests came from. A COPY-OUT
+ * mutation probe is the one runner whose record root cannot answer. It runs the
+ * guard inside `/tmp/mutation-probe.XXXXXX/mirror`, which deliberately has no `.git`.
+ * The mirror holds the origin checkout's files as symlinks, plus the probe's own
+ * scratch copy of the subject. So `git status` there fails, and every
+ * copy-out row recorded `commit_sha=NULL, worktree_dirty=true` even when the
+ * origin was a pristine checkout of one commit. Spec-evidence freshness rates a
+ * dirty run `unknown` (EI-24159008584241244), so no mutation row was usable
+ * from any tree.
+ *
+ * mutation-probe.sh exports the origin checkout as
+ * PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT for copy-out guards. Snapshotting it answers
+ * the question freshness asks: did every file the run could load, apart from the
+ * mutated subject, come from one commit? The deliberate mutation is still
+ * labelled by mutationPhase. A probe whose origin is the shared tree is still
+ * dirty, so the change only lets a clean origin (an as-committed clone) prove it.
+ * It is honoured ONLY inside a probe run and only for an absolute path; otherwise
+ * the record root stands.
+ */
+export function resolveWorktreeSnapshotRoot(): string {
+  const origin = process.env.PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT?.trim();
+  if (origin && isAbsolute(origin) && isMutationProbeRun()) return origin;
+  return resolveRecordRoot();
+}
+
+/**
  * Snapshot the whole shared tree rather than only the currently reported
  * module. Vitest's onInit hook runs before module discovery, and an unrelated
  * generated artifact can still invalidate the commit identity stamped on a
@@ -391,7 +419,7 @@ async function resolveGitContext(): Promise<GitContext> {
  * or failure visible as dirty instead of silently restoring the old default.
  */
 export async function captureWorktreeSnapshot(): Promise<WorktreeGitSnapshot> {
-  const root = resolveRecordRoot();
+  const root = resolveWorktreeSnapshotRoot();
   const [commit, porcelain] = await Promise.all([
     runGit('git rev-parse HEAD', root, 2_000),
     runGit('git status --porcelain --untracked-files=all', root, 2_000),
