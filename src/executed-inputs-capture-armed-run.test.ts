@@ -90,12 +90,16 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       expect(existsSync(run.mapPath), run.output.slice(-4000)).toBe(true);
       const map = JSON.parse(readFileSync(run.mapPath, 'utf8')) as {
         workspaceName: string;
-        rows: Array<{ inputsCaptured?: boolean }>;
+        rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[] }>;
       };
       expect(map.workspaceName).toBe(FIXTURE_WORKSPACE);
       expect(map.rows).toHaveLength(1);
       // The setup's afterAll wrote the file's inputs record and the reporter consumed it.
       expect(map.rows[0]?.inputsCaptured).toBe(true);
+      // P-001 (proof-v2): the config that ran the file is recorded as one of its inputs (absolute
+      // in the out file, relativised at flush), so a change to it voids exactly this proof.
+      expect(map.rows[0]?.readPaths).toContain(FIXTURE_CONFIG);
+      expect(map.rows[0]?.opaqueReasons ?? []).not.toContain('config-deps-unavailable');
 
       // The runner-readable result channel reports this flush. The database is unreachable, so
       // the outcome is never `written`; it must still describe the one row.

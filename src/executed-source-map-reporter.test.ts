@@ -14,10 +14,37 @@ import ExecutedSourceMapReporter, {
   executedSourceRunnerIdentity,
   isolatedByConfig,
   normalizeExecutedKey,
+  resolveConfigDependencies,
   shouldRecordModule,
   type ExecutedSourceFlush,
   type ExecutedSourceMapResult,
 } from './executed-source-map-reporter';
+
+// gate-test-reuse-yield-2026-10-01 P-001: the config that ran a file is one of its proof inputs.
+describe('resolveConfigDependencies', () => {
+  it('unions the root and per-project configFileDependencies, absolute paths only, sorted', () => {
+    const ctx = {
+      vite: { config: { configFileDependencies: ['/r/ws/vitest.config.ts', '/r/ws/helper.ts'] } },
+      projects: [
+        { vite: { config: { configFileDependencies: ['/r/ws/vitest.config.ts', 'relative/ignored.ts'] } } },
+        { vite: { config: { configFileDependencies: ['/r/other/vitest.config.ts'] } } },
+      ],
+    };
+    expect(resolveConfigDependencies(ctx)).toEqual(['/r/other/vitest.config.ts', '/r/ws/helper.ts', '/r/ws/vitest.config.ts']);
+  });
+
+  it('reports an UNKNOWN config as null — never as "no config input"', () => {
+    expect(resolveConfigDependencies({})).toBeNull();
+    expect(resolveConfigDependencies(undefined)).toBeNull();
+    expect(resolveConfigDependencies({ vite: { config: { configFileDependencies: [] } } })).toBeNull();
+    const throwing = {
+      get vite(): never {
+        throw new Error('server not ready');
+      },
+    };
+    expect(resolveConfigDependencies(throwing)).toBeNull();
+  });
+});
 import {
   EXECUTED_SOURCE_MAP_IMPORT_LIMIT,
   PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV,
