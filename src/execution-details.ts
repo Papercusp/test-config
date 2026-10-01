@@ -39,6 +39,8 @@ export interface TestRunExecutionDetails {
   testNamePattern: string | null;
   /** Observed from the executing project's registered config; absent on older rows. */
   testLayer?: RecordedTestLayer;
+  /** Identity of an individual live LLM scenario case; absent on other and older rows. */
+  scenarioId?: string;
   passed: number;
   failed: number;
   skipped: number;
@@ -64,7 +66,7 @@ export interface TestRunExecutionDetails {
 
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
-  'testNamePattern', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
+  'testNamePattern', 'scenarioId', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason',
 ]);
 
@@ -120,6 +122,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || typeof value.filePath !== 'string' || value.filePath.length === 0
     || !isNullableString(value.runGroupId) || !isNullableString(value.workspaceId)
     || !isNullableString(value.harnessSlug) || !isNullableString(value.testNamePattern)
+    || (value.scenarioId !== undefined && (typeof value.scenarioId !== 'string' || value.scenarioId.length === 0))
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
     || !isNullableString(value.mutationPhase) || !isNullableString(value.commitSha)
