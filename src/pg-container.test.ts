@@ -32,6 +32,7 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from "./pg-container.ts";
 import { withContainerRecoveryReResolution } from "./pg-container.ts";
 import {
@@ -50,6 +51,21 @@ const SOURCE = readFileSync(
 const BASELINE_SCHEMA_SOURCE = readFileSync(
   fileURLToPath(new URL("./baseline-schema-global-setup.ts", import.meta.url)),
   "utf8",
+);
+function sourceWithoutComments(source: string, fileName: string): string {
+  const parsed = ts.createSourceFile(
+    fileName,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  return ts.createPrinter({ removeComments: true }).printFile(parsed);
+}
+const EXECUTABLE_SOURCE = sourceWithoutComments(SOURCE, "pg-container.ts");
+const EXECUTABLE_BASELINE_SCHEMA_SOURCE = sourceWithoutComments(
+  BASELINE_SCHEMA_SOURCE,
+  "baseline-schema-global-setup.ts",
 );
 // These fixtures live in Papercusp's nested source checkout, which is not
 // present in every consumer harness that vendors @papercusp/test-config.
@@ -197,18 +213,18 @@ describe("getTestPg container healthcheck (EI-21116464706451765)", () => {
     // withHealthCheck only configures Docker; it does not replace
     // PostgreSqlContainer's default health-check wait strategy. Each safe site
     // must opt into a port-only wait, then check SQL from the host.
-    expect(SOURCE.match(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/g)).toHaveLength(2);
-    expect(BASELINE_SCHEMA_SOURCE).toMatch(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/);
-    const healthcheckIdx = SOURCE.search(/\.withHealthCheck\(/);
-    const startupWaitIdx = SOURCE.search(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/);
-    const hostProbeIdx = SOURCE.search(
+    expect(EXECUTABLE_SOURCE.match(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/g)).toHaveLength(2);
+    expect(EXECUTABLE_BASELINE_SCHEMA_SOURCE).toMatch(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/);
+    const healthcheckIdx = EXECUTABLE_SOURCE.search(/\.withHealthCheck\(/);
+    const startupWaitIdx = EXECUTABLE_SOURCE.search(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/);
+    const hostProbeIdx = EXECUTABLE_SOURCE.search(
       /postgres\(\s*container\.getConnectionUri\(\)/,
     );
     expect(healthcheckIdx).toBeGreaterThan(-1);
     expect(startupWaitIdx).toBeGreaterThan(healthcheckIdx);
     expect(hostProbeIdx).toBeGreaterThan(healthcheckIdx);
-    expect(SOURCE).toMatch(/admin\.unsafe\(FRAMEWORK_ROLES_DDL\)/);
-    expect(BASELINE_SCHEMA_SOURCE).toMatch(/isBaselineContainerHealthy\(candidate\.getConnectionUri\(\)\)/);
+    expect(EXECUTABLE_SOURCE).toMatch(/admin\.unsafe\(FRAMEWORK_ROLES_DDL\)/);
+    expect(EXECUTABLE_BASELINE_SCHEMA_SOURCE).toMatch(/isBaselineContainerHealthy\(candidate\.getConnectionUri\(\)\)/);
   });
 });
 
