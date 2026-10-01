@@ -286,6 +286,40 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(helperCalls[0].columns).toContain('execution_details');
   });
 
+  it('hands postgres-js the execution_details OBJECT, never pre-stringified JSON (EI-24799048791133095)', async () => {
+    // The reporter's hand-rolled client keeps postgres-js's default jsonb
+    // serializer (JSON.stringify). A pre-stringified value is therefore encoded
+    // twice and lands as a jsonb STRING scalar, so `execution_details->>'key'`
+    // silently reads NULL. 826k ledger rows were written that way.
+    const helperCalls: Array<{ rows: Record<string, unknown>[] }> = [];
+    const sql = Object.assign(
+      (first: TemplateStringsArray | readonly Record<string, unknown>[]) => {
+        if (!Array.isArray(first) || 'raw' in first) return Promise.resolve([]);
+        helperCalls.push({ rows: [...(first as readonly Record<string, unknown>[])] });
+        return {};
+      },
+      { end: async () => undefined },
+    ) as unknown as Parameters<typeof insertTestRunRowsWithSql>[0];
+    const at = new Date('2026-10-01T00:00:00.000Z');
+    const details = {
+      schemaVersion: 1, root: '/tmp', filePath: 'a.test.ts', runGroupId: null, workspaceId: null,
+      harnessSlug: null, testNamePattern: null, passed: 1, failed: 0, skipped: 0,
+      collectionFailed: false, mutationPhase: 'mutant', commitSha: 'abc123', worktreeDirty: false,
+    } as const;
+    await insertTestRunRowsWithSql(sql, [{
+      filePath: 'a.test.ts', status: 'pass', durationMs: 1, startedAt: at, finishedAt: at,
+      outputTail: null, isScratchConfig: false, worktreeDirty: false, commitSha: 'abc123',
+      executionDetails: details,
+    }], {
+      branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: null,
+      harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null,
+    });
+
+    const stored = helperCalls[0]?.rows[0]?.execution_details;
+    expect(typeof stored).toBe('object');
+    expect(stored).toEqual(details);
+  });
+
   it('records mutation-probe modules with their explicit phase metadata', async () => {
     const previousProbe = process.env.PAPERCUSP_MUTATION_PROBE;
     const previousPhase = process.env.PAPERCUSP_MUTATION_PHASE;

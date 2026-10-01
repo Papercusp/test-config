@@ -1116,7 +1116,11 @@ export async function insertTestRunRowsWithSql(
         rss_mb: context.rssMb,
         is_scratch_config: row.isScratchConfig,
         worktree_dirty: row.worktreeDirty,
-        execution_details: row.executionDetails ? JSON.stringify(row.executionDetails) : null,
+        // EI-24799048791133095: pass the OBJECT. This client keeps postgres-js's
+        // default jsonb serializer (JSON.stringify), so a pre-stringified value was
+        // encoded twice and stored as a jsonb STRING scalar; every
+        // `execution_details->>'key'` read then returned NULL.
+        execution_details: row.executionDetails ?? null,
       }));
     const query = sql`
       INSERT INTO harness_shared.test_runs
