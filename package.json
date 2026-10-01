@@ -80,6 +80,7 @@
     "msw": "^2.7.0",
     "supertest": "^7.0.0",
     "testcontainers": "^11.0.0",
+    "tsconfck": "^3.1.6",
     "vite-tsconfig-paths": "^5.1.4",
     "vitest-fail-on-console": "^0.7.1"
   },
