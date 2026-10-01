@@ -31,7 +31,7 @@
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
 import { exec } from 'node:child_process';
-import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, type TestRunExecutionDetails } from './execution-details.ts';
@@ -424,7 +424,111 @@ export async function captureWorktreeSnapshot(run: WorktreeGitRunner = runGit): 
     runGitWithRetry(run, 'git rev-parse HEAD', root),
     runGitWithRetry(run, 'git status --porcelain --untracked-files=all', root),
   ]);
-  return { commit, porcelain };
+  if (!porcelain) return { commit, porcelain };
+  const exemption = await resolveProbeSubjectExemption(root, run);
+  return { commit, porcelain: exemption ? exemptProbeSubject(porcelain, exemption) : porcelain };
+}
+
+/**
+ * WI-10004952: the one path an IN-TREE mutation probe is entitled to leave modified.
+ *
+ * A copy-out probe mutates a scratch copy, so its origin checkout stays clean and
+ * PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT lets a clean clone prove the row clean. An
+ * in-tree probe mutates the subject IN the checkout, so the porcelain snapshot always
+ * showed that subject and every in-tree row landed worktree_dirty=true, even from a
+ * pristine `lint:as-committed --keep` clone. mutation-probe.sh now names the subject
+ * (PAPERCUSP_MUTATION_PROBE_SUBJECT, absolute) in in-tree mode; the snapshot drops
+ * exactly that path's modification line and nothing else, which answers the same
+ * question the origin-root rule answers: did every file the run could load, apart
+ * from the mutated subject, come from one commit?
+ *
+ * A subject inside a submodule shows in the superproject as ONE line for the
+ * submodule. That line is exempt only when the submodule still sits at the commit
+ * the superproject pins AND its own porcelain is exactly the subject; a moved
+ * gitlink or any other dirt keeps the row dirty.
+ */
+export interface ProbeSubjectExemption {
+  /** Subject path relative to the snapshot root (POSIX). */
+  subjectRel: string;
+  nested: {
+    /** The nested repository's path relative to the snapshot root (POSIX). */
+    repoRel: string;
+    /** Subject path relative to the nested repository (POSIX). */
+    subjectRelInRepo: string;
+    /** The nested repository's own porcelain, or null when unreadable. */
+    porcelain: string | null;
+    /** Its HEAD equals the gitlink the snapshot root's HEAD pins. */
+    gitlinkMatches: boolean;
+  } | null;
+}
+
+/** Porcelain v1 modification codes only: an added, deleted, renamed or untracked
+ * subject is not the in-place edit a probe makes, so it is never exempt. Lowercase
+ * `m` is the short-format submodule-modified-content code. */
+const PROBE_SUBJECT_EXEMPT_STATUS = /^[Mm]{1,2}$/;
+
+function parsePorcelainLine(line: string): { status: string; path: string } | null {
+  // runGit trims stdout, so the FIRST line's leading space is gone (" M a" reads "M a");
+  // split on the status token instead of fixed columns.
+  const m = line.trim().match(/^(\S{1,2})\s+(.+)$/);
+  return m ? { status: m[1], path: m[2] } : null;
+}
+
+export function exemptProbeSubject(porcelain: string, ex: ProbeSubjectExemption): string {
+  return porcelain
+    .split('\n')
+    .filter((line) => {
+      if (!line.trim()) return false;
+      const p = parsePorcelainLine(line);
+      if (!p || !PROBE_SUBJECT_EXEMPT_STATUS.test(p.status)) return true;
+      if (ex.nested === null) return p.path !== ex.subjectRel;
+      if (p.path !== ex.nested.repoRel) return true;
+      if (!ex.nested.gitlinkMatches || ex.nested.porcelain === null) return true;
+      return exemptProbeSubject(ex.nested.porcelain, { subjectRel: ex.nested.subjectRelInRepo, nested: null }) !== '';
+    })
+    .join('\n');
+}
+
+function toPosixPath(p: string): string {
+  return p.split('\\').join('/');
+}
+
+function realOrSelf(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+export async function resolveProbeSubjectExemption(
+  root: string,
+  run: WorktreeGitRunner = runGit,
+): Promise<ProbeSubjectExemption | null> {
+  const subject = process.env.PAPERCUSP_MUTATION_PROBE_SUBJECT?.trim();
+  if (!subject || !isAbsolute(subject) || !isMutationProbeRun()) return null;
+  const subjectReal = realOrSelf(subject);
+  const subjectRepo = await runGitWithRetry(run, 'git rev-parse --show-toplevel', dirname(subjectReal));
+  if (!subjectRepo) return null;
+  const rootReal = realOrSelf(root);
+  const repoRel = toPosixPath(relative(rootReal, subjectRepo));
+  if (repoRel.startsWith('..') || isAbsolute(repoRel) || repoRel.includes("'")) return null;
+  const subjectRel = toPosixPath(relative(rootReal, subjectReal));
+  if (repoRel === '') return { subjectRel, nested: null };
+  const [porcelain, head, gitlink] = await Promise.all([
+    runGitWithRetry(run, 'git status --porcelain --untracked-files=all', subjectRepo),
+    runGitWithRetry(run, 'git rev-parse HEAD', subjectRepo),
+    runGitWithRetry(run, `git rev-parse 'HEAD:${repoRel}'`, rootReal),
+  ]);
+  return {
+    subjectRel,
+    nested: {
+      repoRel,
+      subjectRelInRepo: toPosixPath(relative(subjectRepo, subjectReal)),
+      porcelain,
+      gitlinkMatches: !!head && head === gitlink,
+    },
+  };
 }
 
 /**

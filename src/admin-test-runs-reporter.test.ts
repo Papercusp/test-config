@@ -24,6 +24,7 @@ import AdminTestRunsReporter, {
   computeWorkspaceRootFrom,
   computeWorktreeDirty,
   describeWorktreeDirt,
+  exemptProbeSubject,
   WORKTREE_SNAPSHOT_GIT_BUDGETS_MS,
   computeIsScratchConfig,
   inferWorkspaceRoot,
@@ -1245,5 +1246,134 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
   it('a HEAD read that times out once is retried too', async () => {
     const { run } = fakeGit({ 'git rev-parse HEAD': [null, 'abc123'], [STATUS]: [''] });
     expect(await captureWorktreeSnapshot(run)).toEqual({ commit: 'abc123', porcelain: '' });
+  });
+});
+
+/**
+ * WI-10004952: an IN-TREE mutation probe mutates its subject inside the checkout, so
+ * the snapshot used to see that subject and every in-tree row landed dirty, even from
+ * a pristine as-committed clone. mutation-probe.sh now names the subject and the
+ * snapshot exempts exactly that path. Real git, real files: the property is which
+ * porcelain lines survive, and a stubbed reader would prove nothing.
+ */
+describe('WI-10004952 — an in-tree probe’s own subject is not dirt, and nothing else is exempt', () => {
+  const made: string[] = [];
+  const keys = ['PAPERCUSP_MUTATION_PROBE', 'PAPERCUSP_MUTATION_PROBE_SUBJECT', 'PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT'] as const;
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'protocol.file.allow=always', ...args], {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+
+  function repo(prefix: string, files: Record<string, string>): string {
+    const root = mkdtempSync(join(tmpdir(), prefix));
+    made.push(root);
+    git(root, 'init', '-q');
+    for (const [name, body] of Object.entries(files)) {
+      mkdirSync(join(root, name, '..'), { recursive: true });
+      writeFileSync(join(root, name), body);
+    }
+    git(root, 'add', '-A');
+    git(root, 'commit', '-q', '-m', 'init');
+    return root;
+  }
+  /** A superproject whose `lib` submodule holds the subject. */
+  function superWithSubmodule(): { root: string; sub: string } {
+    const inner = repo('pc-probe-inner-', { 'src/subject.ts': 'export const x = 1;\n' });
+    const root = repo('pc-probe-super-', { 'README.md': 'x\n' });
+    git(root, 'submodule', 'add', '-q', inner, 'lib');
+    git(root, 'commit', '-q', '-m', 'add lib');
+    return { root, sub: join(root, 'lib') };
+  }
+  async function snapshotAt(root: string, subject: string | null, probe = true) {
+    setRunRoot(root);
+    delete process.env.PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT;
+    if (probe) process.env.PAPERCUSP_MUTATION_PROBE = '1';
+    else delete process.env.PAPERCUSP_MUTATION_PROBE;
+    if (subject) process.env.PAPERCUSP_MUTATION_PROBE_SUBJECT = subject;
+    else delete process.env.PAPERCUSP_MUTATION_PROBE_SUBJECT;
+    const snap = await captureWorktreeSnapshot();
+    return { snap, dirty: computeWorktreeDirty(snap, snap) };
+  }
+
+  afterEach(() => {
+    setRunRoot(null);
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    while (made.length) {
+      try { rmSync(made.pop() as string, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
+  it('THE BUG: without the subject named, an in-tree mutant in a clean clone records dirty', async () => {
+    const root = repo('pc-probe-intree-', { 'subject.ts': 'export const x = 1;\n', 'other.ts': 'y\n' });
+    writeFileSync(join(root, 'subject.ts'), 'export const x = 2;\n');
+    expect((await snapshotAt(root, null)).dirty).toBe(true);
+  });
+
+  it('THE FIX: the named subject is the only change, so the row proves clean at HEAD', async () => {
+    const root = repo('pc-probe-intree-', { 'subject.ts': 'export const x = 1;\n', 'other.ts': 'y\n' });
+    writeFileSync(join(root, 'subject.ts'), 'export const x = 2;\n');
+    const { snap, dirty } = await snapshotAt(root, join(root, 'subject.ts'));
+    expect(snap).toEqual({ commit: git(root, 'rev-parse', 'HEAD'), porcelain: '' });
+    expect(dirty).toBe(false);
+  });
+
+  it('any OTHER modified or untracked path keeps the row dirty', async () => {
+    const root = repo('pc-probe-intree-', { 'subject.ts': 'export const x = 1;\n', 'other.ts': 'y\n' });
+    writeFileSync(join(root, 'subject.ts'), 'export const x = 2;\n');
+    writeFileSync(join(root, 'other.ts'), 'z\n');
+    writeFileSync(join(root, 'stray.ts'), 'w\n');
+    const { snap, dirty } = await snapshotAt(root, join(root, 'subject.ts'));
+    expect(dirty).toBe(true);
+    expect(snap.porcelain).toContain('other.ts');
+    expect(snap.porcelain).toContain('stray.ts');
+    expect(snap.porcelain).not.toContain('subject.ts');
+  });
+
+  it('outside a probe run the subject variable is ignored', async () => {
+    const root = repo('pc-probe-intree-', { 'subject.ts': 'export const x = 1;\n' });
+    writeFileSync(join(root, 'subject.ts'), 'export const x = 2;\n');
+    expect((await snapshotAt(root, join(root, 'subject.ts'), false)).dirty).toBe(true);
+  });
+
+  it('a DELETED subject is not the in-place edit a probe makes, so it stays dirty', async () => {
+    const root = repo('pc-probe-intree-', { 'subject.ts': 'export const x = 1;\n' });
+    rmSync(join(root, 'subject.ts'));
+    expect((await snapshotAt(root, join(root, 'subject.ts'))).dirty).toBe(true);
+  });
+
+  it('a subject inside a submodule: exempt when the submodule sits at its pinned commit and only the subject changed', async () => {
+    const { root, sub } = superWithSubmodule();
+    writeFileSync(join(sub, 'src/subject.ts'), 'export const x = 2;\n');
+    expect((await snapshotAt(root, null)).dirty).toBe(true);
+    const { snap, dirty } = await snapshotAt(root, join(sub, 'src/subject.ts'));
+    expect(snap.porcelain).toBe('');
+    expect(dirty).toBe(false);
+  });
+
+  it('a subject inside a submodule with ANY other dirt in that submodule stays dirty', async () => {
+    const { root, sub } = superWithSubmodule();
+    writeFileSync(join(sub, 'src/subject.ts'), 'export const x = 2;\n');
+    writeFileSync(join(sub, 'src/stray.ts'), 'w\n');
+    expect((await snapshotAt(root, join(sub, 'src/subject.ts'))).dirty).toBe(true);
+  });
+
+  it('a submodule whose HEAD moved off the pinned gitlink stays dirty even if only the subject is modified', async () => {
+    const { root, sub } = superWithSubmodule();
+    writeFileSync(join(sub, 'src/later.ts'), 'v\n');
+    git(sub, 'add', '-A');
+    git(sub, 'commit', '-q', '-m', 'moves HEAD off the gitlink');
+    writeFileSync(join(sub, 'src/subject.ts'), 'export const x = 2;\n');
+    expect((await snapshotAt(root, join(sub, 'src/subject.ts'))).dirty).toBe(true);
+  });
+
+  it('parses the trimmed FIRST porcelain line the same as the rest (runGit trims stdout)', () => {
+    const ex = { subjectRel: 'a/subject.ts', nested: null };
+    expect(exemptProbeSubject('M a/subject.ts\n M b/other.ts', ex)).toBe(' M b/other.ts');
+    expect(exemptProbeSubject('M b/other.ts\n M a/subject.ts', ex)).toBe('M b/other.ts');
+    expect(exemptProbeSubject('?? a/subject.ts', ex)).toBe('?? a/subject.ts');
   });
 });
