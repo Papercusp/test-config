@@ -59,6 +59,7 @@
 // carries the same `provide` member this file destructures.
 import type { TestProject } from 'vitest/node';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
+import { Wait } from 'testcontainers';
 import postgres from 'postgres';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { readFile, rename, writeFile } from 'node:fs/promises';
@@ -633,13 +634,13 @@ export default async function setup({ provide }: TestProject) {
         // created 08-24) still running `pg_isready` @250ms/1000-retries, eleven
         // days after the fix landed at the sibling call site.
         //
-        // Safe HERE specifically because the override removes a startup gate
-        // (PostgreSqlContainer waits on forHealthCheck + forListeningPorts) and
-        // this site already performs the required host-side SQL readiness check
-        // immediately after start: `isBaselineContainerHealthy` below validates
-        // the (possibly reused) container and reprovisions a fresh one if it is
-        // not actually serving papercusp_it.
+        // `withHealthCheck` changes Docker's health command, not PostgreSqlContainer's
+        // default Wait.forAll([forHealthCheck, forListeningPorts]) strategy. Use
+        // a port-only wait so a stale/transient health bit cannot reject a reused
+        // candidate before the host-side SQL check below can validate it and
+        // rotate the reuse generation when it is not serving papercusp_it.
         .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
+        .withWaitStrategy(Wait.forListeningPorts())
         .withLabels({ [BASELINE_SCHEMA_REUSE_GENERATION_LABEL]: String(generation) })
         // Reuse the baseline container across Vitest processes. The previous
         // ephemeral container replayed ~476 migrations for every focused file;

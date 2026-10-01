@@ -47,6 +47,10 @@ const SOURCE = readFileSync(
   fileURLToPath(new URL("./pg-container.ts", import.meta.url)),
   "utf8",
 );
+const BASELINE_SCHEMA_SOURCE = readFileSync(
+  fileURLToPath(new URL("./baseline-schema-global-setup.ts", import.meta.url)),
+  "utf8",
+);
 // These fixtures live in Papercusp's nested source checkout, which is not
 // present in every consumer harness that vendors @papercusp/test-config.
 // Keep the portable source guard below active everywhere, and inspect the
@@ -189,18 +193,22 @@ describe("getTestPg container healthcheck (EI-21116464706451765)", () => {
     );
   });
 
-  it("keeps host-side SQL readiness after the non-destructive Docker healthcheck", () => {
-    // The override REMOVES a startup gate: PostgreSqlContainer waits on
-    // Wait.forAll([forHealthCheck(), forListeningPorts()]), so `exit 0` leaves
-    // only "TCP port published" — which is not "Postgres accepts SQL". The
-    // host-side probe is what makes the override safe, so it must come after.
+  it("uses port-only startup waits and keeps host-side SQL readiness", () => {
+    // withHealthCheck only configures Docker; it does not replace
+    // PostgreSqlContainer's default health-check wait strategy. Each safe site
+    // must opt into a port-only wait, then check SQL from the host.
+    expect(SOURCE.match(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/g)).toHaveLength(2);
+    expect(BASELINE_SCHEMA_SOURCE).toMatch(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/);
     const healthcheckIdx = SOURCE.search(/\.withHealthCheck\(/);
+    const startupWaitIdx = SOURCE.search(/\.withWaitStrategy\(Wait\.forListeningPorts\(\)\)/);
     const hostProbeIdx = SOURCE.search(
       /postgres\(\s*container\.getConnectionUri\(\)/,
     );
     expect(healthcheckIdx).toBeGreaterThan(-1);
+    expect(startupWaitIdx).toBeGreaterThan(healthcheckIdx);
     expect(hostProbeIdx).toBeGreaterThan(healthcheckIdx);
     expect(SOURCE).toMatch(/admin\.unsafe\(FRAMEWORK_ROLES_DDL\)/);
+    expect(BASELINE_SCHEMA_SOURCE).toMatch(/isBaselineContainerHealthy\(candidate\.getConnectionUri\(\)\)/);
   });
 });
 

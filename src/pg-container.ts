@@ -2,6 +2,7 @@ import {
   PostgreSqlContainer,
   type StartedPostgreSqlContainer,
 } from "@testcontainers/postgresql";
+import { Wait } from "testcontainers";
 import postgres from "postgres";
 import { randomBytes } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
@@ -217,13 +218,16 @@ function isReprovisionableSharedTestPgFailure(message: string): boolean {
  *
  * ⚠ THIS CONSTANT IS ONLY SAFE WITH A HOST-SIDE SQL READINESS PROBE, and that
  * is why it is a shared constant rather than something each site inlines.
- * `PostgreSqlContainer` gates startup on
+ * `PostgreSqlContainer` defaults to
  * `Wait.forAll([Wait.forHealthCheck(), Wait.forListeningPorts()])`
- * (@testcontainers/postgresql/build/postgresql-container.js). Overriding the
- * healthcheck to `exit 0` therefore REMOVES a real startup gate — what remains
- * is only "the TCP port is published", which is NOT "Postgres accepts SQL"
- * (it can still be in crash recovery). Every site using this MUST perform its
- * own host-side readiness wait immediately after `.start()`:
+ * (@testcontainers/postgresql/build/postgresql-container.js). Setting a Docker
+ * healthcheck does NOT replace that wait strategy. Call sites that use this
+ * harmless `exit 0` healthcheck must explicitly use
+ * `.withWaitStrategy(Wait.forListeningPorts())`; then the host-side SQL probe,
+ * not Docker's mutable/reused health state, decides whether Postgres is ready.
+ * The port-only wait is NOT "Postgres accepts SQL" (it can still be in crash
+ * recovery), so every site using this MUST perform its own host-side readiness
+ * wait immediately after `.start()`:
  *   - `getTestPg` below     -> the FRAMEWORK_ROLES_DDL retry loop
  *   - baseline-schema-global-setup -> `isBaselineContainerHealthy` + reprovision
  * A site with no such probe must NOT adopt this constant until it grows one;
@@ -267,7 +271,8 @@ export async function startDedicatedTestPg(
   opts: { command?: string[]; readyBudgetMs?: number } = {},
 ): Promise<StartedPostgreSqlContainer> {
   let container = new PostgreSqlContainer(TEST_PG_IMAGE)
-    .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK });
+    .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
+    .withWaitStrategy(Wait.forListeningPorts());
   if (opts.command) container = container.withCommand(opts.command);
   const started = await container.start();
   const ready = await probePgReachable(started.getConnectionUri(), opts.readyBudgetMs ?? 120_000);
@@ -492,9 +497,11 @@ export async function getTestPg(): Promise<string> {
               // the 250ms healthcheck then repeats the crash indefinitely. Keep the
               // Docker health bit non-destructive and let the host-side
               // FRAMEWORK_ROLES_DDL loop below own real SQL readiness. The sibling
-              // listening-port wait still prevents returning before the TCP port is
-              // published, and the host loop refuses until Postgres is writable.
+              // listening-port wait prevents Testcontainers from rejecting a
+              // reused candidate on a stale/transient Docker health status; the
+              // host loop still refuses until Postgres is writable.
               .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
+              .withWaitStrategy(Wait.forListeningPorts())
               .withReuse()
               .start(),
           async (container) => {
