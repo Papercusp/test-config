@@ -9,7 +9,9 @@ import {
   escapeGlobLiteral,
   executedSourceRunContext,
   executedSourceRunnerIdentity,
+  normalizeReuseSkipFiles,
   resolveReuseSkipExclude,
+  resolveReuseSkipFiles,
 } from './test-pass-reuse-skip';
 
 // gate-file-level-test-reuse-2026-09-27 P-008: the vitest side of per-file pass reuse. Every
@@ -64,6 +66,22 @@ describe('resolveReuseSkipExclude', () => {
       expect(resolveReuseSkipExclude({ [PC_TEST_REUSE_SKIP_LIST_ENV]: p }, log)).toEqual([]);
     }
     expect(logs.filter((l) => /UNREADABLE|DECLINED/.test(l))).toHaveLength(cases.length);
+  });
+
+  // gate-test-reuse-yield-2026-10-01 P-006 (D-005): the pure-lane runner sizes its shards from
+  // resolveReuseSkipFiles, so it must make EXACTLY the decision the exclude entries are built from.
+  it('resolveReuseSkipFiles returns the literal files behind the exclude entries, and [] whenever exclude is []', () => {
+    const env = {
+      [PC_TEST_REUSE_SKIP_LIST_ENV]: listFile({ ...here(), files: ['./lib/b.test.ts', 'app/(g)/[id].test.ts', 'lib/b.test.ts'] }),
+    };
+    const files = resolveReuseSkipFiles(env, log);
+    expect(files).toEqual(['app/(g)/[id].test.ts', 'lib/b.test.ts']);
+    expect(files.map(escapeGlobLiteral)).toEqual(resolveReuseSkipExclude(env, log));
+    expect(normalizeReuseSkipFiles(['b', './a', 'a\\x'])).toEqual(['a', 'a/x', 'b']);
+
+    const declined = { [PC_TEST_REUSE_SKIP_LIST_ENV]: listFile({ ...here(), runnerIdentity: 'v0.0.0 plan9 mips', files: ['a.test.ts'] }) };
+    expect(resolveReuseSkipFiles(declined, log)).toEqual([]);
+    expect(resolveReuseSkipFiles({}, log)).toEqual([]);
   });
 
   it('escapes every glob metacharacter and nothing else', () => {
