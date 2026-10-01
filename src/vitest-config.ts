@@ -17,6 +17,14 @@ import { resolveLaneInclude, type TestLane } from './lane-split.ts';
 import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
 // gate-file-level-test-reuse-2026-09-27 P-008: per-file pass reuse (PC_TEST_REUSE_SKIP_LIST).
 import { resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
+import {
+  EXECUTED_INPUTS_CAPTURE_SETUP,
+  FAIL_ON_CONSOLE_SETUP,
+  HANDLE_LEAK_SETUP,
+  HERMETIC_ENV_SETUP,
+  NO_REAL_PG_SETUP,
+  TESTING_LIBRARY_TIMEOUT_SETUP,
+} from './worker-setup-files.ts';
 
 // 'e2e' (EI-24442044145393058): a live, end-to-end run against a real running system (a
 // serving operator, the real database, real git). Its only runtime difference from 'unit' is
@@ -68,23 +76,8 @@ export interface DefineVitestConfigOptions {
 const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.papercusp/**', '**/_retired/**'];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
-const HERMETIC_ENV_SETUP = resolve(__dirname, 'setup-hermetic-env.ts');
-// EI-19311807188719573: unit-layer-only rail forbidding a real Postgres connection.
-// See the file's own doc comment for why it guards the consequence (a live pool) rather
-// than the cause (an un-memoized dynamic import under concurrency).
-const NO_REAL_PG_SETUP = resolve(__dirname, 'setup-no-real-pg.ts');
-// EI-9990: bumps @testing-library/dom's waitFor/findBy* internal poll timeout
-// for shared-box tolerance — a no-op for any package without
-// @testing-library/dom on its graph. See the file's own doc comment.
-const TESTING_LIBRARY_TIMEOUT_SETUP = resolve(__dirname, 'setup-testing-library-timeout.ts');
-// WI-38215 / plan gate-suite-speedup-2026-08-12 D-014+D-016: attributes a leaked
-// timer/listener/registry entry to the file that LEFT it, instead of to the file
-// that happened to be running when it fired (which is what vitest reports, and it
-// sends you to edit an innocent file). Observe-and-report only — it never fails a
-// test; see the file's own doc comment for why, and for why it must be registered
-// FIRST (outermost bracket, so sibling setups' create/release pairs cancel out).
-const HANDLE_LEAK_SETUP = resolve(__dirname, 'setup-handle-leak-detector.ts');
+// The worker setup files (and why each exists) live in worker-setup-files.ts, so the reuse rule's
+// main-process closure (main-process-closure.ts) can tell them apart from reporters/globalSetup.
 // The monorepo root (libs/test-config/src → up 3 = repo root). Whitelisted in
 // Vite's server.fs.allow below so a `vitest run --root <pkg>` invocation can
 // still serve this hoisted setup file + other workspace deps. Without it, a
@@ -188,7 +181,6 @@ export function executedSourceMapConfig(env: NodeJS.ProcessEnv = process.env): {
 // evaluation (before any worker exists) and inherited by every worker through the env. When it
 // cannot be created, nothing is captured and every recorded row stays non-reusable.
 export const PC_EXECUTED_INPUTS_DIR_ENV = 'PC_EXECUTED_INPUTS_DIR';
-const EXECUTED_INPUTS_CAPTURE_SETUP = resolve(__dirname, 'executed-inputs-capture-setup.ts');
 
 /** Ensure the hand-off directory exists and is named in `env`; false when unavailable. */
 export function armExecutedInputsCapture(env: NodeJS.ProcessEnv = process.env): boolean {
