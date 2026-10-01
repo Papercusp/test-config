@@ -92,14 +92,72 @@ describe('toolchainTsconfigFiles', () => {
     expect(set.has('tsconfig.custom.json')).toBe(false);
   });
 
-  it('throws when any entry cannot be parsed, so the caller keeps every root tsconfig global', async () => {
+  it('throws when a TRACKED entry cannot be parsed, so the caller keeps every root tsconfig global', async () => {
     const root = tree({
       'tsconfig.base.json': json({}),
       'pkg/tsconfig.json': json({ extends: '../tsconfig.missing.json' }),
     });
-    await expect(toolchainTsconfigFiles({ repoRoot: root, listTrackedFiles: () => [] })).rejects.toThrow(
-      /could not parse 1 config/,
-    );
+    await expect(
+      toolchainTsconfigFiles({ repoRoot: root, listTrackedFiles: () => ['pkg/tsconfig.json'] }),
+    ).rejects.toThrow(/could not parse 1 config/);
+  });
+
+  // WI-10004941: copied dependency debris under an untracked dir (the plugin's skip rule matches
+  // only a dir named exactly node_modules) used to void the whole derivation.
+  it('skips an UNTRACKED entry that cannot be parsed and still derives the tracked set', async () => {
+    const root = tree({
+      'pkg/tsconfig.json': json({ extends: '../tsconfig.base.json' }),
+      'tsconfig.base.json': json({}),
+      '.papercusp/tmp/x/node_modules.pinned-deps-tmp.1/call-bound/tsconfig.json': json({
+        extends: '@ljharb/tsconfig',
+      }),
+    });
+    const skipped: string[][] = [];
+    const set = await toolchainTsconfigFiles({
+      repoRoot: root,
+      listTrackedFiles: () => ['pkg/tsconfig.json', 'tsconfig.base.json'],
+      onUntrackedParseFailures: (f) => skipped.push(f),
+    });
+    expect(set.has('pkg/tsconfig.json')).toBe(true);
+    expect(set.has('tsconfig.base.json')).toBe(true);
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toHaveLength(1);
+    expect(skipped[0][0]).toMatch(/^\.papercusp\/tmp\/x\/node_modules\.pinned-deps-tmp\.1\/call-bound\/tsconfig\.json: /);
+  });
+
+  it('keeps every tracked config an unparseable untracked entry read before its failing link', async () => {
+    // tsconfig.mid.json is reached ONLY through the failing untracked entry: no tracked entry
+    // extends it. tsconfck reads it before failing on its own extends, so a change to it can
+    // change the toolchain's outcome and it must stay in the set.
+    const root = tree({
+      'pkg/tsconfig.json': json({}),
+      'scratch/tsconfig.json': json({ extends: '../tsconfig.mid.json' }),
+      'tsconfig.mid.json': json({ extends: './tsconfig.missing.json' }),
+    });
+    const set = await toolchainTsconfigFiles({
+      repoRoot: root,
+      listTrackedFiles: () => ['pkg/tsconfig.json', 'tsconfig.mid.json'],
+    });
+    expect(set.has('tsconfig.mid.json')).toBe(true);
+    expect(set.has('pkg/tsconfig.json')).toBe(true);
+  });
+
+  it('throws for an untracked failure when the read recording is not live', async () => {
+    // A tsconfck whose parse never registers with the cache: the partial chain is unknown, so the
+    // skip is unsafe and the failure must fall back to "unavailable".
+    const root = tree({ 'u/tsconfig.json': json({}) });
+    const tsconfck = {
+      findAll: async () => [join(root, 'u/tsconfig.json')],
+      parse: async () => {
+        throw new Error('boom');
+      },
+      TSConfckCache: class {
+        setParseResult(): void {}
+      },
+    };
+    await expect(
+      toolchainTsconfigFiles({ repoRoot: root, listTrackedFiles: () => [], tsconfck }),
+    ).rejects.toThrow(/could not parse 1 config.*u\/tsconfig\.json: boom/);
   });
 });
 

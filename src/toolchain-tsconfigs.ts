@@ -28,9 +28,24 @@
  *
  * Everything errs toward MORE configs read: a literal that merely looks like a config name, an
  * entry under an untracked directory, or a solution reference adds to the set and costs reuse,
- * never soundness. Any parse failure THROWS: the caller then keeps every root tsconfig global
- * (the pre-P-004 rule), because a config tsconfck cannot parse may still have been read up to
- * the failing link.
+ * never soundness.
+ *
+ * Parse failures (WI-10004941). A config tsconfck cannot parse may still have been read up to the
+ * failing link, so the set also holds every file tsconfck READ, recorded at the cache: tsconfck
+ * registers each config with `cache.setParseResult` before reading it (the entry itself, and every
+ * extended or referenced file), so a failed parse still leaves its partial chain in the set. A
+ * missing file that a reference names is recorded too, because creating it would change the parse.
+ *   - A TRACKED entry that fails still THROWS: the caller then keeps every root tsconfig global
+ *     (the pre-P-004 rule). Kept fail-closed on purpose: the recording relies on tsconfck
+ *     internals, and a broken tracked config is rare enough that losing the narrowing costs little.
+ *   - An UNTRACKED entry that fails is skipped, as vite-tsconfig-paths itself logs and skips it.
+ *     It can never be a drift path (drift is a git diff), and every tracked config it read before
+ *     failing is in the set through the recording above. Typical case: copied dependency debris
+ *     such as `.papercusp/tmp/.../node_modules.pinned-deps-tmp.*`, which the plugin's skip rule
+ *     (a dir named exactly `node_modules`) still descends. The skip needs the recording to be
+ *     live: when the failing entry itself was not recorded, the failure throws instead.
+ *   - Package resolution inputs (a package.json `exports` an `extends` specifier resolves
+ *     through) are outside this set for failed and successful parses alike.
  *
  * Computed at the judged tree. A change that removes a config from the set must edit the config
  * that stopped extending or referencing it. That config is still reached (or is a deleted
@@ -75,10 +90,15 @@ interface ParseResultLike {
   referenced?: ParseResultLike[];
 }
 
+/** tsconfck's cache. `setParseResult` is internal API: tsconfck calls it for every config it reads. */
+interface TsconfckCacheLike {
+  setParseResult(file: string, result: unknown, isRootFile?: boolean): void;
+}
+
 interface TsconfckLike {
   findAll(dir: string, options: { configNames: string[]; skip: (dir: string) => boolean }): Promise<string[]>;
   parse(file: string, options: { cache: unknown }): Promise<ParseResultLike>;
-  TSConfckCache: new () => unknown;
+  TSConfckCache: new () => TsconfckCacheLike;
 }
 
 function defaultListTrackedFiles(repoRoot: string): string[] {
@@ -98,11 +118,14 @@ export interface ToolchainTsconfigOptions {
   listTrackedFiles?: (repoRoot: string) => string[];
   /** Seam: the tsconfck module (default: the copy vite-tsconfig-paths imports). */
   tsconfck?: TsconfckLike;
+  /** Called once with `<path>: <error>` for each untracked entry skipped because it failed to parse. */
+  onUntrackedParseFailures?: (failures: string[]) => void;
 }
 
 /**
  * The repo-relative POSIX paths of every tsconfig/jsconfig file the vitest toolchain reads.
- * Throws when any entry fails to parse (callers treat that as "unavailable").
+ * Throws when a tracked entry fails to parse (callers treat that as "unavailable"); an untracked
+ * entry that fails is skipped, keeping every config it read (see the file header).
  */
 export async function toolchainTsconfigFiles(o: ToolchainTsconfigOptions): Promise<Set<string>> {
   const t: TsconfckLike = o.tsconfck ?? ((await import('tsconfck')) as unknown as TsconfckLike);
@@ -130,13 +153,31 @@ export async function toolchainTsconfigFiles(o: ToolchainTsconfigOptions): Promi
     for (const e of r.extended ?? []) reachedAbs.add(e.tsconfigFile);
     for (const ref of r.referenced ?? []) visit(ref);
   };
-  const cache = new t.TSConfckCache();
+  // Every config tsconfck reads, including the partial chain of a parse that fails.
+  const readAbs = new Set<string>();
+  class RecordingCache extends t.TSConfckCache {
+    override setParseResult(file: string, result: unknown, isRootFile?: boolean): void {
+      readAbs.add(file);
+      super.setParseResult(file, result, isRootFile);
+    }
+  }
+  const cache = new RecordingCache();
+  const trackedSet = new Set(tracked);
   const failures: string[] = [];
+  const skippedUntracked: string[] = [];
   for (const entry of entries) {
     try {
       visit(await t.parse(entry, { cache }));
     } catch (err) {
-      failures.push(`${relative(o.repoRoot, entry)}: ${String((err as Error)?.message ?? err).slice(0, 160)}`);
+      const rel = relative(o.repoRoot, entry).split(sep).join('/');
+      const line = `${rel}: ${String((err as Error)?.message ?? err).slice(0, 160)}`;
+      if (trackedSet.has(rel) || !readAbs.has(entry)) {
+        failures.push(line);
+        continue;
+      }
+      skippedUntracked.push(line);
+      const at = (err as { tsconfigFile?: unknown })?.tsconfigFile;
+      if (typeof at === 'string' && at) readAbs.add(at);
     }
   }
   if (failures.length > 0) {
@@ -144,6 +185,8 @@ export async function toolchainTsconfigFiles(o: ToolchainTsconfigOptions): Promi
       `tsconfck could not parse ${failures.length} config(s); first: ${failures.slice(0, 3).join(' | ')}`,
     );
   }
+  if (skippedUntracked.length > 0) o.onUntrackedParseFailures?.(skippedUntracked);
+  for (const abs of readAbs) reachedAbs.add(abs);
 
   const reached = new Set<string>();
   for (const abs of reachedAbs) {
