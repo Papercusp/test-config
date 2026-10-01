@@ -139,8 +139,8 @@ describe("assertPgReachable — EI-2627", () => {
       .then(() => null, (error: unknown) => error as Error);
     const error = await rejection;
     expect(error).toBeInstanceOf(Error);
-    expect(error?.message).toMatch(/myFixture.*no such database.*non-retryable.*container startup churn/s);
-    expect(error?.message).not.toMatch(/EI-2627|docker ps/);
+    expect(error?.message).toMatch(/myFixture.*non-retryable error.*no such database.*Verify the injected DSN credentials\/database/s);
+    expect(error?.message).not.toMatch(/EI-2627|docker ps|container startup churn/);
     expect(unsafe).toHaveBeenCalledTimes(1);
   });
 

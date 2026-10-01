@@ -128,7 +128,7 @@ export async function assertPgReachable(
   }
   throw new Error(
     `${label}: the integration baseline Postgres probe failed fast on a non-retryable error ` +
-      `(${lastError}). The probe does not classify this as container startup churn or retry it. ` +
+      `(${lastError}). This failure is not retried. ` +
       `Verify the injected DSN credentials/database and confirm it points at the container selected by global setup.`,
   );
 }
