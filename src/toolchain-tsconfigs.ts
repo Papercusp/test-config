@@ -50,8 +50,8 @@ export const TOOLCHAIN_TSCONFIG_ENTRY_NAMES: readonly string[] = ['tsconfig.json
  * that tsconfigPaths() is called nowhere else.
  */
 export function isToolchainConfigSource(rel: string): boolean {
-  if (/(?:^|\/)vite(?:st)?[.-][^/]*\.[cm]?[jt]sx?$/.test(rel)) return true;
-  return /^libs\/test-config\/src\/.*\.[cm]?[jt]sx?$/.test(rel) && !/\.test\.[cm]?[jt]sx?$/.test(rel);
+  if (/\.test\.[cm]?[jt]sx?$/.test(rel)) return false;
+  return /(?:^|\/)vite(?:st)?[.-][^/]*\.[cm]?[jt]sx?$/.test(rel) || /^libs\/test-config\/src\/.*\.[cm]?[jt]sx?$/.test(rel);
 }
 
 /** A string literal that names a config file: `'./tsconfig.test.json'`, `"jsconfig.app.json"`. */
