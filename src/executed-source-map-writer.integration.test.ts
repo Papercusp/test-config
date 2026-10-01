@@ -140,4 +140,35 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
     const retired = await sql`SELECT 1 FROM harness_shared.test_executed_sources WHERE test_file = 'src/m1.test.ts'`;
     expect(retired).toHaveLength(0);
   });
+
+  /**
+   * WI-10004880 — the upsert used to conflict on (workspace, file, sha) and SET run_context, so a
+   * clean-local run at a gate candidate sha flipped the gate's pass proof to clean-local and
+   * loadReuseProofs (WHERE run_context = 'green-checkpoint') stopped seeing it.
+   */
+  it('a clean-local write at a gate sha never flips the gate proof, and a same-context rewrite still replaces', async () => {
+    const SHA_C = 'c'.repeat(40);
+    const write = (runContext: string, readPaths: string[]) =>
+      writeExecutedSourceRows(
+        {
+          rows: [row('src/ctx.test.ts', { inputsCaptured: true, readPaths })],
+          recordedSha: SHA_C,
+          runGroupId: null,
+          workspaceName: '@probe/ws',
+          runContext,
+        },
+        handle,
+      );
+    const gateRows = () => sql<{ read_paths: string[] }[]>`
+      SELECT read_paths FROM harness_shared.test_executed_sources
+       WHERE workspace_name = '@probe/ws' AND test_file = 'src/ctx.test.ts'
+         AND recorded_sha = ${SHA_C} AND run_context = 'green-checkpoint'`;
+
+    await write('green-checkpoint', ['fixtures/first.json']);
+    await write('clean-local', ['fixtures/local.json']);
+    expect(await gateRows()).toEqual([{ read_paths: ['fixtures/first.json'] }]);
+
+    await write('green-checkpoint', ['fixtures/second.json']);
+    expect(await gateRows()).toEqual([{ read_paths: ['fixtures/second.json'] }]);
+  });
 });

@@ -264,9 +264,10 @@ function moduleIsIsolated(testModule: TestModule): boolean {
 }
 
 /**
- * Default writer: one bounded transaction per chunk. The upsert keeps the newest observation
- * for (workspace, file, sha); the trailing delete retires rows at OTHER shas for the same
- * files, so the table holds one row per test file per workspace rather than one per gate run.
+ * Default writer, per chunk: replace this run context's row for (workspace, file, sha) with
+ * the newest observation (delete + target-less insert, WI-10004880), then retire this
+ * context's rows at OTHER shas for the same files, so the table holds one row per test file
+ * per workspace per run context rather than one per gate run.
  */
 export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: PgHandle): Promise<void> {
   const handle = pg ?? (await tryGetPg());
@@ -283,6 +284,20 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
     // boolean to boolean[]" (WI-10003597 — it silently recorded zero pass proofs at the gate).
     const captured = chunk.map((r) => (r.inputsCaptured === true ? 'true' : 'false'));
     const workspaceName = chunk[0]!.workspaceName;
+    // WI-10004880: replace only THIS context's row at this sha, then insert with a target-less
+    // ON CONFLICT DO NOTHING. The old `ON CONFLICT (workspace_name, test_file, recorded_sha) DO
+    // UPDATE SET run_context = EXCLUDED.run_context` let a clean-local run at a gate candidate sha
+    // flip the gate's pass proof to clean-local, hiding it from loadReuseProofs. The target-less
+    // form is deliberately schema-agnostic: under today's 3-column key a cross-context collision
+    // keeps the existing row, and once the key gains run_context both contexts' rows coexist,
+    // with no writer change and no deploy-ordering window in which writes fail.
+    await sql`
+      DELETE FROM harness_shared.test_executed_sources
+       WHERE workspace_name = ${workspaceName}
+         AND test_file = ANY(${files}::text[])
+         AND recorded_sha = ${flush.recordedSha}
+         AND run_context IS NOT DISTINCT FROM ${flush.runContext ?? null}::text
+    `;
     await sql`
       INSERT INTO harness_shared.test_executed_sources
         (workspace_name, test_file, recorded_sha, executed_modules, module_count, run_group_id,
@@ -298,16 +313,7 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
              ${flush.runnerIdentity ?? null}
         FROM unnest(${files}::text[], ${modules}::text[], ${reads}::text[], ${captured}::text[], ${opaque}::text[])
           AS u(f, m, r, c, o)
-      ON CONFLICT (workspace_name, test_file, recorded_sha) DO UPDATE
-        SET executed_modules = EXCLUDED.executed_modules,
-            module_count = EXCLUDED.module_count,
-            run_group_id = EXCLUDED.run_group_id,
-            read_paths = EXCLUDED.read_paths,
-            inputs_captured = EXCLUDED.inputs_captured,
-            opaque_reasons = EXCLUDED.opaque_reasons,
-            run_context = EXCLUDED.run_context,
-            runner_identity = EXCLUDED.runner_identity,
-            recorded_at = now()
+      ON CONFLICT DO NOTHING
     `;
     // Scoped to this run context (plus legacy pre-1236 NULL rows): a clean-local recording must
     // not erase the green-checkpoint's pass proof for the same file, since reuse only ever
