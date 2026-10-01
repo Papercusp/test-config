@@ -22,9 +22,17 @@ export function executedSourceRunContext(env: NodeJS.ProcessEnv = process.env): 
   return env.GREEN_CHECKPOINT === '1' ? 'green-checkpoint' : 'clean-local';
 }
 
-/** node version + platform + arch of this process (D-004 rule 6). */
+/**
+ * Proof format (gate-test-reuse-yield-2026-10-01 P-001): a `proof-v2` proof records, in readPaths,
+ * the vitest config that ran the file plus its relative imports (executed-source-map-reporter.ts),
+ * so the selector treats a nested vitest config as a per-proof input rather than a global one.
+ * PINNED equal to scripts/lib/test-pass-reuse.mjs REUSE_PROOF_FORMAT (the selector side).
+ */
+export const REUSE_PROOF_FORMAT = 'proof-v2';
+
+/** Proof format + node version + platform + arch of this process (D-004 rule 6, P-001). */
 export function executedSourceRunnerIdentity(): string {
-  return `${process.version} ${process.platform} ${process.arch}`;
+  return `${REUSE_PROOF_FORMAT} ${process.version} ${process.platform} ${process.arch}`;
 }
 
 export interface ReuseSkipList {

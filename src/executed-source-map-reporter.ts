@@ -111,6 +111,38 @@ export function classifyReadPaths(
   return { readPaths: [...readPaths].sort(), opaqueReasons };
 }
 
+interface ConfigDepsSource {
+  vite?: { config?: { configFileDependencies?: unknown } };
+  projects?: Array<{ vite?: { config?: { configFileDependencies?: unknown } } }>;
+}
+
+/**
+ * gate-test-reuse-yield-2026-10-01 P-001: every vitest config this run loaded, plus the files those
+ * configs import by RELATIVE path, as absolute paths — vite's `configFileDependencies` of the root
+ * project and of each project. Vite bundles a config's relative imports (recorded) and externalizes
+ * its bare ones (not recorded); test-pass-reuse.mjs isGlobalRunnerInput explains why the bare ones
+ * are covered. Measured 2026-10-01 (vitest 4.1.8, vite 7.3.5): a workspace config yields
+ * `[<its config>]`, and one importing `./helper` yields `[<helper>, <its config>]`.
+ *
+ * @returns sorted unique absolute paths, or null when no config dependency is visible (an unknown
+ *          config, which the caller must treat as opaque — never as "no config input").
+ */
+export function resolveConfigDependencies(ctx: unknown): string[] | null {
+  const deps = new Set<string>();
+  const add = (v: unknown): void => {
+    if (!Array.isArray(v)) return;
+    for (const p of v) if (typeof p === 'string' && isAbsolute(p)) deps.add(p);
+  };
+  try {
+    const c = ctx as ConfigDepsSource | null | undefined;
+    add(c?.vite?.config?.configFileDependencies);
+    for (const project of Array.isArray(c?.projects) ? c.projects : []) add(project?.vite?.config?.configFileDependencies);
+  } catch {
+    return null; // a getter that throws (server not ready) is an unknown config
+  }
+  return deps.size > 0 ? [...deps].sort() : null;
+}
+
 /** Build `isTracked` from `git ls-files` output: a tracked file, or a directory holding one. */
 export function trackedPredicate(trackedFiles: Iterable<string>): (rel: string) => boolean {
   const set = new Set<string>();
@@ -375,8 +407,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
    *  onTestRunEnd cannot end it while this reporter's chunked flush is still writing. */
   private pgLease: (() => Promise<void>) | null = null;
 
-  onInit(_ctx: Vitest): void {
+  /** P-001: absolute paths of the vitest config(s) this run loaded + their relative imports; null = unknown. */
+  private configDeps: string[] | null = null;
+
+  onInit(ctx: Vitest): void {
     if (!this.armed) return;
+    this.configDeps = resolveConfigDependencies(ctx);
     this.pgLease ??= retainSharedPg();
     this.worktreeBefore = this.readWorktreeSnapshot();
     this.pending = [];
@@ -437,14 +473,19 @@ export default class ExecutedSourceMapReporter implements Reporter {
       // P-009: the worker's runtime-inputs record. Absent = inputs unknown = never reusable.
       const inputs = readInputsRecord(this.inputsDir, testModule.moduleId);
       this.discardInputs(testModule.moduleId);
+      // P-001 (proof-v2): the config that ran this file is one of its inputs. Without it the
+      // selector could not scope a nested vitest config change to the proofs it affects, so a
+      // captured row whose config is unknown is made opaque (never reused) rather than recorded
+      // as if the config did not matter.
+      const configDeps = inputs !== null ? this.configDeps : [];
       this.pending.push({
         workspaceName: this.armed.workspaceName,
         testFile,
         executedModules,
         inputsCaptured: inputs !== null,
         // Absolute until flush, where classifyReadPaths relativises them against the tracked tree.
-        readPaths: inputs?.reads ?? [],
-        opaqueReasons: inputs?.opaque ?? [],
+        readPaths: [...(inputs?.reads ?? []), ...(configDeps ?? [])],
+        opaqueReasons: [...(inputs?.opaque ?? []), ...(configDeps === null ? ['config-deps-unavailable'] : [])],
       });
     } catch {
       /* swallow — D-007 */
