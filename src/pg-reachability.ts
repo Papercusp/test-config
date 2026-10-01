@@ -105,10 +105,10 @@ function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<vo
 }
 
 /**
- * `probePgReachable` + throw an ACTIONABLE error naming this as a known
- * local-environment class (EI-2627) rather than surfacing postgres's raw,
- * cryptic error ("no such database: papercusp_it") deep inside a later query.
- * For fixtures that need reachability confirmed before proceeding.
+ * `probePgReachable` and throw class-specific actionable guidance. Retryable
+ * startup/recovery failures retain the EI-2627 local-container diagnosis;
+ * non-retryable connection/setup errors (such as authentication or a missing
+ * database) fail fast with DSN guidance instead of being labeled container churn.
  */
 export async function assertPgReachable(
   dsn: string,
@@ -117,11 +117,19 @@ export async function assertPgReachable(
 ): Promise<void> {
   const result = await probePgReachable(dsn, budgetMs);
   if (result.ok) return;
+  const lastError = result.lastError ?? 'unknown Postgres connection error';
+  if (RETRYABLE_MSG.test(lastError)) {
+    throw new Error(
+      `${label}: the integration baseline Postgres is unreachable after ${result.elapsedMs}ms of startup retry ` +
+        `(${lastError}). This is very likely EI-2627 — local box/testcontainer churn reaped or ` +
+        `recycled the shared baseline-schema container (pgvector/pgvector:pg18, db "papercusp_it") — NOT a ` +
+        `code regression. Check \`docker ps\` for a live papercusp_it container and re-run; CI is unaffected.`,
+    );
+  }
   throw new Error(
-    `${label}: the integration baseline Postgres is unreachable after ${result.elapsedMs}ms of retry ` +
-      `(${result.lastError}). This is very likely EI-2627 — local box/testcontainer churn reaped or ` +
-      `recycled the shared baseline-schema container (pgvector/pgvector:pg18, db "papercusp_it") — NOT a ` +
-      `code regression. Check \`docker ps\` for a live papercusp_it container and re-run; CI is unaffected.`,
+    `${label}: the integration baseline Postgres probe failed fast on a non-retryable error ` +
+      `(${lastError}). The probe does not classify this as container startup churn or retry it. ` +
+      `Verify the injected DSN credentials/database and confirm it points at the container selected by global setup.`,
   );
 }
 

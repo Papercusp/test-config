@@ -133,11 +133,37 @@ describe("assertPgReachable — EI-2627", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("throws an EI-2627-tagged, actionable error naming the caller label on failure", async () => {
+  it("reports a missing database as a fast setup error, not container churn", async () => {
     unsafe.mockRejectedValueOnce(new Error("no such database: papercusp_it"));
-    await expect(
-      assertPgReachable("postgres://x", "myFixture", 5000),
-    ).rejects.toThrow(/myFixture.*EI-2627.*docker ps/s);
+    const rejection = assertPgReachable("postgres://x", "myFixture", 5000)
+      .then(() => null, (error: unknown) => error as Error);
+    const error = await rejection;
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toMatch(/myFixture.*no such database.*non-retryable.*container startup churn/s);
+    expect(error?.message).not.toMatch(/EI-2627|docker ps/);
+    expect(unsafe).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports password authentication failure as a credential error, not container churn", async () => {
+    unsafe.mockRejectedValueOnce(new Error('password authentication failed for user "marsh-office"'));
+    const rejection = assertPgReachable("postgres://x", "myFixture", 5000)
+      .then(() => null, (error: unknown) => error as Error);
+    const error = await rejection;
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toMatch(/myFixture.*password authentication failed/);
+    expect(error?.message).not.toMatch(/EI-2627|docker ps|container startup churn/);
+    expect(unsafe).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps EI-2627 guidance for retryable startup failures", async () => {
+    unsafe.mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:5432"));
+    const rejection = assertPgReachable("postgres://x", "myFixture", 500)
+      .then(() => null, (error: unknown) => error as Error);
+    await vi.runAllTimersAsync();
+    const error = await rejection;
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toMatch(/myFixture.*EI-2627.*docker ps/s);
+    expect(unsafe).toHaveBeenCalledTimes(2);
   });
 });
 
