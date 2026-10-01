@@ -93,7 +93,15 @@ export async function startDedicatedNativePg(
         '-D', dataDir,
         '-p', String(port),
         '-c', 'listen_addresses=127.0.0.1',
-        '-c', `unix_socket_directories=${dataDir}`,
+        // WI-10004469: no Unix socket. Every caller connects over TCP 127.0.0.1, and a
+        // socket in dataDir fails startup outright once `<baseDir>/papercusp-native-pg-XXXXXX/
+        // .s.PGSQL.<port>` exceeds the kernel's 107-byte sun_path limit
+        // ("FATAL: could not create any Unix-domain sockets") — a long TMPDIR was enough.
+        '-c', 'unix_socket_directories=',
+        // Keep server messages on stderr, where logTail captures them. With the collector
+        // on, a startup FATAL went to <dataDir>/log, which cleanup deletes, so the error
+        // carried no cause.
+        '-c', 'logging_collector=off',
         ...nativePgSettingArgs(opts.settings ?? {}),
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] },
@@ -104,12 +112,21 @@ export async function startDedicatedNativePg(
     };
     child.stdout?.on('data', keep);
     child.stderr?.on('data', keep);
+    // A postmaster that dies at startup must end the wait at once rather than after the
+    // whole readiness budget. 'close' (not 'exit') fires after stdio drains, so the
+    // FATAL is already in logTail when the error below is built.
+    const postmasterGone = new AbortController();
+    let postmasterExit: string | undefined;
+    child.once('close', (code, signal) => {
+      postmasterExit = `postmaster exited before accepting connections (code ${code ?? 'null'}, signal ${signal ?? 'none'})`;
+      postmasterGone.abort();
+    });
     const uri = `postgres://postgres@127.0.0.1:${port}/postgres`;
-    const ready = await probePgReachable(uri, opts.readyBudgetMs ?? 60_000);
+    const ready = await probePgReachable(uri, opts.readyBudgetMs ?? 60_000, { signal: postmasterGone.signal });
     if (!ready.ok) {
       throw new Error(
         `startDedicatedNativePg: cluster never answered SELECT 1 within ${ready.elapsedMs}ms ` +
-          `(${ready.lastError}); server log tail:\n${logTail.join('')}`,
+          `(${postmasterExit ?? ready.lastError}); server log tail:\n${logTail.join('')}`,
       );
     }
     const proc = child;

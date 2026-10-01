@@ -50,14 +50,24 @@ export interface PgReachabilityResult {
  * transient startup/recovery race (see RETRYABLE_MSG). Any other failure
  * (auth, "no such database", …) returns immediately — that is a genuine
  * staleness/config signal, not something a retry can ride out.
+ *
+ * `opts.signal` ends the retry loop early (before the next attempt and during
+ * the backoff sleep). A caller that owns the server process aborts it when that
+ * process exits, so a server that died at startup is reported at once instead
+ * of after the whole budget (WI-10004469).
  */
 export async function probePgReachable(
   dsn: string,
   budgetMs = 15_000,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<PgReachabilityResult> {
   const startedAt = Date.now();
   let lastError: string | undefined;
+  const { signal } = opts;
   for (let attempt = 1; ; attempt++) {
+    if (signal?.aborted) {
+      return { ok: false, elapsedMs: Date.now() - startedAt, lastError: lastError ?? 'aborted before the first attempt' };
+    }
     const probe = postgres(dsn, {
       max: 1,
       onnotice: () => {},
@@ -72,11 +82,26 @@ export async function probePgReachable(
       if (!RETRYABLE_MSG.test(lastError) || elapsedMs >= budgetMs) {
         return { ok: false, elapsedMs, lastError };
       }
-      await new Promise((r) => setTimeout(r, Math.min(attempt * 500, 3000)));
+      await abortableDelay(Math.min(attempt * 500, 3000), signal);
     } finally {
       await probe.end({ timeout: 5 }).catch(() => {});
     }
   }
+}
+
+/** Resolve after `ms`, or as soon as `signal` aborts (never rejects). */
+function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return new Promise((r) => setTimeout(r, ms));
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
 }
 
 /**
