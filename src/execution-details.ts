@@ -48,12 +48,24 @@ export interface TestRunExecutionDetails {
   commitSha: string | null;
   /** True unless the whole worktree was proven stable around the run. */
   worktreeDirty: boolean;
+  /**
+   * WHY `worktreeDirty` is true, named at flush time (WI-10004866). The gate
+   * re-materializes its checkout on the next run, so the ledger row is the only
+   * place the cause survives. Present only on dirty rows; absent on clean rows
+   * and on every row written before this field existed.
+   *
+   * Rollout is expand-then-contract: this parser accepts the key BEFORE the
+   * reporter writes it, because the parser is strict (an unknown key makes the
+   * row unproven) and the deployed operator parses rows that the working-tree
+   * reporter writes.
+   */
+  worktreeDirtyReason?: string;
 }
 
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
-  'commitSha', 'worktreeDirty', 'testLayer',
+  'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason',
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -110,7 +122,10 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
     || !isNullableString(value.mutationPhase) || !isNullableString(value.commitSha)
-    || typeof value.worktreeDirty !== 'boolean') {
+    || typeof value.worktreeDirty !== 'boolean'
+    || (value.worktreeDirtyReason !== undefined
+      && (typeof value.worktreeDirtyReason !== 'string' || value.worktreeDirtyReason.length === 0
+        || value.worktreeDirty !== true))) {
     return undefined;
   }
   return value as unknown as TestRunExecutionDetails;
