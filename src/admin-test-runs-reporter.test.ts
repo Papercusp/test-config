@@ -24,6 +24,7 @@ import AdminTestRunsReporter, {
   computeWorkspaceRootFrom,
   computeWorktreeDirty,
   describeWorktreeDirt,
+  WORKTREE_SNAPSHOT_GIT_BUDGETS_MS,
   computeIsScratchConfig,
   inferWorkspaceRoot,
   insertTestRunRowsWithSql,
@@ -1197,5 +1198,52 @@ describe('WI-10004898 — copy-out probe rows are measured against the origin ch
     process.env.PAPERCUSP_MUTATION_PROBE = '1';
     process.env.PAPERCUSP_MUTATION_PROBE_ORIGIN_ROOT = 'relative/origin';
     expect(resolveWorktreeSnapshotRoot()).toBe(recordRoot);
+  });
+});
+
+describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', () => {
+  const STATUS = 'git status --porcelain --untracked-files=all';
+  /** A fake git: each command answers from its queue in order; null models a timed-out exec. */
+  const fakeGit = (answers: Record<string, Array<string | null>>) => {
+    const calls: Array<{ cmd: string; timeoutMs: number }> = [];
+    const run = async (cmd: string, _cwd: string, timeoutMs: number) => {
+      calls.push({ cmd, timeoutMs });
+      const queue = answers[cmd] ?? [];
+      return queue.length > 0 ? (queue.shift() as string | null) : null;
+    };
+    return { run, calls };
+  };
+
+  it('a status read that times out once and then answers empty proves the tree CLEAN', async () => {
+    const { run, calls } = fakeGit({ 'git rev-parse HEAD': ['abc123'], [STATUS]: [null, ''] });
+    const snap = await captureWorktreeSnapshot(run);
+    expect(snap).toEqual({ commit: 'abc123', porcelain: '' });
+    expect(computeWorktreeDirty(snap, snap)).toBe(false);
+    expect(calls.filter((c) => c.cmd === STATUS).map((c) => c.timeoutMs)).toEqual([...WORKTREE_SNAPSHOT_GIT_BUDGETS_MS]);
+  });
+
+  it('the retry gets a LARGER budget than the first attempt', () => {
+    expect(WORKTREE_SNAPSHOT_GIT_BUDGETS_MS.length).toBeGreaterThanOrEqual(2);
+    expect(WORKTREE_SNAPSHOT_GIT_BUDGETS_MS[1]).toBeGreaterThan(WORKTREE_SNAPSHOT_GIT_BUDGETS_MS[0]);
+  });
+
+  it('a status read that fails on EVERY attempt stays unreadable, so the run is still DIRTY (D-007)', async () => {
+    const { run } = fakeGit({ 'git rev-parse HEAD': ['abc123'], [STATUS]: [null, null, null] });
+    const snap = await captureWorktreeSnapshot(run);
+    expect(snap.porcelain).toBeNull();
+    expect(describeWorktreeDirt(snap, snap)).toBe('git status unreadable before the run');
+  });
+
+  it('a real dirty answer on the first attempt is NOT retried away', async () => {
+    const { run, calls } = fakeGit({ 'git rev-parse HEAD': ['abc123'], [STATUS]: [' M peer-edit.ts', ''] });
+    const snap = await captureWorktreeSnapshot(run);
+    expect(snap.porcelain).toBe(' M peer-edit.ts');
+    expect(computeWorktreeDirty(snap, snap)).toBe(true);
+    expect(calls.filter((c) => c.cmd === STATUS)).toHaveLength(1);
+  });
+
+  it('a HEAD read that times out once is retried too', async () => {
+    const { run } = fakeGit({ 'git rev-parse HEAD': [null, 'abc123'], [STATUS]: [''] });
+    expect(await captureWorktreeSnapshot(run)).toEqual({ commit: 'abc123', porcelain: '' });
   });
 });

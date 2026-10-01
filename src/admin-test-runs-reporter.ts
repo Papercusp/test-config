@@ -418,13 +418,32 @@ export function resolveWorktreeSnapshotRoot(): string {
  * row. The fail-safe null handling in computeWorktreeDirty makes git timeout
  * or failure visible as dirty instead of silently restoring the old default.
  */
-export async function captureWorktreeSnapshot(): Promise<WorktreeGitSnapshot> {
+export async function captureWorktreeSnapshot(run: WorktreeGitRunner = runGit): Promise<WorktreeGitSnapshot> {
   const root = resolveWorktreeSnapshotRoot();
   const [commit, porcelain] = await Promise.all([
-    runGit('git rev-parse HEAD', root, 2_000),
-    runGit('git status --porcelain --untracked-files=all', root, 2_000),
+    runGitWithRetry(run, 'git rev-parse HEAD', root),
+    runGitWithRetry(run, 'git status --porcelain --untracked-files=all', root),
   ]);
   return { commit, porcelain };
+}
+
+/**
+ * WI-10004931: per-attempt budgets for each snapshot git read. A timed-out read
+ * returns null, and null is dirty by design (D-007), so a single 2s budget let
+ * fleet IO load stamp a provably clean tree dirty: a ~38-submodule clone's
+ * `git status` measured 1.8s while vitest ran beside it. Only a read that fails
+ * on EVERY attempt stays null, so missing proof still records dirty.
+ */
+export const WORKTREE_SNAPSHOT_GIT_BUDGETS_MS: readonly number[] = [2_000, 8_000];
+
+export type WorktreeGitRunner = (cmd: string, cwd: string, timeoutMs: number) => Promise<string | null>;
+
+async function runGitWithRetry(run: WorktreeGitRunner, cmd: string, cwd: string): Promise<string | null> {
+  for (const budget of WORKTREE_SNAPSHOT_GIT_BUDGETS_MS) {
+    const out = await run(cmd, cwd, budget);
+    if (out !== null) return out;
+  }
+  return null;
 }
 
 export interface TestRunRow {
