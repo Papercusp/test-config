@@ -277,7 +277,7 @@ interface SourceGraphNode {
 const sourceHash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 
 /**
- * EI-24827847586322829: importDurations is completed at module end. Snapshot the existing
+ * EI-24827847586322829: importDurations grows as tests run. Snapshot this module's existing
  * environment graph at collection, then select the actually reported modules at end. Never
  * reconstruct original bytes from end-of-run disk or a graph entry replaced during the test.
  * This diagnostic is deliberately independent of HEAD and never authorizes database reuse.
@@ -587,9 +587,18 @@ export default class ExecutedSourceMapReporter implements Reporter {
     // Fingerprinting has a cost. Only the existing optional diagnostic OUT channel requests it.
     if (!this.armed?.outPath || isMutationProbeRun()) return;
     try {
-      this.collectedSources.set(testModule, captureCollectedSources(
-        testModule.viteEnvironment?.moduleGraph.idToModuleMap.values(), { repoRoot: this.repoRoot },
-      ));
+      const imports = testModule.diagnostic().importDurations as Record<string, ImportDurationLike> | undefined;
+      const reported = new Set(collectExecutedModules(imports, { repoRoot: this.repoRoot, testFile: testModule.moduleId }));
+      const graph = testModule.viteEnvironment?.moduleGraph.idToModuleMap;
+      // The server graph may contain another file's transforms. Those do not establish when
+      // THIS file imported a module; a later import must remain a gap even if already cached.
+      const nodes = graph && [...graph.values()].filter(node => {
+        const path = node.id && normalizeExecutedKey(node.id, this.repoRoot);
+        return path && reported.has(path);
+      });
+      const captured = captureCollectedSources(nodes, { repoRoot: this.repoRoot });
+      if (!imports || Object.keys(imports).length === 0) captured.reasons.push('collection-import-record-unavailable');
+      this.collectedSources.set(testModule, captured);
     } catch {
       this.collectedSources.set(testModule, { modules: new Map(), reasons: ['collection-graph-unreadable'] });
     }

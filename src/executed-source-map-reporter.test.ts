@@ -338,6 +338,30 @@ describe('ExecutedSourceMapReporter', () => {
     expect(flushes[0]!.rows[0]).not.toHaveProperty('sourceEvidence');
   });
 
+  it('leaves a late import unknown even when another test already populated its server graph entry', async () => {
+    const self = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
+    const source = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.ts');
+    const late = join(REPO_ROOT, 'libs/test-config/src/executed-source-fingerprints.test.ts');
+    const nodes = new Map([self, source, late].map(id => [id, {
+      id, transformResult: { map: { sources: [id], sourcesContent: [readFileSync(id, 'utf8')] } },
+    }]));
+    const imports = { [source]: {} };
+    const mod = Object.assign(fakeModule({ moduleId: self, imports }), {
+      viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
+    });
+    const { r } = reporter();
+    r.onInit({} as never);
+    r.onTestModuleCollected(mod);
+    imports[late] = {};
+    r.onTestModuleEnd(mod);
+    await r.onTestRunEnd();
+    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    expect(out.rows[0].sourceEvidence).toMatchObject({
+      status: 'unknown',
+      reasons: ['module-not-captured-at-collection:libs/test-config/src/executed-source-fingerprints.test.ts'],
+    });
+  });
+
   // EI-24542010215430349: a gate rescue rerun runs armed so a capture-caused red reproduces, but
   // nothing it sees may become a proof — not a pass row, and not a retirement either, even from a
   // CLEAN checkout where the ordinary path would write both.

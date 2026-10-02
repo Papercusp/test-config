@@ -100,10 +100,9 @@ describe('prospective Vite source fingerprints (EI-24827847586322829)', () => {
   });
 
   it('refuses conflicting source versions for the same repository path', () => {
-    const captured = captureCollectedSources([node(SELF), node(DEP), node(`${DEP}?v=2`, 'other bytes')], options);
-    // The query is a Vite module identity; its map still points at the actual source path.
-    const duplicate = captured.modules.get('dep.ts')!;
-    duplicate.sources.push({ path: 'dep.ts', sha256: hash('other bytes') });
+    const captured = captureCollectedSources([node(SELF), node(DEP), {
+      id: `${DEP}?v=2`, transformResult: { map: { sources: [DEP], sourcesContent: ['other bytes'] } },
+    }], options);
     const evidence = qualifyCollectedSources(captured, { [DEP]: {} }, options);
     expect(evidence.status).toBe('unknown');
     expect(evidence.reasons).toContain('conflicting-source-maps:dep.ts');
