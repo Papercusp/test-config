@@ -114,6 +114,8 @@ ensurePapercuspTmpdir();
 // + fail-soft (D-007): a missing DB / cold checkout never changes a test outcome. Opt-out via
 // PAPERCUSP_DISABLE_TEST_RUNS_REPORTER=1 (the reporter's own test sets it).
 const ADMIN_TEST_RUNS_REPORTER = resolve(__dirname, 'admin-test-runs-reporter.ts');
+/** The host repository's "may this run start?" veto — see host-preflight-global-setup.ts. */
+export const HOST_PREFLIGHT_GLOBAL_SETUP = resolve(__dirname, 'host-preflight-global-setup.ts');
 
 // ── EXECUTED-SOURCE MAP (gate-latency-selection-and-retry-policy-2026-09-06, P-002) ──────
 // A second reporter that records, per test FILE, the modules vitest actually executed, into
@@ -233,6 +235,11 @@ interface GateOwnedParts {
   reporters: string[];
   /** Setup files that must precede every other setup file. */
   leadingSetupFiles: string[];
+  /**
+   * globalSetup files that must precede every other globalSetup: the host preflight's refusal has
+   * to land before anything else (a testcontainer, a schema clone) starts on the run's behalf.
+   */
+  leadingGlobalSetup: string[];
   /** Exclude globs for files whose pass proof is still valid at the judged sha. */
   reuseSkipExclude: string[];
   experimental: { importDurations: { limit: number; print: false } } | undefined;
@@ -248,6 +255,8 @@ function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedPart
     ],
     // The capture patches node:fs, so never in a real browser.
     leadingSetupFiles: layer === 'browser' ? [] : executedSourceMap.setupFiles,
+    // Every layer: globalSetup runs in vitest's node main process even for a browser run.
+    leadingGlobalSetup: [HOST_PREFLIGHT_GLOBAL_SETUP],
     // affected-tests arms the skip channel for unit vitest tasks alone, and the reader re-checks
     // run context + runner identity (a declined list means every file runs).
     reuseSkipExclude: layer === 'unit' ? resolveReuseSkipExclude(env) : [],
@@ -258,6 +267,8 @@ function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedPart
 export interface GateParticipationOptions {
   /** The workspace's own setup files. The gate's capture setup is placed before them. */
   setupFiles?: string[];
+  /** The workspace's own globalSetup files. The host preflight is placed before them. */
+  globalSetup?: string[];
   /** The workspace's own exclude globs, merged with vitest's defaults and the reuse skip list. */
   exclude?: string[];
 }
@@ -265,6 +276,8 @@ export interface GateParticipationOptions {
 export interface GateParticipationFragment {
   reporters: string[];
   setupFiles: string[];
+  /** The host preflight. Pass the workspace's own globalSetup through `opts.globalSetup`. */
+  globalSetup: string[];
   exclude: string[];
   experimental?: { importDurations: { limit: number; print: false } };
 }
@@ -287,6 +300,7 @@ export function gateParticipationConfig(
   return {
     reporters: ['default', ...gate.reporters],
     setupFiles: [...gate.leadingSetupFiles, ...(opts.setupFiles ?? [])],
+    globalSetup: [...gate.leadingGlobalSetup, ...(opts.globalSetup ?? [])],
     exclude: [...configDefaults.exclude, ...(opts.exclude ?? []), ...gate.reuseSkipExclude],
     ...(gate.experimental ? { experimental: gate.experimental } : {}),
   };
@@ -833,7 +847,7 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
           ? Number(process.env.VITEST_INTEGRATION_HOOK_TIMEOUT_MS) || 90_000
           : 60_000,
       setupFiles: finalSetup,
-      globalSetup,
+      globalSetup: [...gate.leadingGlobalSetup, ...globalSetup],
       reporters: process.env.CI
         ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }], ...gate.reporters]
         : ['default', ...gate.reporters],
