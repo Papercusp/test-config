@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import { configDefaults } from 'vitest/config';
 import {
   ADMIN_TEST_RUNS_REPORTER_PATH,
+  HOST_PREFLIGHT_GLOBAL_SETUP,
   EXECUTED_SOURCE_MAP_IMPORT_LIMIT,
   PC_EXECUTED_INPUTS_DIR_ENV,
   PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV,
@@ -72,8 +73,18 @@ describe('gateParticipationConfig — what a hand-rolled unit config spreads in'
     expect(fragment).toEqual({
       reporters: ['default', ADMIN_TEST_RUNS_REPORTER_PATH],
       setupFiles: ['./src/test-setup.ts'],
+      globalSetup: [HOST_PREFLIGHT_GLOBAL_SETUP],
       exclude: [...configDefaults.exclude, 'src/**/*.integration.test.ts'],
     });
+  });
+
+  // WI-10005724: a hand-rolled config must not lose the host preflight to its own globalSetup,
+  // and the preflight must run FIRST so its refusal precedes any container start-up.
+  it('puts the host preflight before the caller globalSetup', () => {
+    expect(gateParticipationConfig({ globalSetup: ['./src/own-global-setup.ts'] }, {}).globalSetup).toEqual([
+      HOST_PREFLIGHT_GLOBAL_SETUP,
+      './src/own-global-setup.ts',
+    ]);
   });
 
   it('keeps vitest default excludes even with no caller excludes — setting exclude replaces them', () => {
