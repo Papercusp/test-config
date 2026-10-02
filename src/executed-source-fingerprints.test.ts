@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { captureCollectedSources, qualifyCollectedSources } from './executed-source-map-reporter';
+import { executedSourceOriginalsPlugin, PC_EXECUTED_SOURCE_ORIGINAL_META } from './vitest-config';
 
 const ROOT = '/repo';
 const SELF = '/repo/test.test.ts';
@@ -112,24 +113,40 @@ describe('prospective Vite source fingerprints (EI-24827847586322829)', () => {
     const root = mkdtempSync(join(tmpdir(), 'collected-vite-sources-'));
     const self = join(root, 'test.test.ts');
     const dep = join(root, 'dep.ts');
+    const erased = join(root, 'ports.ts');
     writeFileSync(self, 'import { answer } from "./dep.ts"; export const observed = answer;\n');
     writeFileSync(dep, 'export const answer: number = 42;\n');
+    writeFileSync(erased, 'export interface Ports { answer: number }\n');
     const { createServer } = await import('vite');
     const server = await createServer({
       root, configFile: false, server: { middlewareMode: true, watch: null },
+      plugins: [executedSourceOriginalsPlugin()],
       optimizeDeps: { noDiscovery: true }, logLevel: 'silent',
     });
     try {
       const environment = server.environments.ssr!;
       await environment.transformRequest(self);
       await environment.transformRequest(dep);
+      await environment.transformRequest(erased);
+      const erasedNode = environment.moduleGraph.getModuleById(erased)!;
+      const erasedMap = erasedNode.transformResult!.map as { sources: string[] };
+      expect(erasedMap.sources).toEqual([]); // reproduction: esbuild erased every TS declaration
+      const noReceipt = captureCollectedSources([{ ...erasedNode, info: { meta: {} } }], { repoRoot: root });
+      expect(noReceipt.modules.get('ports.ts')!.reasons).toContain('module-source-unresolved:ports.ts');
+      expect(erasedNode.info?.meta?.[PC_EXECUTED_SOURCE_ORIGINAL_META]).toMatchObject({
+        version: 1, id: erased, sha256: hash(readFileSync(erased, 'utf8')),
+      });
       const captured = captureCollectedSources(environment.moduleGraph.idToModuleMap.values(), { repoRoot: root });
-      const evidence = qualifyCollectedSources(captured, { [dep]: {} }, { repoRoot: root, testFile: self });
+      const imports = { [dep]: {}, [erased]: {} };
+      const evidence = qualifyCollectedSources(captured, imports, { repoRoot: root, testFile: self });
       expect(evidence.status).toBe('stable');
       expect(evidence.sources.find(source => source.path === 'dep.ts')!.sha256)
         .toBe(hash(readFileSync(dep, 'utf8')));
+      expect(evidence.sources.find(source => source.path === 'ports.ts')).toMatchObject({
+        sha256: hash(readFileSync(erased, 'utf8')), basis: 'vite-pre-transform',
+      });
       writeFileSync(dep, 'export const answer: number = 99;\n');
-      expect(qualifyCollectedSources(captured, { [dep]: {} }, { repoRoot: root, testFile: self }))
+      expect(qualifyCollectedSources(captured, imports, { repoRoot: root, testFile: self }))
         .toMatchObject({ status: 'changed', reasons: ['source-changed:dep.ts'] });
     } finally {
       await server.close();

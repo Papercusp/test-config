@@ -47,7 +47,7 @@ import {
   type PgHandle,
   type WorktreeGitSnapshot,
 } from './admin-test-runs-reporter';
-import { executedSourceMapArmed } from './vitest-config';
+import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META } from './vitest-config';
 
 export interface ExecutedSourceRow {
   workspaceName: string;
@@ -247,6 +247,7 @@ export function collectExecutedModules(
 interface SourceFingerprint {
   path: string;
   sha256: string;
+  basis?: 'vite-pre-transform';
 }
 
 interface CollectedModuleSources {
@@ -271,6 +272,8 @@ export interface ExecutedSourceEvidence {
 
 interface SourceGraphNode {
   id: string | null;
+  meta?: Record<string, unknown>;
+  info?: { meta?: Record<string, unknown> };
   transformResult?: { map?: unknown } | null;
 }
 
@@ -298,7 +301,23 @@ export function captureCollectedSources(
       const map = node.transformResult?.map as {
         sources?: unknown; sourcesContent?: unknown; sourceRoot?: unknown;
       } | null | undefined;
-      if (!map || !Array.isArray(map.sources) || !Array.isArray(map.sourcesContent)) {
+      const original = node.info?.meta?.[PC_EXECUTED_SOURCE_ORIGINAL_META] as {
+        version?: unknown; id?: unknown; sha256?: unknown;
+      } | undefined;
+      // An erased type-only module has no original map entry. Use the exact transform input
+      // receipt when available, never current disk bytes as a substitute for missing originals.
+      if ((!map || !Array.isArray(map.sources) || map.sources.length === 0) && original?.version === 1 &&
+          typeof original.id === 'string' && normalizeExecutedKey(original.id, o.repoRoot) === rel &&
+          typeof original.sha256 === 'string' && /^[a-f0-9]{64}$/.test(original.sha256)) {
+        entry.sources.push({ path: rel, sha256: original.sha256, basis: 'vite-pre-transform' });
+        try {
+          if (sourceHash(readSource(resolve(o.repoRoot, rel))) !== original.sha256) {
+            entry.reasons.push(`collection-source-mismatch:${rel}`);
+          }
+        } catch {
+          entry.reasons.push(`collection-source-unreadable:${rel}`);
+        }
+      } else if (!map || !Array.isArray(map.sources) || !Array.isArray(map.sourcesContent)) {
         entry.reasons.push(`source-map-unavailable:${rel}`);
       } else {
         for (let i = 0; i < map.sources.length; i++) {
@@ -350,7 +369,7 @@ export function qualifyCollectedSources(
   o: { repoRoot: string; testFile: string; readSource?: (absolutePath: string) => Buffer },
 ): ExecutedSourceEvidence {
   const reasons = new Set(collected?.reasons ?? ['collection-evidence-unavailable']);
-  const fingerprints = new Map<string, string>();
+  const fingerprints = new Map<string, SourceFingerprint>();
   const readSource = o.readSource ?? readFileSync;
   if (!importDurations || Object.keys(importDurations).length === 0) reasons.add('import-record-unavailable');
   const modules = collectExecutedModules(importDurations, o);
@@ -368,12 +387,13 @@ export function qualifyCollectedSources(
     for (const reason of entry.reasons) reasons.add(reason);
     for (const source of entry.sources) {
       const previous = fingerprints.get(source.path);
-      if (previous && previous !== source.sha256) reasons.add(`conflicting-source-maps:${source.path}`);
-      else fingerprints.set(source.path, source.sha256);
+      if (previous && previous.sha256 !== source.sha256) reasons.add(`conflicting-source-maps:${source.path}`);
+      else fingerprints.set(source.path, source);
     }
   }
   let changed = false;
-  const sources = [...fingerprints].sort(([a], [b]) => a.localeCompare(b)).map(([path, sha256]) => {
+  const sources = [...fingerprints.values()].sort((a, b) => a.path.localeCompare(b.path)).map(source => {
+    const { path, sha256 } = source;
     let currentSha256: string | null = null;
     try {
       currentSha256 = sourceHash(readSource(resolve(o.repoRoot, path)));
@@ -384,7 +404,7 @@ export function qualifyCollectedSources(
     } catch {
       reasons.add(`source-unreadable:${path}`);
     }
-    return { path, sha256, currentSha256 };
+    return { ...source, currentSha256 };
   });
   return {
     schemaVersion: 'vite-collected-source-evidence-v1',

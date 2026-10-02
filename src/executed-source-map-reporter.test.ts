@@ -129,6 +129,10 @@ describe('executedSourceMapConfig — the reporter and the raised limit travel t
     expect(cfg.reporters).toHaveLength(1);
     expect(cfg.reporters[0]).toMatch(/executed-source-map-reporter\.ts$/);
     expect(cfg.experimental).toEqual({ importDurations: { limit: EXECUTED_SOURCE_MAP_IMPORT_LIMIT, print: false } });
+    expect(cfg.plugins).toBeUndefined();
+    expect(executedSourceMapConfig({
+      [PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV]: '@x/w', [PC_EXECUTED_SOURCE_MAP_OUT_ENV]: '/tmp/o.json',
+    }).plugins?.map(plugin => plugin.name)).toEqual(['papercusp-executed-source-originals']);
     // vitest 4.1.8 caps the reported map at `limit` and defaults it to 0 (or 10 when printing);
     // anything in that range would silently record a near-empty executed set.
     expect(EXECUTED_SOURCE_MAP_IMPORT_LIMIT).toBeGreaterThanOrEqual(100_000);

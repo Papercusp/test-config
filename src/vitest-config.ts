@@ -3,6 +3,8 @@
 // alias `ViteUserConfig`. Import that under our existing local name so nothing else here changes.
 import { configDefaults, defineConfig, type ViteUserConfig as UserConfig } from 'vitest/config';
 import tsconfigPaths from 'vite-tsconfig-paths';
+import type { Plugin } from 'vite';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -145,6 +147,21 @@ export const PC_EXECUTED_SOURCE_MAP_RESULT_ENV = 'PC_EXECUTED_SOURCE_MAP_RESULT'
 export const PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV = 'PC_EXECUTED_SOURCE_MAP_NO_PERSIST';
 export const EXECUTED_SOURCE_MAP_IMPORT_LIMIT = 1_000_000;
 const EXECUTED_SOURCE_MAP_REPORTER = resolve(__dirname, 'executed-source-map-reporter.ts');
+/** Vite's existing module metadata carries the original transform input, including erased TS. */
+export const PC_EXECUTED_SOURCE_ORIGINAL_META = 'papercuspExecutedOriginalSource';
+
+export function executedSourceOriginalsPlugin(): Plugin {
+  return {
+    name: 'papercusp-executed-source-originals',
+    enforce: 'pre',
+    transform(code, id) {
+      // Metadata only: no code/map replacement and no source text retained in memory.
+      return { meta: { [PC_EXECUTED_SOURCE_ORIGINAL_META]: {
+        version: 1, id, sha256: createHash('sha256').update(code).digest('hex'),
+      } } };
+    },
+  };
+}
 
 /** The arming decision, PURE over an env — `null` when the runner did not ask for a map. */
 export function executedSourceMapArmed(
@@ -166,12 +183,15 @@ export function executedSourceMapConfig(env: NodeJS.ProcessEnv = process.env): {
   reporters: string[];
   experimental: { importDurations: { limit: number; print: false } } | undefined;
   setupFiles: string[];
+  plugins?: Plugin[];
 } {
-  if (!executedSourceMapArmed(env)) return { reporters: [], experimental: undefined, setupFiles: [] };
+  const armed = executedSourceMapArmed(env);
+  if (!armed) return { reporters: [], experimental: undefined, setupFiles: [] };
   return {
     reporters: [EXECUTED_SOURCE_MAP_REPORTER],
     experimental: { importDurations: { limit: EXECUTED_SOURCE_MAP_IMPORT_LIMIT, print: false } },
     setupFiles: armExecutedInputsCapture(env) ? [EXECUTED_INPUTS_CAPTURE_SETUP] : [],
+    ...(armed.outPath ? { plugins: [executedSourceOriginalsPlugin()] } : {}),
   };
 }
 
@@ -208,6 +228,7 @@ export function armExecutedInputsCapture(env: NodeJS.ProcessEnv = process.env): 
 // of 73 tasks). defineVitestConfig and gateParticipationConfig now both read THIS function, so a
 // new gate-owned piece reaches every enrolled config at once instead of drifting.
 interface GateOwnedParts {
+  plugins: Plugin[];
   /** Gate-owned reporters only — never 'default' / 'junit', which each config chooses. */
   reporters: string[];
   /** Setup files that must precede every other setup file. */
@@ -220,6 +241,7 @@ interface GateOwnedParts {
 function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedParts {
   const executedSourceMap = executedSourceMapConfig(env);
   return {
+    plugins: executedSourceMap.plugins ?? [],
     reporters: [
       ...(env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' ? [] : [ADMIN_TEST_RUNS_REPORTER]),
       ...executedSourceMap.reporters,
@@ -665,7 +687,7 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   }
 
   return defineConfig({
-    plugins: [tsconfigPaths({ ignoreConfigErrors: true })],
+    plugins: [tsconfigPaths({ ignoreConfigErrors: true }), ...gate.plugins],
     // Use a project-local Vite cache dir instead of os.tmpdir() (which is
     // TMPDIR=/tmp/claude on this dev box — a read-only path that doesn't
     // exist, causing every vitest run to ENOENT on the ssr/ sub-directory
