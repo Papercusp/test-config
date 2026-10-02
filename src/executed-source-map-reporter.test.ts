@@ -297,6 +297,47 @@ describe('ExecutedSourceMapReporter', () => {
     expect(moved.flushes).toEqual([]);
   });
 
+  it('keeps collected source evidence in OUT across HEAD movement without stamping reusable proof', async () => {
+    const self = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
+    const source = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.ts');
+    const nodes = new Map([self, source].map(id => [id, {
+      id, transformResult: { map: { sources: [id], sourcesContent: [readFileSync(id, 'utf8')] } },
+    }]));
+    const mod = Object.assign(fakeModule({ moduleId: self, imports: { [source]: {} } }), {
+      viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
+    });
+    let n = 0;
+    const { r, flushes } = reporter(async () => ({ commit: n++ === 0 ? 'aaaa000' : 'bbbb000', porcelain: '' }));
+    r.onInit({} as never);
+    r.onTestModuleCollected(mod);
+    // Replacing the server graph must not replace the originals we already captured.
+    nodes.clear();
+    r.onTestModuleEnd(mod);
+    await r.onTestRunEnd();
+    expect(flushes).toEqual([]);
+    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    expect(out.worktreeDirty).toBe(true);
+    expect(out.rows[0].sourceEvidence).toMatchObject({
+      status: 'stable', scope: 'repository-worker-vite-original-sources', reasons: [],
+    });
+    expect(out.rows[0].sourceEvidence.sources.map((s: { path: string }) => s.path)).toEqual([
+      'libs/test-config/src/executed-source-map-reporter.test.ts',
+      'libs/test-config/src/executed-source-map-reporter.ts',
+    ]);
+  });
+
+  it('does no source fingerprint work unless the optional OUT channel requests it', async () => {
+    delete process.env[PC_EXECUTED_SOURCE_MAP_OUT_ENV];
+    const { r, flushes } = reporter();
+    const mod = fakeModule({});
+    Object.defineProperty(mod, 'viteEnvironment', { get: () => { throw new Error('must not read graph'); } });
+    r.onInit({} as never);
+    r.onTestModuleCollected(mod);
+    r.onTestModuleEnd(mod);
+    await r.onTestRunEnd();
+    expect(flushes[0]!.rows[0]).not.toHaveProperty('sourceEvidence');
+  });
+
   // EI-24542010215430349: a gate rescue rerun runs armed so a capture-caused red reproduces, but
   // nothing it sees may become a proof — not a pass row, and not a retirement either, even from a
   // CLEAN checkout where the ordinary path would write both.
