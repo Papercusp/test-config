@@ -54,3 +54,22 @@ describe('parseTestRunExecutionDetails — worktreeDirtyReason (WI-10004866)', (
     expect(parseTestRunExecutionDetails({ ...details({ worktreeDirty: true }), dirtReason: 'x' })).toBeUndefined();
   });
 });
+
+describe('parseTestRunExecutionDetails — runStartedAt (EI-24827834166866368)', () => {
+  it('accepts rows written before the field existed', () => {
+    expect(parseTestRunExecutionDetails(details())?.runStartedAt).toBeUndefined();
+  });
+
+  it('accepts a recorded run start, including the jsonb-string storage shape', () => {
+    const row = details({ worktreeDirty: true, runStartedAt: '2026-10-02T01:00:00.000Z' });
+    expect(parseTestRunExecutionDetails(row)?.runStartedAt).toBe('2026-10-02T01:00:00.000Z');
+    expect(parseTestRunExecutionDetails(JSON.stringify(row))?.runStartedAt).toBe('2026-10-02T01:00:00.000Z');
+  });
+
+  it('rejects a run start that is not a parseable instant: an unreadable bound must not pass as one', () => {
+    expect(parseTestRunExecutionDetails(details({ runStartedAt: '' }))).toBeUndefined();
+    expect(parseTestRunExecutionDetails(details({ runStartedAt: 'not-a-date' }))).toBeUndefined();
+    expect(parseTestRunExecutionDetails(details({ runStartedAt: 1790900000000 }))).toBeUndefined();
+    expect(parseTestRunExecutionDetails(details({ runStartedAt: null }))).toBeUndefined();
+  });
+});

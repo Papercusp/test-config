@@ -62,13 +62,32 @@ export interface TestRunExecutionDetails {
    * reporter writes.
    */
   worktreeDirtyReason?: string;
+  /**
+   * When the WHOLE Vitest run began (ISO-8601 UTC), stamped in the reporter's onInit,
+   * before Vitest discovers, imports or collects any module (EI-24827834166866368).
+   * The row's `started_at` column is finished_at - test duration, so it postdates
+   * collection: an edit made after Vitest read a file but before that file's tests
+   * started is invisible to an mtime check against it. Every byte this run executed
+   * was read at or after `runStartedAt`, so it is the sound lower bound for "was this
+   * file modified after the run measured it".
+   *
+   * Expand-then-contract, like `worktreeDirtyReason`: this parser accepts the key
+   * before the reporter writes it, because the deployed operator parses rows the
+   * working-tree reporter writes, and an unknown key makes the row unproven.
+   */
+  runStartedAt?: string;
 }
 
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'scenarioId', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
-  'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason',
+  'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt',
 ]);
+
+/** A recorded instant: a non-empty string Date can parse. Used for `runStartedAt`. */
+export function isRecordedInstant(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && !Number.isNaN(new Date(value).getTime());
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -129,7 +148,8 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || typeof value.worktreeDirty !== 'boolean'
     || (value.worktreeDirtyReason !== undefined
       && (typeof value.worktreeDirtyReason !== 'string' || value.worktreeDirtyReason.length === 0
-        || value.worktreeDirty !== true))) {
+        || value.worktreeDirty !== true))
+    || (value.runStartedAt !== undefined && !isRecordedInstant(value.runStartedAt))) {
     return undefined;
   }
   return value as unknown as TestRunExecutionDetails;
