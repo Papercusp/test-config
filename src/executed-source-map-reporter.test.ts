@@ -342,6 +342,33 @@ describe('ExecutedSourceMapReporter', () => {
     expect(flushes[0]!.rows[0]).not.toHaveProperty('sourceEvidence');
   });
 
+  it('retains failed worker source diagnostics in OUT without creating a reusable pass', async () => {
+    const self = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
+    const source = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.ts');
+    const nodes = new Map([self, source].map(id => [id, {
+      id, transformResult: { map: { sources: [id], sourcesContent: [readFileSync(id, 'utf8')] } },
+    }]));
+    const mod = Object.assign(fakeModule({ state: 'failed', moduleId: self, imports: { [source]: {} } }), {
+      viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
+    });
+    const { r, flushes } = reporter();
+    r.onInit({} as never);
+    r.onTestModuleCollected(mod);
+    r.onTestModuleEnd(mod);
+    await r.onTestRunEnd();
+    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    expect(out.diagnostics).toEqual([expect.objectContaining({
+      testFile: 'libs/test-config/src/executed-source-map-reporter.test.ts', state: 'failed',
+      sourceEvidence: expect.objectContaining({ status: 'stable', sources: expect.arrayContaining([
+        expect.objectContaining({ path: 'libs/test-config/src/executed-source-map-reporter.ts' }),
+      ]) }),
+    })]);
+    expect(out.rows).toEqual([]);
+    expect(flushes[0]!.rows).toEqual([]);
+    expect(flushes[0]!.retiredFiles).toEqual(['libs/test-config/src/executed-source-map-reporter.test.ts']);
+    expect(flushes[0]).not.toHaveProperty('diagnostics');
+  });
+
   it('leaves a late import unknown even when another test already populated its server graph entry', async () => {
     const self = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
     const source = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.ts');

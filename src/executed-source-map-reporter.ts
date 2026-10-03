@@ -564,6 +564,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private skipped = 0;
   private flushed = false;
   private collectedSources = new WeakMap<TestModule, CollectedSourceEvidence>();
+  // OUT diagnostics describe executions, including failed or incomplete ones.
+  // They never enter the reusable-pass table or the selector's rows.
+  private diagnostics: Array<{ testFile: string; state: string; sourceEvidence: ExecutedSourceEvidence }> = [];
 
   private discardInputs(moduleId: string): void {
     if (!this.inputsDir) return;
@@ -601,6 +604,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.skipped = 0;
     this.flushed = false;
     this.collectedSources = new WeakMap();
+    this.diagnostics = [];
   }
 
   onTestModuleCollected(testModule: TestModule): void {
@@ -633,6 +637,20 @@ export default class ExecutedSourceMapReporter implements Reporter {
         state = testModule.state();
       } catch {
         /* fail-soft: treat as not recordable */
+      }
+      if (this.armed.outPath) {
+        const testFile = normalizeExecutedKey(testModule.moduleId, this.repoRoot);
+        if (testFile) {
+          let imports: Record<string, ImportDurationLike> | undefined;
+          try { imports = testModule.diagnostic().importDurations as typeof imports; } catch { /* unknown */ }
+          const sourceEvidence = qualifyCollectedSources(this.collectedSources.get(testModule), imports,
+            { repoRoot: this.repoRoot, testFile: testModule.moduleId });
+          if (!moduleIsIsolated(testModule)) {
+            sourceEvidence.status = sourceEvidence.status === 'changed' ? 'changed' : 'unknown';
+            sourceEvidence.reasons.push('worker-not-isolated');
+          }
+          this.diagnostics.push({ testFile, state, sourceEvidence });
+        }
       }
       if (!shouldRecordModule(state)) {
         this.skipped += 1;
@@ -718,7 +736,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
       try {
         writeFileSync(
           this.armed.outPath,
-          JSON.stringify({ workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty, skipped: this.skipped, rows }, null, 1),
+          JSON.stringify({ workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty,
+            skipped: this.skipped, rows, diagnostics: this.diagnostics }, null, 1),
         );
       } catch (e) {
         log(`out-file write failed (${e instanceof Error ? e.message : String(e)}) ${summary}`);
