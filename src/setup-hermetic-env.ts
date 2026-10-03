@@ -72,6 +72,12 @@
  *    genuinely wants the request-only-host branch still sets the var itself, in its own
  *    beforeEach/test body, which runs after this module-level scrub and so still wins.
  *
+ *  - PAPERCUSP_SPAWNER_SIDECAR / PAPERCUSP_SPAWNER_SIDECAR_MODE — per-host rollout
+ *    controls. Inherited `=1` enables managed sidecar processes during tests, which can
+ *    start systemd scopes and leave delayed lifecycle callbacks after the triggering test.
+ *    The rollout is opt-in in production, so tests that exercise it set these vars
+ *    explicitly after this scrub.
+ *
  *  - PORT — the operator's own listen port, and the ONLY entry here that is not
  *    PAPERCUSP_-prefixed. Every su/psu agent shell on this box carries `PORT` (3070 for
  *    the release operator, 3055 for dev). Under `isolate: true` a value a test set never
@@ -221,6 +227,8 @@ if (stateDirNeedsRedirect(process.env.PAPERCUSP_PSU_PTY_DIR, join(homedir(), '.p
 }
 delete process.env.PAPERCUSP_BACKGROUND_WORKERS;
 delete process.env.PAPERCUSP_HONO_PORT;
+delete process.env.PAPERCUSP_SPAWNER_SIDECAR;
+delete process.env.PAPERCUSP_SPAWNER_SIDECAR_MODE;
 delete process.env.PORT;
 // Spawned operator sessions carry the live listener bind into child tests. A
 // fleet runner commonly uses `0.0.0.0`, but unit tests have no remote-admin

@@ -117,6 +117,17 @@ describe('setup-hermetic-env: the psu operator pin is scrubbed (WI-10004341)', (
   });
 });
 
+describe('setup-hermetic-env: per-host spawner rollout is scrubbed', () => {
+  it('removes inherited sidecar rollout controls so tests opt in explicitly', async () => {
+    const after = await runSetupOn({
+      PAPERCUSP_SPAWNER_SIDECAR: '1',
+      PAPERCUSP_SPAWNER_SIDECAR_MODE: '1',
+    });
+    expect(after.PAPERCUSP_SPAWNER_SIDECAR).toBeUndefined();
+    expect(after.PAPERCUSP_SPAWNER_SIDECAR_MODE).toBeUndefined();
+  });
+});
+
 /**
  * WI-10004854: tests must never write managed-pty state (discovery records, sockets,
  * per-owner event logs, the sender inject audit) into the live ~/.papercusp/psu-pty.
