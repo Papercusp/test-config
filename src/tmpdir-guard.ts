@@ -64,6 +64,13 @@ const GIB = 1024 ** 3;
 export const DEFAULT_TMPDIR_CRITICAL_HEADROOM = Object.freeze({
   freePctMin: 0.02,
   freeBytesMin: 2 * GIB,
+  // WI-10005970: the percentage floor is CAPPED at this many bytes. On the 8 TB volume that
+  // backs /tmp here, 2% is 160 GB. A test run never needs that much, and at 120 GB free
+  // the uncapped floor relocated every launcher (and every test-spawned child that
+  // re-applies this guard) to /dev/shm, breaking tests that pass their own TMPDIR. The cap
+  // only affects volumes above ~3.2 TB; a normal-sized volume keeps the plain 2% rule. Same
+  // class as WI-10005931 (a percentage reserve on a very large volume).
+  pctFloorCapBytes: 64 * GIB,
 });
 
 export interface TmpdirStatfs {
@@ -121,7 +128,11 @@ export function tmpdirHasCriticalHeadroom(
         'PAPERCUSP_DISK_ALARM_CRITICAL_GB',
         DEFAULT_TMPDIR_CRITICAL_HEADROOM.freeBytesMin / GIB,
       ) * GIB;
-    return freeBytes >= freeBytesMin && freeBytes / totalBytes >= freePctMin;
+    const pctFloorBytes = Math.min(
+      totalBytes * freePctMin,
+      DEFAULT_TMPDIR_CRITICAL_HEADROOM.pctFloorCapBytes,
+    );
+    return freeBytes >= Math.max(freeBytesMin, pctFloorBytes);
   } catch {
     return true;
   }
