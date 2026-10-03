@@ -133,6 +133,15 @@ describe('setup-hermetic-env: the managed-pty state dir is redirected (WI-100048
     expect(stateDirNeedsRedirect(process.env.PAPERCUSP_PSU_PTY_DIR, liveDir)).toBe(false);
   });
 
+  it('keeps managed native fixture control sockets within the Linux path limit', async () => {
+    if (process.platform !== 'linux') return;
+    const after = await runSetupOn({ PAPERCUSP_PSU_PTY_DIR: liveDir });
+    // This owner came from the full-file run whose socket failed with EINVAL.
+    const owner = 'su-port-negative-24878-missing-native-marker-106388';
+    const socket = join(after.PAPERCUSP_PSU_PTY_DIR as string, `${owner}.sock`);
+    expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(107);
+  });
+
   it('redirects an INHERITED value that is the live dir (a psu shell leaking its own env)', async () => {
     const after = await runSetupOn({ PAPERCUSP_PSU_PTY_DIR: liveDir });
     expect(after.PAPERCUSP_PSU_PTY_DIR).toBeTruthy();

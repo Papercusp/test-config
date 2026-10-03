@@ -208,7 +208,8 @@ if (!process.env.PAPERCUSP_VOICE_IPC_DIR) {
 // same pollution class as PAPERCUSP_WORKSPACE_ID below. A test that needs a
 // specific dir sets it in its own body, after this file runs.
 if (stateDirNeedsRedirect(process.env.PAPERCUSP_PSU_PTY_DIR, join(homedir(), '.papercusp', 'psu-pty'))) {
-  const psuPtyHermeticDir = createHermeticDir(join(tmpdir(), 'papercusp-psu-pty-hermetic'));
+  // Leave room for fixture owner IDs within Linux's 107-byte socket path.
+  const psuPtyHermeticDir = createHermeticDir(join(tmpdir(), 'pc-pty'));
   process.env.PAPERCUSP_PSU_PTY_DIR = psuPtyHermeticDir;
   process.on('exit', () => {
     try {
