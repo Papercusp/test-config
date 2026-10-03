@@ -137,6 +137,15 @@ describe('tmpdirHasCriticalHeadroom', () => {
     expect(tmpdirHasCriticalHeadroom('/tmp/pcv', {}, statfs(1_000, 21))).toBe(true);
   });
 
+  it('caps the percentage floor on a multi-TB volume: 8 TB with 120 GiB free is ample (WI-10005970)', () => {
+    // The measured shape: /tmp on an 8 TB volume at 1.5% free. Uncapped, 2% demanded 160 GB
+    // and relocated every launcher to /dev/shm.
+    expect(tmpdirHasCriticalHeadroom('/tmp/pcv', {}, statfs(8_000, 120))).toBe(true);
+    // The cap is a floor, not a waiver: the same volume below the cap is still critical.
+    expect(tmpdirHasCriticalHeadroom('/tmp/pcv', {}, statfs(8_000, 63))).toBe(false);
+    expect(tmpdirHasCriticalHeadroom('/tmp/pcv', {}, statfs(8_000, 64))).toBe(true);
+  });
+
   it('rejects a small filesystem below the shared absolute byte floor', () => {
     expect(tmpdirHasCriticalHeadroom('/tmp/pcv', {}, statfs(20, 1))).toBe(false);
   });
