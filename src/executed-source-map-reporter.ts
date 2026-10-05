@@ -279,6 +279,62 @@ interface SourceGraphNode {
 
 const sourceHash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 
+/** Disk observations AFTER Vite loaded its config, never original loaded-source proof. */
+export interface ConfigSourceSnapshots {
+  schemaVersion: 'vitest-config-disk-snapshots-v1';
+  scope: 'repository-vite-config-dependencies';
+  basis: 'reporter-init-disk';
+  status: 'unchanged' | 'changed' | 'unknown';
+  sources: Array<{ path: string; sha256: string | null; currentSha256: string | null }>;
+  reasons: string[];
+}
+
+interface ConfigSourceCapture {
+  sources: Array<{ path: string; sha256: string | null }>;
+  reasons: string[];
+}
+
+export function captureConfigSources(
+  paths: string[] | null,
+  o: { repoRoot: string; readSource?: (absolutePath: string) => Buffer },
+): ConfigSourceCapture {
+  const sources = new Map<string, string | null>();
+  const reasons = new Set<string>();
+  const readSource = o.readSource ?? readFileSync;
+  if (!paths?.length) reasons.add('config-dependencies-unavailable');
+  for (const absolute of paths ?? []) {
+    const path = normalizeExecutedKey(absolute, o.repoRoot);
+    if (!path) { reasons.add(`config-dependency-outside-repository:${absolute}`); continue; }
+    try { sources.set(path, sourceHash(readSource(resolve(o.repoRoot, path)))); }
+    catch { sources.set(path, null); reasons.add(`config-source-unreadable:${path}`); }
+  }
+  return { sources: [...sources].sort(([a], [b]) => a.localeCompare(b)).map(([path, sha256]) => ({ path, sha256 })),
+    reasons: [...reasons].sort() };
+}
+
+export function qualifyConfigSources(
+  captured: ConfigSourceCapture | undefined,
+  o: { repoRoot: string; readSource?: (absolutePath: string) => Buffer },
+): ConfigSourceSnapshots {
+  const reasons = new Set(captured?.reasons ?? ['config-snapshots-unavailable']);
+  const readSource = o.readSource ?? readFileSync;
+  let changed = false;
+  const sources = (captured?.sources ?? []).map(source => {
+    let currentSha256: string | null = null;
+    try { currentSha256 = sourceHash(readSource(resolve(o.repoRoot, source.path))); }
+    catch { reasons.add(`config-source-unreadable:${source.path}`); }
+    if (source.sha256 !== null && currentSha256 !== null && source.sha256 !== currentSha256) {
+      changed = true;
+      reasons.add(`config-source-changed:${source.path}`);
+    }
+    return { ...source, currentSha256 };
+  });
+  if (sources.length === 0) reasons.add('config-sources-unavailable');
+  return { schemaVersion: 'vitest-config-disk-snapshots-v1', scope: 'repository-vite-config-dependencies',
+    basis: 'reporter-init-disk', status: changed ? 'changed' : reasons.size > 0 ? 'unknown' : 'unchanged',
+    sources, reasons: [...reasons].sort() };
+}
+
 /**
  * EI-24827847586322829: importDurations grows as tests run. Snapshot this module's existing
  * environment graph at collection, then select the actually reported modules at end. Never
@@ -593,10 +649,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   /** P-001: absolute paths of the vitest config(s) this run loaded + their relative imports; null = unknown. */
   private configDeps: string[] | null = null;
+  private configSourceCapture: ConfigSourceCapture | undefined;
 
   onInit(ctx: Vitest): void {
     if (!this.armed) return;
     this.configDeps = resolveConfigDependencies(ctx);
+    this.configSourceCapture = this.armed.outPath
+      ? captureConfigSources(this.configDeps, { repoRoot: this.repoRoot }) : undefined;
     this.pgLease ??= retainSharedPg();
     this.worktreeBefore = this.readWorktreeSnapshot();
     this.pending = [];
@@ -737,7 +796,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
         writeFileSync(
           this.armed.outPath,
           JSON.stringify({ workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty,
-            skipped: this.skipped, rows, diagnostics: this.diagnostics }, null, 1),
+            skipped: this.skipped, rows, diagnostics: this.diagnostics,
+            configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }) }, null, 1),
         );
       } catch (e) {
         log(`out-file write failed (${e instanceof Error ? e.message : String(e)}) ${summary}`);
