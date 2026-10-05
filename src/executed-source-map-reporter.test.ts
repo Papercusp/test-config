@@ -10,11 +10,13 @@ import { PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
   EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS,
   appendExecutedSourceMapResult,
+  captureConfigSources,
   collectExecutedModules,
   executedSourceRunContext,
   executedSourceRunnerIdentity,
   isolatedByConfig,
   normalizeExecutedKey,
+  qualifyConfigSources,
   resolveConfigDependencies,
   shouldRecordModule,
   type ExecutedSourceFlush,
@@ -46,6 +48,48 @@ describe('resolveConfigDependencies', () => {
     expect(resolveConfigDependencies(throwing)).toBeNull();
   });
 });
+describe('config dependency disk snapshots', () => {
+  const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+
+  it('retains a config helper change after initialization', () => {
+    const captured = captureConfigSources(['/repo/config.ts', '/repo/helper.ts'], {
+      repoRoot: '/repo', readSource: () => Buffer.from('original'),
+    });
+    expect(qualifyConfigSources(captured, { repoRoot: '/repo', readSource: path =>
+      Buffer.from(path.endsWith('helper.ts') ? 'changed' : 'original') })).toMatchObject({
+      basis: 'reporter-init-disk', status: 'changed', reasons: ['config-source-changed:helper.ts'],
+      sources: expect.arrayContaining([{ path: 'helper.ts', sha256: digest('original'), currentSha256: digest('changed') }]),
+    });
+  });
+
+  it('keeps missing dependency discovery unknown', () => {
+    expect(qualifyConfigSources(captureConfigSources(null, { repoRoot: '/repo' }), { repoRoot: '/repo' }))
+      .toMatchObject({ status: 'unknown', sources: [], reasons: expect.arrayContaining(['config-dependencies-unavailable']) });
+  });
+
+  it('keeps an external config unknown even when the repository subset is readable', () => {
+    expect(qualifyConfigSources(captureConfigSources(['/repo/config.ts', '/external/helper.ts'], {
+      repoRoot: '/repo', readSource: () => Buffer.from('config'),
+    }), { repoRoot: '/repo', readSource: () => Buffer.from('config') })).toMatchObject({
+      status: 'unknown', reasons: ['config-dependency-outside-repository:/external/helper.ts'],
+    });
+  });
+
+  it('never fills an unavailable initial snapshot from later bytes', () => {
+    const captured = captureConfigSources(['/repo/config.ts'], {
+      repoRoot: '/repo', readSource: () => { throw new Error('unreadable'); },
+    });
+    expect(qualifyConfigSources(captured, { repoRoot: '/repo', readSource: () => Buffer.from('late') }))
+      .toMatchObject({ status: 'unknown', sources: [{ path: 'config.ts', sha256: null, currentSha256: digest('late') }] });
+  });
+
+  it('keeps a deleted config unknown without losing its initial snapshot', () => {
+    const captured = captureConfigSources(['/repo/config.ts'], { repoRoot: '/repo', readSource: () => Buffer.from('original') });
+    expect(qualifyConfigSources(captured, { repoRoot: '/repo', readSource: () => { throw new Error('deleted'); } }))
+      .toMatchObject({ status: 'unknown', sources: [{ path: 'config.ts', sha256: digest('original'), currentSha256: null }] });
+  });
+});
+
 import {
   EXECUTED_SOURCE_MAP_IMPORT_LIMIT,
   PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV,
