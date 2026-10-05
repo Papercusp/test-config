@@ -2,9 +2,9 @@
  * Loaded with Node --import BEFORE Vite evaluates configs. Reporter-time disk
  * reads cannot recover these bytes. This never authorizes reusable test passes. */
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import * as nodeModule from 'node:module';
-import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 interface LoadedSource { path: string; sha256: string | null }
@@ -50,6 +50,34 @@ function install(): void {
       !process.env.PC_EXECUTED_SOURCE_MAP_OUT || !process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE) return;
   const state: Capture = { sources: new Map(), reasons: new Set() };
   shared[KEY] = state;
+  // npm, command routers and their descendants do not instantiate the Vitest
+  // reporter. Retain each process's observed inputs beside that same OUT file.
+  // A missing exit receipt remains unknown (for example a killed process).
+  const repoRoot = process.env.PC_EXECUTED_SOURCE_MAP_ROOT;
+  const outPath = process.env.PC_EXECUTED_SOURCE_MAP_OUT;
+  if (repoRoot && isAbsolute(repoRoot)) process.once('exit', exitCode => {
+    try {
+      const entry = process.argv[1] ? resolve(process.argv[1]) : null;
+      const rel = entry ? relative(repoRoot, entry).split(/[\\/]/).join('/') : null;
+      const entrypoint = rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../') &&
+        !rel.split('/').includes('node_modules') ? rel : null;
+      const evidence = qualifyLoadedSources([...state.sources.keys()], repoRoot, 'process');
+      if (!entrypoint || !evidence.sources.some(source => source.path === entrypoint && source.sha256 !== null)) {
+        evidence.reasons.push('process-entrypoint-original-load-unavailable');
+        if (evidence.status === 'stable') evidence.status = 'unknown';
+      }
+      const directory = `${outPath}.processes`;
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, `${process.pid}.json`), JSON.stringify({
+        schemaVersion: 'node-loaded-process-sources-v1', scope: 'repository-node-process-sources',
+        entrypoint, pid: process.pid, parentPid: process.ppid, exitCode, ...evidence,
+        // These are observed inputs, never a census of every descendant or a
+        // complete runtime identity. The preload itself predates its own hook.
+        unresolved: ['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured',
+          'node-external-native-runtime-unmeasured'],
+      }));
+    } catch { /* The consumer records absent/malformed receipts as unknown. */ }
+  });
   if (typeof nodeModule.registerHooks !== 'function') {
     state.reasons.add('config-node-load-hook-unavailable');
     return;
@@ -106,7 +134,7 @@ export interface LoadedMainProcessSources extends Omit<LoadedConfigSources, 'sch
   scope: 'repository-node-main-process-sources';
 }
 
-function qualifyLoadedSources(paths: string[] | null, repoRoot: string, prefix: 'config' | 'main-process'):
+function qualifyLoadedSources(paths: string[] | null, repoRoot: string, prefix: 'config' | 'main-process' | 'process'):
   Omit<LoadedConfigSources, 'schemaVersion' | 'scope'> {
   const state = shared[KEY];
   const reasons = new Set(state?.reasons ?? [`${prefix}-node-load-capture-unavailable`]);
