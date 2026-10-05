@@ -507,6 +507,7 @@ describe('ExecutedSourceMapReporter', () => {
       ['pass after an inline retry', ['passed'], { retryCount: 1, flaky: false }, 'fail'],
       ['flaky pass', ['passed'], { retryCount: 0, flaky: true }, 'fail'],
       ['missing retry diagnostic', ['passed'], {}, 'unknown'],
+      ['undefined retry diagnostic', ['passed'], undefined, 'unknown'],
       ['negative retry diagnostic', ['passed'], { retryCount: -1, flaky: false }, 'unknown'],
     ] as const)('retains a named first-attempt verdict for %s', async (_name, states, diagnostic, verdict) => {
       const { r } = reporter();
@@ -536,6 +537,20 @@ describe('ExecutedSourceMapReporter', () => {
       expect(results()[0]).toMatchObject({ outcome: 'nothing-to-record', rows: 0, fileResults: {
         files: [{ testFile: 'libs/test-config/src/__fake__/thing.test.ts', verdict: 'pass' }],
       } });
+    });
+
+    it('preserves a known retry failure after an unknown diagnostic', async () => {
+      const { r } = reporter();
+      r.onInit({} as never);
+      const mod = Object.assign(fakeModule({}), {
+        children: { allTests: () => [undefined, { retryCount: 1, flaky: false }].map(diagnostic => ({
+          result: () => ({ state: 'passed' }), diagnostic: () => diagnostic,
+        })) },
+      });
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd();
+      await r.onExit();
+      expect(results()[0]!.fileResults!.files[0]!.verdict).toBe('fail');
     });
 
     it('keeps unreadable case diagnostics unknown and an explicit failed module failed', async () => {

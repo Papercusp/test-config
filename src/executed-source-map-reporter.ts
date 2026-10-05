@@ -615,6 +615,7 @@ function firstAttemptModuleVerdict(testModule: TestModule, state: string): 'pass
     if (typeof testModule.children?.allTests !== 'function') return 'unknown';
     for (const test of testModule.children.allTests()) {
       const diagnostic = test.diagnostic();
+      if (!diagnostic) { unmeasured = true; continue; }
       // Vitest retries only after a failed attempt. A later pass cannot erase that miss.
       if (diagnostic.flaky === true || diagnostic.retryCount > 0) return 'fail';
       if (!Number.isSafeInteger(diagnostic.retryCount) || diagnostic.retryCount !== 0 ||
