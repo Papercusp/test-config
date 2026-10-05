@@ -80,12 +80,14 @@ function install(): void {
   // A missing exit receipt remains unknown (for example a killed process).
   const repoRoot = process.env.PC_EXECUTED_SOURCE_MAP_ROOT;
   const outPath = process.env.PC_EXECUTED_SOURCE_MAP_OUT;
+  // argv and cwd are mutable application state. Capture the original entry
+  // before the command body can rewrite them, rather than trusting them at exit.
+  const entry = process.argv[1] ? resolve(process.argv[1]) : null;
+  const rel = repoRoot && entry ? relative(repoRoot, entry).split(/[\\/]/).join('/') : null;
+  const entrypoint = rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../') &&
+    !rel.split('/').includes('node_modules') ? rel : null;
   if (repoRoot && isAbsolute(repoRoot)) process.once('exit', exitCode => {
     try {
-      const entry = process.argv[1] ? resolve(process.argv[1]) : null;
-      const rel = entry ? relative(repoRoot, entry).split(/[\\/]/).join('/') : null;
-      const entrypoint = rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../') &&
-        !rel.split('/').includes('node_modules') ? rel : null;
       const evidence = qualifyLoadedSources([...state.sources.keys()], repoRoot, 'process');
       if (!entrypoint || !evidence.sources.some(source => source.path === entrypoint && source.sha256 !== null)) {
         evidence.reasons.push('process-entrypoint-original-load-unavailable');
