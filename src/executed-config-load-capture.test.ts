@@ -15,6 +15,42 @@ const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=d
   Buffer.from(JSON.stringify(map)).toString('base64');
 
 describe('original config load evidence', () => {
+  it('reports duplicate capture modules while sharing one hook and the loaded inputs', () => {
+    const root = mkdtempSync(join(tmpdir(), 'duplicate-original-load-'));
+    const capture = new URL('./executed-config-load-capture.ts', import.meta.url);
+    const singleton = new URL('../../generic/module-singleton/src/index.ts', import.meta.url);
+    const helper = join(root, 'helper.mjs');
+    const source = 'export const value = 3;\n';
+    try {
+      writeFileSync(helper, source);
+      const env = { ...process.env };
+      for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
+          key === 'NODE_OPTIONS') delete env[key];
+      const script = `const before = process.listenerCount('exit');
+        const first = await import(${JSON.stringify(capture.href)});
+        await import(${JSON.stringify(`${capture.href}?duplicate`)});
+        await import(${JSON.stringify(pathToFileURL(helper).href)});
+        const { moduleEvaluationCount, listModuleDuplications } = await import(${JSON.stringify(singleton.href)});
+        const key = '@papercusp/test-config.original-config-loads';
+        console.log(JSON.stringify({ evaluations: moduleEvaluationCount(key),
+          duplicate: listModuleDuplications().find(entry => entry.key === key),
+          exitListenersAdded: process.listenerCount('exit') - before,
+          evidence: first.qualifyLoadedConfigSources([${JSON.stringify(helper)}], ${JSON.stringify(root)}) }));`;
+      const out = execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+        cwd: root, encoding: 'utf8', timeout: 30000,
+        env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'duplicate-load-test',
+          PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json'), PC_EXECUTED_SOURCE_MAP_ROOT: root,
+          PC_EXECUTED_SOURCE_MAP_PRELOAD: '1' },
+      });
+      expect(JSON.parse(out.trim())).toMatchObject({ evaluations: 2,
+        duplicate: { key: '@papercusp/test-config.original-config-loads', evaluations: 2 },
+        exitListenersAdded: 1,
+        evidence: { status: 'stable', sources: [{ path: 'helper.mjs', sha256: digest(source),
+          currentSha256: digest(source) }] },
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('keeps real worker-thread observations separate from the parent with the same PID', () => {
     const root = mkdtempSync(join(tmpdir(), 'thread-original-load-'));
     const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));

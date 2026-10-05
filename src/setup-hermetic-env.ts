@@ -229,6 +229,11 @@ delete process.env.PAPERCUSP_BACKGROUND_WORKERS;
 delete process.env.PAPERCUSP_HONO_PORT;
 delete process.env.PAPERCUSP_SPAWNER_SIDECAR;
 delete process.env.PAPERCUSP_SPAWNER_SIDECAR_MODE;
+// EI-25164235306950609: a fixture host shares the test runner's pc scope.
+// Inheriting the parent agent's headless flag falsely authorizes sweeping that
+// scope on teardown, killing sibling workers and esbuild. Headless fixtures
+// that own a session set this explicitly after setup.
+delete process.env.PAPERCUSP_PSU_HEADLESS;
 delete process.env.PORT;
 // Spawned operator sessions carry the live listener bind into child tests. A
 // fleet runner commonly uses `0.0.0.0`, but unit tests have no remote-admin

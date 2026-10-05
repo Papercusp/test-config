@@ -7,11 +7,12 @@ import * as nodeModule from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isMainThread, threadId } from 'node:worker_threads';
+import { pinModuleState } from '@papercusp/module-singleton';
 
 interface LoadedSource { path: string; sha256: string | null }
 interface Capture { sources: Map<string, Set<string | null>>; reasons: Set<string> }
-const KEY = Symbol.for('@papercusp/test-config.original-config-loads');
-const shared = globalThis as typeof globalThis & { [KEY]?: Capture };
+const shared = pinModuleState<{ capture: Capture | null }>(
+  '@papercusp/test-config.original-config-loads', () => ({ capture: null }));
 const hash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 
 /** Read the originals EMBEDDED IN THE ACTUALLY LOADED Vite ESM config bundle.
@@ -47,10 +48,10 @@ export function configBundleSources(code: string): LoadedSource[] | null {
 }
 
 function install(): void {
-  if (shared[KEY] || process.env.PC_EXECUTED_SOURCE_MAP_PRELOAD !== '1' ||
+  if (shared.capture || process.env.PC_EXECUTED_SOURCE_MAP_PRELOAD !== '1' ||
       !process.env.PC_EXECUTED_SOURCE_MAP_OUT || !process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE) return;
   const state: Capture = { sources: new Map(), reasons: new Set() };
-  shared[KEY] = state;
+  shared.capture = state;
   // A later preload can wrap this hook and replace the bytes it observed.
   // Without a receipt for that layer, the intermediate bytes are not original
   // execution authority. Recognize only this preload, including symlink paths.
@@ -165,7 +166,7 @@ export interface LoadedMainProcessSources extends Omit<LoadedConfigSources, 'sch
 
 function qualifyLoadedSources(paths: string[] | null, repoRoot: string, prefix: 'config' | 'main-process' | 'process'):
   Omit<LoadedConfigSources, 'schemaVersion' | 'scope'> {
-  const state = shared[KEY];
+  const state = shared.capture;
   const reasons = new Set(state?.reasons ?? [`${prefix}-node-load-capture-unavailable`]);
   let changed = false;
   if (!paths?.length) reasons.add(`${prefix}-dependencies-unavailable`);
@@ -201,7 +202,7 @@ export function qualifyLoadedConfigSources(paths: string[] | null, repoRoot: str
 
 export function qualifyLoadedMainProcessSources(configPaths: string[] | null, repoRoot: string): LoadedMainProcessSources {
   const config = new Set(configPaths ?? []);
-  const paths = [...(shared[KEY]?.sources.keys() ?? [])].filter(path => !config.has(path));
+  const paths = [...(shared.capture?.sources.keys() ?? [])].filter(path => !config.has(path));
   const evidence = qualifyLoadedSources(paths, repoRoot, 'main-process');
   if (!configPaths?.length) {
     evidence.reasons.push('main-process-config-population-unavailable');
