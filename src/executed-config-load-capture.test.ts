@@ -15,6 +15,36 @@ const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=d
   Buffer.from(JSON.stringify(map)).toString('base64');
 
 describe('original config load evidence', () => {
+  it('keeps real worker-thread observations separate from the parent with the same PID', () => {
+    const root = mkdtempSync(join(tmpdir(), 'thread-original-load-'));
+    const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
+    const outPath = join(root, 'out.json');
+    const source = 'export const value = 1;\n';
+    try {
+      writeFileSync(join(root, 'helper.mjs'), source);
+      writeFileSync(join(root, 'child.mjs'), "import { value } from './helper.mjs'; console.log(value);\n");
+      writeFileSync(join(root, 'parent.mjs'), "import { Worker } from 'node:worker_threads'; new Worker(new URL('./child.mjs', import.meta.url));\n");
+      const env = { ...process.env };
+      for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
+          key === 'NODE_OPTIONS') delete env[key];
+      const output = execFileSync(process.execPath, ['parent.mjs'], { cwd: root, encoding: 'utf8', timeout: 30000,
+        env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'thread-load-test', PC_EXECUTED_SOURCE_MAP_OUT: outPath,
+          PC_EXECUTED_SOURCE_MAP_ROOT: root, PC_EXECUTED_SOURCE_MAP_PRELOAD: '1',
+          NODE_OPTIONS: `--import=${pathToFileURL(capture).href}` },
+      });
+      expect(output.trim()).toBe('1');
+      const receipts = readdirSync(`${outPath}.processes`).map(file =>
+        JSON.parse(readFileSync(join(`${outPath}.processes`, file), 'utf8')));
+      expect(receipts).toHaveLength(2);
+      expect(new Set(receipts.map(receipt => receipt.pid)).size).toBe(1);
+      const thread = receipts.find(receipt => receipt.isMainThread === false);
+      expect(thread).toMatchObject({ entrypoint: null, status: 'unknown', threadId: expect.any(Number),
+        reasons: expect.arrayContaining(['process-worker-thread-entrypoint-unmeasured']),
+        sources: expect.arrayContaining([{ path: 'helper.mjs', sha256: digest(source), currentSha256: digest(source) }]),
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(['stable', 'self-restoring', 'commonjs', 'overriding-loader', 'mutated-argv'] as const)
     ('retains original inputs from a real parent and child command at exit (%s)', kind => {
       const root = mkdtempSync(join(tmpdir(), 'command-original-load-'));

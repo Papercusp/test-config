@@ -468,7 +468,11 @@ describe('ExecutedSourceMapReporter', () => {
     await r.onExit();
     expect(flushes).toEqual([]);
     expect(results()).toEqual([
-      { workspaceName: '@papercusp/test-config', outcome: 'not-persisted', rows: 1, retired: 1, skipped: 1, sha: clean.commit, dirty: false, error: null },
+      { workspaceName: '@papercusp/test-config', outcome: 'not-persisted', rows: 1, retired: 1, skipped: 1, sha: clean.commit, dirty: false, error: null,
+        fileResults: { version: 1, runnerIdentity: executedSourceRunnerIdentity(), runContext: executedSourceRunContext(), runGroupId: 'grp-1', files: [
+          { testFile: 'libs/test-config/src/__fake__/thing.test.ts', verdict: 'unknown' },
+          { testFile: 'libs/test-config/src/__fake__/other.test.ts', verdict: 'fail' },
+        ] } },
     ]);
   });
 
@@ -494,6 +498,60 @@ describe('ExecutedSourceMapReporter', () => {
   // row (WI-10003597 — 8h of zero pass proofs) was invisible. Each flush now leaves one durable
   // line saying what it did, for the runner to surface.
   describe('result file (PC_EXECUTED_SOURCE_MAP_RESULT)', () => {
+    it.each([
+      ['fully executed pass', ['passed'], { retryCount: 0, flaky: false }, 'pass'],
+      ['passing module with a skipped case', ['passed', 'skipped'], { retryCount: 0, flaky: false }, 'unknown'],
+      ['empty module', [], { retryCount: 0, flaky: false }, 'unknown'],
+      ['pending case', ['pending'], { retryCount: 0, flaky: false }, 'unknown'],
+      ['failed case behind a passing module state', ['failed'], { retryCount: 0, flaky: false }, 'fail'],
+      ['pass after an inline retry', ['passed'], { retryCount: 1, flaky: false }, 'fail'],
+      ['flaky pass', ['passed'], { retryCount: 0, flaky: true }, 'fail'],
+      ['missing retry diagnostic', ['passed'], {}, 'unknown'],
+      ['negative retry diagnostic', ['passed'], { retryCount: -1, flaky: false }, 'unknown'],
+    ] as const)('retains a named first-attempt verdict for %s', async (_name, states, diagnostic, verdict) => {
+      const { r } = reporter();
+      r.onInit({} as never);
+      const mod = Object.assign(fakeModule({}), {
+        children: { allTests: () => states.map(state => ({ result: () => ({ state }), diagnostic: () => diagnostic })) },
+      });
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd();
+      await r.onExit();
+      expect(results()).toHaveLength(1);
+      expect(results()[0]!.fileResults).toEqual({
+        version: 1, runnerIdentity: executedSourceRunnerIdentity(), runContext: executedSourceRunContext(), runGroupId: 'grp-1',
+        files: [{ testFile: 'libs/test-config/src/__fake__/thing.test.ts', verdict }],
+      });
+    });
+
+    it('records pure-lane execution even when isolation prevents a reusable proof', async () => {
+      const { r, flushes } = reporter();
+      r.onInit({} as never);
+      const mod = Object.assign(fakeModule({ isolate: false }), {
+        children: { allTests: () => [{ result: () => ({ state: 'passed' }), diagnostic: () => ({ retryCount: 0, flaky: false }) }] },
+      });
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd();
+      expect(flushes).toEqual([]);
+      expect(results()[0]).toMatchObject({ outcome: 'nothing-to-record', rows: 0, fileResults: {
+        files: [{ testFile: 'libs/test-config/src/__fake__/thing.test.ts', verdict: 'pass' }],
+      } });
+    });
+
+    it('keeps unreadable case diagnostics unknown and an explicit failed module failed', async () => {
+      const { r } = reporter();
+      r.onInit({} as never);
+      r.onTestModuleEnd(Object.assign(fakeModule({}), {
+        children: { allTests: () => [{ result: () => ({ state: 'passed' }), diagnostic: () => { throw new Error('unreadable'); } }] },
+      }));
+      r.onTestModuleEnd(fakeModule({ state: 'failed', moduleId: join(REPO_ROOT, 'libs/test-config/src/__fake__/other.test.ts') }));
+      await r.onTestRunEnd();
+      expect(results()[0]!.fileResults!.files).toEqual([
+        { testFile: 'libs/test-config/src/__fake__/thing.test.ts', verdict: 'unknown' },
+        { testFile: 'libs/test-config/src/__fake__/other.test.ts', verdict: 'fail' },
+      ]);
+    });
+
     it('reports a landed write as written, with the row count and sha', async () => {
       const { r } = reporter();
       r.onInit({} as never);
@@ -510,6 +568,9 @@ describe('ExecutedSourceMapReporter', () => {
           sha: clean.commit,
           dirty: false,
           error: null,
+          fileResults: { version: 1, runnerIdentity: executedSourceRunnerIdentity(), runContext: executedSourceRunContext(), runGroupId: 'grp-1', files: [
+            { testFile: 'libs/test-config/src/__fake__/thing.test.ts', verdict: 'unknown' },
+          ] },
         },
       ]);
     });
