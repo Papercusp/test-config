@@ -1,4 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -340,6 +341,23 @@ describe('ExecutedSourceMapReporter', () => {
     r.onTestModuleEnd(mod);
     await r.onTestRunEnd();
     expect(flushes[0]!.rows[0]).not.toHaveProperty('sourceEvidence');
+  });
+
+  it('retains config dependency disk snapshots in OUT without putting them in reusable passes', async () => {
+    const config = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
+    const hash = createHash('sha256').update(readFileSync(config)).digest('hex');
+    const { r, flushes } = reporter();
+    r.onInit({ vite: { config: { configFileDependencies: [config] } } } as never);
+    r.onTestModuleEnd(fakeModule({}));
+    await r.onTestRunEnd();
+    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    expect(out.configSources).toEqual({
+      schemaVersion: 'vitest-config-disk-snapshots-v1', scope: 'repository-vite-config-dependencies',
+      basis: 'reporter-init-disk', status: 'unchanged', reasons: [],
+      sources: [{ path: 'libs/test-config/src/executed-source-map-reporter.test.ts',
+        sha256: hash, currentSha256: hash }],
+    });
+    expect(flushes[0]).not.toHaveProperty('configSources');
   });
 
   it('retains failed worker source diagnostics in OUT without creating a reusable pass', async () => {
