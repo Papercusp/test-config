@@ -246,6 +246,11 @@ delete process.env.PAPERCUSP_POT_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
 delete process.env.PAPERCUSP_RELEASE_ROOT;
 delete process.env.PAPERCUSP_CHECKPOINT_ROOT;
+// EI-25165052071544976: release-shell fixtures must select their private
+// generation store. The host service's override otherwise publishes and walks
+// the live shared store, while assertions expect the fixture-local directory.
+// Tests of the override set it explicitly after this setup, as other env seams do.
+delete process.env.PAPERCUSP_DEPENDENCY_GENERATION_ROOT;
 delete process.env.PAPERCUSP_INTEGRATION_BRANCH;
 delete process.env.PAPERCUSP_RELEASE_REF;
 

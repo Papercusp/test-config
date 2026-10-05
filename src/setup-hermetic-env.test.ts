@@ -92,6 +92,16 @@ async function runSetupOn(values: Record<string, string>): Promise<Record<string
  * vacuously in any shell that never carried the pin, so this re-runs the setup module on
  * an env that DOES carry it and checks the result, whatever shell launched the test.
  */
+describe('setup-hermetic-env: inherited live dependency-generation store is scrubbed', () => {
+  it('removes the host store before release-shell fixtures select their private root', async () => {
+    const after = await runSetupOn({
+      PAPERCUSP_DEPENDENCY_GENERATION_ROOT: '/mnt/data/live-dependency-generations',
+    });
+    expect(after.PAPERCUSP_DEPENDENCY_GENERATION_ROOT).toBeUndefined();
+  });
+
+});
+
 describe('setup-hermetic-env: the psu operator pin is scrubbed (WI-10004341)', () => {
   it('removes a :3170 operator pin and its provenance marker', async () => {
     const after = await runSetupOn({
