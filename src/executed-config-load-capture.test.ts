@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -15,6 +15,47 @@ const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=d
   Buffer.from(JSON.stringify(map)).toString('base64');
 
 describe('original config load evidence', () => {
+  it.each(['stable', 'self-restoring', 'commonjs'] as const)
+    ('retains original inputs from a real parent and child command at exit (%s)', kind => {
+      const root = mkdtempSync(join(tmpdir(), 'command-original-load-'));
+      const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
+      const outPath = join(root, 'out.json');
+      const extension = kind === 'commonjs' ? 'cjs' : 'mjs';
+      const stable = kind === 'commonjs' ? 'exports.value = 1;\n' : 'export const value = 1;\n';
+      const helper = join(root, `helper.${extension}`);
+      const loaded = kind === 'self-restoring' ? `import { writeFileSync } from 'node:fs';
+        writeFileSync(${JSON.stringify(helper)}, ${JSON.stringify(stable)});
+        export const value = 2;\n` : stable;
+      try {
+        writeFileSync(helper, loaded);
+        writeFileSync(join(root, 'child.mjs'), `import { value } from './helper.${extension}';
+          console.log(value);\n`);
+        writeFileSync(join(root, 'parent.mjs'), `import { spawnSync } from 'node:child_process';
+          const child = spawnSync(process.execPath, ['child.mjs'], { stdio: 'inherit', env: process.env });
+          process.exit(child.status ?? 1);\n`);
+        const env = { ...process.env };
+        for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
+            key === 'NODE_OPTIONS') delete env[key];
+        execFileSync(process.execPath, ['parent.mjs'], { cwd: root, encoding: 'utf8', timeout: 30000,
+          env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'command-load-test',
+            PC_EXECUTED_SOURCE_MAP_OUT: outPath, PC_EXECUTED_SOURCE_MAP_ROOT: root,
+            PC_EXECUTED_SOURCE_MAP_PRELOAD: '1', NODE_OPTIONS: `--import=${pathToFileURL(capture).href}` },
+        });
+        expect(existsSync(`${outPath}.processes`)).toBe(true);
+        const receipts = readdirSync(`${outPath}.processes`).map(file =>
+          JSON.parse(readFileSync(join(`${outPath}.processes`, file), 'utf8')));
+        expect(receipts.map(receipt => receipt.entrypoint).sort()).toEqual(['child.mjs', 'parent.mjs']);
+        const child = receipts.find(receipt => receipt.entrypoint === 'child.mjs');
+        expect(child).toMatchObject({ schemaVersion: 'node-loaded-process-sources-v1',
+          scope: 'repository-node-process-sources', basis: 'node-load-hook',
+          sources: expect.arrayContaining([{ path: `helper.${extension}`,
+            sha256: kind === 'commonjs' ? null : digest(loaded), currentSha256: digest(stable) }]),
+          unresolved: expect.arrayContaining(['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured']),
+        });
+        expect(child.status).toBe(kind === 'stable' ? 'stable' : kind === 'self-restoring' ? 'changed' : 'unknown');
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
   it('keeps a missing preload unknown instead of reading the original from disk', () => {
     expect(qualifyLoadedConfigSources(['/repo/config.mjs'], '/repo')).toMatchObject({
       status: 'unknown', sources: [{ path: 'config.mjs', sha256: null, currentSha256: null }],
