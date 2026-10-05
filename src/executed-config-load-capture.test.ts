@@ -15,7 +15,7 @@ const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=d
   Buffer.from(JSON.stringify(map)).toString('base64');
 
 describe('original config load evidence', () => {
-  it.each(['stable', 'self-restoring', 'commonjs'] as const)
+  it.each(['stable', 'self-restoring', 'commonjs', 'overriding-loader'] as const)
     ('retains original inputs from a real parent and child command at exit (%s)', kind => {
       const root = mkdtempSync(join(tmpdir(), 'command-original-load-'));
       const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
@@ -33,14 +33,22 @@ describe('original config load evidence', () => {
         writeFileSync(join(root, 'parent.mjs'), `import { spawnSync } from 'node:child_process';
           const child = spawnSync(process.execPath, ['child.mjs'], { stdio: 'inherit', env: process.env });
           process.exit(child.status ?? 1);\n`);
+        const loader = join(root, 'loader.mjs');
+        if (kind === 'overriding-loader') writeFileSync(loader, `import { registerHooks } from 'node:module';
+          registerHooks({ load(url, context, nextLoad) {
+            const result = nextLoad(url, context);
+            return url.endsWith('/helper.mjs') ? { ...result, source: 'export const value = 2;\\n' } : result;
+          } });\n`);
         const env = { ...process.env };
         for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
             key === 'NODE_OPTIONS') delete env[key];
-        execFileSync(process.execPath, ['parent.mjs'], { cwd: root, encoding: 'utf8', timeout: 30000,
+        const output = execFileSync(process.execPath, ['parent.mjs'], { cwd: root, encoding: 'utf8', timeout: 30000,
           env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'command-load-test',
             PC_EXECUTED_SOURCE_MAP_OUT: outPath, PC_EXECUTED_SOURCE_MAP_ROOT: root,
-            PC_EXECUTED_SOURCE_MAP_PRELOAD: '1', NODE_OPTIONS: `--import=${pathToFileURL(capture).href}` },
+            PC_EXECUTED_SOURCE_MAP_PRELOAD: '1', NODE_OPTIONS: `--import=${pathToFileURL(capture).href}` +
+              (kind === 'overriding-loader' ? ` --import=${pathToFileURL(loader).href}` : '') },
         });
+        expect(output.trim()).toBe(kind === 'self-restoring' || kind === 'overriding-loader' ? '2' : '1');
         expect(existsSync(`${outPath}.processes`)).toBe(true);
         const receipts = readdirSync(`${outPath}.processes`).map(file =>
           JSON.parse(readFileSync(join(`${outPath}.processes`, file), 'utf8')));
@@ -49,7 +57,7 @@ describe('original config load evidence', () => {
         expect(child).toMatchObject({ schemaVersion: 'node-loaded-process-sources-v1',
           scope: 'repository-node-process-sources', basis: 'node-load-hook',
           sources: expect.arrayContaining([{ path: `helper.${extension}`,
-            sha256: kind === 'commonjs' ? null : digest(loaded), currentSha256: digest(stable) }]),
+            sha256: kind === 'commonjs' || kind === 'overriding-loader' ? null : digest(loaded), currentSha256: digest(stable) }]),
           unresolved: expect.arrayContaining(['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured']),
         });
         expect(child.status).toBe(kind === 'stable' ? 'stable' : kind === 'self-restoring' ? 'changed' : 'unknown');
