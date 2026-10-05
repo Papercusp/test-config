@@ -15,7 +15,7 @@ const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=d
   Buffer.from(JSON.stringify(map)).toString('base64');
 
 describe('original config load evidence', () => {
-  it.each(['stable', 'self-restoring', 'commonjs', 'overriding-loader'] as const)
+  it.each(['stable', 'self-restoring', 'commonjs', 'overriding-loader', 'mutated-argv'] as const)
     ('retains original inputs from a real parent and child command at exit (%s)', kind => {
       const root = mkdtempSync(join(tmpdir(), 'command-original-load-'));
       const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
@@ -29,6 +29,7 @@ describe('original config load evidence', () => {
       try {
         writeFileSync(helper, loaded);
         writeFileSync(join(root, 'child.mjs'), `import { value } from './helper.${extension}';
+          ${kind === 'mutated-argv' ? "process.argv[1] = 'helper.mjs';" : ''}
           console.log(value);\n`);
         writeFileSync(join(root, 'parent.mjs'), `import { spawnSync } from 'node:child_process';
           const child = spawnSync(process.execPath, ['child.mjs'], { stdio: 'inherit', env: process.env });
@@ -60,7 +61,7 @@ describe('original config load evidence', () => {
             sha256: kind === 'commonjs' || kind === 'overriding-loader' ? null : digest(loaded), currentSha256: digest(stable) }]),
           unresolved: expect.arrayContaining(['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured']),
         });
-        expect(child.status).toBe(kind === 'stable' ? 'stable' : kind === 'self-restoring' ? 'changed' : 'unknown');
+        expect(child.status).toBe(kind === 'stable' || kind === 'mutated-argv' ? 'stable' : kind === 'self-restoring' ? 'changed' : 'unknown');
       } finally { rmSync(root, { recursive: true, force: true }); }
     });
 
