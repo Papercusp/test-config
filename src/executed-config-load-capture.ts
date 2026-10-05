@@ -2,7 +2,7 @@
  * Loaded with Node --import BEFORE Vite evaluates configs. Reporter-time disk
  * reads cannot recover these bytes. This never authorizes reusable test passes. */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import * as nodeModule from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -50,6 +50,31 @@ function install(): void {
       !process.env.PC_EXECUTED_SOURCE_MAP_OUT || !process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE) return;
   const state: Capture = { sources: new Map(), reasons: new Set() };
   shared[KEY] = state;
+  // A later preload can wrap this hook and replace the bytes it observed.
+  // Without a receipt for that layer, the intermediate bytes are not original
+  // execution authority. Recognize only this preload, including symlink paths.
+  const preloads: string[] = [];
+  const args = process.execArgv;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--eval' || args[i] === '-e') { i++; continue; }
+    if (args[i] === '--import') preloads.push(args[++i] ?? '');
+    else if (args[i].startsWith('--import=')) preloads.push(args[i].slice(9));
+    else if (/^(?:--(?:experimental-)?loader|--require|-r)(?:=|$)/.test(args[i]))
+      state.reasons.add('node-loader-chain-unmeasured');
+  }
+  const options = process.env.NODE_OPTIONS ?? '';
+  const importFlags = [...options.matchAll(/(?:^|\s)--import(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s]+))/g)];
+  for (const match of importFlags) preloads.push(match[1] ?? match[2] ?? match[3]);
+  if ((options.match(/(?:^|\s)--import(?==|\s|$)/g)?.length ?? 0) !== importFlags.length ||
+      /(?:^|\s)(?:--(?:experimental-)?loader|--require|-r)(?:=|\s|$)/.test(options))
+    state.reasons.add('node-loader-chain-unmeasured');
+  for (const preload of preloads) {
+    try {
+      const path = preload.startsWith('file:') ? fileURLToPath(preload) : resolve(preload);
+      if (realpathSync(path) !== realpathSync(fileURLToPath(import.meta.url)))
+        state.reasons.add('node-loader-chain-unmeasured');
+    } catch { state.reasons.add('node-loader-chain-unmeasured'); }
+  }
   // npm, command routers and their descendants do not instantiate the Vitest
   // reporter. Retain each process's observed inputs beside that same OUT file.
   // A missing exit receipt remains unknown (for example a killed process).
@@ -74,7 +99,7 @@ function install(): void {
         // These are observed inputs, never a census of every descendant or a
         // complete runtime identity. The preload itself predates its own hook.
         unresolved: ['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured',
-          'node-external-native-runtime-unmeasured'],
+          'node-external-native-runtime-unmeasured', 'node-loader-chain-not-closed'],
       }));
     } catch { /* The consumer records absent/malformed receipts as unknown. */ }
   });
@@ -84,7 +109,7 @@ function install(): void {
   }
   const record = ({ path, sha256 }: LoadedSource): void => {
     const seen = state.sources.get(path) ?? new Set<string | null>();
-    seen.add(sha256);
+    seen.add(state.reasons.has('node-loader-chain-unmeasured') ? null : sha256);
     state.sources.set(path, seen);
   };
   nodeModule.registerHooks({ load(url, context, nextLoad) {
