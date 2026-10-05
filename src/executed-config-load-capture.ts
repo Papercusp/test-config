@@ -64,14 +64,17 @@ function install(): void {
     try {
       if (!url.startsWith('file:') || loaded.source == null) return loaded;
       const path = fileURLToPath(url);
-      const code = typeof loaded.source === 'string' ? loaded.source : Buffer.from(loaded.source).toString('utf8');
+      const bytes = typeof loaded.source === 'string' ? Buffer.from(loaded.source) :
+        loaded.source instanceof ArrayBuffer ? Buffer.from(loaded.source) :
+          Buffer.from(loaded.source.buffer, loaded.source.byteOffset, loaded.source.byteLength);
+      const code = bytes.toString('utf8');
       if (/\.timestamp-\d+-[a-f0-9]+\.mjs$/.test(path)) {
         const originals = configBundleSources(code);
         if (!originals) state.reasons.add('config-bundle-originals-unavailable');
         else originals.forEach(record);
       } else if (!path.split(/[\\/]/).includes('node_modules') &&
           (loaded.format === 'module' || loaded.format === 'module-typescript')) {
-        record({ path, sha256: hash(typeof loaded.source === 'string' ? loaded.source : Buffer.from(loaded.source)) });
+        record({ path, sha256: hash(bytes) });
       }
       // CommonJS compile overrides and Vite's runner loader are not witnessed
       // by this ESM seam. Their missing sources remain explicit below.
