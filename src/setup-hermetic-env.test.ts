@@ -102,6 +102,13 @@ describe('setup-hermetic-env: inherited live dependency-generation store is scru
 
 });
 
+describe('setup-hermetic-env: inherited headless session ownership is scrubbed', () => {
+  it('removes headless provenance before fixtures can reap their shared test scope', async () => {
+    const after = await runSetupOn({ PAPERCUSP_PSU_HEADLESS: '1' });
+    expect(after.PAPERCUSP_PSU_HEADLESS).toBeUndefined();
+  });
+});
+
 describe('setup-hermetic-env: the psu operator pin is scrubbed (WI-10004341)', () => {
   it('removes a :3170 operator pin and its provenance marker', async () => {
     const after = await runSetupOn({
