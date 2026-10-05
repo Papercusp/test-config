@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import * as nodeModule from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isMainThread, threadId } from 'node:worker_threads';
 
 interface LoadedSource { path: string; sha256: string | null }
 interface Capture { sources: Map<string, Set<string | null>>; reasons: Set<string> }
@@ -84,20 +85,21 @@ function install(): void {
   // before the command body can rewrite them, rather than trusting them at exit.
   const entry = process.argv[1] ? resolve(process.argv[1]) : null;
   const rel = repoRoot && entry ? relative(repoRoot, entry).split(/[\\/]/).join('/') : null;
-  const entrypoint = rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../') &&
+  const entrypoint = isMainThread && rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../') &&
     !rel.split('/').includes('node_modules') ? rel : null;
   if (repoRoot && isAbsolute(repoRoot)) process.once('exit', exitCode => {
     try {
       const evidence = qualifyLoadedSources([...state.sources.keys()], repoRoot, 'process');
+      if (!isMainThread) evidence.reasons.push('process-worker-thread-entrypoint-unmeasured');
       if (!entrypoint || !evidence.sources.some(source => source.path === entrypoint && source.sha256 !== null)) {
         evidence.reasons.push('process-entrypoint-original-load-unavailable');
         if (evidence.status === 'stable') evidence.status = 'unknown';
       }
       const directory = `${outPath}.processes`;
       mkdirSync(directory, { recursive: true });
-      writeFileSync(join(directory, `${process.pid}.json`), JSON.stringify({
+      writeFileSync(join(directory, `${process.pid}-${threadId}.json`), JSON.stringify({
         schemaVersion: 'node-loaded-process-sources-v1', scope: 'repository-node-process-sources',
-        entrypoint, pid: process.pid, parentPid: process.ppid, exitCode, ...evidence,
+        entrypoint, pid: process.pid, parentPid: process.ppid, isMainThread, threadId, exitCode, ...evidence,
         // These are observed inputs, never a census of every descendant or a
         // complete runtime identity. The preload itself predates its own hook.
         unresolved: ['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured',

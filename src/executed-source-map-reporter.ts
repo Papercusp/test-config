@@ -40,6 +40,7 @@ import {
   captureWorktreeSnapshot,
   closeSharedPgIfUnheld,
   computeWorktreeDirty,
+  collectModuleExecution,
   retainSharedPg,
   inferWorkspaceRoot,
   isMutationProbeRun,
@@ -591,9 +592,40 @@ export interface ExecutedSourceMapResult {
   dirty: boolean;
   /** The writer's error message for `failed`; null otherwise. */
   error: string | null;
+  /** Named results from THIS Vitest process, independent of proof persistence.
+   * The launcher must snapshot its initial result file before any separate retry. */
+  fileResults?: {
+    version: 1;
+    runnerIdentity: string;
+    runContext: string;
+    runGroupId: string | null;
+    files: Array<{ testFile: string; verdict: 'pass' | 'fail' | 'unknown' }>;
+  };
 }
 
 const RESULT_ERROR_MAX_CHARS = 500;
+
+/** A final passing module is insufficient: skips and retries can hide its first attempt. */
+function firstAttemptModuleVerdict(testModule: TestModule, state: string): 'pass' | 'fail' | 'unknown' {
+  if (state === 'failed') return 'fail';
+  const execution = collectModuleExecution(testModule);
+  if (execution?.failed || execution?.collectionFailed) return 'fail';
+  let unmeasured = false;
+  try {
+    if (typeof testModule.children?.allTests !== 'function') return 'unknown';
+    for (const test of testModule.children.allTests()) {
+      const diagnostic = test.diagnostic();
+      // Vitest retries only after a failed attempt. A later pass cannot erase that miss.
+      if (diagnostic.flaky === true || diagnostic.retryCount > 0) return 'fail';
+      if (!Number.isSafeInteger(diagnostic.retryCount) || diagnostic.retryCount !== 0 ||
+          diagnostic.flaky !== false) unmeasured = true;
+    }
+  } catch {
+    return 'unknown';
+  }
+  return state === 'passed' && execution && execution.passed > 0 && execution.skipped === 0 && !unmeasured
+    ? 'pass' : 'unknown';
+}
 
 /** Append the flush outcome to the runner's result file. Fail-soft: a lost line is logged. */
 export function appendExecutedSourceMapResult(resultPath: string | null, result: ExecutedSourceMapResult): void {
@@ -624,6 +656,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
   // OUT diagnostics describe executions, including failed or incomplete ones.
   // They never enter the reusable-pass table or the selector's rows.
   private diagnostics: Array<{ testFile: string; state: string; sourceEvidence: ExecutedSourceEvidence }> = [];
+  private fileResults: NonNullable<ExecutedSourceMapResult['fileResults']>['files'] = [];
 
   private discardInputs(moduleId: string): void {
     if (!this.inputsDir) return;
@@ -665,6 +698,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.flushed = false;
     this.collectedSources = new WeakMap();
     this.diagnostics = [];
+    this.fileResults = [];
   }
 
   onTestModuleCollected(testModule: TestModule): void {
@@ -698,6 +732,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
       } catch {
         /* fail-soft: treat as not recordable */
       }
+      const resultFile = normalizeExecutedKey(testModule.moduleId, this.repoRoot);
+      if (resultFile) this.fileResults.push({ testFile: resultFile, verdict: firstAttemptModuleVerdict(testModule, state) });
       if (this.armed.outPath) {
         const testFile = normalizeExecutedKey(testModule.moduleId, this.repoRoot);
         if (testFile) {
@@ -818,6 +854,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
         sha: recordedSha,
         dirty: worktreeDirty,
         error,
+        fileResults: {
+          version: 1,
+          runnerIdentity: executedSourceRunnerIdentity(),
+          runContext: executedSourceRunContext(),
+          runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+          files: [...this.fileResults],
+        },
       });
     if (rows.length === 0 && retiredFiles.length === 0) {
       log(`nothing to record ${summary}`);
