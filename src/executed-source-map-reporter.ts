@@ -48,7 +48,7 @@ import {
   type WorktreeGitSnapshot,
 } from './admin-test-runs-reporter';
 import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META } from './vitest-config';
-import { qualifyLoadedConfigSources } from './executed-config-load-capture.ts';
+import { qualifyLoadedConfigSources, qualifyLoadedMainProcessSources } from './executed-config-load-capture.ts';
 
 export interface ExecutedSourceRow {
   workspaceName: string;
@@ -799,7 +799,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
           JSON.stringify({ workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty,
             skipped: this.skipped, rows, diagnostics: this.diagnostics,
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
-            configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot) }, null, 1),
+            configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot),
+            mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot) }, null, 1),
         );
       } catch (e) {
         log(`out-file write failed (${e instanceof Error ? e.message : String(e)}) ${summary}`);

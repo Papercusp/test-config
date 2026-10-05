@@ -62,8 +62,12 @@ function install(): void {
   nodeModule.registerHooks({ load(url, context, nextLoad) {
     const loaded = nextLoad(url, context);
     try {
-      if (!url.startsWith('file:') || loaded.source == null) return loaded;
+      if (!url.startsWith('file:')) return loaded;
       const path = fileURLToPath(url);
+      if (loaded.source == null) {
+        if (!path.split(/[\\/]/).includes('node_modules')) record({ path, sha256: null });
+        return loaded;
+      }
       const bytes = typeof loaded.source === 'string' ? Buffer.from(loaded.source) :
         loaded.source instanceof ArrayBuffer ? Buffer.from(loaded.source) :
           Buffer.from(loaded.source.buffer, loaded.source.byteOffset, loaded.source.byteLength);
@@ -73,8 +77,10 @@ function install(): void {
         if (!originals) state.reasons.add('config-bundle-originals-unavailable');
         else originals.forEach(record);
       } else if (!path.split(/[\\/]/).includes('node_modules') &&
-          (loaded.format === 'module' || loaded.format === 'module-typescript')) {
+          (loaded.format === 'module' || loaded.format === 'module-typescript' || loaded.format === 'json')) {
         record({ path, sha256: hash(bytes) });
+      } else if (!path.split(/[\\/]/).includes('node_modules')) {
+        record({ path, sha256: null });
       }
       // CommonJS compile overrides and Vite's runner loader are not witnessed
       // by this ESM seam. Their missing sources remain explicit below.
@@ -93,33 +99,56 @@ export interface LoadedConfigSources {
   reasons: string[];
 }
 
-export function qualifyLoadedConfigSources(paths: string[] | null, repoRoot: string): LoadedConfigSources {
+/** The repository files observed by this main process, beyond bundled config
+ * inputs. This does not establish external/native code or child-process closure. */
+export interface LoadedMainProcessSources extends Omit<LoadedConfigSources, 'schemaVersion' | 'scope'> {
+  schemaVersion: 'node-loaded-main-process-sources-v1';
+  scope: 'repository-node-main-process-sources';
+}
+
+function qualifyLoadedSources(paths: string[] | null, repoRoot: string, prefix: 'config' | 'main-process'):
+  Omit<LoadedConfigSources, 'schemaVersion' | 'scope'> {
   const state = shared[KEY];
-  const reasons = new Set(state?.reasons ?? ['config-node-load-capture-unavailable']);
+  const reasons = new Set(state?.reasons ?? [`${prefix}-node-load-capture-unavailable`]);
   let changed = false;
-  if (!paths?.length) reasons.add('config-dependencies-unavailable');
+  if (!paths?.length) reasons.add(`${prefix}-dependencies-unavailable`);
   const sources: LoadedConfigSources['sources'] = [];
   for (const absolute of paths ?? []) {
     const path = relative(repoRoot, absolute).split(/[\\/]/).join('/');
     if (!isAbsolute(absolute) || !path || path === '..' || path.startsWith('../') || isAbsolute(path) ||
         path.split('/').includes('node_modules')) {
-      reasons.add(`config-loaded-source-outside-repository:${absolute}`);
+      reasons.add(`${prefix}-loaded-source-outside-repository:${absolute}`);
       continue;
     }
     const hashes = state?.sources.get(absolute);
     const sha256 = hashes?.size === 1 ? [...hashes][0]! : null;
-    if (sha256 === null) reasons.add(`config-original-load-unavailable:${path}`);
+    if (sha256 === null) reasons.add(`${prefix}-original-load-unavailable:${path}`);
     let currentSha256: string | null = null;
     try { currentSha256 = hash(readFileSync(resolve(repoRoot, path))); }
-    catch { reasons.add(`config-loaded-source-unreadable:${path}`); }
+    catch { reasons.add(`${prefix}-loaded-source-unreadable:${path}`); }
     if (sha256 !== null && currentSha256 !== null && sha256 !== currentSha256) {
       changed = true;
-      reasons.add(`config-loaded-source-changed:${path}`);
+      reasons.add(`${prefix}-loaded-source-changed:${path}`);
     }
     sources.push({ path, sha256, currentSha256 });
   }
-  if (sources.length === 0) reasons.add('config-loaded-sources-unavailable');
-  return { schemaVersion: 'node-loaded-config-sources-v1', scope: 'repository-vite-config-dependencies',
-    basis: 'node-load-hook', status: changed ? 'changed' : reasons.size ? 'unknown' : 'stable',
+  if (sources.length === 0) reasons.add(`${prefix}-loaded-sources-unavailable`);
+  return { basis: 'node-load-hook', status: changed ? 'changed' : reasons.size ? 'unknown' : 'stable',
     sources: sources.sort((a, b) => a.path.localeCompare(b.path)), reasons: [...reasons].sort() };
+}
+
+export function qualifyLoadedConfigSources(paths: string[] | null, repoRoot: string): LoadedConfigSources {
+  return { schemaVersion: 'node-loaded-config-sources-v1', scope: 'repository-vite-config-dependencies',
+    ...qualifyLoadedSources(paths, repoRoot, 'config') };
+}
+
+export function qualifyLoadedMainProcessSources(configPaths: string[] | null, repoRoot: string): LoadedMainProcessSources {
+  const config = new Set(configPaths ?? []);
+  const paths = [...(shared[KEY]?.sources.keys() ?? [])].filter(path => !config.has(path));
+  const evidence = qualifyLoadedSources(paths, repoRoot, 'main-process');
+  if (!configPaths?.length) {
+    evidence.reasons.push('main-process-config-population-unavailable');
+    if (evidence.status === 'stable') evidence.status = 'unknown';
+  }
+  return { schemaVersion: 'node-loaded-main-process-sources-v1', scope: 'repository-node-main-process-sources', ...evidence };
 }
