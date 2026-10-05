@@ -205,6 +205,7 @@ describe("isStatefulTestSource", () => {
       `afterEach(() => __resetThingForTests());`,
       `beforeEach(() => _resetPlanTemplateRegistryForTests());`,
       `beforeEach(() => resetGovernorRegistry());`,
+      `afterAll(() => setLocalEmbedEngineOverride(null));`,
       `import './register-things';\n`,
       `await expect(import('./wire-things')).resolves.toBeDefined();`,
       `await import('./register-async-things');`,
@@ -268,6 +269,25 @@ describe("isStatefulTestSource", () => {
     expect(
       isStatefulTestSource(`await Promise.resolve(runCalculation());`),
     ).toBe(false);
+  });
+
+  it("isolates override setters and restores while keeping override reads pure", () => {
+    // The deterministic embedder installs a pinned process-wide engine override.
+    // A clean fresh-process run cannot make that write safe in a reused worker.
+    const sources = [
+      `setLocalEmbedEngineOverride(() => deterministicEmbedding);`,
+      `afterAll(() => setLocalEmbedEngineOverride(null));`,
+      `clearTransportOverride();`,
+      `resetProviderOverrideForTests();`,
+    ];
+    for (const source of sources) {
+      expect(viMockOnlyMatcher(source)).toBe(false);
+      expect(isStatefulTestSource(source)).toBe(true);
+    }
+
+    expect(isStatefulTestSource(`expect(hasLocalEmbedEngineOverride()).toBe(true);`)).toBe(false);
+    expect(isStatefulTestSource(`const client = getTransportOverride();`)).toBe(false);
+    expect(isStatefulTestSource(`setFormValue('name', 'Ada');`)).toBe(false);
   });
 
   it("CONTROL C: beats the vi.mock-only matcher on a bare side-effect import", () => {

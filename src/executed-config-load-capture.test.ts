@@ -43,23 +43,30 @@ describe('original config load evidence', () => {
     { sourceRoot: '../relative/', sources: ['config.mjs'], sourcesContent: ['code'] }])
     ('rejects an incomplete source map %j', map => expect(configBundleSources(bundle(map))).toBeNull());
 
-  it.each(['native', 'bundle', 'runner'] as const)('observes actual Vite config evaluation (%s loader)', loader => {
+  it.each(['native', 'native-ts', 'bundle', 'runner', 'commonjs-bundle'] as const)('observes actual Vite config evaluation (%s loader)', kind => {
     const root = mkdtempSync(join(tmpdir(), 'config-original-load-'));
     const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
     const vite = import.meta.resolve('vite');
-    const original = 'export const count = 1;\n';
-    const restored = 'export const count = 2;\n';
+    const loader = kind === 'native-ts' ? 'native' : kind === 'commonjs-bundle' ? 'bundle' : kind;
+    const cjs = kind === 'commonjs-bundle';
+    const extension = kind === 'native-ts' ? 'ts' : cjs ? 'cjs' : 'mjs';
+    const original = cjs ? 'exports.count = 1;\n' : `export const count${kind === 'native-ts' ? ': number' : ''} = 1;\n`;
+    const restored = cjs ? 'exports.count = 2;\n' : `export const count${kind === 'native-ts' ? ': number' : ''} = 2;\n`;
     try {
-      writeFileSync(join(root, 'helper.mjs'), original);
-      writeFileSync(join(root, 'config.mjs'), `import { count } from './helper.mjs';
+      const helper = join(root, `helper.${extension}`);
+      const configPath = join(root, `config.${extension}`);
+      writeFileSync(helper, original);
+      writeFileSync(configPath, cjs ? `const { count } = require('./helper.cjs');
+        require('node:fs').writeFileSync(${JSON.stringify(helper)}, ${JSON.stringify(restored)});
+        module.exports = { test: { count } };` : `import { count } from './helper.${extension}';
         import { writeFileSync } from 'node:fs';
-        writeFileSync(new URL('./helper.mjs', import.meta.url), ${JSON.stringify(restored)});
+        writeFileSync(new URL('./helper.${extension}', import.meta.url), ${JSON.stringify(restored)});
         export default { test: { count } };`);
       const script = `import { loadConfigFromFile } from ${JSON.stringify(vite)};
-        const config = await loadConfigFromFile({ command: 'serve', mode: 'test' }, ${JSON.stringify(join(root, 'config.mjs'))}, ${JSON.stringify(root)}, undefined, undefined, ${JSON.stringify(loader)});
+        const config = await loadConfigFromFile({ command: 'serve', mode: 'test' }, ${JSON.stringify(configPath)}, ${JSON.stringify(root)}, undefined, undefined, ${JSON.stringify(loader)});
         const { qualifyLoadedConfigSources } = await import(${JSON.stringify(pathToFileURL(capture).href)});
         console.log(JSON.stringify({ count: config.config.test.count,
-          evidence: qualifyLoadedConfigSources([${JSON.stringify(join(root, 'config.mjs'))}, ${JSON.stringify(join(root, 'helper.mjs'))}], ${JSON.stringify(root)}) }));`;
+          evidence: qualifyLoadedConfigSources([${JSON.stringify(configPath)}, ${JSON.stringify(helper)}], ${JSON.stringify(root)}) }));`;
       const out = execFileSync(process.execPath, ['--import', capture, '--input-type=module', '--eval', script], {
         encoding: 'utf8', timeout: 30000, cwd: root,
         env: { ...process.env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'load-test', PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json'),
@@ -67,9 +74,9 @@ describe('original config load evidence', () => {
       });
       const result = JSON.parse(out.trim());
       expect(result.count).toBe(1);
-      if (loader === 'runner') expect(result.evidence.status).toBe('unknown');
+      if (loader === 'runner' || cjs) expect(result.evidence.status).toBe('unknown');
       else expect(result.evidence).toMatchObject({ basis: 'node-load-hook', status: 'changed',
-        sources: expect.arrayContaining([{ path: 'helper.mjs', sha256: digest(original), currentSha256: digest(restored) }]),
+        sources: expect.arrayContaining([{ path: `helper.${extension}`, sha256: digest(original), currentSha256: digest(restored) }]),
       });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

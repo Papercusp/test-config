@@ -212,6 +212,11 @@ export const STATEFUL_PATTERNS = [
   // classifier left it in the reused pure fork. Keep this narrow to Registry-named helpers so an
   // ordinary local `resetForm()` does not exile an otherwise pure test.
   /\b(?:reset|clear)[A-Za-z0-9_$]*Registry[A-Za-z0-9_$]*\s*\(/,
+  // Override setters replace shared module/process bindings even when the mutation lives
+  // inside an imported helper. The deterministic embedder's engine setter was classified
+  // pure despite writing a pinned singleton; clearing/restoring it has the same scope.
+  // Reads (has/get…Override) and ordinary local setters remain pure-eligible.
+  /\b(?:set|clear|reset)[A-Za-z0-9_$]*Override[A-Za-z0-9_$]*\s*\(/,
   // ⚠ The trailing-comment branch is LOAD-BEARING, not tidiness. The first version of this
   // pattern ended at `;?\s*$` and therefore missed
   //     import './reconcile-rule'; // registers plan-item-reconcile:done into the global engine
