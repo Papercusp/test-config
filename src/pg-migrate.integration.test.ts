@@ -315,6 +315,13 @@ describe('buildTemplate hardening (WI-1992)', () => {
     uri.pathname = `/${buildName}`;
     const activeBuild = postgres(uri.toString(), { max: 1, onnotice: () => {} });
     cleanupClients.push(activeBuild);
+    // A postgres-js query is lazy and a cold client has no backend yet. Prove
+    // that this build connection exists before asking the waiter to assess its
+    // activity; otherwise it legitimately recovers the idle stale holder first.
+    const [{ pid: buildPid }] = await activeBuild<{ pid: number }[]>`SELECT pg_backend_pid() AS pid`;
+    const [{ datname: activeDatabase }] = await holder<{ datname: string }[]>`
+      SELECT datname FROM pg_stat_activity WHERE pid = ${buildPid}`;
+    expect(activeDatabase).toBe(buildName);
     // Stay active across at least two one-second waiter polls. A sub-poll sleep
     // could let this test pass without ever exercising the database-progress
     // suppression branch.
@@ -327,6 +334,9 @@ describe('buildTemplate hardening (WI-1992)', () => {
       await holder.unsafe(`SELECT set_config('application_name', $1, false)`, [templateBuilderApplicationName(key)]);
       await holder.unsafe(`SELECT pg_advisory_unlock(hashtext($1::text))`, [lock]);
     })();
+    // Observe any rejection immediately; the assertion still awaits the same
+    // promise after the build, without a timing-dependent unhandled rejection.
+    void release.catch(() => {});
 
     const built = await getOrBuildTemplate(key, async (url) => {
       const c = postgres(url, { max: 1, onnotice: () => {} });
@@ -437,7 +447,22 @@ describe('managed test database lifecycle (WI-10003219)', () => {
     await admin.unsafe(
       `COMMENT ON DATABASE "${orphan.name}" IS '${TEST_DB_MANAGED_MARKER}${Date.now() - 2 * 24 * 60 * 60 * 1000}'`,
     );
-    await trigger.drop();
+    // The janitor intentionally selects at most three global candidates and
+    // may defer while another process owns its lock. Scope the existing SQL
+    // executor seam to this test's catalog rows and establish lock ownership;
+    // real age/marker/activity predicates and DROP statements still run in PG.
+    const scopedAdmin = {
+      unsafe: (query: string) => admin.unsafe(query.replace(
+        'FROM pg_database d',
+        `FROM (SELECT * FROM pg_database WHERE datname IN ('${orphan.name}', '${trigger.name}')) d`,
+      )),
+    };
+    await admin.unsafe(`SELECT pg_advisory_lock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`);
+    try {
+      expect(await dropDatabaseWithLock(scopedAdmin, trigger.name)).toBe('dropped');
+    } finally {
+      await admin.unsafe(`SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`);
+    }
     const rows = await admin.unsafe(
       `SELECT datname FROM pg_database WHERE datname = '${orphan.name}'`,
     ) as Array<{ datname: string }>;
