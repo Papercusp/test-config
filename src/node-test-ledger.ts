@@ -164,15 +164,28 @@ export interface BeginNodeTestLedgerOptions {
   writeRows?: (rows: readonly TestRunRow[]) => Promise<void>;
 }
 
-/** Start a node:test ledger session. Call BEFORE spawning the child (the before-snapshot). */
-export function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): NodeTestLedgerSession {
+/**
+ * Start a node:test ledger session. AWAIT it BEFORE spawning the child: the before-snapshot
+ * has to SETTLE first.
+ *
+ * EI-24836213046334894: scripts/test-files.mjs runs `node --test` through spawnSync, which
+ * blocks this event loop for the whole run. A before-snapshot still in flight at that point
+ * cannot finish: its git child's exec timeout fires mid-block and reports an empty HEAD
+ * (every as-committed R-6 run recorded `HEAD unreadable (before= after=<sha>)`). A retry would
+ * be worse, because it would read the tree AFTER the run, and a "before" equal to "after"
+ * proves nothing about stability.
+ */
+export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): Promise<NodeTestLedgerSession> {
   const { repoRoot } = options;
   const readSnapshot = options.readSnapshot ?? captureWorktreeSnapshot;
   const writeRows = options.writeRows ?? insertRows;
   // The snapshot and the ledger path filter both resolve against the checkout under test.
   setRunRoot(repoRoot);
-  const before = readSnapshot();
-  before.catch(() => undefined); // observed again in record(); never an unhandled rejection
+  // Settled here, observed in record(): a failed before-snapshot is a dirty run, never a throw.
+  const before = await readSnapshot().then(
+    (snapshot) => ({ snapshot, error: null as unknown }),
+    (error: unknown) => ({ snapshot: null, error }),
+  );
   const dir = mkdtempSync(join(tmpdir(), 'node-test-ledger-'));
   const summaryPath = join(dir, 'summary.json');
 
@@ -198,8 +211,9 @@ export function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): NodeTe
         let worktreeDirtyReason: string | null = 'snapshot not taken';
         let commitSha: string | null = null;
         try {
+          if (!before.snapshot) throw before.error ?? new Error('before-snapshot unavailable');
           const after = await readSnapshot();
-          worktreeDirtyReason = describeWorktreeDirt(await before, after);
+          worktreeDirtyReason = describeWorktreeDirt(before.snapshot, after);
           worktreeDirty = worktreeDirtyReason !== null;
           commitSha = after.commit;
         } catch (err) {

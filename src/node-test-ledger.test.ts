@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { runGit } from './admin-test-runs-reporter.ts';
 import type { TestRunRow, WorktreeGitSnapshot } from './admin-test-runs-reporter.ts';
 import { parseTestRunExecutionDetails } from './execution-details.ts';
 import { createNodeTestLedgerFold, oneLineMessage } from './node-test-ledger-collector.ts';
@@ -162,12 +163,12 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     dir = null;
   });
 
-  function runChild(fixture: string) {
+  async function runChild(fixture: string) {
     dir = mkdtempSync(join(tmpdir(), 'node-test-ledger-fixture-'));
     writeFileSync(join(dir, 'fx.test.mjs'), fixture);
     const written: TestRunRow[] = [];
     const snapshot: WorktreeGitSnapshot = { commit: 'feedface00', porcelain: '' };
-    const session = beginNodeTestLedger({
+    const session = await beginNodeTestLedger({
       repoRoot: dir,
       readSnapshot: async () => snapshot,
       writeRows: async (rows) => {
@@ -181,7 +182,7 @@ describe('beginNodeTestLedger — a real node --test child', () => {
   }
 
   it('keeps the spec output on stdout and records a failing mutant run with its failed case', async () => {
-    const { session, child, written } = runChild([
+    const { session, child, written } = await runChild([
       "import { test, describe } from 'node:test';",
       "import assert from 'node:assert';",
       "describe('outer', () => {",
@@ -205,7 +206,7 @@ describe('beginNodeTestLedger — a real node --test child', () => {
   it('records nothing, and says why, when the child never reported', async () => {
     dir = mkdtempSync(join(tmpdir(), 'node-test-ledger-fixture-'));
     const written: TestRunRow[] = [];
-    const session = beginNodeTestLedger({
+    const session = await beginNodeTestLedger({
       repoRoot: dir,
       readSnapshot: async () => ({ commit: 'a', porcelain: '' }),
       writeRows: async (rows) => {
@@ -216,5 +217,79 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     expect(outcome.recorded).toBe(0);
     expect(outcome.reason).toMatch(/no collector summary/);
     expect(written).toEqual([]);
+  });
+});
+
+// The router spawns `node --test` with spawnSync, which blocks the event loop for the whole run.
+// Measured on every as-committed R-6 run (WI-10003960): `HEAD unreadable (before= after=<sha>)`.
+describe('the before-snapshot survives a caller that blocks the event loop (EI-24836213046334894)', () => {
+  it('settles the before-snapshot before begin returns, so it is never in flight across the spawn', async () => {
+    const order: string[] = [];
+    let reads = 0;
+    const repoRoot = mkdtempSync(join(tmpdir(), 'node-test-ledger-order-'));
+    try {
+      const session = await beginNodeTestLedger({
+        repoRoot,
+        readSnapshot: async () => {
+          reads += 1;
+          const read = reads;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          order.push(`snapshot-${read}`);
+          return { commit: 'cafe0001', porcelain: '' };
+        },
+        writeRows: async () => undefined,
+      });
+      order.push('spawn');
+      expect(order).toEqual(['snapshot-1', 'spawn']);
+      await session.record(); // no collector summary; the session still removes its own temp dir
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('records a run dirty, not thrown, when the before-snapshot itself failed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'node-test-ledger-before-fail-'));
+    try {
+      writeFileSync(join(dir, 'fx.test.mjs'), "import { test } from 'node:test'; test('ok', () => {});");
+      const written: TestRunRow[] = [];
+      let reads = 0;
+      const session = await beginNodeTestLedger({
+        repoRoot: dir,
+        readSnapshot: async () => {
+          reads += 1;
+          if (reads === 1) throw new Error('git unavailable');
+          return { commit: 'cafe0002', porcelain: '' };
+        },
+        writeRows: async (rows) => {
+          written.push(...rows);
+        },
+      });
+      spawnSync(process.execPath, ['--test', ...session.reporterArgs, 'fx.test.mjs'], {
+        cwd: dir, encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' },
+      });
+      const outcome = await session.record();
+      expect(outcome).toEqual({ recorded: 1, reason: 'worktree_dirty: snapshot threw: git unavailable' });
+      expect(written[0]).toMatchObject({ status: 'pass', worktreeDirty: true, commitSha: null });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runGit reports a git child killed by its timeout as unreadable (null), never as empty output', async () => {
+    // Control: an unblocked loop reads the real output.
+    expect(await runGit('git --version', process.cwd(), 5_000)).toMatch(/^git version /);
+    // Block the loop past the timeout while the child is in flight: exec's timeout handler then
+    // destroys the unread stdout of a child that already exited 0, so the callback sees
+    // err=null and stdout ''. That must surface as unreadable, never as a (false-clean) ''.
+    // Blocking from a setImmediate (check phase) makes the order deterministic: the next loop
+    // iteration runs the expired timeout (timers phase) before it reads the pipe (poll phase).
+    const pending = await new Promise<Promise<string | null>>((resolve) => {
+      setImmediate(() => {
+        const read = runGit('git --version', process.cwd(), 100);
+        spawnSync('sleep', ['0.5']);
+        resolve(read);
+      });
+    });
+    expect(await pending).toBeNull();
   });
 });

@@ -356,11 +356,20 @@ export function computeWorktreeDirty(before: WorktreeGitSnapshot, after: Worktre
 }
 
 let _gitCache: { value: GitContext; expiresAt: number } | null = null;
-function runGit(cmd: string, cwd: string, timeoutMs: number): Promise<string | null> {
+/**
+ * EI-24836213046334894: a KILLED child's output is never a reading. When the event loop is
+ * blocked past `timeout` (a caller's spawnSync), exec's timeout handler destroys the still
+ * unread stdout and signals a child that had already exited 0, so the callback reports
+ * err=null with stdout '' (measured on Node v25.9.0). That '' is a false read: an empty HEAD,
+ * or an empty `git status --porcelain` that looks like a CLEAN tree. `child.killed` is the one
+ * signal that survives the race, so it maps to null (unreadable) like any other failure.
+ * Exported for the regression test only.
+ */
+export function runGit(cmd: string, cwd: string, timeoutMs: number): Promise<string | null> {
   return new Promise((resolveP) => {
     try {
       const child = exec(cmd, { cwd, timeout: timeoutMs }, (err, stdout) => {
-        resolveP(err ? null : stdout.trim());
+        resolveP(err || child.killed ? null : stdout.trim());
       });
       child.on('error', () => resolveP(null));
     } catch {
