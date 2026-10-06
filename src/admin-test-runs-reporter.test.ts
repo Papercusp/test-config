@@ -44,6 +44,9 @@ import AdminTestRunsReporter, {
   resolveWorktreeSnapshotRoot,
   shouldRecordTestRunPath,
   TEST_RUN_INSERT_BATCH_SIZE,
+  TEST_RUN_RECEIPT_ENV,
+  appendTestRunReceipts,
+  reporterWriteBudget,
   type PgSql,
   type TestRunRow,
 } from './admin-test-runs-reporter';
@@ -346,6 +349,92 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     const stored = helperCalls[0]?.rows[0]?.execution_details;
     expect(typeof stored).toBe('object');
     expect(stored).toEqual(details);
+  });
+
+  describe('per-row write receipts (WI-10006245)', () => {
+    const context = {
+      branch: 'staging', inferredCommit: null, declaredSource: 'mutation-probe' as const, runGroupId: null,
+      harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null,
+    };
+    const at = new Date('2026-10-06T01:15:00.000Z');
+    const row = (filePath: string, status: TestRunRow['status'] = 'fail'): TestRunRow => ({
+      filePath, status, durationMs: 1, startedAt: at, finishedAt: at, outputTail: null,
+      isScratchConfig: false, worktreeDirty: false, commitSha: 'abc123', executionDetails: null,
+    });
+    /** A fake client whose STATEMENT result is `statement()`; the bulk helper just passes through. */
+    const fakeSql = (statement: () => Promise<unknown>): PgSql =>
+      Object.assign(
+        (first: unknown) => (Array.isArray(first) && !('raw' in (first as object)) ? {} : statement()),
+        { end: async () => undefined },
+      ) as unknown as PgSql;
+
+    it('pairs RETURNING ids to rows by file path, not by position', async () => {
+      const sql = fakeSql(async () => [
+        { id: '902', file_path: 'b.test.ts' },
+        { id: '901', file_path: 'a.test.ts' },
+      ]);
+      const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts'), row('b.test.ts', 'pass')], context);
+      expect(receipts).toEqual([
+        { filePath: 'a.test.ts', status: 'fail', outcome: 'inserted', id: '901' },
+        { filePath: 'b.test.ts', status: 'pass', outcome: 'inserted', id: '902' },
+      ]);
+    });
+
+    it('reports a batch that outlives its budget as timeout instead of silently dropping it', async () => {
+      const sql = fakeSql(() => new Promise(() => {}));
+      const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts')], context, {
+        insertTimeoutMs: 20, totalInsertMs: 1_000,
+      });
+      expect(receipts).toEqual([
+        { filePath: 'a.test.ts', status: 'fail', outcome: 'timeout', reason: 'pg_insert_timeout_20ms' },
+      ]);
+    });
+
+    it('reports a rejected insert as failed with the reason', async () => {
+      const sql = fakeSql(async () => { throw new Error('remaining connection slots are reserved'); });
+      const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts')], context, {
+        insertTimeoutMs: 1_000, totalInsertMs: 1_000,
+      });
+      expect(receipts).toEqual([
+        { filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: 'remaining connection slots are reserved' },
+      ]);
+    });
+
+    it('marks a returned row set that omits a file as failed, never as inserted', async () => {
+      const sql = fakeSql(async () => []);
+      const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts')], context);
+      expect(receipts).toEqual([
+        { filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: 'insert_returned_no_id' },
+      ]);
+    });
+
+    it('appends receipts as JSON lines only when the receipt file is named', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'test-run-receipts-'));
+      try {
+        const file = join(dir, 'receipts.jsonl');
+        const receipt = { filePath: 'a.test.ts', status: 'fail', outcome: 'inserted' as const, id: '7' };
+        appendTestRunReceipts({}, [receipt]);
+        expect(() => readFileSync(file, 'utf8')).toThrow();
+        appendTestRunReceipts({ [TEST_RUN_RECEIPT_ENV]: file }, [receipt, { ...receipt, id: '8' }]);
+        expect(readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
+          receipt,
+          { ...receipt, id: '8' },
+        ]);
+        // Fail-soft: an unwritable receipt path never throws out of the reporter.
+        expect(() => appendTestRunReceipts({ [TEST_RUN_RECEIPT_ENV]: join(dir, 'missing', 'x.jsonl') }, [receipt])).not.toThrow();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps the 1s fail-soft budget for ordinary runs and widens it only for evidence runs', () => {
+      expect(reporterWriteBudget({})).toEqual({
+        connectTimeoutSec: 1, insertTimeoutMs: 1_000, totalInsertMs: 4_500, flushBudgetMs: 5_000,
+      });
+      const evidence = reporterWriteBudget({ [TEST_RUN_RECEIPT_ENV]: '/tmp/r.jsonl' });
+      expect(evidence.insertTimeoutMs).toBeGreaterThan(1_000);
+      expect(evidence.flushBudgetMs).toBeGreaterThan(evidence.totalInsertMs);
+    });
   });
 
   it('records mutation-probe modules with their explicit phase metadata', async () => {

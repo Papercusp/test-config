@@ -31,7 +31,7 @@
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
 import { exec } from 'node:child_process';
-import { readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import {
@@ -955,7 +955,11 @@ export function tryGetPg(): Promise<PgHandle> {
         process.env.PAPERCUSP_TEST_RUNS_DB_URL ??
         process.env.HARNESS_ADMIN_DATABASE_URL ??
         'postgresql://harness_admin:harness_admin_pwd@localhost:5432/papercusp';
-      const sql = pg(url, { max: 2, connect_timeout: 1, onnotice: () => {} });
+      const sql = pg(url, {
+        max: 2,
+        connect_timeout: reporterWriteBudget(process.env).connectTimeoutSec,
+        onnotice: () => {},
+      });
       return { sql };
     } catch (e) {
       if (process.env.PAPERCUSP_DEBUG_REPORTER) {
@@ -1086,8 +1090,58 @@ const TEST_RUN_INSERT_COLUMNS = [
 // 500 rows × 18 columns = 9,000 bind parameters, comfortably below Postgres's
 // 65,535-parameter ceiling even for a full unsharded workspace run.
 export const TEST_RUN_INSERT_BATCH_SIZE = 500;
-const TEST_RUN_INSERT_TIMEOUT_MS = 1_000;
-const TEST_RUN_TOTAL_FLUSH_TIMEOUT_MS = 4_500;
+
+/**
+ * WI-10006245: a run whose rows are EVIDENCE (a mutation probe binding its
+ * mutant FAIL row) names a receipt file. Every row this reporter tries to write
+ * gets one JSON line there: `inserted` with the test_runs id, `timeout` (the row
+ * may still have landed), or `failed` with the reason. Without it every failure
+ * below is swallowed (D-007), which is how three caught mutants left no row and
+ * nothing said so until a bind found nothing to bind.
+ */
+export const TEST_RUN_RECEIPT_ENV = 'PAPERCUSP_TEST_RUN_RECEIPT_FILE';
+
+export type TestRunReceipt =
+  | { filePath: string; status: string; outcome: 'inserted'; id: string }
+  | { filePath: string; status: string; outcome: 'timeout' | 'failed'; reason: string };
+
+export function appendTestRunReceipts(env: NodeJS.ProcessEnv, receipts: readonly TestRunReceipt[]): void {
+  const file = env[TEST_RUN_RECEIPT_ENV]?.trim();
+  if (!file || receipts.length === 0) return;
+  try {
+    appendFileSync(file, receipts.map((receipt) => `${JSON.stringify(receipt)}\n`).join(''));
+  } catch {
+    /* fail-soft — D-007: a receipt is a report, never a reason to fail the run */
+  }
+}
+
+/**
+ * Write budget. The 1s connect / 1s per-batch / 4.5s total / 5s flush defaults
+ * keep an ordinary run from ever stalling on the ledger. An evidence run (one
+ * that names a receipt file) gets a longer budget, because a missing row there
+ * costs a whole re-run. Suspected cause of the missing mutant rows: this budget
+ * expiring while the gate held the box [inferred — the receipt reason is what
+ * confirms or refutes it].
+ */
+export function reporterWriteBudget(env: NodeJS.ProcessEnv): {
+  connectTimeoutSec: number;
+  insertTimeoutMs: number;
+  totalInsertMs: number;
+  flushBudgetMs: number;
+} {
+  return env[TEST_RUN_RECEIPT_ENV]?.trim()
+    ? { connectTimeoutSec: 10, insertTimeoutMs: 15_000, totalInsertMs: 25_000, flushBudgetMs: 30_000 }
+    : { connectTimeoutSec: 1, insertTimeoutMs: 1_000, totalInsertMs: 4_500, flushBudgetMs: 5_000 };
+}
+
+function receiptReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 200) || 'unknown';
+}
+
+function unwrittenReceipts(rows: readonly TestRunRow[], outcome: 'timeout' | 'failed', reason: string): TestRunReceipt[] {
+  return rows.map((row) => ({ filePath: row.filePath, status: row.status, outcome, reason }));
+}
 
 type TestRunInsertContext = {
   branch: string | null;
@@ -1128,13 +1182,18 @@ export async function insertTestRunRowsWithSql(
   sql: PgSql,
   rows: readonly TestRunRow[],
   context: TestRunInsertContext,
-): Promise<void> {
-  const deadline = Date.now() + TEST_RUN_TOTAL_FLUSH_TIMEOUT_MS;
+  budget: Pick<ReturnType<typeof reporterWriteBudget>, 'insertTimeoutMs' | 'totalInsertMs'> = reporterWriteBudget(process.env),
+): Promise<TestRunReceipt[]> {
+  const receipts: TestRunReceipt[] = [];
+  const deadline = Date.now() + budget.totalInsertMs;
   for (let offset = 0; offset < rows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
     const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) return;
-    const batch = rows
-      .slice(offset, offset + TEST_RUN_INSERT_BATCH_SIZE)
+    if (remainingMs <= 0) {
+      receipts.push(...unwrittenReceipts(rows.slice(offset), 'timeout', `flush_deadline_${budget.totalInsertMs}ms`));
+      return receipts;
+    }
+    const sourceRows = rows.slice(offset, offset + TEST_RUN_INSERT_BATCH_SIZE);
+    const batch = sourceRows
       .map((row) => ({
         file_path: row.filePath,
         framework: 'vitest',
@@ -1161,16 +1220,52 @@ export async function insertTestRunRowsWithSql(
         // `execution_details->>'key'` read then returned NULL.
         execution_details: row.executionDetails ?? null,
       }));
-    const query = sql`
+    let written: unknown;
+    let failure: unknown = null;
+    const query = Promise.resolve(sql`
       INSERT INTO harness_shared.test_runs
         ${sql(batch, ...TEST_RUN_INSERT_COLUMNS)}
-    `;
-    const completed = await settleWithin(
-      query,
-      Math.min(TEST_RUN_INSERT_TIMEOUT_MS, remainingMs),
+      RETURNING id, file_path
+    `).then(
+      (value) => { written = value; },
+      (error) => { failure = error ?? new Error('insert_rejected'); throw failure; },
     );
-    if (!completed) return;
+    const timeoutMs = Math.min(budget.insertTimeoutMs, remainingMs);
+    const completed = await settleWithin(query, timeoutMs);
+    if (!completed) {
+      receipts.push(
+        ...(failure
+          ? unwrittenReceipts(sourceRows, 'failed', receiptReason(failure))
+          : unwrittenReceipts(sourceRows, 'timeout', `pg_insert_timeout_${timeoutMs}ms`)),
+        // Later batches are never attempted once one has not completed.
+        ...unwrittenReceipts(rows.slice(offset + TEST_RUN_INSERT_BATCH_SIZE), 'timeout', 'not_attempted_after_failed_batch'),
+      );
+      return receipts;
+    }
+    receipts.push(...insertedReceipts(sourceRows, written));
   }
+  return receipts;
+}
+
+/**
+ * Pair RETURNING rows back to the rows we sent. Matched by file_path (multiset), not
+ * position: Postgres does not promise RETURNING order for a multi-row insert.
+ */
+function insertedReceipts(sourceRows: readonly TestRunRow[], written: unknown): TestRunReceipt[] {
+  const returned = Array.isArray(written) ? (written as Array<{ id?: unknown; file_path?: unknown }>) : [];
+  const idsByPath = new Map<string, string[]>();
+  for (const row of returned) {
+    if (row?.id === undefined || row.id === null || typeof row.file_path !== 'string') continue;
+    const ids = idsByPath.get(row.file_path) ?? [];
+    ids.push(String(row.id));
+    idsByPath.set(row.file_path, ids);
+  }
+  return sourceRows.map((row): TestRunReceipt => {
+    const id = idsByPath.get(row.filePath)?.shift();
+    return id === undefined
+      ? { filePath: row.filePath, status: row.status, outcome: 'failed', reason: 'insert_returned_no_id' }
+      : { filePath: row.filePath, status: row.status, outcome: 'inserted', id };
+  });
 }
 
 /**
@@ -1190,11 +1285,14 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
   } catch { /* fail-soft */ }
 
   const pg = await tryGetPg();
-  if (!pg) return;
+  if (!pg) {
+    appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'failed', 'pg_unavailable'));
+    return;
+  }
 
   const { loopLagP95Ms, rssMb } = captureReporterSaturationSnapshot();
   try {
-    await insertTestRunRowsWithSql(pg.sql, rows, {
+    const receipts = await insertTestRunRowsWithSql(pg.sql, rows, {
       branch,
       inferredCommit,
       declaredSource: resolveTestRunSource(),
@@ -1204,8 +1302,10 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
       loopLagP95Ms,
       rssMb,
     });
-  } catch {
-    /* swallow — D-007 */
+    appendTestRunReceipts(process.env, receipts);
+  } catch (error) {
+    /* swallow — D-007; an evidence run still learns why through its receipt */
+    appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'failed', receiptReason(error)));
   }
 }
 
@@ -1494,10 +1594,20 @@ export default class AdminTestRunsReporter implements Reporter {
         ? { ...row.executionDetails, worktreeDirty, commitSha }
         : null,
     }));
-    await Promise.race([
-      this.writeRows(rows.map((row) => ({ ...row, worktreeDirty, commitSha }))),
-      new Promise((r) => setTimeout(r, 5000)),
+    const { flushBudgetMs } = reporterWriteBudget(process.env);
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    const finished = await Promise.race([
+      this.writeRows(rows.map((row) => ({ ...row, worktreeDirty, commitSha }))).then(() => true),
+      new Promise<false>((r) => {
+        flushTimer = setTimeout(() => r(false), flushBudgetMs);
+      }),
     ]);
+    if (flushTimer) clearTimeout(flushTimer);
+    if (!finished) {
+      // The writer may still finish (and append its own `inserted` lines) before the
+      // process exits; a reader takes `inserted` over `timeout` for the same file.
+      appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'timeout', `flush_budget_${flushBudgetMs}ms`));
+    }
   }
 
   private flushFailureDetails(): void {
