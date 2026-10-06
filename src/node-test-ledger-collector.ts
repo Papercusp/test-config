@@ -34,6 +34,12 @@ export interface NodeTestFailedCase {
   title: string;
   /** The assertion/error message on one line. */
   message: string;
+  /**
+   * True only when the TEST BODY threw (node:test failureType 'testCodeFailure'), the same
+   * population Vitest reports as a failed assertion. A hook failure, timeout or cancellation
+   * is a failed case but not assertion evidence: mutation-probe must not score it CAUGHT.
+   */
+  codeFailure: boolean;
 }
 
 export interface NodeTestFileResult {
@@ -161,7 +167,11 @@ export function createNodeTestLedgerFold(): {
         return;
       }
       state.result.failed += 1;
-      state.result.failedCases.push({ title, message: oneLineMessage(error) });
+      state.result.failedCases.push({
+        title,
+        message: oneLineMessage(error),
+        codeFailure: record(error)?.failureType === 'testCodeFailure',
+      });
     },
     summary() {
       return {

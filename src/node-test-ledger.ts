@@ -148,6 +148,24 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, ctx: NodeTe
 export interface NodeTestLedgerOutcome {
   recorded: number;
   reason: string | null;
+  /**
+   * Cases whose test body threw, in the shape scripts/test-files.mjs prints as
+   * TEST_FILE_ASSERTION_FAILURE lines (formatFailedAssertionDiagnostics). Without them a
+   * node:test mutant run is always `inconclusive` to mutation-probe, however it failed.
+   */
+  assertionFailures: Array<{ file: string; name: string; messages: string[] }>;
+}
+
+/** Summary -> the router's assertion-failure diagnostics. Pure; only body failures count. */
+export function nodeTestAssertionFailures(summary: NodeTestLedgerSummary): NodeTestLedgerOutcome['assertionFailures'] {
+  const out: NodeTestLedgerOutcome['assertionFailures'] = [];
+  for (const result of summary.files) {
+    if (typeof result?.file !== 'string' || !Array.isArray(result.failedCases)) continue;
+    for (const c of result.failedCases) {
+      if (c?.codeFailure === true) out.push({ file: result.file, name: c.title, messages: [c.message] });
+    }
+  }
+  return out;
 }
 
 export interface NodeTestLedgerSession {
@@ -197,15 +215,17 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
       `--test-reporter-destination=${summaryPath}`,
     ],
     async record(opts = {}) {
+      let assertionFailures: NodeTestLedgerOutcome['assertionFailures'] = [];
       try {
         let text: string;
         try {
           text = readFileSync(summaryPath, 'utf8');
         } catch {
-          return { recorded: 0, reason: 'no collector summary (the node:test child did not report)' };
+          return { recorded: 0, reason: 'no collector summary (the node:test child did not report)', assertionFailures };
         }
         const summary = parseNodeTestLedgerSummary(text);
-        if (!summary) return { recorded: 0, reason: 'collector summary is malformed' };
+        if (!summary) return { recorded: 0, reason: 'collector summary is malformed', assertionFailures };
+        assertionFailures = nodeTestAssertionFailures(summary);
 
         let worktreeDirty = true;
         let worktreeDirtyReason: string | null = 'snapshot not taken';
@@ -234,11 +254,11 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
           mutationPhase: resolveMutationProbePhase(),
           testNamePattern: opts.testNamePattern ?? null,
         });
-        if (rows.length === 0) return { recorded: 0, reason: 'no recordable file executed a case' };
+        if (rows.length === 0) return { recorded: 0, reason: 'no recordable file executed a case', assertionFailures };
         await writeRows(rows);
-        return { recorded: rows.length, reason: worktreeDirty ? `worktree_dirty: ${worktreeDirtyReason}` : null };
+        return { recorded: rows.length, reason: worktreeDirty ? `worktree_dirty: ${worktreeDirtyReason}` : null, assertionFailures };
       } catch (err) {
-        return { recorded: 0, reason: `recording failed: ${err instanceof Error ? err.message : String(err)}` };
+        return { recorded: 0, reason: `recording failed: ${err instanceof Error ? err.message : String(err)}`, assertionFailures };
       } finally {
         rmSync(dir, { recursive: true, force: true });
         if (!options.writeRows) await closeSharedPgIfUnheld().catch(() => undefined);

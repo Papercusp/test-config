@@ -20,6 +20,7 @@ import type { NodeTestLedgerSummary } from './node-test-ledger-collector.ts';
 import {
   beginNodeTestLedger,
   buildNodeTestRunRows,
+  nodeTestAssertionFailures,
   parseNodeTestLedgerSummary,
 } from './node-test-ledger.ts';
 import type { NodeTestRowContext } from './node-test-ledger.ts';
@@ -68,7 +69,8 @@ describe('node:test ledger collector fold', () => {
 
     const [file] = fold.summary().files;
     expect(file).toMatchObject({ file: FILE, passed: 1, failed: 1, skipped: 2, fileLevelFailure: null, durationMs: 12 });
-    expect(file.failedCases).toEqual([{ title: 'suite > bad', message: 'expected 1 to be 2' }]);
+    // No failureType on this synthetic error, so it is a failed case but not assertion evidence.
+    expect(file.failedCases).toEqual([{ title: 'suite > bad', message: 'expected 1 to be 2', codeFailure: false }]);
   });
 
   it('records a crashed file as a file-level failure, not a case', () => {
@@ -91,6 +93,17 @@ describe('node:test ledger collector fold', () => {
     expect(oneLineMessage({ message: 'a\n\n b' })).toBe('a b');
     expect(oneLineMessage(undefined)).toBe('failed');
     expect(oneLineMessage({ message: 'x'.repeat(900) }).length).toBe(500);
+  });
+});
+
+describe('assertion evidence for mutation-probe (EI-24836213046334894)', () => {
+  it('credits only test-body failures: a hook failure is a failed case but not assertion evidence', () => {
+    const fold = createNodeTestLedgerFold();
+    fold.push(ev('test:fail', { name: 'body', details: { error: { failureType: 'testCodeFailure', cause: new Error('boom') } } }));
+    fold.push(ev('test:fail', { name: 'hooked', details: { error: { failureType: 'hookFailed', cause: new Error('setup') } } }));
+    const summary = fold.summary();
+    expect(summary.files[0].failedCases.map((c) => [c.title, c.codeFailure])).toEqual([['body', true], ['hooked', false]]);
+    expect(nodeTestAssertionFailures(summary)).toEqual([{ file: FILE, name: 'body', messages: [expect.stringMatching(/boom/)] }]);
   });
 });
 
@@ -194,7 +207,11 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     expect(child.stdout).toContain('fails here');
 
     const outcome = await session.record();
-    expect(outcome).toEqual({ recorded: 1, reason: null });
+    expect(outcome).toMatchObject({ recorded: 1, reason: null });
+    // The router prints these as TEST_FILE_ASSERTION_FAILURE lines; mutation-probe needs them.
+    expect(outcome.assertionFailures).toEqual([
+      { file: expect.stringMatching(/fx\.test\.mjs$/), name: 'outer > fails here', messages: [expect.stringMatching(/one is not two/)] },
+    ]);
     expect(written).toHaveLength(1);
     expect(written[0]).toMatchObject({ filePath: 'fx.test.mjs', status: 'fail', commitSha: 'feedface00', worktreeDirty: false });
     expect(written[0].outputTail).toMatch(/^outer > fails here: one is not two/);
@@ -268,7 +285,7 @@ describe('the before-snapshot survives a caller that blocks the event loop (EI-2
         cwd: dir, encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' },
       });
       const outcome = await session.record();
-      expect(outcome).toEqual({ recorded: 1, reason: 'worktree_dirty: snapshot threw: git unavailable' });
+      expect(outcome).toEqual({ recorded: 1, reason: 'worktree_dirty: snapshot threw: git unavailable', assertionFailures: [] });
       expect(written[0]).toMatchObject({ status: 'pass', worktreeDirty: true, commitSha: null });
     } finally {
       rmSync(dir, { recursive: true, force: true });
