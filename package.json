@@ -90,6 +90,7 @@
     "vitest-fail-on-console": "^0.7.1"
   },
   "devDependencies": {
+    "@nestjs/core": "^11.1.24",
     "@types/supertest": "^6.0.0",
     "nuqs": "^2.8.9"
   },
