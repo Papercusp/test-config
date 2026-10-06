@@ -1148,7 +1148,13 @@ export async function insertTestRunRowsWithSql(
   }
 }
 
-async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
+/**
+ * The ledger writer every recorder shares: git context, source (ci/local/mutation-probe),
+ * harness/workspace scope and saturation, then one bounded bulk insert. Exported so the
+ * node:test recorder (node-test-ledger.ts, EI-24836213046334894) writes rows with exactly
+ * the semantics this Vitest reporter does instead of a parallel copy.
+ */
+export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
   if (rows.length === 0) return;
   let branch: string | null = null;
   let inferredCommit: string | null = null;
