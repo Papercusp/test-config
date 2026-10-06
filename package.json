@@ -65,6 +65,11 @@
       "types": "./src/execution-details.ts",
       "import": "./src/execution-details.ts",
       "default": "./src/execution-details.ts"
+    },
+    "./console-noise-filter": {
+      "types": "./src/console-noise-filter.ts",
+      "import": "./src/console-noise-filter.ts",
+      "default": "./src/console-noise-filter.ts"
     }
   },
   "scripts": {
