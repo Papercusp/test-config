@@ -34,7 +34,10 @@ import { exec } from 'node:child_process';
 import { readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, type TestRunExecutionDetails } from './execution-details.ts';
+import {
+  TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, isRecordedCaseTitle,
+  MAX_RECORDED_FAILED_CASES, type TestRunExecutionDetails,
+} from './execution-details.ts';
 
 /**
  * EI-19307211919650123: classify the `.git` entry at `dir` for the root walk.
@@ -572,21 +575,28 @@ export interface TestRunRow {
 
 /** Read Vitest's completed cases, not module status or a truncated stdout tail. */
 export function collectModuleExecution(testModule: TestModule): Pick<
-  NonNullable<TestRunRow['executionDetails']>, 'passed' | 'failed' | 'skipped' | 'collectionFailed'
+  NonNullable<TestRunRow['executionDetails']>, 'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'failedCaseTitles'
 > | null {
   try {
     const status = moduleStatus(testModule);
     if (status === 'error' || typeof testModule.children?.allTests !== 'function') return null;
     let passed = 0, failed = 0, skipped = 0;
+    const failedCaseTitles = new Set<string>();
     for (const test of testModule.children.allTests()) {
       switch (test.result().state) {
         case 'passed': passed++; break;
-        case 'failed': failed++; break;
+        case 'failed':
+          failed++;
+          if (isRecordedCaseTitle(test.fullName) && failedCaseTitles.size < MAX_RECORDED_FAILED_CASES) {
+            failedCaseTitles.add(test.fullName);
+          }
+          break;
         case 'skipped': skipped++; break;
         default: return null; // pending/unreadable is not a completed measurement
       }
     }
-    return { passed, failed, skipped, collectionFailed: status === 'fail' && failed === 0 };
+    return { passed, failed, skipped, collectionFailed: status === 'fail' && failed === 0,
+      ...(failedCaseTitles.size > 0 ? { failedCaseTitles: [...failedCaseTitles] } : {}) };
   } catch {
     return null;
   }

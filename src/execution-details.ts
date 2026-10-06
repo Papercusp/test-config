@@ -10,6 +10,16 @@
 
 export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
 
+export const MAX_RECORDED_FAILED_CASES = 64;
+export const MAX_RECORDED_CASE_TITLE_CHARS = 2_048;
+
+/** Exact identities, never clipped prefixes or assertion-message/DOM lines. */
+export function isRecordedCaseTitle(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+    && value.length <= MAX_RECORDED_CASE_TITLE_CHARS && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 /**
  * THE test-layer taxonomy (EI-24434635346407728). One vocabulary for what a ledger row
  * may RECORD and what an acceptance BAR may REQUIRE: operator-core's
@@ -43,6 +53,12 @@ export interface TestRunExecutionDetails {
   scenarioId?: string;
   passed: number;
   failed: number;
+  /**
+   * Measured failed TestCase.fullName identities, independent of output_tail.
+   * That human diagnostic is tail-truncated and can contain only DOM text.
+   * Optional for legacy writers; bounded names are exact, not truncated.
+   */
+  failedCaseTitles?: string[];
   skipped: number;
   collectionFailed: boolean;
   mutationPhase: string | null;
@@ -81,7 +97,7 @@ export interface TestRunExecutionDetails {
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'scenarioId', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
-  'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt',
+  'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
 ]);
 
 /** A recorded instant: a non-empty string Date can parse. Used for `runStartedAt`. */
@@ -144,6 +160,13 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.scenarioId !== undefined && (typeof value.scenarioId !== 'string' || value.scenarioId.length === 0))
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
+    || (value.failedCaseTitles !== undefined && (
+      !Array.isArray(value.failedCaseTitles)
+      || value.failedCaseTitles.length > MAX_RECORDED_FAILED_CASES
+      || value.failedCaseTitles.length > (value.failed as number)
+      || value.failedCaseTitles.some(title => !isRecordedCaseTitle(title))
+      || new Set(value.failedCaseTitles).size !== value.failedCaseTitles.length
+      || (value.failedCaseTitles.length > 0 && value.collectionFailed !== false)))
     || !isNullableString(value.mutationPhase) || !isNullableString(value.commitSha)
     || typeof value.worktreeDirty !== 'boolean'
     || (value.worktreeDirtyReason !== undefined

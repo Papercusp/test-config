@@ -73,3 +73,26 @@ describe('parseTestRunExecutionDetails — runStartedAt (EI-24827834166866368)',
     expect(parseTestRunExecutionDetails(details({ runStartedAt: null }))).toBeUndefined();
   });
 });
+
+describe('parseTestRunExecutionDetails — failedCaseTitles (EI-25248905256718690)', () => {
+  it('accepts exact structured identities and stored JSON strings without changing legacy rows', () => {
+    const row = { ...details({ failed: 2 }), failedCaseTitles: ['suite — fails: with a colon', 'suite > also fails'] };
+    expect(parseTestRunExecutionDetails(row)).toMatchObject({ failedCaseTitles: row.failedCaseTitles });
+    expect(parseTestRunExecutionDetails(JSON.stringify(row))).toMatchObject({ failedCaseTitles: row.failedCaseTitles });
+    expect(parseTestRunExecutionDetails(details())).toBeDefined();
+  });
+
+  it.each([
+    { failed: 0, failedCaseTitles: ['not a failed test'] },
+    { failed: 1, collectionFailed: true, failedCaseTitles: ['setup is not an assertion'] },
+    { failed: 2, failedCaseTitles: ['same title', 'same title'] },
+    { failed: 1, failedCaseTitles: [' leading space'] },
+    { failed: 1, failedCaseTitles: ['multiline\nDOM'] },
+    { failed: 1, failedCaseTitles: ['\u001b[36mDOM'] },
+    { failed: 1, failedCaseTitles: ['x'.repeat(2_049)] },
+    { failed: 65, failedCaseTitles: Array.from({ length: 65 }, (_, i) => `case ${i}`) },
+    { failed: 1, failedCaseTitles: null },
+  ])('rejects malformed or contradictory identities: %j', overrides => {
+    expect(parseTestRunExecutionDetails({ ...details(), ...overrides })).toBeUndefined();
+  });
+});

@@ -95,6 +95,31 @@ describe('durable module execution measurement', () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it('retains exact failed-case identities when DOM errors erase them from the tail (EI-25248905256718690)', async () => {
+    const names = ['suite — first > fails: at a colon', 'suite > second fails', 'suite > third fails'];
+    const fakeModule = {
+      state: () => 'failed',
+      children: { allTests: () => [
+        { fullName: 'suite > passes', result: () => ({ state: 'passed' }) },
+        ...names.map(fullName => ({ fullName, result: () => ({
+          state: 'failed', errors: [{ message: `<aside>${'DOM '.repeat(3_000)}</aside>` }],
+        }) })),
+      ] },
+      moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+      diagnostic: () => ({ duration: 1 }), errors: () => [],
+    };
+    const rows: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+      async row => { rows.push(row); });
+    reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
+    reporter.onTestModuleEnd(fakeModule as never);
+    await reporter.onTestRunEnd();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].outputTail).toHaveLength(4_000);
+    for (const name of names) expect(rows[0].outputTail).not.toContain(name);
+    expect(rows[0].executionDetails).toMatchObject({ passed: 1, failed: 3, failedCaseTitles: names });
+  });
 });
 
 afterEach(() => {
