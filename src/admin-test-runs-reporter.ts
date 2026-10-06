@@ -938,9 +938,13 @@ export function tryGetPg(): Promise<PgHandle> {
       // without relying on esModuleInterop in every consumer's tsconfig.
       const mod = (await import('postgres')) as { default?: unknown };
       const pg = (mod.default ?? mod) as (url: string, opts: Record<string, unknown>) => PgSql;
+      // The dedicated ledger variable wins (WI-10006736): an isolated verifier exports
+      // HARNESS_ADMIN_DATABASE_URL at its throwaway database, so a run that must keep its
+      // results points PAPERCUSP_TEST_RUNS_DB_URL at the shared ledger. Keep this order in
+      // step with resolveExecutedMapPgUrl (scripts/lib/executed-source-map.mjs).
       const url =
-        process.env.HARNESS_ADMIN_DATABASE_URL ??
         process.env.PAPERCUSP_TEST_RUNS_DB_URL ??
+        process.env.HARNESS_ADMIN_DATABASE_URL ??
         'postgresql://harness_admin:harness_admin_pwd@localhost:5432/papercusp';
       const sql = pg(url, { max: 2, connect_timeout: 1, onnotice: () => {} });
       return { sql };
