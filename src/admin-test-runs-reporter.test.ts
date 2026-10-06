@@ -992,6 +992,7 @@ describe('resolveTestRunHarnessSlug / resolveTestRunWorkspaceId (WI-6583)', () =
     'PAPERCUSP_TEST_RUN_HARNESS',
     'HARNESS_SLUG',
     'PAPERCUSP_HARNESS_SLUG',
+    'PAPERCUSP_TEST_RUN_WORKSPACE',
     'PAPERCUSP_WORKSPACE_ID',
     'PAPERCUSP_WORKSPACE',
   ] as const;
@@ -1051,6 +1052,15 @@ describe('resolveTestRunHarnessSlug / resolveTestRunWorkspaceId (WI-6583)', () =
     process.env.PAPERCUSP_WORKSPACE_ID = 'ws-id';
     process.env.PAPERCUSP_WORKSPACE = 'ws-legacy';
     expect(resolveTestRunWorkspaceId()).toBe('ws-id');
+  });
+
+  // The isolated rig rebinds PAPERCUSP_WORKSPACE_ID to its throwaway workspace; the
+  // ledger-only override must beat it or isolated e2e rows land unreadably scoped.
+  it('resolveTestRunWorkspaceId: PAPERCUSP_TEST_RUN_WORKSPACE (ledger override) wins over a rig-rebound PAPERCUSP_WORKSPACE_ID', () => {
+    process.env.PAPERCUSP_TEST_RUN_WORKSPACE = 'papercusp-workspace';
+    process.env.PAPERCUSP_WORKSPACE_ID = 'verify-tauri-isolated-90';
+    process.env.PAPERCUSP_WORKSPACE = 'verify-tauri-isolated-90';
+    expect(resolveTestRunWorkspaceId()).toBe('papercusp-workspace');
   });
 });
 

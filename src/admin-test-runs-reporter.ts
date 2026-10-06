@@ -1032,9 +1032,25 @@ export function resolveTestRunHarnessSlug(): string | null {
   );
 }
 
-/** Sibling of {@link resolveTestRunHarnessSlug} — see its doc comment. */
+/**
+ * Sibling of {@link resolveTestRunHarnessSlug} — see its doc comment.
+ *
+ * `PAPERCUSP_TEST_RUN_WORKSPACE` is the ledger-only override and wins, mirroring
+ * `PAPERCUSP_TEST_RUN_HARNESS`. It exists because the isolated verify-tauri-headless rig
+ * rebinds `PAPERCUSP_WORKSPACE_ID` to its throwaway `verify-tauri-isolated-<display>`
+ * workspace for the app under test, so an isolated e2e run's SHARED-ledger rows were
+ * stamped with a workspace that no workspace-scoped reader (spec-evidence binding, the
+ * Tests tab) will ever match — measured 2026-10-06, rows 20845991/20845992. The runner
+ * (scripts/run-operator-e2e-isolated.sh) pins it to the caller's workspace before the rig
+ * starts; the app still sees the isolated id. Same shape as PAPERCUSP_TEST_RUNS_DB_URL.
+ */
 export function resolveTestRunWorkspaceId(): string | null {
-  return process.env.PAPERCUSP_WORKSPACE_ID || process.env.PAPERCUSP_WORKSPACE || null;
+  return (
+    process.env.PAPERCUSP_TEST_RUN_WORKSPACE ||
+    process.env.PAPERCUSP_WORKSPACE_ID ||
+    process.env.PAPERCUSP_WORKSPACE ||
+    null
+  );
 }
 
 const TEST_RUN_INSERT_COLUMNS = [
