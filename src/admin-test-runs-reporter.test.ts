@@ -103,7 +103,10 @@ describe('durable module execution measurement', () => {
       children: { allTests: () => [
         { fullName: 'suite > passes', result: () => ({ state: 'passed' }) },
         ...names.map(fullName => ({ fullName, result: () => ({
-          state: 'failed', errors: [{ message: `<aside>${'DOM '.repeat(3_000)}</aside>` }],
+          state: 'failed', errors: [{
+            message: `<aside>${'DOM '.repeat(3_000)}</aside>`,
+            actual: 'actual DOM '.repeat(1_000), expected: 'expected DOM '.repeat(1_000),
+          }],
         }) })),
       ] },
       moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
