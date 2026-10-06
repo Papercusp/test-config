@@ -126,8 +126,8 @@ describe('buildNodeTestRunRows', () => {
 
   it('puts one `<full name>: <message>` line per failed case in output_tail and the titles in execution details', () => {
     const failedCases = [
-      { title: 'guard > rejects libavcodec', message: 'expected exit 1' },
-      { title: 'D-013: the guard fails on each newly covered GPL library', message: 'got 0' },
+      { title: 'guard > rejects libavcodec', message: 'expected exit 1', codeFailure: true },
+      { title: 'D-013: the guard fails on each newly covered GPL library', message: 'got 0', codeFailure: true },
     ];
     const [row] = buildNodeTestRunRows(
       summary([result({ passed: 5, failed: 2, failedCases })]),
