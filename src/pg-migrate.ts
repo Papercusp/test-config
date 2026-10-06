@@ -600,10 +600,9 @@ async function recoverStaleTemplateBuilder(
   )) as Array<{ terminated: boolean }>;
   const terminated = rows[0]?.terminated === true;
   if (terminated) {
-    // eslint-disable-next-line no-console
-    console.error(
+    process.stderr.write(
       `[getOrBuildTemplate] stage=template-lock-recovery key=${key} ` +
-        `holderPid=${holder.pid} staleHeartbeatMs=${Date.now() - heartbeatAt}`,
+        `holderPid=${holder.pid} staleHeartbeatMs=${Date.now() - heartbeatAt}\n`,
     );
   }
   return terminated;
@@ -725,8 +724,9 @@ async function buildTemplate(
       // caller that supplies lockTimeoutMs gets a bounded acquisition instead.
       const lockWaitMs = await acquireTemplateLock(a, key, lock, lockTimeoutMs);
       if (lockWaitMs > 5_000) {
-        // eslint-disable-next-line no-console
-        console.error(`[getOrBuildTemplate] stage=template-lock-wait key=${key} elapsedMs=${lockWaitMs}`);
+        // Successful progress belongs on stderr, outside strict-console error
+        // assertions in the integration test currently requesting the template.
+        process.stderr.write(`[getOrBuildTemplate] stage=template-lock-wait key=${key} elapsedMs=${lockWaitMs}\n`);
       }
       return a;
     } catch (e) {
@@ -794,10 +794,9 @@ async function buildTemplate(
           const buildElapsedMs = Date.now() - buildStartedAt;
           const migrationCount =
             provisionResult && typeof provisionResult === 'object' ? provisionResult.migrationCount : undefined;
-          // eslint-disable-next-line no-console
-          console.error(
+          process.stderr.write(
             `[getOrBuildTemplate] stage=template-build key=${key} ` +
-              `migrations=${migrationCount ?? 'unknown'} elapsedMs=${buildElapsedMs}`,
+              `migrations=${migrationCount ?? 'unknown'} elapsedMs=${buildElapsedMs}\n`,
           );
           // A stale-holder recovery terminates the lock-owning backend. postgres-js
           // may transparently reconnect, so successful provision alone is not

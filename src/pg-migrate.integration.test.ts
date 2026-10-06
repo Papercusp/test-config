@@ -44,15 +44,18 @@ function freshKey(): string {
 const cleanupDbs: string[] = [];
 const cleanupClients: postgres.Sql[] = [];
 
-// buildTemplate intentionally emits stage diagnostics on stderr. Suppress those
-// expected lines in this fail-on-console suite; the lock test below still asserts
-// that the build-stage diagnostic was emitted.
+// Progress remains observable on stderr, without being treated as a test error.
+// Assert that no successful build/recovery emits console.error: suppressing it
+// without this check hid the defect from every strict-console fixture consumer.
 beforeEach(() => {
   vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(process.stderr, 'write');
 });
 
 afterEach(() => {
+  const consoleErrors = vi.mocked(console.error).mock.calls;
   vi.restoreAllMocks();
+  expect(consoleErrors).toEqual([]);
 });
 
 async function adminClient(): Promise<postgres.Sql> {
@@ -219,7 +222,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
       }
     });
     expect(built).toBe(name);
-    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('stage=template-build'));
+    expect(process.stderr.write).toHaveBeenCalledWith(expect.stringContaining('stage=template-build'));
     expect(await templateState(holder, name)).toBe('ready');
   });
 
@@ -239,7 +242,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
       // an arbitrary fixed window.
       releaseTimer = setTimeout(() => {
         void holder.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`).catch(() => {});
-      }, 250);
+      }, 5_200);
 
       const built = await getOrBuildTemplate(key, async (url) => {
         const c = postgres(url, { max: 1, onnotice: () => {} });
@@ -249,14 +252,15 @@ describe('buildTemplate hardening (WI-1992)', () => {
           await c.end({ timeout: 5 });
         }
       });
-      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(150);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(5_000);
       expect(built).toBe(name);
+      expect(process.stderr.write).toHaveBeenCalledWith(expect.stringContaining('stage=template-lock-wait'));
       expect(await templateState(holder, name)).toBe('ready');
     } finally {
       if (releaseTimer) clearTimeout(releaseTimer);
       await holder.unsafe(`SELECT pg_advisory_unlock(hashtext('${lock}'))`).catch(() => {});
     }
-  });
+  }, 30_000);
 
   it('recovers an unchanged stale builder heartbeat without imposing a fixed deadline on live builders', async () => {
     const key = freshKey();
@@ -284,7 +288,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
       });
       expect(built).toBe(name);
       expect(Date.now() - startedAt).toBeLessThan(15_000);
-      expect(console.error).toHaveBeenCalledWith(expect.stringContaining('stage=template-lock-recovery'));
+      expect(process.stderr.write).toHaveBeenCalledWith(expect.stringContaining('stage=template-lock-recovery'));
       expect(await templateState(await adminClient(), name)).toBe('ready');
     } finally {
       // The recovery path terminates the original backend. postgres-js can
@@ -336,7 +340,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const holderPidAfter = (await holder.unsafe(`SELECT pg_backend_pid() AS pid`)) as Array<{ pid: number }>;
     expect(holderPidAfter[0]?.pid).toBe(holderPid[0]?.pid);
     expect(built).toBe(name);
-    expect(console.error).not.toHaveBeenCalledWith(
+    expect(process.stderr.write).not.toHaveBeenCalledWith(
       expect.stringContaining(`stage=template-lock-recovery key=${key}`),
     );
     expect(await templateState(await adminClient(), name)).toBe('ready');
