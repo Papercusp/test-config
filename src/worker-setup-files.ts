@@ -20,6 +20,8 @@ export const HERMETIC_ENV_SETUP = resolve(__dirname, 'setup-hermetic-env.ts');
 // See the file's own doc comment for why it guards the consequence (a live pool) rather
 // than the cause (an un-memoized dynamic import under concurrency).
 export const NO_REAL_PG_SETUP = resolve(__dirname, 'setup-no-real-pg.ts');
+// WI-10006585: integration-layer-only guard for the captured live database target.
+export const NO_LIVE_PG_SETUP = resolve(__dirname, 'setup-no-live-pg.ts');
 // EI-9990: bumps @testing-library/dom's waitFor/findBy* internal poll timeout
 // for shared-box tolerance — a no-op for any package without
 // @testing-library/dom on its graph. See the file's own doc comment.
@@ -39,6 +41,7 @@ export const WORKER_SETUP_FILE_PATHS: readonly string[] = [
   FAIL_ON_CONSOLE_SETUP,
   HERMETIC_ENV_SETUP,
   NO_REAL_PG_SETUP,
+  NO_LIVE_PG_SETUP,
   TESTING_LIBRARY_TIMEOUT_SETUP,
   HANDLE_LEAK_SETUP,
   EXECUTED_INPUTS_CAPTURE_SETUP,

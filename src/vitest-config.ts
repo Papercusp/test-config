@@ -25,6 +25,7 @@ import {
   FAIL_ON_CONSOLE_SETUP,
   HANDLE_LEAK_SETUP,
   HERMETIC_ENV_SETUP,
+  NO_LIVE_PG_SETUP,
   NO_REAL_PG_SETUP,
   TESTING_LIBRARY_TIMEOUT_SETUP,
 } from './worker-setup-files.ts';
@@ -625,11 +626,15 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   if (layer === 'integration' && process.env.TESTCONTAINERS_RYUK_DISABLED == null) {
     process.env.TESTCONTAINERS_RYUK_DISABLED = 'true';
   }
-  // EI-19311807188719573: the UNIT layer additionally forbids a real Postgres
-  // connection. Unit-only — the integration layer legitimately builds real clients
-  // against a testcontainer. Ordered FIRST so the rail is armed before any other
-  // setup file can touch the db layer.
-  const layerSetup = layer === 'unit' ? [NO_REAL_PG_SETUP] : [];
+  // EI-19311807188719573: the UNIT layer forbids every real Postgres connection.
+  // WI-10006585: the INTEGRATION layer allows its testcontainer endpoint but refuses
+  // a pool that resolves to the captured live target. Both are ordered FIRST so the
+  // rail is armed before any other setup file can touch the db layer.
+  const layerSetup = layer === 'unit'
+    ? [NO_REAL_PG_SETUP]
+    : layer === 'integration'
+      ? [NO_LIVE_PG_SETUP]
+      : [];
   // HANDLE_LEAK_SETUP sits immediately after layerSetup: NO_REAL_PG_SETUP keeps its
   // documented first position (it arms a rail at module-eval time, before anything
   // can touch the db layer), while the leak detector still brackets every REMAINING
