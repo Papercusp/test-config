@@ -53,6 +53,46 @@ import AdminTestRunsReporter, {
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
+describe('runtime environment recorded around execution', () => {
+  async function record(fingerprints: Array<string | null>, throws = false) {
+    const rows: TestRunRow[] = [];
+    const reader = vi.fn(async () => {
+      if (throws) throw new Error('runtime unavailable');
+      const fingerprint = fingerprints.shift();
+      return fingerprint ? { schemaVersion: 1 as const, units: ['bg-host'], fingerprint,
+        observedAt: '2000-01-01T00:00:00Z' } : null;
+    });
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+      async row => { rows.push(row); }, undefined, reader);
+    await reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
+    reporter.onTestModuleEnd({ state: () => 'passed',
+      children: { allTests: () => [{ fullName: 'suite > observed', result: () => ({ state: 'passed' }) }] },
+      moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+      diagnostic: () => ({ duration: 1 }), errors: () => [],
+    } as never);
+    await reporter.onTestRunEnd();
+    return { details: rows[0].executionDetails!, reader };
+  }
+  it('measures before collection and after execution without accepting a backdated observation', async () => {
+    const { details, reader } = await record(['a'.repeat(64), 'a'.repeat(64)]);
+    expect(reader).toHaveBeenCalledTimes(2);
+    expect(details.runtimeEnvironmentBefore?.fingerprint).toBe('a'.repeat(64));
+    expect(details.runtimeEnvironmentAfter?.fingerprint).toBe('a'.repeat(64));
+    expect(Date.parse(details.runtimeEnvironmentBefore!.observedAt)).toBeGreaterThan(Date.parse('2026-01-01'));
+  });
+  it('preserves restart drift instead of replacing the execution-time witness with the later runtime', async () => {
+    const { details } = await record(['a'.repeat(64), 'b'.repeat(64)]);
+    expect(details.runtimeEnvironmentBefore?.fingerprint).toBe('a'.repeat(64));
+    expect(details.runtimeEnvironmentAfter?.fingerprint).toBe('b'.repeat(64));
+  });
+  it('keeps an unavailable measurement absent and does not change a passing test outcome', async () => {
+    const { details } = await record([], true);
+    expect(details).toMatchObject({ passed: 1, failed: 0 });
+    expect(details).not.toHaveProperty('runtimeEnvironmentBefore');
+    expect(details).not.toHaveProperty('runtimeEnvironmentAfter');
+  });
+});
+
 describe('durable module execution measurement', () => {
   const module = (states: string[], state = 'passed') => ({
     state: () => state,

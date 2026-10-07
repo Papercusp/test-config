@@ -37,6 +37,7 @@ import { homedir } from 'node:os';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, isRecordedCaseTitle,
   MAX_RECORDED_FAILED_CASES, MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
+  parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment,
 } from './execution-details.ts';
 
 /**
@@ -1497,6 +1498,7 @@ export default class AdminTestRunsReporter implements Reporter {
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
     writeRow?: TestRunRowWriter,
     writeRows?: TestRunRowsWriter,
+    readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>,
   ) {
     // Vitest constructs reporters with its options object. Keep that runtime
     // contract intact while allowing the unit suite to inject deterministic
@@ -1510,16 +1512,37 @@ export default class AdminTestRunsReporter implements Reporter {
             await Promise.allSettled(rows.map((row) => writeRow(row)));
           }
         : insertRows);
+    const configuredReader = typeof readWorktreeSnapshotOrOptions === 'object'
+      ? readWorktreeSnapshotOrOptions?.readRuntimeEnvironment : undefined;
+    this.readRuntimeEnvironment = readRuntimeEnvironment ??
+      (typeof configuredReader === 'function'
+        ? configuredReader as () => Promise<RecordedRuntimeEnvironment | null> : undefined);
   }
 
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: TestRunRowsWriter;
+  private readonly readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>;
+
+  private async captureRuntimeEnvironment(): Promise<RecordedRuntimeEnvironment | undefined> {
+    if (!this.readRuntimeEnvironment) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        Promise.resolve().then(() => this.readRuntimeEnvironment!()),
+        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 1_000); }),
+      ]);
+      const parsed = parseRecordedRuntimeEnvironment(result);
+      // The reporter owns the observation instant. A reader cannot backdate it.
+      return parsed ? { ...parsed, observedAt: new Date().toISOString() } : undefined;
+    } catch { return undefined; }
+    finally { if (timer) clearTimeout(timer); }
+  }
   private preferredPassedCasePattern?: RegExp;
 
   /** WI-10003715: this reporter's lease on the shared PG client (see retainSharedPg). */
   private pgLease: (() => Promise<void>) | null = null;
 
-  onInit(ctx: Vitest): void {
+  async onInit(ctx: Vitest): Promise<void> {
     // Select which actually passing identities occupy the existing bounded
     // evidence field, without filtering execution or changing skip counts.
     // Late cases in a large suite otherwise have no full-suite proof path.
@@ -1548,6 +1571,8 @@ export default class AdminTestRunsReporter implements Reporter {
         testLayer: (ctx?.config?.provide as Record<string, unknown> | undefined)?.papercuspTestLayer }),
       mutationPhase: resolveMutationProbePhase(),
     };
+    const runtimeEnvironmentBefore = await this.captureRuntimeEnvironment();
+    if (runtimeEnvironmentBefore) this.executionContext.runtimeEnvironmentBefore = runtimeEnvironmentBefore;
   }
 
   /** Per-module hook — queue the row until the end snapshot is available. */
@@ -1610,12 +1635,14 @@ export default class AdminTestRunsReporter implements Reporter {
       );
     }
 
+    const runtimeEnvironmentAfter = await this.captureRuntimeEnvironment();
     const rows = this.pending.splice(0).map((row) => ({
       ...row,
       worktreeDirty,
       commitSha,
       executionDetails: row.executionDetails
-        ? { ...row.executionDetails, worktreeDirty, commitSha }
+        ? { ...row.executionDetails, worktreeDirty, commitSha,
+          ...(runtimeEnvironmentAfter ? { runtimeEnvironmentAfter } : {}) }
         : null,
     }));
     const { flushBudgetMs } = reporterWriteBudget(process.env);

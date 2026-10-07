@@ -3,8 +3,31 @@ import { describe, expect, it } from 'vitest';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
   parseTestRunExecutionDetails,
+  stableRecordedRuntimeEnvironment,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
+
+describe('recorded runtime execution witnesses', () => {
+  const before = { schemaVersion: 1, units: ['bg-host', 'desktop'], fingerprint: 'a'.repeat(64),
+    observedAt: '2026-10-07T00:00:00Z' };
+  const after = { ...before, units: ['desktop', 'bg-host'], observedAt: '2026-10-07T00:01:00Z' };
+  it('requires independently recorded matching observations around execution', () => {
+    expect(stableRecordedRuntimeEnvironment(before, after)).toEqual(before);
+    expect(stableRecordedRuntimeEnvironment(before, undefined)).toBeUndefined();
+    expect(stableRecordedRuntimeEnvironment(undefined, after)).toBeUndefined();
+    expect(stableRecordedRuntimeEnvironment(before, { ...after, fingerprint: 'b'.repeat(64) })).toBeUndefined();
+    expect(stableRecordedRuntimeEnvironment(before, { ...after, units: ['bg-host'] })).toBeUndefined();
+    expect(stableRecordedRuntimeEnvironment(before, { ...after, observedAt: '2026-10-06T00:00:00Z' })).toBeUndefined();
+  });
+  it('rejects incomplete, duplicate-unit and caller-extended witnesses in the strict persisted contract', () => {
+    expect(parseTestRunExecutionDetails(details({ runtimeEnvironmentBefore: before, runtimeEnvironmentAfter: after })))
+      .toMatchObject({ runtimeEnvironmentBefore: before, runtimeEnvironmentAfter: after });
+    for (const value of [{ ...before, fingerprint: 'claimed' }, { ...before, units: [] },
+      { ...before, units: ['bg-host', 'bg-host'] }, { ...before, observedAt: '' }, { ...before, trusted: true }]) {
+      expect(parseTestRunExecutionDetails(details({ runtimeEnvironmentBefore: value }))).toBeUndefined();
+    }
+  });
+});
 
 function details(overrides: Partial<Record<keyof TestRunExecutionDetails, unknown>> = {}): Record<string, unknown> {
   return {

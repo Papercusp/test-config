@@ -19,6 +19,7 @@ import { resolveLaneInclude, type TestLane } from './lane-split.ts';
 import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
 // gate-file-level-test-reuse-2026-09-27 P-008: per-file pass reuse (PC_TEST_REUSE_SKIP_LIST).
 import { resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
+import type { RecordedRuntimeEnvironment } from './execution-details.ts';
 import {
   EXECUTED_INPUTS_CAPTURE_SETUP,
   FAIL_ON_CONSOLE_SETUP,
@@ -50,6 +51,8 @@ declare module 'vitest' {
 
 export interface DefineVitestConfigOptions {
   layer: TestLayer;
+  /** Registered live-host reader; absent on ordinary suites. Reporter brackets execution with it. */
+  readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>;
   setupFiles?: string[];
   globalSetup?: string[];
   include?: string[];
@@ -644,6 +647,10 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   // too; node-only (it patches node:fs), so gateOwnedParts omits it in the browser layer.
   const gate = gateOwnedParts(layer, process.env);
   const inputsCaptureSetup = gate.leadingSetupFiles;
+  const gateReporters = gate.reporters.map(reporter =>
+    reporter === ADMIN_TEST_RUNS_REPORTER && opts.readRuntimeEnvironment
+      ? [reporter, { readRuntimeEnvironment: opts.readRuntimeEnvironment }] as [string, Record<string, unknown>]
+      : reporter);
   const finalSetup = allowConsoleNoise
     ? [...inputsCaptureSetup, ...layerSetup, ...leakSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
     : [
@@ -849,8 +856,8 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       setupFiles: finalSetup,
       globalSetup: [...gate.leadingGlobalSetup, ...globalSetup],
       reporters: process.env.CI
-        ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }], ...gate.reporters]
-        : ['default', ...gate.reporters],
+        ? [['default', { summary: false }], ['junit', { outputFile: './junit.xml' }], ...gateReporters]
+        : ['default', ...gateReporters],
       // P-002: present ONLY when the executed-source-map reporter is armed (see
       // executedSourceMapConfig); an unarmed run keeps vitest's own default.
       ...(gate.experimental ? { experimental: gate.experimental } : {}),

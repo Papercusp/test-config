@@ -40,6 +40,38 @@ export function isRecordedTestLayer(value: unknown): value is RecordedTestLayer 
   return typeof value === 'string' && (RECORDED_TEST_LAYERS as readonly string[]).includes(value);
 }
 
+/** Independently measured by a registered runtime reader, never a test assertion. */
+export interface RecordedRuntimeEnvironment {
+  schemaVersion: 1;
+  units: string[];
+  fingerprint: string;
+  observedAt: string;
+}
+
+export function parseRecordedRuntimeEnvironment(value: unknown): RecordedRuntimeEnvironment | undefined {
+  if (!isRecord(value) || Object.keys(value).some(key =>
+    !['schemaVersion', 'units', 'fingerprint', 'observedAt'].includes(key))
+    || value.schemaVersion !== 1 || !Array.isArray(value.units)
+    || value.units.length === 0 || value.units.length > 32
+    || value.units.some(unit => typeof unit !== 'string' || !unit.trim() || unit.trim() !== unit || unit.length > 120)
+    || new Set(value.units).size !== value.units.length
+    || typeof value.fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.fingerprint)
+    || !isRecordedInstant(value.observedAt)) return undefined;
+  return value as unknown as RecordedRuntimeEnvironment;
+}
+
+/** A single observation cannot prove which runtime a whole test execution used. */
+export function stableRecordedRuntimeEnvironment(
+  before: unknown, after: unknown,
+): RecordedRuntimeEnvironment | undefined {
+  const first = parseRecordedRuntimeEnvironment(before);
+  const last = parseRecordedRuntimeEnvironment(after);
+  if (!first || !last || first.fingerprint !== last.fingerprint
+    || JSON.stringify([...first.units].sort()) !== JSON.stringify([...last.units].sort())
+    || Date.parse(last.observedAt) < Date.parse(first.observedAt)) return undefined;
+  return first;
+}
+
 export interface TestRunExecutionDetails {
   schemaVersion: typeof TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION;
   root: string;
@@ -95,13 +127,15 @@ export interface TestRunExecutionDetails {
    * working-tree reporter writes, and an unknown key makes the row unproven.
    */
   runStartedAt?: string;
+  runtimeEnvironmentBefore?: RecordedRuntimeEnvironment;
+  runtimeEnvironmentAfter?: RecordedRuntimeEnvironment;
 }
 
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'scenarioId', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
-  'passedCaseTitles',
+  'passedCaseTitles', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
 ]);
 
 /** A recorded instant: a non-empty string Date can parse. Used for `runStartedAt`. */
@@ -185,7 +219,9 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.worktreeDirtyReason !== undefined
       && (typeof value.worktreeDirtyReason !== 'string' || value.worktreeDirtyReason.length === 0
         || value.worktreeDirty !== true))
-    || (value.runStartedAt !== undefined && !isRecordedInstant(value.runStartedAt))) {
+    || (value.runStartedAt !== undefined && !isRecordedInstant(value.runStartedAt))
+    || (value.runtimeEnvironmentBefore !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentBefore))
+    || (value.runtimeEnvironmentAfter !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentAfter))) {
     return undefined;
   }
   return value as unknown as TestRunExecutionDetails;
