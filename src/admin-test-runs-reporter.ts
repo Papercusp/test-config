@@ -583,7 +583,7 @@ export interface TestRunRow {
 }
 
 /** Read Vitest's completed cases, not module status or a truncated stdout tail. */
-export function collectModuleExecution(testModule: TestModule): Pick<
+export function collectModuleExecution(testModule: TestModule, preferredPassedCasePattern?: RegExp): Pick<
   NonNullable<TestRunRow['executionDetails']>,
   'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'failedCaseTitles' | 'passedCaseTitles'
 > | null {
@@ -593,12 +593,18 @@ export function collectModuleExecution(testModule: TestModule): Pick<
     let passed = 0, failed = 0, skipped = 0;
     const failedCaseTitles = new Set<string>();
     const passedCaseTitles = new Set<string>();
+    const preferredPassedCaseTitles = new Set<string>();
     for (const test of testModule.children.allTests()) {
       switch (test.result().state) {
         case 'passed':
           passed++;
           if (isRecordedCaseTitle(test.fullName) && passedCaseTitles.size < MAX_RECORDED_PASSED_CASES) {
             passedCaseTitles.add(test.fullName);
+          }
+          if (isRecordedCaseTitle(test.fullName) && preferredPassedCasePattern &&
+              preferredPassedCaseTitles.size < MAX_RECORDED_PASSED_CASES) {
+            preferredPassedCasePattern.lastIndex = 0;
+            if (preferredPassedCasePattern.test(test.fullName)) preferredPassedCaseTitles.add(test.fullName);
           }
           break;
         case 'failed':
@@ -611,10 +617,12 @@ export function collectModuleExecution(testModule: TestModule): Pick<
         default: return null; // pending/unreadable is not a completed measurement
       }
     }
+    const recordedPassedCaseTitles = [...new Set([...preferredPassedCaseTitles, ...passedCaseTitles])]
+      .slice(0, MAX_RECORDED_PASSED_CASES);
     return {
       passed, failed, skipped, collectionFailed: status === 'fail' && failed === 0,
       ...(failedCaseTitles.size > 0 ? { failedCaseTitles: [...failedCaseTitles] } : {}),
-      ...(passedCaseTitles.size > 0 ? { passedCaseTitles: [...passedCaseTitles] } : {}),
+      ...(recordedPassedCaseTitles.length > 0 ? { passedCaseTitles: recordedPassedCaseTitles } : {}),
     };
   } catch {
     return null;
@@ -1506,11 +1514,17 @@ export default class AdminTestRunsReporter implements Reporter {
 
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: TestRunRowsWriter;
+  private preferredPassedCasePattern?: RegExp;
 
   /** WI-10003715: this reporter's lease on the shared PG client (see retainSharedPg). */
   private pgLease: (() => Promise<void>) | null = null;
 
   onInit(ctx: Vitest): void {
+    // Select which actually passing identities occupy the existing bounded
+    // evidence field, without filtering execution or changing skip counts.
+    // Late cases in a large suite otherwise have no full-suite proof path.
+    const preferredTitles = process.env.PAPERCUSP_TEST_RUN_CASE_TITLE_PATTERN?.trim();
+    this.preferredPassedCasePattern = preferredTitles ? new RegExp(preferredTitles) : undefined;
     this.pgLease ??= retainSharedPg();
     // WI-10000776 — FIRST (after the lease above, which reads no root), before anything reads a root. Vitest calls onInit before it
     // executes any test module, so this is the one moment the checkout under test is
@@ -1553,7 +1567,7 @@ export default class AdminTestRunsReporter implements Reporter {
       const outputTail = buildOutputTail(testModule, status);
       this.failureDetails.push(...collectTestFailureDetails(testModule, filePath));
 
-      const counts = collectModuleExecution(testModule);
+      const counts = collectModuleExecution(testModule, this.preferredPassedCasePattern);
       // Root and project configs may differ in a multi-project run. The module's
       // project wins; absence there stays unknown instead of inheriting a root label.
       const testLayer = testModule.project

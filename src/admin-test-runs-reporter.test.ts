@@ -63,6 +63,46 @@ describe('durable module execution measurement', () => {
     expect(collectModuleExecution(module(['passed', 'passed', 'skipped', 'failed'], 'failed')))
       .toEqual({ passed: 2, failed: 1, skipped: 1, collectionFailed: false });
   });
+  it('records requested late passing identities within the cap without crediting skipped or failed cases', () => {
+    const cases = Array.from({ length: 80 }, (_, i) => ({
+      fullName: `suite > proof-${i}`,
+      result: () => ({ state: i === 78 ? 'skipped' : i === 79 ? 'failed' : 'passed' }),
+    }));
+    const measured = collectModuleExecution({
+      state: () => 'failed', children: { allTests: () => cases },
+    } as never, /proof-(70|78|79)$/g);
+    expect(measured).toMatchObject({ passed: 78, failed: 1, skipped: 1, collectionFailed: false });
+    expect(measured?.passedCaseTitles).toHaveLength(64);
+    expect(measured?.passedCaseTitles?.[0]).toBe('suite > proof-70');
+    expect(measured?.passedCaseTitles).not.toContain('suite > proof-78');
+    expect(measured?.passedCaseTitles).not.toContain('suite > proof-79');
+    expect(measured?.failedCaseTitles).toEqual(['suite > proof-79']);
+    expect(collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never)
+      ?.passedCaseTitles).not.toContain('suite > proof-70');
+  });
+  it('persists a preferred late identity while running the whole module', async () => {
+    vi.stubEnv('PAPERCUSP_TEST_RUN_CASE_TITLE_PATTERN', 'late-proof$');
+    const rows: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+      async row => { rows.push(row); });
+    try {
+      reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
+      const cases = Array.from({ length: 80 }, (_, i) => ({
+        fullName: i === 79 ? 'suite > late-proof' : `suite > case-${i}`,
+        result: () => ({ state: 'passed' }),
+      }));
+      reporter.onTestModuleEnd({ state: () => 'passed', children: { allTests: () => cases },
+        moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+        diagnostic: () => ({ duration: 1 }), errors: () => [],
+      } as never);
+      await reporter.onTestRunEnd();
+      expect(rows[0].executionDetails).toMatchObject({ passed: 80, failed: 0, skipped: 0, testNamePattern: null });
+      expect(rows[0].executionDetails?.passedCaseTitles).toHaveLength(64);
+      expect(rows[0].executionDetails?.passedCaseTitles?.[0]).toBe('suite > late-proof');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it('retains a failed collection even without a failed assertion', () => {
     expect(collectModuleExecution(module(['skipped'], 'failed')))
       .toEqual({ passed: 0, failed: 0, skipped: 1, collectionFailed: true });
