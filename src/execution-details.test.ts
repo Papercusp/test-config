@@ -74,7 +74,7 @@ describe('parseTestRunExecutionDetails — runStartedAt (EI-24827834166866368)',
   });
 });
 
-describe('parseTestRunExecutionDetails — failedCaseTitles (EI-25248905256718690)', () => {
+describe('parseTestRunExecutionDetails — measured case identities', () => {
   it('accepts exact structured identities and stored JSON strings without changing legacy rows', () => {
     const row = { ...details({ failed: 2 }), failedCaseTitles: ['suite — fails: with a colon', 'suite > also fails'] };
     expect(parseTestRunExecutionDetails(row)).toMatchObject({ failedCaseTitles: row.failedCaseTitles });
@@ -93,6 +93,27 @@ describe('parseTestRunExecutionDetails — failedCaseTitles (EI-2524890525671869
     { failed: 65, failedCaseTitles: Array.from({ length: 65 }, (_, i) => `case ${i}`) },
     { failed: 1, failedCaseTitles: null },
   ])('rejects malformed or contradictory identities: %j', overrides => {
+    expect(parseTestRunExecutionDetails({ ...details(), ...overrides })).toBeUndefined();
+  });
+
+  it('accepts exact measured passing identities without changing legacy rows', () => {
+    const row = { ...details(), passedCaseTitles: ['suite > passed case', 'suite — second: passed'] };
+    expect(parseTestRunExecutionDetails(row)).toMatchObject({ passedCaseTitles: row.passedCaseTitles });
+    expect(parseTestRunExecutionDetails(JSON.stringify(row))).toMatchObject({ passedCaseTitles: row.passedCaseTitles });
+    expect(parseTestRunExecutionDetails(details())).toBeDefined();
+  });
+
+  it.each([
+    { passed: 0, passedCaseTitles: ['not a passed test'] },
+    { passed: 1, collectionFailed: true, passedCaseTitles: ['setup is not an assertion'] },
+    { passed: 2, passedCaseTitles: ['same title', 'same title'] },
+    { passed: 1, passedCaseTitles: [' leading space'] },
+    { passed: 1, passedCaseTitles: ['multiline\nDOM'] },
+    { passed: 1, passedCaseTitles: ['x'.repeat(2_049)] },
+    { passed: 65, passedCaseTitles: Array.from({ length: 65 }, (_, i) => `case ${i}`) },
+    { passed: 1, passedCaseTitles: null },
+    { failed: 1, failedCaseTitles: ['suite > case'], passedCaseTitles: ['suite > case'] },
+  ])('rejects malformed or contradictory passing identities: %j', overrides => {
     expect(parseTestRunExecutionDetails({ ...details(), ...overrides })).toBeUndefined();
   });
 });

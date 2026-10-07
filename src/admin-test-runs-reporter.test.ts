@@ -124,7 +124,9 @@ describe('durable module execution measurement', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].outputTail).toHaveLength(4_000);
     for (const name of names) expect(rows[0].outputTail).not.toContain(name);
-    expect(rows[0].executionDetails).toMatchObject({ passed: 1, failed: 3, failedCaseTitles: names });
+    expect(rows[0].executionDetails).toMatchObject({
+      passed: 1, failed: 3, failedCaseTitles: names, passedCaseTitles: ['suite > passes'],
+    });
   });
 });
 

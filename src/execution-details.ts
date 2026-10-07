@@ -11,6 +11,7 @@
 export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
 
 export const MAX_RECORDED_FAILED_CASES = 64;
+export const MAX_RECORDED_PASSED_CASES = 64;
 export const MAX_RECORDED_CASE_TITLE_CHARS = 2_048;
 
 /** Exact identities, never clipped prefixes or assertion-message/DOM lines. */
@@ -59,6 +60,8 @@ export interface TestRunExecutionDetails {
    * Optional for legacy writers; bounded names are exact, not truncated.
    */
   failedCaseTitles?: string[];
+  /** Measured TestCase.fullName identities for passed assertions; bounded, never caller-authored. */
+  passedCaseTitles?: string[];
   skipped: number;
   collectionFailed: boolean;
   mutationPhase: string | null;
@@ -98,6 +101,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'scenarioId', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
+  'passedCaseTitles',
 ]);
 
 /** A recorded instant: a non-empty string Date can parse. Used for `runStartedAt`. */
@@ -167,6 +171,15 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
       || value.failedCaseTitles.some(title => !isRecordedCaseTitle(title))
       || new Set(value.failedCaseTitles).size !== value.failedCaseTitles.length
       || (value.failedCaseTitles.length > 0 && value.collectionFailed !== false)))
+    || (value.passedCaseTitles !== undefined && (
+      !Array.isArray(value.passedCaseTitles)
+      || value.passedCaseTitles.length > MAX_RECORDED_PASSED_CASES
+      || value.passedCaseTitles.length > (value.passed as number)
+      || value.passedCaseTitles.some(title => !isRecordedCaseTitle(title))
+      || new Set(value.passedCaseTitles).size !== value.passedCaseTitles.length
+      || (value.passedCaseTitles.length > 0 && value.collectionFailed !== false)
+      || (value.failedCaseTitles !== undefined
+        && value.passedCaseTitles.some(title => value.failedCaseTitles!.includes(title)))))
     || !isNullableString(value.mutationPhase) || !isNullableString(value.commitSha)
     || typeof value.worktreeDirty !== 'boolean'
     || (value.worktreeDirtyReason !== undefined

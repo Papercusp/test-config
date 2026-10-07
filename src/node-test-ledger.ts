@@ -31,6 +31,7 @@ import {
 import type { TestRunRow } from './admin-test-runs-reporter.ts';
 import {
   MAX_RECORDED_FAILED_CASES,
+  MAX_RECORDED_PASSED_CASES,
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
   isRecordedCaseTitle,
 } from './execution-details.ts';
@@ -109,6 +110,9 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, ctx: NodeTe
       : [...new Set(result.failedCases.map((c) => c.title))]
           .filter((title) => isRecordedCaseTitle(title))
           .slice(0, Math.min(MAX_RECORDED_FAILED_CASES, result.failed));
+    const passedCaseTitles = Array.isArray(result.passedCaseTitles)
+      ? [...new Set(result.passedCaseTitles.filter((title) => isRecordedCaseTitle(title)))].slice(0, MAX_RECORDED_PASSED_CASES)
+      : [];
 
     const durationMs = Math.max(0, Math.round(result.durationMs));
     const executionDetails: TestRunExecutionDetails = {
@@ -122,6 +126,7 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, ctx: NodeTe
       passed: result.passed,
       failed: result.failed,
       ...(failedCaseTitles.length > 0 ? { failedCaseTitles } : {}),
+      ...(passedCaseTitles.length > 0 ? { passedCaseTitles } : {}),
       skipped: result.skipped,
       collectionFailed,
       mutationPhase: ctx.mutationPhase,

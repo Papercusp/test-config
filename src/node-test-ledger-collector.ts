@@ -28,6 +28,14 @@ export const NODE_TEST_LEDGER_SUMMARY_SCHEMA_VERSION = 1 as const;
 export const NODE_TEST_NAME_SEPARATOR = ' > ';
 
 const MAX_MESSAGE_CHARS = 500;
+const MAX_RECORDED_PASSED_CASES = 64;
+const MAX_RECORDED_CASE_TITLE_CHARS = 2_048;
+
+function isRecordedCaseTitle(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+    && value.length <= MAX_RECORDED_CASE_TITLE_CHARS && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
 
 export interface NodeTestFailedCase {
   /** Full case name: ancestor suite/test names and the case name joined by ' > '. */
@@ -48,6 +56,8 @@ export interface NodeTestFileResult {
   passed: number;
   failed: number;
   skipped: number;
+  /** Bounded exact names of passed assertions; missing names remain unknown, not failed. */
+  passedCaseTitles?: string[];
   failedCases: NodeTestFailedCase[];
   /** Set when the FILE failed (load error, crash) rather than an individual case. */
   fileLevelFailure: string | null;
@@ -112,7 +122,10 @@ export function createNodeTestLedgerFold(): {
     let state = files.get(file);
     if (!state) {
       state = {
-        result: { file, passed: 0, failed: 0, skipped: 0, failedCases: [], fileLevelFailure: null, durationMs: 0 },
+        result: {
+          file, passed: 0, failed: 0, skipped: 0, passedCaseTitles: [], failedCases: [],
+          fileLevelFailure: null, durationMs: 0,
+        },
         stack: [],
       };
       files.set(file, state);
@@ -149,7 +162,14 @@ export function createNodeTestLedgerFold(): {
       if (event.type === 'test:pass') {
         if (isSuite) return;
         if (isFlagSet(data.skip) || isFlagSet(data.todo)) state.result.skipped += 1;
-        else state.result.passed += 1;
+        else {
+          state.result.passed += 1;
+          const passedCaseTitles = state.result.passedCaseTitles ?? (state.result.passedCaseTitles = []);
+          if (isRecordedCaseTitle(title) && passedCaseTitles.length < MAX_RECORDED_PASSED_CASES
+            && !passedCaseTitles.includes(title)) {
+            passedCaseTitles.push(title);
+          }
+        }
         return;
       }
 
@@ -176,11 +196,15 @@ export function createNodeTestLedgerFold(): {
     summary() {
       return {
         schemaVersion: NODE_TEST_LEDGER_SUMMARY_SCHEMA_VERSION,
-        files: [...files.values()].map((state) => ({
-          ...state.result,
+        files: [...files.values()].map((state) => {
+          const { passedCaseTitles, ...result } = state.result;
+          return {
+          ...result,
+          ...(passedCaseTitles?.length ? { passedCaseTitles: [...passedCaseTitles] } : {}),
           durationMs: Math.round(state.result.durationMs),
           failedCases: [...state.result.failedCases],
-        })),
+          };
+        }),
       };
     },
   };

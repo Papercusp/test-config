@@ -68,7 +68,9 @@ describe('node:test ledger collector fold', () => {
     fold.push(ev('test:fail', { name: 'todo case', todo: true, details: { type: 'test', error: { message: 'x' } } }));
 
     const [file] = fold.summary().files;
-    expect(file).toMatchObject({ file: FILE, passed: 1, failed: 1, skipped: 2, fileLevelFailure: null, durationMs: 12 });
+    expect(file).toMatchObject({
+      file: FILE, passed: 1, failed: 1, skipped: 2, passedCaseTitles: ['suite > ok'], fileLevelFailure: null, durationMs: 12,
+    });
     // No failureType on this synthetic error, so it is a failed case but not assertion evidence.
     expect(file.failedCases).toEqual([{ title: 'suite > bad', message: 'expected 1 to be 2', codeFailure: false }]);
   });
@@ -110,18 +112,22 @@ describe('assertion evidence for mutation-probe (EI-24836213046334894)', () => {
 describe('buildNodeTestRunRows', () => {
   const summary = (files: NodeTestLedgerSummary['files']): NodeTestLedgerSummary => ({ schemaVersion: 1, files });
   const result = (o: Partial<NodeTestLedgerSummary['files'][number]> = {}) => ({
-    file: FILE, passed: 0, failed: 0, skipped: 0, failedCases: [], fileLevelFailure: null, durationMs: 40, ...o,
+    file: FILE, passed: 0, failed: 0, skipped: 0, passedCaseTitles: [], failedCases: [],
+    fileLevelFailure: null, durationMs: 40, ...o,
   });
 
   it('writes a repo-relative row whose execution details satisfy the stored contract', () => {
-    const [row] = buildNodeTestRunRows(summary([result({ passed: 7 })]), ctx());
+    const [row] = buildNodeTestRunRows(summary([result({ passed: 7, passedCaseTitles: ['guard > passed'] })]), ctx());
     expect(row).toMatchObject({
       filePath: 'papercusp-desktop/test/guard.test.js', status: 'pass', durationMs: 40,
       outputTail: null, worktreeDirty: false, commitSha: 'c0ffee1234567890', isScratchConfig: false,
     });
     expect(row.startedAt.toISOString()).toBe('2026-10-06T16:59:59.960Z');
     const parsed = parseTestRunExecutionDetails(row.executionDetails);
-    expect(parsed).toMatchObject({ filePath: 'papercusp-desktop/test/guard.test.js', passed: 7, failed: 0, collectionFailed: false });
+    expect(parsed).toMatchObject({
+      filePath: 'papercusp-desktop/test/guard.test.js', passed: 7, failed: 0, collectionFailed: false,
+      passedCaseTitles: ['guard > passed'],
+    });
   });
 
   it('puts one `<full name>: <message>` line per failed case in output_tail and the titles in execution details', () => {
