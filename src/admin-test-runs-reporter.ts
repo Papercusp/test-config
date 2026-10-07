@@ -514,25 +514,21 @@ function realOrSelf(p: string): string {
   }
 }
 
-export async function resolveProbeSubjectExemption(
-  root: string,
-  run: WorktreeGitRunner = runGit,
-): Promise<ProbeSubjectExemption | null> {
+/** One exemption policy, interpreted by both awaited and native synchronous hooks. */
+function* probeSubjectExemptionReads(root: string): Generator<{ cmd: string; cwd: string }, ProbeSubjectExemption | null, string | null> {
   const subject = process.env.PAPERCUSP_MUTATION_PROBE_SUBJECT?.trim();
   if (!subject || !isAbsolute(subject) || !isMutationProbeRun()) return null;
   const subjectReal = realOrSelf(subject);
-  const subjectRepo = await runGitWithRetry(run, 'git rev-parse --show-toplevel', dirname(subjectReal));
+  const subjectRepo = yield { cmd: 'git rev-parse --show-toplevel', cwd: dirname(subjectReal) };
   if (!subjectRepo) return null;
   const rootReal = realOrSelf(root);
   const repoRel = toPosixPath(relative(rootReal, subjectRepo));
   if (repoRel.startsWith('..') || isAbsolute(repoRel) || repoRel.includes("'")) return null;
   const subjectRel = toPosixPath(relative(rootReal, subjectReal));
   if (repoRel === '') return { subjectRel, nested: null };
-  const [porcelain, head, gitlink] = await Promise.all([
-    runGitWithRetry(run, 'git status --porcelain --untracked-files=all', subjectRepo),
-    runGitWithRetry(run, 'git rev-parse HEAD', subjectRepo),
-    runGitWithRetry(run, `git rev-parse 'HEAD:${repoRel}'`, rootReal),
-  ]);
+  const porcelain = yield { cmd: 'git status --porcelain --untracked-files=all', cwd: subjectRepo };
+  const head = yield { cmd: 'git rev-parse HEAD', cwd: subjectRepo };
+  const gitlink = yield { cmd: `git rev-parse 'HEAD:${repoRel}'`, cwd: rootReal };
   return {
     subjectRel,
     nested: {
@@ -542,6 +538,34 @@ export async function resolveProbeSubjectExemption(
       gitlinkMatches: !!head && head === gitlink,
     },
   };
+}
+
+export async function resolveProbeSubjectExemption(root: string, run: WorktreeGitRunner = runGit): Promise<ProbeSubjectExemption | null> {
+  const reads = probeSubjectExemptionReads(root);
+  let step = reads.next();
+  while (!step.done) {
+    const { cmd, cwd } = step.value;
+    step = reads.next(await runGitWithRetry(run, cmd, cwd));
+  }
+  return step.value;
+}
+
+export function resolveProbeSubjectExemptionSync(
+  root: string,
+  run: (cmd: string, cwd: string, timeoutMs: number) => string | null,
+): ProbeSubjectExemption | null {
+  const reads = probeSubjectExemptionReads(root);
+  let step = reads.next();
+  while (!step.done) {
+    const { cmd, cwd } = step.value;
+    let observed: string | null = null;
+    for (const budget of WORKTREE_SNAPSHOT_GIT_BUDGETS_MS) {
+      observed = run(cmd, cwd, budget);
+      if (observed !== null) break;
+    }
+    step = reads.next(observed);
+  }
+  return step.value;
 }
 
 /**
