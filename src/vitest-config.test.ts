@@ -32,6 +32,18 @@ function withArgv(...tokens: string[]): void {
 }
 
 describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
+  it('forwards the registered runtime reader to the reporter without measuring during config evaluation', () => {
+    withArgv();
+    vi.stubEnv('PAPERCUSP_DISABLE_TEST_RUNS_REPORTER', '0');
+    const readRuntimeEnvironment = vi.fn(async () => null);
+    try {
+      const reporters = defineVitestConfig({ layer: 'e2e', readRuntimeEnvironment }).test!.reporters as unknown[];
+      expect(reporters.some(reporter => Array.isArray(reporter)
+        && String(reporter[0]).endsWith('/admin-test-runs-reporter.ts')
+        && reporter[1].readRuntimeEnvironment === readRuntimeEnvironment)).toBe(true);
+      expect(readRuntimeEnvironment).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
   it.each(['unit', 'integration', 'e2e', 'browser'] as const)('publishes the registered %s layer for runtime attribution', (layer) => {
     withArgv();
     expect(defineVitestConfig({ layer }).test?.provide).toEqual({ papercuspTestLayer: layer });
