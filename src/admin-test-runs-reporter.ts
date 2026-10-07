@@ -1533,7 +1533,7 @@ export default class AdminTestRunsReporter implements Reporter {
       ]);
       const parsed = parseRecordedRuntimeEnvironment(result);
       // The reporter owns the observation instant. A reader cannot backdate it.
-      return parsed ? { ...parsed, observedAt: new Date().toISOString() } : undefined;
+      return parsed ? { ...parsed, units: [...parsed.units], observedAt: new Date().toISOString() } : undefined;
     } catch { return undefined; }
     finally { if (timer) clearTimeout(timer); }
   }
