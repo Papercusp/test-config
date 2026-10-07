@@ -213,7 +213,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
       || new Set(value.passedCaseTitles).size !== value.passedCaseTitles.length
       || (value.passedCaseTitles.length > 0 && value.collectionFailed !== false)
       || (value.failedCaseTitles !== undefined
-        && value.passedCaseTitles.some(title => value.failedCaseTitles!.includes(title)))))
+        && value.passedCaseTitles.some(title => Array.isArray(value.failedCaseTitles) && value.failedCaseTitles.includes(title)))))
     || !isNullableString(value.mutationPhase) || !isNullableString(value.commitSha)
     || typeof value.worktreeDirty !== 'boolean'
     || (value.worktreeDirtyReason !== undefined
