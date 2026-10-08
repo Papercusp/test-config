@@ -132,6 +132,26 @@ export interface TestRunExecutionDetails {
   /** Why a runtime witness is absent, or confirmation that it was captured. */
   runtimeEnvironmentBeforeCaptureStatus?: RuntimeEnvironmentCaptureStatus;
   runtimeEnvironmentAfterCaptureStatus?: RuntimeEnvironmentCaptureStatus;
+  /** Original reporter-hashed artifacts of workers which exist only inside a test. */
+  isolatedRuntimeReceipts?: IsolatedRuntimeReceipt[];
+}
+
+export interface IsolatedRuntimeReceipt {
+  runId: string;
+  resultSha256: string;
+  sourceSha256: string;
+  lifecycleSha256: string;
+}
+
+export function parseIsolatedRuntimeReceipts(value: unknown): IsolatedRuntimeReceipt[] | undefined {
+  if (!Array.isArray(value) || !value.length || value.length > 32) return undefined;
+  const keys = ['runId', 'resultSha256', 'sourceSha256', 'lifecycleSha256'];
+  if (value.some(row => !isRecord(row) || Object.keys(row).length !== keys.length
+    || Object.keys(row).some(key => !keys.includes(key))
+    || typeof row.runId !== 'string' || !/^\d{8}T\d{6}Z-\d+(?:\.\d+)?$/.test(row.runId)
+    || keys.slice(1).some(key => typeof row[key] !== 'string' || !/^[a-f0-9]{64}$/.test(row[key] as string)))
+    || new Set(value.map(row => row.runId)).size !== value.length) return undefined;
+  return value as IsolatedRuntimeReceipt[];
 }
 
 export type RuntimeEnvironmentCaptureStatus =
@@ -148,6 +168,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
+  'isolatedRuntimeReceipts',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -237,6 +258,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
       && (typeof value.worktreeDirtyReason !== 'string' || value.worktreeDirtyReason.length === 0
         || value.worktreeDirty !== true))
     || (value.runStartedAt !== undefined && !isRecordedInstant(value.runStartedAt))
+    || (value.isolatedRuntimeReceipts !== undefined && !parseIsolatedRuntimeReceipts(value.isolatedRuntimeReceipts))
     || (value.runtimeEnvironmentBefore !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentBefore))
     || (value.runtimeEnvironmentAfter !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentAfter))
     || (value.runtimeEnvironmentBeforeCaptureStatus !== undefined

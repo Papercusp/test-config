@@ -78,6 +78,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts --passWithNoTests"
   },
   "dependencies": {
+    "@papercusp/verification-harness": "*",
     "@nestjs/testing": "^11.2.7",
     "@papercusp/module-singleton": "*",
     "@testcontainers/postgresql": "^11.0.0",

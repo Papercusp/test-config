@@ -34,11 +34,34 @@ import { exec } from 'node:child_process';
 import { appendFileSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { defaultEvidenceRoot } from '@papercusp/verification-harness';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, isRecordedCaseTitle,
   MAX_RECORDED_FAILED_CASES, MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
   parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment, type RuntimeEnvironmentCaptureStatus,
+  parseIsolatedRuntimeReceipts, type IsolatedRuntimeReceipt,
 } from './execution-details.ts';
+
+/** Hash original bytes at recording time; a fixture-supplied digest is never trusted. */
+export function collectIsolatedRuntimeReceipts(testModule: TestModule): IsolatedRuntimeReceipt[] | undefined {
+  try {
+    const receipts: IsolatedRuntimeReceipt[] = [];
+    const base = realpathSync(defaultEvidenceRoot('isolated-integration'));
+    for (const test of testModule.children.allTests()) {
+      if (test.result()?.state !== 'passed') return undefined;
+      const runId = test.meta()?.papercuspIsolatedRuntimeRunId;
+      if (typeof runId !== 'string' || !/^\d{8}T\d{6}Z-\d+(?:\.\d+)?$/.test(runId)) return undefined;
+      const hashes = ['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json'].map(file => {
+        const path = realpathSync(join(base, runId, file));
+        if (relative(base, path).startsWith('..') || statSync(path).size > 1_048_576) throw new Error('invalid runtime artifact');
+        return createHash('sha256').update(readFileSync(path)).digest('hex');
+      });
+      receipts.push({ runId, resultSha256: hashes[0], sourceSha256: hashes[1], lifecycleSha256: hashes[2] });
+    }
+    return parseIsolatedRuntimeReceipts(receipts);
+  } catch { return undefined; }
+}
 
 /**
  * EI-19307211919650123: classify the `.git` entry at `dir` for the root walk.
@@ -1641,6 +1664,10 @@ export default class AdminTestRunsReporter implements Reporter {
         : this.executionContext?.testLayer;
       const executionDetails = counts && this.executionContext
         ? { ...this.executionContext, testLayer, filePath, ...counts } : null;
+      if (executionDetails && testLayer === 'integration') {
+        const receipts = collectIsolatedRuntimeReceipts(testModule);
+        if (receipts) Object.assign(executionDetails, { isolatedRuntimeReceipts: receipts });
+      }
       this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail,
         isScratchConfig: this.isScratchConfig, executionDetails });
     } catch {
