@@ -36,7 +36,35 @@
  * hook, which vitest forwards to the reporter and thence to `output_tail`.
  */
 
-import { pinModuleState } from '@papercusp/module-singleton';
+import { pinModuleState, readPinnedModuleState } from '@papercusp/module-singleton';
+
+/**
+ * The rail's THROW-SITE counter (WI-10007538), pinned by
+ * libs/papercusp/libs/db/src/connection.ts under this key. The message buckets
+ * below only see blocked attempts whose caller logged through console.error /
+ * console.warn; a caller that swallowed the throw or logged via console.log left
+ * no trace, so the census read zero for attempts that happened. Read through
+ * `readPinnedModuleState` (never `pinModuleState`): this package must not import
+ * the database package, and a read must not count as a module evaluation.
+ * The key is pinned end-to-end by db's connection-forbid-real-pg.test.ts.
+ */
+export const REAL_PG_RAIL_STATE_KEY = '@papercusp/db-org.real-pg-rail';
+
+export interface RealPgRailState {
+  blocked: number;
+  callers: string[];
+}
+
+/**
+ * Blocked real-PG attempts in THIS test file (reset per file by
+ * setup-fail-on-console.ts), with up to 3 distinct `pool ← caller frame`
+ * exemplars. Zero when the db package never loaded, since then nothing could
+ * have reached the rail.
+ */
+export function readRealPgRailBlocks(): RealPgRailState {
+  const state = readPinnedModuleState<RealPgRailState>(REAL_PG_RAIL_STATE_KEY);
+  return state ? { blocked: state.blocked, callers: [...state.callers] } : { blocked: 0, callers: [] };
+}
 
 /**
  * Buckets worth counting SEPARATELY. Everything else aggregates into `other`:
@@ -152,6 +180,13 @@ export function readSilencedConsoleExemplars(): Record<string, string[]> {
 export function resetSilencedConsoleCensus(): void {
   census.clear();
   exemplars.clear();
+  // The rail counter lives on globalThis too, so it also outlives the per-file
+  // module-registry reset. Zero it in place (the db module holds this object).
+  const rail = readPinnedModuleState<RealPgRailState>(REAL_PG_RAIL_STATE_KEY);
+  if (rail) {
+    rail.blocked = 0;
+    rail.callers.length = 0;
+  }
 }
 
 /**
@@ -176,6 +211,18 @@ export function summariseSilencedConsole(): string | null {
     for (const sample of exemplars.get(bucket.key) ?? []) {
       detail.push(`${SUMMARY_PREFIX}   ↳ ${sample}`);
     }
+  }
+  // WI-10007538: attempts the message buckets cannot see. One blocked attempt
+  // usually yields one silenced message, so a throw-site count ABOVE the bucket
+  // count means some caller swallowed the throw or logged it via console.log.
+  const rail = readRealPgRailBlocks();
+  const unseen = rail.blocked - (census.get('real-pg-blocked') ?? 0);
+  if (unseen > 0) {
+    parts.push(
+      `${rail.blocked} real-PG attempts blocked at the rail's throw site, ${unseen} of them ` +
+        'never logged via console.error/warn (swallowed, or logged via console.log) [WI-10007538]',
+    );
+    for (const caller of rail.callers) detail.push(`${SUMMARY_PREFIX}   ↳ rail caller: ${caller}`);
   }
   if (parts.length === 0) return null;
   return [`${SUMMARY_PREFIX} ${parts.join('; ')}`, ...detail].join('\n');

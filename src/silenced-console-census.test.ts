@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { pinModuleState } from '@papercusp/module-singleton';
 import { isSilencedConsoleMessage } from './console-noise-filter.ts';
 import {
+  REAL_PG_RAIL_STATE_KEY,
+  readRealPgRailBlocks,
   readSilencedConsoleCensus,
   readSilencedConsoleExemplars,
   recordSilencedMessage,
   resetSilencedConsoleCensus,
   summariseSilencedConsole,
+  type RealPgRailState,
 } from './silenced-console-census.ts';
 
 /** The exact text `assertRealPgAllowed` throws (connection.ts), as a call site logs it. */
@@ -173,5 +177,52 @@ describe('silenced-console census (EI-21253580842180372)', () => {
         '[inbox-wake] idle-probe roster read failed',
       );
     });
+  });
+});
+
+/**
+ * WI-10007538: the rail's THROW-SITE counter. The db package pins it under
+ * REAL_PG_RAIL_STATE_KEY; here the test plays the db side by pinning the same
+ * key, so these cases exercise only the census half. The real db half (and the
+ * key agreeing across both packages) is pinned in
+ * libs/papercusp/libs/db/src/connection-forbid-real-pg.test.ts.
+ */
+describe('real-PG rail throw-site census (WI-10007538)', () => {
+  const rail = pinModuleState<RealPgRailState>(REAL_PG_RAIL_STATE_KEY, () => ({ blocked: 0, callers: [] }));
+
+  beforeEach(() => {
+    resetSilencedConsoleCensus();
+  });
+
+  it('reports blocked attempts that no console message carried, naming the caller', () => {
+    // The p2p seeder shape: the throw was caught and logged via console.log, so
+    // the message buckets saw nothing at all.
+    rail.blocked = 2;
+    rail.callers.push('org-admin ← at packages/operator-core/lib/p2p/ensure-host-routines.ts:128:30');
+    const summary = summariseSilencedConsole() ?? '';
+    expect(summary).toContain("2 real-PG attempts blocked at the rail's throw site, 2 of them never logged");
+    expect(summary).toContain('rail caller: org-admin ← at packages/operator-core/lib/p2p/ensure-host-routines.ts');
+  });
+
+  it('adds no throw-site line when every block also reached a silenced console message', () => {
+    rail.blocked = 1;
+    recordSilencedMessage(RAIL_MESSAGE);
+    const summary = summariseSilencedConsole() ?? '';
+    expect(summary).toContain('1 unit-layer real-PG connections blocked');
+    expect(summary).not.toContain('throw site');
+  });
+
+  it('reads zero, and summarises nothing, on a clean file', () => {
+    expect(readRealPgRailBlocks()).toEqual({ blocked: 0, callers: [] });
+    expect(summariseSilencedConsole()).toBeNull();
+  });
+
+  it('per-file reset zeroes the db-owned counter IN PLACE (the db module keeps its reference)', () => {
+    rail.blocked = 3;
+    rail.callers.push('org-admin ← at x.ts:1:1');
+    resetSilencedConsoleCensus();
+    expect(rail.blocked).toBe(0);
+    expect(rail.callers).toEqual([]);
+    expect(readRealPgRailBlocks()).toEqual({ blocked: 0, callers: [] });
   });
 });

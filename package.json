@@ -26,6 +26,11 @@
       "import": "./src/mock-sql.ts",
       "default": "./src/mock-sql.ts"
     },
+    "./silenced-console-census": {
+      "types": "./src/silenced-console-census.ts",
+      "import": "./src/silenced-console-census.ts",
+      "default": "./src/silenced-console-census.ts"
+    },
     "./vitest-config": {
       "types": "./src/vitest-config.ts",
       "import": "./src/vitest-config.ts",
