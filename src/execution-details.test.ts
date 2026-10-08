@@ -8,6 +8,16 @@ import {
 } from './execution-details.ts';
 
 describe('recorded runtime execution witnesses', () => {
+  it('accepts exact original integration receipts and rejects missing hashes, extensions and duplicate runs', () => {
+    const receipt = { runId: '20261008T000000Z-100', resultSha256: 'a'.repeat(64),
+      sourceSha256: 'b'.repeat(64), lifecycleSha256: 'c'.repeat(64) };
+    expect(parseTestRunExecutionDetails(details({ isolatedRuntimeReceipts: [receipt] })))
+      .toMatchObject({ isolatedRuntimeReceipts: [receipt] });
+    for (const receipts of [[], [receipt, receipt], [{ ...receipt, trusted: true }],
+      [{ ...receipt, lifecycleSha256: '' }], [{ ...receipt, runId: '../other' }]]) {
+      expect(parseTestRunExecutionDetails(details({ isolatedRuntimeReceipts: receipts }))).toBeUndefined();
+    }
+  });
   const before = { schemaVersion: 1, units: ['bg-host', 'desktop'], fingerprint: 'a'.repeat(64),
     observedAt: '2026-10-07T00:00:00Z' };
   const after = { ...before, units: ['desktop', 'bg-host'], observedAt: '2026-10-07T00:01:00Z' };
