@@ -97,4 +97,9 @@ declare module 'vitest' {
   interface ProvidedContext {
     baselineSchemaDsn: string;
   }
+  // Written by isolated-runtime integration tests (Object.assign(context.task.meta, …))
+  // and read back by admin-test-runs-reporter's collectIsolatedRuntimeReceipts.
+  interface TaskMeta {
+    papercuspIsolatedRuntimeRunId?: string;
+  }
 }
