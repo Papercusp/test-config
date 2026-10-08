@@ -1682,6 +1682,7 @@ export default class AdminTestRunsReporter implements Reporter {
       commitSha,
       executionDetails: row.executionDetails
         ? { ...row.executionDetails, worktreeDirty, commitSha,
+          ...(worktreeDirty && dirtReason ? { worktreeDirtyReason: dirtReason } : {}),
           runtimeEnvironmentAfterCaptureStatus: runtimeEnvironmentAfter.status,
           ...(runtimeEnvironmentAfter.status === 'captured'
             ? { runtimeEnvironmentAfter: runtimeEnvironmentAfter.witness } : {}) }

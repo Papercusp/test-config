@@ -981,12 +981,68 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       state: () => 'passed',
       diagnostic: () => ({ duration: 12 }),
       errors: () => [],
+      children: { allTests: () => [{ fullName: 'clean control', result: () => ({ state: 'passed' }) }] },
     } as unknown as Parameters<typeof r.onTestModuleEnd>[0]);
 
     await r.onTestRunEnd();
     expect(persisted).toHaveLength(1);
     expect(persisted[0].worktreeDirty).toBe(false);
     expect(persisted[0].commitSha).toBe('abc');
+    expect(persisted[0].executionDetails).toBeTruthy();
+    expect(persisted[0].executionDetails).not.toHaveProperty('worktreeDirtyReason');
+  });
+
+  it.each(['local', 'mutation-probe', 'ci'])('persists the dirty reason for %s receipts', async (source) => {
+    vi.stubEnv('PAPERCUSP_TEST_RUN_SOURCE', source);
+    vi.stubEnv('PAPERCUSP_MUTATION_PROBE', source === 'mutation-probe' ? '1' : '');
+    const snapshots = [
+      { commit: 'abc', porcelain: '' },
+      { commit: 'abc', porcelain: ' M unrelated-source.ts' },
+    ];
+    const persisted: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(
+      async () => snapshots.shift()!,
+      async (row) => { persisted.push(row); },
+    );
+    try {
+      reporter.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      reporter.onTestModuleEnd({
+        moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
+        state: () => 'passed', diagnostic: () => ({ duration: 12 }), errors: () => [],
+        children: { allTests: () => [{ fullName: 'dirty receipt control', result: () => ({ state: 'passed' }) }] },
+      } as never);
+      await reporter.onTestRunEnd();
+      expect(persisted).toHaveLength(1);
+      expect(parseTestRunExecutionDetails(persisted[0].executionDetails)).toMatchObject({
+        worktreeDirty: true,
+        worktreeDirtyReason: '1 porcelain line(s) after the run:  M unrelated-source.ts',
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('persists an unreadable status reason instead of losing the provenance failure', async () => {
+    const snapshots = [
+      { commit: 'abc', porcelain: '' },
+      { commit: 'abc', porcelain: null },
+    ];
+    const persisted: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(
+      async () => snapshots.shift()!,
+      async (row) => { persisted.push(row); },
+    );
+    reporter.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+    reporter.onTestModuleEnd({
+      moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
+      state: () => 'passed', diagnostic: () => ({ duration: 12 }), errors: () => [],
+      children: { allTests: () => [{ fullName: 'unreadable status control', result: () => ({ state: 'passed' }) }] },
+    } as never);
+    await reporter.onTestRunEnd();
+    expect(parseTestRunExecutionDetails(persisted[0].executionDetails)).toMatchObject({
+      worktreeDirty: true,
+      worktreeDirtyReason: 'git status unreadable after the run',
+    });
   });
 
   // WI-10004076: a declared-ci run demoted to local must say why, while the tree still exists.
