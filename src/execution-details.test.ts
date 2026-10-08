@@ -27,6 +27,22 @@ describe('recorded runtime execution witnesses', () => {
       expect(parseTestRunExecutionDetails(details({ runtimeEnvironmentBefore: value }))).toBeUndefined();
     }
   });
+  it('validates runtime capture statuses and keeps each status consistent with its witness', () => {
+    const row = details({
+      runtimeEnvironmentBefore: before,
+      runtimeEnvironmentAfterCaptureStatus: 'timed-out',
+      runtimeEnvironmentBeforeCaptureStatus: 'captured',
+    });
+    expect(parseTestRunExecutionDetails(row)).toMatchObject({
+      runtimeEnvironmentBefore: before,
+      runtimeEnvironmentBeforeCaptureStatus: 'captured',
+      runtimeEnvironmentAfterCaptureStatus: 'timed-out',
+    });
+    expect(parseTestRunExecutionDetails(details({ runtimeEnvironmentBeforeCaptureStatus: 'captured' }))).toBeUndefined();
+    expect(parseTestRunExecutionDetails(details({ runtimeEnvironmentAfter: after,
+      runtimeEnvironmentAfterCaptureStatus: 'timed-out' }))).toBeUndefined();
+    expect(parseTestRunExecutionDetails(details({ runtimeEnvironmentAfterCaptureStatus: 'silent' }))).toBeUndefined();
+  });
 });
 
 function details(overrides: Partial<Record<keyof TestRunExecutionDetails, unknown>> = {}): Record<string, unknown> {

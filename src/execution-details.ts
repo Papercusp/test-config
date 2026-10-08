@@ -129,14 +129,31 @@ export interface TestRunExecutionDetails {
   runStartedAt?: string;
   runtimeEnvironmentBefore?: RecordedRuntimeEnvironment;
   runtimeEnvironmentAfter?: RecordedRuntimeEnvironment;
+  /** Why a runtime witness is absent, or confirmation that it was captured. */
+  runtimeEnvironmentBeforeCaptureStatus?: RuntimeEnvironmentCaptureStatus;
+  runtimeEnvironmentAfterCaptureStatus?: RuntimeEnvironmentCaptureStatus;
 }
+
+export type RuntimeEnvironmentCaptureStatus =
+  | 'captured'
+  | 'not-configured'
+  | 'unavailable'
+  | 'invalid'
+  | 'timed-out'
+  | 'error';
 
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'scenarioId', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
+  'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
 ]);
+
+function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
+  return value === 'captured' || value === 'not-configured' || value === 'unavailable'
+    || value === 'invalid' || value === 'timed-out' || value === 'error';
+}
 
 /** A recorded instant: a non-empty string Date can parse. Used for `runStartedAt`. */
 export function isRecordedInstant(value: unknown): value is string {
@@ -221,7 +238,13 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
         || value.worktreeDirty !== true))
     || (value.runStartedAt !== undefined && !isRecordedInstant(value.runStartedAt))
     || (value.runtimeEnvironmentBefore !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentBefore))
-    || (value.runtimeEnvironmentAfter !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentAfter))) {
+    || (value.runtimeEnvironmentAfter !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentAfter))
+    || (value.runtimeEnvironmentBeforeCaptureStatus !== undefined
+      && (!isRuntimeEnvironmentCaptureStatus(value.runtimeEnvironmentBeforeCaptureStatus)
+        || (value.runtimeEnvironmentBeforeCaptureStatus === 'captured') !== (value.runtimeEnvironmentBefore !== undefined)))
+    || (value.runtimeEnvironmentAfterCaptureStatus !== undefined
+      && (!isRuntimeEnvironmentCaptureStatus(value.runtimeEnvironmentAfterCaptureStatus)
+        || (value.runtimeEnvironmentAfterCaptureStatus === 'captured') !== (value.runtimeEnvironmentAfter !== undefined)))) {
     return undefined;
   }
   return value as unknown as TestRunExecutionDetails;
