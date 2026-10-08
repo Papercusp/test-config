@@ -11,6 +11,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +20,7 @@ import AdminTestRunsReporter, {
   buildOutputTail,
   captureWorktreeSnapshot,
   collectModuleExecution,
+  collectIsolatedRuntimeReceipts,
   captureReporterSaturationSnapshot,
   classifyGitEntry,
   computeWorkspaceRootFrom,
@@ -53,6 +55,29 @@ import AdminTestRunsReporter, {
 import { parseTestRunExecutionDetails } from './execution-details.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+
+describe('original isolated runtime receipt recording', () => {
+  it('hashes the real bytes, refusing ordinary, partial and duplicate fixture claims', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'isolated-reporter-'));
+    vi.stubEnv('VH_EVIDENCE_ROOT_BASE', dir);
+    const runId = '20261008T000000Z-100';
+    const base = join(dir, 'isolated-integration', runId);
+    const files = ['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json'];
+    const test = { result: () => ({ state: 'passed' }), meta: () => ({ papercuspIsolatedRuntimeRunId: runId }) };
+    const module = (tests: unknown[]) => ({ children: { allTests: () => tests } }) as never;
+    try {
+      for (const file of files) { mkdirSync(join(base, file, '..'), { recursive: true }); writeFileSync(join(base, file), '{}'); }
+      const expected = createHash('sha256').update('{}').digest('hex');
+      expect(collectIsolatedRuntimeReceipts(module([test])))
+        .toEqual([{ runId, resultSha256: expected, sourceSha256: expected, lifecycleSha256: expected }]);
+      expect(collectIsolatedRuntimeReceipts(module([test, test]))).toBeUndefined();
+      expect(collectIsolatedRuntimeReceipts(module([{ ...test, meta: () => ({}) }]))).toBeUndefined();
+      expect(collectIsolatedRuntimeReceipts(module([{ ...test, result: () => ({ state: 'failed' }) }]))).toBeUndefined();
+      rmSync(join(base, files[2]));
+      expect(collectIsolatedRuntimeReceipts(module([test]))).toBeUndefined();
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('runtime environment recorded around execution', () => {
   async function record(fingerprints: Array<string | null>, fault?: { call: number; kind: 'error' | 'timeout' }) {
