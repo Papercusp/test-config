@@ -54,10 +54,14 @@ import AdminTestRunsReporter, {
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
 describe('runtime environment recorded around execution', () => {
-  async function record(fingerprints: Array<string | null>, throws = false) {
+  async function record(fingerprints: Array<string | null>, fault?: { call: number; kind: 'error' | 'timeout' }) {
     const rows: TestRunRow[] = [];
+    let calls = 0;
     const reader = vi.fn(async () => {
-      if (throws) throw new Error('runtime unavailable');
+      calls += 1;
+      if (fault?.call === calls && fault.kind === 'error') throw new Error('runtime unavailable');
+      if (fault?.call === calls && fault.kind === 'timeout')
+        await new Promise(resolve => setTimeout(resolve, 1_100));
       const fingerprint = fingerprints.shift();
       return fingerprint ? { schemaVersion: 1 as const, units: ['bg-host'], fingerprint,
         observedAt: '2000-01-01T00:00:00Z' } : null;
@@ -78,6 +82,8 @@ describe('runtime environment recorded around execution', () => {
     expect(reader).toHaveBeenCalledTimes(2);
     expect(details.runtimeEnvironmentBefore?.fingerprint).toBe('a'.repeat(64));
     expect(details.runtimeEnvironmentAfter?.fingerprint).toBe('a'.repeat(64));
+    expect(details.runtimeEnvironmentBeforeCaptureStatus).toBe('captured');
+    expect(details.runtimeEnvironmentAfterCaptureStatus).toBe('captured');
     expect(Date.parse(details.runtimeEnvironmentBefore!.observedAt)).toBeGreaterThan(Date.parse('2026-01-01'));
   });
   it('preserves restart drift instead of replacing the execution-time witness with the later runtime', async () => {
@@ -86,9 +92,19 @@ describe('runtime environment recorded around execution', () => {
     expect(details.runtimeEnvironmentAfter?.fingerprint).toBe('b'.repeat(64));
   });
   it('keeps an unavailable measurement absent and does not change a passing test outcome', async () => {
-    const { details } = await record([], true);
+    const { details } = await record([], { call: 1, kind: 'error' });
     expect(details).toMatchObject({ passed: 1, failed: 0 });
     expect(details).not.toHaveProperty('runtimeEnvironmentBefore');
+    expect(details).not.toHaveProperty('runtimeEnvironmentAfter');
+    expect(details.runtimeEnvironmentBeforeCaptureStatus).toBe('error');
+    expect(details.runtimeEnvironmentAfterCaptureStatus).toBe('unavailable');
+  });
+  it('records a timed-out after-runtime read without changing the passing test outcome', async () => {
+    const { details } = await record(['a'.repeat(64)], { call: 2, kind: 'timeout' });
+    expect(details).toMatchObject({ passed: 1, failed: 0 });
+    expect(details.runtimeEnvironmentBeforeCaptureStatus).toBe('captured');
+    expect(details.runtimeEnvironmentAfterCaptureStatus).toBe('timed-out');
+    expect(details.runtimeEnvironmentBefore?.fingerprint).toBe('a'.repeat(64));
     expect(details).not.toHaveProperty('runtimeEnvironmentAfter');
   });
 });
@@ -1208,6 +1224,25 @@ describe('resolveTestRunHarnessSlug / resolveTestRunWorkspaceId (WI-6583)', () =
     process.env.HARNESS_SLUG = 'from-spawn';
     process.env.PAPERCUSP_HARNESS_SLUG = 'from-shell';
     expect(resolveTestRunHarnessSlug()).toBe('from-spawn');
+  });
+
+  it.each([
+    ['PAPERCUSP_TEST_RUN_HARNESS', '*'],
+    ['PAPERCUSP_TEST_RUN_HARNESS', 'all'],
+    ['PAPERCUSP_TEST_RUN_HARNESS', ' ALL '],
+    ['HARNESS_SLUG', '*'],
+    ['HARNESS_SLUG', 'all'],
+    ['PAPERCUSP_HARNESS_SLUG', '*'],
+    ['PAPERCUSP_HARNESS_SLUG', 'all'],
+  ] as const)('resolveTestRunHarnessSlug: rejects %s sentinel %j', (key, value) => {
+    process.env[key] = value;
+    expect(resolveTestRunHarnessSlug()).toBeNull();
+  });
+
+  it('resolveTestRunHarnessSlug: does not fall through a sentinel override to ambient harness attribution', () => {
+    process.env.PAPERCUSP_TEST_RUN_HARNESS = 'all';
+    process.env.HARNESS_SLUG = 'from-spawn';
+    expect(resolveTestRunHarnessSlug()).toBeNull();
   });
 
   it('resolveTestRunWorkspaceId: returns null when nothing is set', () => {

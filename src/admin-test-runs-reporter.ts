@@ -37,7 +37,7 @@ import { homedir } from 'node:os';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, isRecordedCaseTitle,
   MAX_RECORDED_FAILED_CASES, MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
-  parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment,
+  parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment, type RuntimeEnvironmentCaptureStatus,
 } from './execution-details.ts';
 
 /**
@@ -1079,12 +1079,18 @@ export async function closeSharedPg(): Promise<void> {
  * specifically so its rows stay unattributed
  * (`source='ci'` rows are about the checkpoint tree, not one hive's own suite).
  */
+function concreteTestRunHarnessSlug(value: string | null | undefined): string | null {
+  const slug = value?.trim();
+  if (!slug || slug === '*' || slug.toLowerCase() === 'all') return null;
+  return slug;
+}
+
 export function resolveTestRunHarnessSlug(): string | null {
-  return (
+  return concreteTestRunHarnessSlug(
     process.env.PAPERCUSP_TEST_RUN_HARNESS ||
     process.env.HARNESS_SLUG ||
     process.env.PAPERCUSP_HARNESS_SLUG ||
-    null
+    null,
   );
 }
 
@@ -1503,6 +1509,10 @@ type PendingTestRunRow = Omit<TestRunRow, 'worktreeDirty' | 'commitSha' | 'execu
   executionDetails?: PendingExecutionDetails | null;
 };
 
+type RuntimeEnvironmentCapture =
+  | { status: 'captured'; witness: RecordedRuntimeEnvironment }
+  | { status: Exclude<RuntimeEnvironmentCaptureStatus, 'captured'> };
+
 export default class AdminTestRunsReporter implements Reporter {
   private pending: PendingTestRunRow[] = [];
   /** Captured in onInit, before Vitest starts executing test modules. */
@@ -1547,18 +1557,22 @@ export default class AdminTestRunsReporter implements Reporter {
   private readonly writeRows: TestRunRowsWriter;
   private readonly readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>;
 
-  private async captureRuntimeEnvironment(): Promise<RecordedRuntimeEnvironment | undefined> {
-    if (!this.readRuntimeEnvironment) return undefined;
+  private async captureRuntimeEnvironment(): Promise<RuntimeEnvironmentCapture> {
+    if (!this.readRuntimeEnvironment) return { status: 'not-configured' };
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = Symbol('runtime-environment-capture-timeout');
     try {
       const result = await Promise.race([
         Promise.resolve().then(() => this.readRuntimeEnvironment!()),
-        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 1_000); }),
+        new Promise<typeof timedOut>(resolve => { timer = setTimeout(() => resolve(timedOut), 1_000); }),
       ]);
+      if (result === timedOut) return { status: 'timed-out' };
+      if (result === null) return { status: 'unavailable' };
       const parsed = parseRecordedRuntimeEnvironment(result);
+      if (!parsed) return { status: 'invalid' };
       // The reporter owns the observation instant. A reader cannot backdate it.
-      return parsed ? { ...parsed, units: [...parsed.units], observedAt: new Date().toISOString() } : undefined;
-    } catch { return undefined; }
+      return { status: 'captured', witness: { ...parsed, units: [...parsed.units], observedAt: new Date().toISOString() } };
+    } catch { return { status: 'error' }; }
     finally { if (timer) clearTimeout(timer); }
   }
   private preferredPassedCasePattern?: RegExp;
@@ -1596,7 +1610,9 @@ export default class AdminTestRunsReporter implements Reporter {
       mutationPhase: resolveMutationProbePhase(),
     };
     const runtimeEnvironmentBefore = await this.captureRuntimeEnvironment();
-    if (runtimeEnvironmentBefore) this.executionContext.runtimeEnvironmentBefore = runtimeEnvironmentBefore;
+    this.executionContext.runtimeEnvironmentBeforeCaptureStatus = runtimeEnvironmentBefore.status;
+    if (runtimeEnvironmentBefore.status === 'captured')
+      this.executionContext.runtimeEnvironmentBefore = runtimeEnvironmentBefore.witness;
   }
 
   /** Per-module hook — queue the row until the end snapshot is available. */
@@ -1666,7 +1682,9 @@ export default class AdminTestRunsReporter implements Reporter {
       commitSha,
       executionDetails: row.executionDetails
         ? { ...row.executionDetails, worktreeDirty, commitSha,
-          ...(runtimeEnvironmentAfter ? { runtimeEnvironmentAfter } : {}) }
+          runtimeEnvironmentAfterCaptureStatus: runtimeEnvironmentAfter.status,
+          ...(runtimeEnvironmentAfter.status === 'captured'
+            ? { runtimeEnvironmentAfter: runtimeEnvironmentAfter.witness } : {}) }
         : null,
     }));
     const { flushBudgetMs } = reporterWriteBudget(process.env);

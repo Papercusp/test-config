@@ -90,11 +90,11 @@ function fileStatus(result: NodeTestFileResult): TestRunRow['status'] | null {
  * pairs a mutant's failed case with a bound test case — and execution_details carries the
  * exact failedCaseTitles, under the same contract parseTestRunExecutionDetails enforces.
  */
-export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, ctx: NodeTestRowContext): TestRunRow[] {
+export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext: NodeTestRowContext): TestRunRow[] {
   const rows: TestRunRow[] = [];
   for (const result of summary.files) {
     if (typeof result?.file !== 'string' || result.file.length === 0) continue;
-    const filePath = toPosixRel(ctx.repoRoot, result.file);
+    const filePath = toPosixRel(runContext.repoRoot, result.file);
     if (!filePath || !shouldRecordTestRunPath(filePath)) continue;
     const status = fileStatus(result);
     if (status === null) continue;
@@ -117,33 +117,33 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, ctx: NodeTe
     const durationMs = Math.max(0, Math.round(result.durationMs));
     const executionDetails: TestRunExecutionDetails = {
       schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
-      root: ctx.repoRoot,
+      root: runContext.repoRoot,
       filePath,
-      runGroupId: ctx.runGroupId,
-      workspaceId: ctx.workspaceId,
-      harnessSlug: ctx.harnessSlug,
-      testNamePattern: ctx.testNamePattern,
+      runGroupId: runContext.runGroupId,
+      workspaceId: runContext.workspaceId,
+      harnessSlug: runContext.harnessSlug,
+      testNamePattern: runContext.testNamePattern,
       passed: result.passed,
       failed: result.failed,
       ...(failedCaseTitles.length > 0 ? { failedCaseTitles } : {}),
       ...(passedCaseTitles.length > 0 ? { passedCaseTitles } : {}),
       skipped: result.skipped,
       collectionFailed,
-      mutationPhase: ctx.mutationPhase,
-      commitSha: ctx.commitSha,
-      worktreeDirty: ctx.worktreeDirty,
-      ...(ctx.worktreeDirty && ctx.worktreeDirtyReason ? { worktreeDirtyReason: ctx.worktreeDirtyReason } : {}),
+      mutationPhase: runContext.mutationPhase,
+      commitSha: runContext.commitSha,
+      worktreeDirty: runContext.worktreeDirty,
+      ...(runContext.worktreeDirty && runContext.worktreeDirtyReason ? { worktreeDirtyReason: runContext.worktreeDirtyReason } : {}),
     };
     rows.push({
       filePath,
       status,
       durationMs,
-      startedAt: new Date(ctx.finishedAt.getTime() - durationMs),
-      finishedAt: ctx.finishedAt,
+      startedAt: new Date(runContext.finishedAt.getTime() - durationMs),
+      finishedAt: runContext.finishedAt,
       outputTail,
       isScratchConfig: false,
-      worktreeDirty: ctx.worktreeDirty,
-      commitSha: ctx.commitSha,
+      worktreeDirty: runContext.worktreeDirty,
+      commitSha: runContext.commitSha,
       executionDetails,
     });
   }
