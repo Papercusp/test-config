@@ -50,6 +50,7 @@ import AdminTestRunsReporter, {
   type PgSql,
   type TestRunRow,
 } from './admin-test-runs-reporter';
+import { parseTestRunExecutionDetails } from './execution-details.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
@@ -221,6 +222,11 @@ describe('durable module execution measurement', () => {
     expect(rows[0].outputTail).toHaveLength(4_000);
     for (const name of names) expect(rows[0].outputTail).not.toContain(name);
     expect(rows[0].executionDetails).toMatchObject({
+      passed: 1, failed: 3, failedCaseTitles: names, passedCaseTitles: ['suite > passes'],
+    });
+    // Recovery readers enforce this exact schema. Keep the writer and reader in
+    // lockstep so a reporter field cannot turn an otherwise measured pass into unknown.
+    expect(parseTestRunExecutionDetails(rows[0].executionDetails)).toMatchObject({
       passed: 1, failed: 3, failedCaseTitles: names, passedCaseTitles: ['suite > passes'],
     });
   });
