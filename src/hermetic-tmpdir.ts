@@ -131,7 +131,7 @@
  *     creator's pid look alive. That merely delays the reap; MAX_AGE is the backstop
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
-import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 /** Never touch a dir younger than this — a peer may have just created it. */
@@ -335,6 +335,115 @@ export function sweepStaleTestScratch(
     ...opts,
     ageOnly: true,
   });
+}
+
+/** Keep Chromium cloud-tutorial diagnostics useful without letting them fill TMPDIR. */
+export const CLOUD_TUTORIAL_NETLOG_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+export const CLOUD_TUTORIAL_NETLOG_MAX_FILES = 16;
+export const CLOUD_TUTORIAL_NETLOG_MAX_BYTES = 1024 ** 3;
+const CLOUD_TUTORIAL_NETLOG_NAME = /^papercusp-cloud-tutorial-netlog-(\d+)(?:-[a-z0-9-]+)?\.json$/i;
+
+export interface CloudTutorialNetlogSweepOptions {
+  now?: number;
+  maxAgeMs?: number;
+  maxFiles?: number;
+  maxBytes?: number;
+  isAlive?: (pid: number) => boolean;
+}
+
+export interface CloudTutorialNetlogSweepResult {
+  scanned: number;
+  removed: number;
+  keptAlive: number;
+  remainingFiles: number;
+  remainingBytes: number;
+  overBudget: boolean;
+}
+
+/**
+ * Prune only this fixture's regular netlog files. New workers get a unique run
+ * token, so a stale file from a recycled pid cannot alias the current writer.
+ * Live workers are retained; age is the backstop for recycled pids and count/byte
+ * limits remove the oldest abandoned diagnostics first.
+ */
+export function sweepCloudTutorialNetlogs(
+  root: string,
+  opts: CloudTutorialNetlogSweepOptions = {},
+): CloudTutorialNetlogSweepResult {
+  const result: CloudTutorialNetlogSweepResult = {
+    scanned: 0,
+    removed: 0,
+    keptAlive: 0,
+    remainingFiles: 0,
+    remainingBytes: 0,
+    overBudget: false,
+  };
+  let entries: ReturnType<typeof readdirSync>;
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return result;
+  }
+
+  const now = opts.now ?? Date.now();
+  const maxAgeMs = opts.maxAgeMs ?? CLOUD_TUTORIAL_NETLOG_MAX_AGE_MS;
+  const maxFiles = opts.maxFiles ?? CLOUD_TUTORIAL_NETLOG_MAX_FILES;
+  const maxBytes = opts.maxBytes ?? CLOUD_TUTORIAL_NETLOG_MAX_BYTES;
+  const isAlive = opts.isAlive ?? creatorIsAlive;
+  const candidates: Array<{ path: string; pid: number; mtimeMs: number; size: number }> = [];
+
+  for (const entry of entries) {
+    const match = CLOUD_TUTORIAL_NETLOG_NAME.exec(entry.name);
+    if (!match || !entry.isFile()) continue;
+    result.scanned += 1;
+    try {
+      const path = join(root, entry.name);
+      const stat = lstatSync(path);
+      if (!stat.isFile()) continue;
+      candidates.push({ path, pid: Number(match[1]), mtimeMs: stat.mtimeMs, size: stat.size });
+    } catch {
+      // A concurrent worker may have already removed or replaced the entry.
+    }
+  }
+
+  candidates.sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path));
+  let remainingFiles = candidates.length;
+  let remainingBytes = candidates.reduce((total, candidate) => total + candidate.size, 0);
+
+  for (const candidate of candidates) {
+    const pastAgeLimit = now - candidate.mtimeMs > maxAgeMs;
+    const overBudget = remainingFiles > maxFiles || remainingBytes > maxBytes;
+    if (!pastAgeLimit && !overBudget) continue;
+    if (!pastAgeLimit && isAlive(candidate.pid)) {
+      result.keptAlive += 1;
+      continue;
+    }
+    try {
+      unlinkSync(candidate.path);
+      result.removed += 1;
+      remainingFiles -= 1;
+      remainingBytes -= candidate.size;
+    } catch {
+      // Best effort: another worker may win the same stale-file cleanup race.
+    }
+  }
+
+  result.remainingFiles = remainingFiles;
+  result.remainingBytes = remainingBytes;
+  result.overBudget = remainingFiles > maxFiles || remainingBytes > maxBytes;
+  return result;
+}
+
+/** Prepare a unique Chromium log path after pruning prior abandoned runs. */
+export function prepareCloudTutorialNetlog(
+  root: string,
+  opts: CloudTutorialNetlogSweepOptions & { pid?: number; runToken?: string } = {},
+): { path: string; chromiumArg: string; cleanup: CloudTutorialNetlogSweepResult } {
+  const cleanup = sweepCloudTutorialNetlogs(root, opts);
+  const pid = opts.pid ?? process.pid;
+  const runToken = opts.runToken ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const path = join(root, `papercusp-cloud-tutorial-netlog-${pid}-${runToken}.json`);
+  return { path, chromiumArg: `--log-net-log=${path}`, cleanup };
 }
 
 /**
