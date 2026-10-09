@@ -26,6 +26,7 @@ import {
   statSync,
   symlinkSync,
   utimesSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,6 +36,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   createHermeticDir,
   creatorIsAlive,
+  prepareCloudTutorialNetlog,
+  sweepCloudTutorialNetlogs,
+  CLOUD_TUTORIAL_NETLOG_MAX_AGE_MS,
+  CLOUD_TUTORIAL_NETLOG_MAX_BYTES,
+  CLOUD_TUTORIAL_NETLOG_MAX_FILES,
   GENERIC_SCRATCH_SWEEP_EXCLUDE,
   GENERIC_SCRATCH_SWEEP_MAX_AGE_MS,
   HERMETIC_SWEEP_MAX_AGE_MS,
@@ -209,6 +215,76 @@ function seedNamed(name: string, ageMs: number): string {
   utimesSync(path, when, when);
   return path;
 }
+
+function seedNetlog(pid: number, token: string | null, content: string, ageMs = 0): string {
+  const suffix = token ? `-${token}` : '';
+  const path = join(root, `papercusp-cloud-tutorial-netlog-${pid}${suffix}.json`);
+  writeFileSync(path, content);
+  const when = (Date.now() - ageMs) / 1000;
+  utimesSync(path, when, when);
+  return path;
+}
+
+describe('cloud tutorial Chromium netlog retention', () => {
+  it('removes only old abandoned netlogs and keeps live, unrelated, and symlink entries', () => {
+    const stale = seedNetlog(DEAD_PID, null, 'old', CLOUD_TUTORIAL_NETLOG_MAX_AGE_MS + 60_000);
+    const live = seedNetlog(ALIVE_PID, 'live', 'active', 60_000);
+    const unrelated = join(root, 'keep-me.json');
+    writeFileSync(unrelated, 'unrelated');
+    const link = join(root, 'papercusp-cloud-tutorial-netlog-987654-live.json');
+    symlinkSync(unrelated, link);
+
+    const result = sweepCloudTutorialNetlogs(root, {
+      now: Date.now(),
+      maxAgeMs: CLOUD_TUTORIAL_NETLOG_MAX_AGE_MS,
+      maxFiles: CLOUD_TUTORIAL_NETLOG_MAX_FILES,
+      maxBytes: CLOUD_TUTORIAL_NETLOG_MAX_BYTES,
+    });
+
+    expect(result.removed).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(live)).toBe(true);
+    expect(existsSync(unrelated)).toBe(true);
+    expect(existsSync(link)).toBe(true);
+    expect(result.overBudget).toBe(false);
+  });
+
+  it('trims the oldest inactive logs until both count and byte budgets hold', () => {
+    const old = seedNetlog(100001, 'old', 'aaaa', 3_000);
+    const middle = seedNetlog(100002, 'middle', 'bbbb', 2_000);
+    const newest = seedNetlog(100003, 'newest', 'cccc', 1_000);
+
+    const result = sweepCloudTutorialNetlogs(root, {
+      now: Date.now(),
+      maxAgeMs: 60_000,
+      maxFiles: 2,
+      maxBytes: 8,
+      isAlive: () => false,
+    });
+
+    expect(result.removed).toBe(1);
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(middle)).toBe(true);
+    expect(existsSync(newest)).toBe(true);
+    expect(result.remainingFiles).toBe(2);
+    expect(result.remainingBytes).toBe(8);
+    expect(result.overBudget).toBe(false);
+  });
+
+  it('prepares a unique Chromium argument after pruning prior runs', () => {
+    const stale = seedNetlog(100004, null, 'old', CLOUD_TUTORIAL_NETLOG_MAX_AGE_MS + 1);
+    const prepared = prepareCloudTutorialNetlog(root, {
+      now: Date.now(),
+      pid: 100005,
+      runToken: 'fixture-run',
+    });
+
+    expect(prepared.path).toBe(join(root, 'papercusp-cloud-tutorial-netlog-100005-fixture-run.json'));
+    expect(prepared.chromiumArg).toBe(`--log-net-log=${prepared.path}`);
+    expect(prepared.cleanup.removed).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+  });
+});
 
 describe('sweepStaleTestScratch', () => {
   // These dirs are NOT pid-stamped (17 real test files mint their own prefix

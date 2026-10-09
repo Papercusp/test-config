@@ -131,6 +131,7 @@
  *     creator's pid look alive. That merely delays the reap; MAX_AGE is the backstop
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
+import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -363,8 +364,8 @@ export interface CloudTutorialNetlogSweepResult {
 /**
  * Prune only this fixture's regular netlog files. New workers get a unique run
  * token, so a stale file from a recycled pid cannot alias the current writer.
- * Live workers are retained; age is the backstop for recycled pids and count/byte
- * limits remove the oldest abandoned diagnostics first.
+ * Live workers are retained under the age limit; age is the backstop for recycled
+ * pids, and count/byte limits remove the oldest abandoned diagnostics first.
  */
 export function sweepCloudTutorialNetlogs(
   root: string,
@@ -441,7 +442,7 @@ export function prepareCloudTutorialNetlog(
 ): { path: string; chromiumArg: string; cleanup: CloudTutorialNetlogSweepResult } {
   const cleanup = sweepCloudTutorialNetlogs(root, opts);
   const pid = opts.pid ?? process.pid;
-  const runToken = opts.runToken ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const runToken = opts.runToken ?? randomUUID();
   const path = join(root, `papercusp-cloud-tutorial-netlog-${pid}-${runToken}.json`);
   return { path, chromiumArg: `--log-net-log=${path}`, cleanup };
 }
