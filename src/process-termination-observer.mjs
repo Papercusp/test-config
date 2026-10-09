@@ -30,6 +30,13 @@ export function observeProcessTermination(callback) {
       }
     };
     process.once('exit', exitCode => notify({ phase: 'exit', exitCode, signal: null }));
+    if (isMainThread) {
+      // Signal listeners disable Node's native action, but their libuv handles
+      // are unreferenced. A short-lived process can otherwise exit before a
+      // pending signal dispatches. Give the poll phase one final turn without
+      // keeping a naturally completed process alive indefinitely.
+      process.once('beforeExit', () => setImmediate(() => {}));
+    }
     if (isMainThread) for (const signal of ['SIGTERM', 'SIGINT']) {
       const observer = () => {
         const hasApplicationHandler = process.listeners(signal).some(listener => listener !== observer);

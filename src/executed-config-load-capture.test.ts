@@ -166,8 +166,9 @@ describe('original config load evidence', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 120000);
 
-  it.each(['SIGTERM', 'SIGINT', 'application-handler', 'observer-failure', 'SIGKILL', 'exit'] as const)
-    ('preserves process termination semantics and duplicate observer delivery (%s)', mode => {
+  it.each((['SIGTERM', 'SIGINT', 'application-handler', 'observer-failure', 'SIGKILL', 'exit'] as const)
+    .flatMap(mode => [false, true].map(keepAlive => ({ mode, keepAlive }))))
+    ('preserves process termination semantics and duplicate observer delivery ($mode, keepAlive=$keepAlive)', ({ mode, keepAlive }) => {
       const dir = mkdtempSync(join(tmpdir(), 'termination-semantics-'));
       const events = join(dir, 'events.jsonl');
       const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
@@ -186,7 +187,7 @@ describe('original config load evidence', () => {
           ${mode === 'observer-failure' ? "first.observeProcessTermination(() => { throw new Error('fixture observer failure'); });" : ''}
           ${mode === 'application-handler' ? "process.once('SIGTERM', () => process.exit(23));" : ''}
           ${mode === 'exit' ? 'process.exitCode = 7;' : `process.kill(process.pid, ${JSON.stringify(mode === 'SIGINT' || mode === 'SIGKILL' ? mode : 'SIGTERM')});
-            setInterval(() => {}, 1000);`}`;
+            ${keepAlive ? 'setInterval(() => {}, 1000);' : ''}`}`;
         const run = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
           env, encoding: 'utf8', timeout: 10000,
         });
