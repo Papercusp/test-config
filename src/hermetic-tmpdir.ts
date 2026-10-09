@@ -134,6 +134,7 @@
 import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 
 /** Never touch a dir younger than this — a peer may have just created it. */
 export const HERMETIC_SWEEP_MIN_AGE_MS = 60_000;
@@ -175,6 +176,19 @@ export const GENERIC_SCRATCH_SWEEP_EXCLUDE: ReadonlySet<string> = new Set([
   'papercusp-voice-ipc-hermetic',
   'papercusp-affected-tests',
 ]);
+
+/**
+ * Affected-run journals are evidence, not test scratch. Keep them beside the
+ * existing operator logs so a later scratch sweep cannot erase settled child
+ * output before a successor audits it. Response files and source maps still use
+ * the independently swept scratch namespace.
+ */
+export function affectedTestRunLogPath(runToken: string, home: string = homedir()): string {
+  if (!/^\d+-[a-f0-9]+$/.test(runToken)) throw new Error('Invalid affected-run log token');
+  const root = join(home, '.papercusp', 'logs', 'papercusp-affected-tests');
+  mkdirSync(root, { recursive: true });
+  return join(root, `${runToken}.log`);
+}
 
 /** Directory name minted per process: `<pid>-<mkdtemp suffix>`. */
 function pidFromEntryName(name: string): number {

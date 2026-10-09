@@ -22,6 +22,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -34,6 +35,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  affectedTestRunLogPath,
   createHermeticDir,
   creatorIsAlive,
   prepareCloudTutorialNetlog,
@@ -325,6 +327,31 @@ describe('sweepStaleTestScratch', () => {
   it('is a no-op on a root that does not exist, and never throws', () => {
     const missing = join(root, 'nope', 'still-nope');
     expect(() => sweepStaleTestScratch(missing)).not.toThrow();
+  });
+});
+
+describe('affected-run journal retention', () => {
+  it('preserves settled diagnostics after the scratch evidence control is swept', () => {
+    const home = join(root, 'home');
+    const scratch = join(root, 'tmp', 'papercusp-affected-tests');
+    mkdirSync(scratch, { recursive: true });
+    const journal = affectedTestRunLogPath('1234-abcd', home);
+    const oldJournal = join(scratch, '1234-abcd.log');
+    const record = 'AFFECTED_TASK_OUTPUT_BEGIN task="failed"\nFAIL example.test.ts\nAFFECTED_TASK_OUTPUT_END task="failed"\n';
+    writeFileSync(journal, record);
+    writeFileSync(oldJournal, record);
+    const old = (Date.now() - GENERIC_SCRATCH_SWEEP_MAX_AGE_MS - 60_000) / 1000;
+    utimesSync(journal, old, old);
+    utimesSync(oldJournal, old, old);
+
+    expect(sweepStaleTestScratch(scratch, { startAt: 0 }).removed).toBe(1);
+    expect(existsSync(oldJournal)).toBe(false);
+    expect(readFileSync(journal, 'utf8')).toBe(record);
+    expect(journal).toBe(join(home, '.papercusp', 'logs', 'papercusp-affected-tests', '1234-abcd.log'));
+  });
+
+  it('refuses a token that could escape the log namespace', () => {
+    expect(() => affectedTestRunLogPath('../outside', join(root, 'home'))).toThrow('Invalid affected-run log token');
   });
 });
 
