@@ -61,6 +61,11 @@
       "import": "./src/tmpdir-guard.ts",
       "default": "./src/tmpdir-guard.ts"
     },
+    "./hermetic-tmpdir": {
+      "types": "./src/hermetic-tmpdir.ts",
+      "import": "./src/hermetic-tmpdir.ts",
+      "default": "./src/hermetic-tmpdir.ts"
+    },
     "./admin-test-runs-reporter": {
       "types": "./src/admin-test-runs-reporter.ts",
       "import": "./src/admin-test-runs-reporter.ts",
