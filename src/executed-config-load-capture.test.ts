@@ -16,6 +16,66 @@ const prefix = (path: string): string => `const __vite_injected_original_dirname
 const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=data:application/json;base64,' +
   Buffer.from(JSON.stringify(map)).toString('base64');
 
+describe('engine script execution observations', () => {
+  it('ties coverage to exact transformed script ids while compilation alone stays unknown', () => {
+    const root = mkdtempSync(join(tmpdir(), 'engine-script-observation-'));
+    const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;
+    const url = pathToFileURL(join(root, 'transformed.mjs')).href;
+    const compiled = 'globalThis.__engineMarker = 1;';
+    const transformed = '(function transformed(){ globalThis.__engineMarker = "🌱"; })';
+    const contextSource = 'globalThis.__contextMarker = 3;';
+    try {
+      // Disk intentionally differs from both compiled forms; engine identity
+      // must never be inferred from a URL or a reporter-time disk read.
+      writeFileSync(join(root, 'transformed.mjs'), 'export const original = true;');
+      const script = `import { Session } from 'node:inspector';
+        import vm from 'node:vm';
+        const { observeEngineScriptExecution } = await import(${JSON.stringify(capture)});
+        const observer = observeEngineScriptExecution(${JSON.stringify(root)});
+        const runtime = new Session(); runtime.connect();
+        const post = (method, params = {}) => { let value, error, done = false;
+          runtime.post(method, params, (e, r) => { error = e; value = r; done = true; });
+          if (!done) throw new Error('pending protocol'); if (error) throw error; return value; };
+        post('Runtime.enable');
+        const { scriptId } = post('Runtime.compileScript', {
+          expression: ${JSON.stringify(compiled)}, sourceURL: ${JSON.stringify(url)}, persistScript: true });
+        const before = observer.snapshot();
+        const beforeMarker = globalThis.__engineMarker ?? null;
+        post('Runtime.runScript', { scriptId });
+        const after = observer.snapshot();
+        const fn = vm.runInThisContext(${JSON.stringify(transformed)}, { filename: ${JSON.stringify(url)} });
+        const wrapper = observer.snapshot(); fn(); const called = observer.snapshot();
+        const context = vm.createContext({});
+        vm.runInContext(${JSON.stringify(contextSource)}, context, { filename: ${JSON.stringify(pathToFileURL(join(root, 'context.mjs')).href)} });
+        console.log(JSON.stringify({ scriptId, before, beforeMarker, after, wrapper, called,
+          marker: globalThis.__engineMarker, context: observer.snapshot(), contextMarker: context.__contextMarker }));
+        observer.disconnect(); runtime.disconnect();`;
+      const env = { ...process.env };
+      delete env.NODE_OPTIONS;
+      for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
+      const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+        encoding: 'utf8', timeout: 10000, env,
+      }).trim());
+      expect(result.beforeMarker).toBeNull();
+      expect(result.before.scripts).toContainEqual(expect.objectContaining({ scriptId: result.scriptId,
+        sourceTextSha256: digest(compiled), execution: 'unknown', coverageRanges: [] }));
+      expect(result.after.scripts).toContainEqual(expect.objectContaining({ scriptId: result.scriptId,
+        sourceTextSha256: digest(compiled), execution: 'observed' }));
+      const wrapped = result.wrapper.scripts.find((row: { sourceTextSha256: string }) => row.sourceTextSha256 === digest(transformed));
+      expect(wrapped.scriptId).not.toBe(result.scriptId);
+      expect(wrapped.coverageRanges).toContainEqual(expect.objectContaining({ functionName: 'transformed', count: 0 }));
+      const called = result.called.scripts.find((row: { scriptId: string }) => row.scriptId === wrapped.scriptId);
+      expect(called.coverageRanges).toContainEqual(expect.objectContaining({ functionName: 'transformed', count: 1 }));
+      expect(result.marker).toBe('🌱');
+      expect(result.contextMarker).toBe(3);
+      expect(result.context.scripts).toContainEqual(expect.objectContaining({ path: 'context.mjs',
+        sourceTextSha256: digest(contextSource), execution: 'observed' }));
+      expect(result.context).toMatchObject({ populationStatus: 'unknown', offsetUnits: 'utf16-code-units',
+        unresolved: expect.arrayContaining(['engine-script-population-unmeasured', 'node-loader-chain-not-closed']) });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 describe('capture diagnostic evidence retention', () => {
   function fixture(mode: 'exit' | 'SIGTERM' | 'SIGINT' = 'SIGTERM') {
     const root = mkdtempSync(join(tmpdir(), 'capture-diagnostic-'));
@@ -159,6 +219,9 @@ describe('original config load evidence', () => {
       expect(existsSync(receipt), `missing worker receipt for ${pid}; parent=${JSON.stringify(parentExits)}`).toBe(true);
       expect(JSON.parse(readFileSync(receipt, 'utf8'))).toMatchObject({ pid, isMainThread: true,
         phase: 'signal', exitCode: null, signal: 'SIGTERM', observedSources: expect.any(Array),
+        engineScripts: { populationStatus: 'unknown', scripts: expect.arrayContaining([
+          expect.objectContaining({ execution: 'observed', sourceTextSha256: expect.stringMatching(/^[a-f0-9]{64}$/) }),
+        ]) },
       });
       expect(membership).toContainEqual(expect.objectContaining({ pid, vitestFork: true,
         phase: 'signal', signal: 'SIGTERM', cgroupPath,
