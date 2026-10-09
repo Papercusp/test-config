@@ -132,7 +132,7 @@
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
 import { randomUUID } from 'node:crypto';
-import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -393,7 +393,7 @@ export function sweepCloudTutorialNetlogs(
     remainingBytes: 0,
     overBudget: false,
   };
-  let entries: ReturnType<typeof readdirSync>;
+  let entries: Dirent<string>[];
   try {
     entries = readdirSync(root, { withFileTypes: true });
   } catch {
