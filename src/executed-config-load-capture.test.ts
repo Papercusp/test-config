@@ -1,8 +1,9 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { configBundleSources, qualifyLoadedConfigSources, qualifyLoadedMainProcessSources } from './executed-config-load-capture.ts';
@@ -15,6 +16,109 @@ const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=d
   Buffer.from(JSON.stringify(map)).toString('base64');
 
 describe('original config load evidence', () => {
+  it.skipIf(process.platform !== 'linux')('retains real Vitest fork termination receipts without changing its SIGTERM exit', () => {
+    const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+    const dir = mkdtempSync(join(tmpdir(), 'vitest-fork-termination-'));
+    const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
+    const containment = join(root, 'scripts/lib/managed-test-cgroup-preload.mjs');
+    const fixture = fileURLToPath(new URL('./__fixtures__/armed-capture/', import.meta.url));
+    const bin = join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'vitest.mjs');
+    const out = join(dir, 'sources.json');
+    const cgroups = join(dir, 'cgroups.jsonl');
+    const exits = join(dir, 'child-exits.jsonl');
+    const parentObserver = join(dir, 'parent-observer.mjs');
+    const cgroupPath = readFileSync('/proc/self/cgroup', 'utf8').split('\n')
+      .find(line => line.startsWith('0::'))?.slice(3);
+    expect(cgroupPath).toBeTruthy();
+    try {
+      // Observe the actual parent-side exit event independently of child preloads.
+      writeFileSync(parentObserver, `import cp from 'node:child_process';
+        import { appendFileSync } from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        const original = cp.fork;
+        cp.fork = (...args) => {
+          const child = original(...args);
+          child.once('exit', (code, signal) => appendFileSync(${JSON.stringify(exits)},
+            JSON.stringify({ pid: child.pid, entry: args[0], code, signal }) + '\\n'));
+          return child;
+        };
+        syncBuiltinESMExports();\n`);
+      const env = { ...process.env };
+      for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
+          /^(PC_|VITEST|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_|AFFECTED_)/.test(key) || key === 'NODE_OPTIONS') delete env[key];
+      execFileSync(process.execPath, ['--import', parentObserver, bin, 'run', '--root', fixture,
+        '--config', join(fixture, 'vitest.config.ts'), '--pool=forks', '--maxWorkers=1', '--no-file-parallelism'], {
+        cwd: root, encoding: 'utf8', timeout: 90000,
+        env: { ...env, NODE_OPTIONS: `--import=${pathToFileURL(capture).href} --import=${pathToFileURL(containment).href}`,
+          PC_EXECUTED_SOURCE_MAP_PRELOAD: '1', PC_EXECUTED_SOURCE_MAP_WORKSPACE: '@papercusp/armed-capture-fixture',
+          PC_EXECUTED_SOURCE_MAP_ROOT: root, PC_EXECUTED_SOURCE_MAP_OUT: out, PC_EXECUTED_SOURCE_MAP_NO_PERSIST: '1',
+          HARNESS_ADMIN_DATABASE_URL: 'postgresql://127.0.0.1:1/termination-fixture',
+          PAPERCUSP_TEST_RUNS_DB_URL: 'postgresql://127.0.0.1:1/termination-fixture',
+          PAPERCUSP_TEST_CGROUP_CONTEXT: JSON.stringify({ runGroup: 'fork-termination-regression',
+            deadlineEpochMs: Date.now() + 90000, cgroupPath, evidencePath: cgroups }),
+        },
+      });
+      const membership = readFileSync(cgroups, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const forks = membership.filter(row => row.vitestFork && row.phase === 'preload');
+      const parentExits = readFileSync(exits, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(forks).toHaveLength(1);
+      const pid = forks[0].pid;
+      expect(parentExits).toContainEqual(expect.objectContaining({ pid, code: null, signal: 'SIGTERM' }));
+      const receipt = join(`${out}.processes`, `${pid}-0.json`);
+      expect(existsSync(receipt), `missing worker receipt for ${pid}; parent=${JSON.stringify(parentExits)}`).toBe(true);
+      expect(JSON.parse(readFileSync(receipt, 'utf8'))).toMatchObject({ pid, isMainThread: true,
+        phase: 'signal', exitCode: null, signal: 'SIGTERM', observedSources: expect.any(Array),
+      });
+      expect(membership).toContainEqual(expect.objectContaining({ pid, vitestFork: true,
+        phase: 'signal', signal: 'SIGTERM', cgroupPath,
+      }));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 120000);
+
+  it.each(['SIGTERM', 'SIGINT', 'application-handler', 'observer-failure', 'SIGKILL', 'exit'] as const)
+    ('preserves process termination semantics and duplicate observer delivery (%s)', mode => {
+      const dir = mkdtempSync(join(tmpdir(), 'termination-semantics-'));
+      const events = join(dir, 'events.jsonl');
+      const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
+      const env = { ...process.env };
+      delete env.NODE_OPTIONS;
+      for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
+      try {
+        writeFileSync(events, '');
+        const script = `import { appendFileSync } from 'node:fs';
+          const first = await import(${JSON.stringify(helper)});
+          const duplicate = await import(${JSON.stringify(helper + '?duplicate')});
+          const record = tag => event => appendFileSync(${JSON.stringify(events)},
+            JSON.stringify({ tag, ...event }) + '\\n');
+          first.observeProcessTermination(record('first'));
+          duplicate.observeProcessTermination(record('duplicate'));
+          ${mode === 'observer-failure' ? "first.observeProcessTermination(() => { throw new Error('fixture observer failure'); });" : ''}
+          ${mode === 'application-handler' ? "process.once('SIGTERM', () => process.exit(23));" : ''}
+          ${mode === 'exit' ? 'process.exitCode = 7;' : `process.kill(process.pid, ${JSON.stringify(mode === 'SIGINT' || mode === 'SIGKILL' ? mode : 'SIGTERM')});
+            setInterval(() => {}, 1000);`}`;
+        const run = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+          env, encoding: 'utf8', timeout: 10000,
+        });
+        const rows = readFileSync(events, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+        expect(run.error).toBeUndefined();
+        if (mode === 'application-handler' || mode === 'exit') {
+          expect(run.signal).toBeNull();
+          expect(run.status).toBe(mode === 'exit' ? 7 : 23);
+          expect(rows.filter(row => row.phase === 'exit')).toEqual([
+            { tag: 'first', phase: 'exit', exitCode: run.status, signal: null },
+            { tag: 'duplicate', phase: 'exit', exitCode: run.status, signal: null },
+          ]);
+        } else {
+          expect(run.status).toBeNull();
+          expect(run.signal).toBe(mode === 'SIGKILL' || mode === 'SIGINT' ? mode : 'SIGTERM');
+          expect(rows).toEqual(mode === 'SIGKILL' ? [] : [
+            { tag: 'first', phase: 'signal', exitCode: null, signal: run.signal },
+            { tag: 'duplicate', phase: 'signal', exitCode: null, signal: run.signal },
+          ]);
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it('reports duplicate capture modules while sharing one hook and the loaded inputs', () => {
     const root = mkdtempSync(join(tmpdir(), 'duplicate-original-load-'));
     const capture = new URL('./executed-config-load-capture.ts', import.meta.url);

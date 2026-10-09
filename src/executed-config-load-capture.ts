@@ -8,6 +8,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isMainThread, threadId } from 'node:worker_threads';
 import { pinModuleState } from '@papercusp/module-singleton';
+import { observeProcessTermination } from './process-termination-observer.mjs';
 
 interface LoadedSource { path: string; sha256: string | null }
 interface Preload { kind: 'import' | 'loader' | 'require'; path: string | null; capture: boolean }
@@ -84,7 +85,9 @@ function install(): void {
   }
   // npm, command routers and their descendants do not instantiate the Vitest
   // reporter. Retain each process's observed inputs beside that same OUT file.
-  // A missing exit receipt remains unknown (for example a killed process).
+  // Vitest stops forks with SIGTERM, which does not emit Node's exit event.
+  // Signal receipts are explicit diagnostics, never evidence of exit code 0.
+  // A missing receipt (including SIGKILL) remains unknown.
   const repoRoot = process.env.PC_EXECUTED_SOURCE_MAP_ROOT;
   const outPath = process.env.PC_EXECUTED_SOURCE_MAP_OUT;
   // argv and cwd are mutable application state. Capture the original entry
@@ -93,7 +96,7 @@ function install(): void {
   const rel = repoRoot && entry ? relative(repoRoot, entry).split(/[\\/]/).join('/') : null;
   const entrypoint = isMainThread && rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../') &&
     !rel.split('/').includes('node_modules') ? rel : null;
-  if (repoRoot && isAbsolute(repoRoot)) process.once('exit', exitCode => {
+  if (repoRoot && isAbsolute(repoRoot)) observeProcessTermination(termination => {
     try {
       const evidence = qualifyLoadedSources([...state.sources.keys()], repoRoot, 'process');
       if (!isMainThread) evidence.reasons.push('process-worker-thread-entrypoint-unmeasured');
@@ -105,7 +108,7 @@ function install(): void {
       mkdirSync(directory, { recursive: true });
       writeFileSync(join(directory, `${process.pid}-${threadId}.json`), JSON.stringify({
         schemaVersion: 'node-loaded-process-sources-v1', scope: 'repository-node-process-sources',
-        entrypoint, pid: process.pid, parentPid: process.ppid, isMainThread, threadId, exitCode, ...evidence,
+        entrypoint, pid: process.pid, parentPid: process.ppid, isMainThread, threadId, ...termination, ...evidence,
         // These are observed inputs, never a census of every descendant or a
         // complete runtime identity. The preload itself predates its own hook.
         unresolved: ['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured',
