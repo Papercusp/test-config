@@ -177,6 +177,8 @@ describe('original config load evidence', () => {
     const out = join(dir, 'sources.json');
     const cgroups = join(dir, 'cgroups.jsonl');
     const exits = join(dir, 'child-exits.jsonl');
+    const evaluatorInputs = join(dir, 'evaluator-inputs.jsonl');
+    const sample = join(fixture, 'sample.armed-fixture.ts');
     const parentObserver = join(dir, 'parent-observer.mjs');
     const cgroupPath = readFileSync('/proc/self/cgroup', 'utf8').split('\n')
       .find(line => line.startsWith('0::'))?.slice(3);
@@ -184,6 +186,8 @@ describe('original config load evidence', () => {
     try {
       // Observe the actual parent-side exit event independently of child preloads.
       writeFileSync(parentObserver, `import cp from 'node:child_process';
+        import vm from 'node:vm';
+        import { createHash } from 'node:crypto';
         import { appendFileSync } from 'node:fs';
         import { syncBuiltinESMExports } from 'node:module';
         const original = cp.fork;
@@ -193,6 +197,17 @@ describe('original config load evidence', () => {
             JSON.stringify({ pid: child.pid, entry: args[0], code, signal }) + '\\n'));
           return child;
         };
+        // Observe the actual evaluator argument independently of inspector
+        // source retrieval. Return its compiled function unchanged; execution
+        // is established separately by the named fixture's coverage range.
+        const originalVm = vm.runInThisContext;
+        vm.runInThisContext = function (code, options, ...rest) {
+          const result = originalVm.call(this, code, options, ...rest);
+          if (options?.filename === ${JSON.stringify(sample)}) appendFileSync(${JSON.stringify(evaluatorInputs)},
+            JSON.stringify({ pid: process.pid, filename: options.filename,
+              sha256: createHash('sha256').update(code).digest('hex'), length: code.length }) + '\\n');
+          return result;
+        };
         syncBuiltinESMExports();\n`);
       const env = { ...process.env };
       for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
@@ -200,7 +215,8 @@ describe('original config load evidence', () => {
       execFileSync(process.execPath, ['--import', parentObserver, bin, 'run', '--root', fixture,
         '--config', join(fixture, 'vitest.config.ts'), '--pool=forks', '--maxWorkers=1', '--no-file-parallelism'], {
         cwd: root, encoding: 'utf8', timeout: 90000,
-        env: { ...env, NODE_OPTIONS: `--import=${pathToFileURL(capture).href} --import=${pathToFileURL(containment).href}`,
+        env: { ...env, NODE_OPTIONS: `--import=${pathToFileURL(capture).href} --import=${pathToFileURL(containment).href}` +
+          ` --import=${pathToFileURL(parentObserver).href}`,
           PC_EXECUTED_SOURCE_MAP_PRELOAD: '1', PC_EXECUTED_SOURCE_MAP_WORKSPACE: '@papercusp/armed-capture-fixture',
           PC_EXECUTED_SOURCE_MAP_ROOT: root, PC_EXECUTED_SOURCE_MAP_OUT: out, PC_EXECUTED_SOURCE_MAP_NO_PERSIST: '1',
           HARNESS_ADMIN_DATABASE_URL: 'postgresql://127.0.0.1:1/termination-fixture',
@@ -222,6 +238,21 @@ describe('original config load evidence', () => {
         engineScripts: { populationStatus: 'unknown', scripts: expect.arrayContaining([
           expect.objectContaining({ execution: 'observed', sourceTextSha256: expect.stringMatching(/^[a-f0-9]{64}$/) }),
         ]) },
+      });
+      const inputs = readFileSync(evaluatorInputs, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(inputs).toHaveLength(1);
+      expect(inputs[0]).toMatchObject({ pid, filename: sample });
+      expect(inputs[0].sha256).not.toBe(digest(readFileSync(sample, 'utf8')));
+      const engine = JSON.parse(readFileSync(receipt, 'utf8')).engineScripts;
+      const evaluated = engine.scripts.filter((row: { sourceTextSha256: string }) =>
+        row.sourceTextSha256 === inputs[0].sha256);
+      expect(evaluated).toHaveLength(1);
+      expect(evaluated[0]).toMatchObject({
+        path: 'libs/test-config/src/__fixtures__/armed-capture/sample.armed-fixture.ts',
+        sourceTextLength: inputs[0].length, execution: 'observed',
+        coverageRanges: expect.arrayContaining([
+          expect.objectContaining({ functionName: 'readFixtureInput', count: 1 }),
+        ]),
       });
       expect(membership).toContainEqual(expect.objectContaining({ pid, vitestFork: true,
         phase: 'signal', signal: 'SIGTERM', cgroupPath,
