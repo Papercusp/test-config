@@ -2,14 +2,14 @@ import {
   PostgreSqlContainer,
   type StartedPostgreSqlContainer,
 } from "@testcontainers/postgresql";
-import { Wait } from "testcontainers";
+import { getContainerRuntimeClient, Wait } from "testcontainers";
 import postgres from "postgres";
 import { randomBytes } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, rename, statfs, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
 import { SubstrateCircuitBreaker } from "./substrate-circuit-breaker.ts";
-import { tmpdirHasCriticalHeadroom } from "./tmpdir-guard.ts";
+import { tmpdirHasCriticalHeadroom, type TmpdirStatfs } from "./tmpdir-guard.ts";
 import {
   probePgReachable,
   RETRYABLE_PG_STARTUP_MSG,
@@ -63,30 +63,49 @@ function describeContainer(container: StartedPostgreSqlContainer): string {
 
 /** Check the PG volume, which need not share the host's guarded TMPDIR filesystem. */
 export async function assertSharedTestPgStorageHeadroom(
-  container: Pick<StartedPostgreSqlContainer, "exec" | "getId" | "getHost" | "getMappedPort">,
+  container: Pick<StartedPostgreSqlContainer, "getId" | "getHost" | "getMappedPort">,
   env: NodeJS.ProcessEnv = process.env,
+  deps: {
+    inspectSource?: (id: string) => Promise<string>;
+    readMountInfo?: () => Promise<string>;
+    readStatfs?: (path: string) => Promise<TmpdirStatfs>;
+  } = {},
 ): Promise<void> {
-  // PID 1 is the postmaster. An exec child exiting nonzero can trigger crash
-  // recovery (EI-18680404964770187), so preserve df's error text but exit zero.
-  const result = await container.exec([
-    "sh", "-c", "df -Pk /var/lib/postgresql; exit 0",
-  ]);
-  const fields = result.output.trim().split("\n").at(-1)?.trim().split(/\s+/);
-  if (!fields || fields.length < 6 || !fields.slice(1, 4).every((v) => /^\d+$/.test(v))) {
-    throw new Error("TEST SUBSTRATE STORAGE UNKNOWN: cannot measure the shared PostgreSQL data volume; " + result.output.slice(0, 300));
+  // Never exec inside the PID-1-postmaster container (EI-18680404964770187).
+  // Docker inspection identifies the data source; Linux mountinfo identifies
+  // its filesystem even when the private volume directory is not traversable.
+  const inspectSource = deps.inspectSource ?? (async (id: string) => {
+    const client = await getContainerRuntimeClient();
+    if (process.platform !== "linux" || !["localhost", "127.0.0.1", "::1"].includes(client.info.containerRuntime.host)) {
+      throw new Error("TEST SUBSTRATE STORAGE UNKNOWN: shared PG storage requires a local Linux Docker daemon or a private PAPERCUSP_TEST_PG_ADMIN_URL");
+    }
+    const info = await client.container.inspect(client.container.getById(id));
+    const mount = info.Mounts.find((entry) => entry.Destination === "/var/lib/postgresql");
+    if (!mount?.Source?.startsWith("/")) {
+      throw new Error("TEST SUBSTRATE STORAGE UNKNOWN: shared PG has no inspectable data-volume source");
+    }
+    return mount.Source;
+  });
+  const source = await inspectSource(container.getId());
+  const mountInfo = await (deps.readMountInfo ?? (() => readFile("/proc/self/mountinfo", "utf8")))();
+  const mountpoint = mountInfo.split("\n")
+    .map((line) => line.split(" ")[4]?.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8))))
+    .filter((path): path is string => !!path && (path === "/" || source === path || source.startsWith(`${path}/`)))
+    .sort((a, b) => b.length - a.length)[0];
+  if (!source.startsWith("/") || !mountpoint) {
+    throw new Error("TEST SUBSTRATE STORAGE UNKNOWN: cannot resolve PostgreSQL data-volume filesystem");
   }
-  const totalKiB = Number(fields[1]);
-  const freeKiB = Number(fields[3]);
-  if (totalKiB <= 0 || !Number.isSafeInteger(totalKiB) || !Number.isSafeInteger(freeKiB) || freeKiB > totalKiB) {
+  const snapshot = await (deps.readStatfs ?? statfs)(mountpoint);
+  const totalBytes = Number(snapshot.blocks) * Number(snapshot.bsize);
+  const freeBytes = Number(snapshot.bavail) * Number(snapshot.bsize);
+  if (totalBytes <= 0 || !Number.isSafeInteger(totalBytes) || !Number.isSafeInteger(freeBytes) || freeBytes < 0 || freeBytes > totalBytes) {
     throw new Error("TEST SUBSTRATE STORAGE UNKNOWN: invalid PostgreSQL data-volume capacity");
   }
-  if (!tmpdirHasCriticalHeadroom("/var/lib/postgresql", env, () => ({
-    blocks: totalKiB, bavail: freeKiB, bsize: 1024,
-  }))) {
+  if (!tmpdirHasCriticalHeadroom(mountpoint, env, () => snapshot)) {
     throw new Error(
       `TEST SUBSTRATE STORAGE LOW: testcontainer ${container.getId().slice(0, 12)} ` +
-      `@ ${container.getHost()}:${container.getMappedPort(5432)} has ${freeKiB * 1024} free bytes ` +
-      `of ${totalKiB * 1024} on its PostgreSQL data volume. Refusing new test writes before ENOSPC. ` +
+      `@ ${container.getHost()}:${container.getMappedPort(5432)} has ${freeBytes} free bytes ` +
+      `of ${totalBytes} on PostgreSQL volume ${source} (filesystem ${mountpoint}). Refusing new test writes before ENOSPC. ` +
       "Reclaim owned storage or use a private test PG on a volume with headroom via PAPERCUSP_TEST_PG_ADMIN_URL; " +
       "do not stop the shared container or delete another test's databases.",
     );

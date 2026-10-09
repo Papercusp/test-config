@@ -51,50 +51,69 @@ const SOURCE = readFileSync(
 
 describe("shared test PG data-volume admission (WI-10007793)", () => {
   const GiB = 1024 ** 3;
-  function container(totalBytes: number, freeBytes: number, output?: string) {
-    const commands: string[][] = [];
+  const pg = {
+    getId: () => "failed-volume-container",
+    getHost: () => "localhost",
+    getMappedPort: () => 32769,
+  };
+  function volume(totalBytes: number, freeBytes: number, source = "/var/lib/docker/volumes/test/_data") {
+    const measured: string[] = [];
     return {
-      commands,
-      exec: async (command: string[]) => {
-        commands.push(command);
-        const stdout = output ??
-          `Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/root ${totalBytes / 1024} ${(totalBytes - freeBytes) / 1024} ${freeBytes / 1024} 100% /var/lib/postgresql\n`;
-        return { exitCode: 0, output: stdout, stdout, stderr: "" };
+      measured,
+      inspectSource: async () => source,
+      readMountInfo: async () => "1 0 8:1 / / rw - ext4 /dev/root rw\n2 1 8:2 / /tmp rw - ext4 /dev/scratch rw\n",
+      readStatfs: async (mountpoint: string) => {
+        measured.push(mountpoint);
+        return { blocks: totalBytes / 1024, bavail: freeBytes / 1024, bsize: 1024 };
       },
-      getId: () => "failed-volume-container",
-      getHost: () => "localhost",
-      getMappedPort: () => 32769,
     };
   }
 
   it("refuses a nearly full PG volume even when host TMPDIR has space", async () => {
-    const pg = container(2_000 * GiB, 14 * GiB);
-    await expect(assertSharedTestPgStorageHeadroom(pg, {})).rejects.toThrow(/STORAGE LOW.*32769.*before ENOSPC/);
-    expect(pg.commands).toEqual([["sh", "-c", "df -Pk /var/lib/postgresql; exit 0"]]);
+    const deps = volume(2_000 * GiB, 14 * GiB);
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, deps)).rejects.toThrow(/STORAGE LOW.*32769.*before ENOSPC/);
+    expect(deps.measured).toEqual(["/"]);
   });
 
   it("allows a healthy volume and rechecks its free space on the next acquisition", async () => {
-    const pg = container(2_000 * GiB, 50 * GiB);
-    await expect(assertSharedTestPgStorageHeadroom(pg, {})).resolves.toBeUndefined();
-    pg.exec = container(2_000 * GiB, 1 * GiB).exec;
-    await expect(assertSharedTestPgStorageHeadroom(pg, {})).rejects.toThrow(/STORAGE LOW/);
+    const deps = volume(2_000 * GiB, 50 * GiB);
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, deps)).resolves.toBeUndefined();
+    deps.readStatfs = volume(2_000 * GiB, GiB).readStatfs;
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, deps)).rejects.toThrow(/STORAGE LOW/);
+  });
+
+  it("uses the deepest mount and decodes escaped paths instead of measuring root", async () => {
+    const deps = volume(20 * GiB, 3 * GiB, "/tmp/pg data/volume");
+    deps.readMountInfo = async () => "1 0 8:1 / / rw - ext4 /dev/root rw\n2 1 8:2 / /tmp rw - ext4 /dev/scratch rw\n3 2 8:3 / /tmp/pg\\040data rw - ext4 /dev/pg rw\n";
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, deps)).resolves.toBeUndefined();
+    expect(deps.measured).toEqual(["/tmp/pg data"]);
   });
 
   it("checks cached acquisitions before returning the database URI", () => {
     expect(SOURCE).toMatch(/const container = await containerPromise;[\s\S]*?await assertSharedTestPgStorageHeadroom\(container\);\s*return container\.getConnectionUri\(\);/);
+    expect(readFileSync(new URL("./baseline-schema-global-setup.ts", import.meta.url), "utf8"))
+      .toMatch(/assertSharedTestPgStorageHeadroom\(container\)\);\s*dsn = container\.getConnectionUri\(\);/);
   });
 
   it("uses the maintained absolute floor and capped percentage policy", async () => {
-    await expect(assertSharedTestPgStorageHeadroom(container(8_000 * GiB, 70 * GiB), {})).resolves.toBeUndefined();
-    await expect(assertSharedTestPgStorageHeadroom(container(20 * GiB, GiB), {})).rejects.toThrow(/STORAGE LOW/);
-    await expect(assertSharedTestPgStorageHeadroom(container(20 * GiB, 3 * GiB), {})).resolves.toBeUndefined();
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, volume(8_000 * GiB, 70 * GiB))).resolves.toBeUndefined();
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, volume(20 * GiB, GiB))).rejects.toThrow(/STORAGE LOW/);
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, volume(20 * GiB, 3 * GiB))).resolves.toBeUndefined();
   });
 
-  it.each(["df: cannot read data volume", "Filesystem\n/dev/root 0 0 0 0% /pg", "Filesystem\n/dev/root 100 0 101 0% /pg"])(
-    "does not treat an unreadable or malformed volume as healthy: %s", async (output) => {
-      await expect(assertSharedTestPgStorageHeadroom(container(GiB, GiB, output), {})).rejects.toThrow(/STORAGE UNKNOWN/);
+  it.each([[0, 0], [GiB, -1], [GiB, GiB * 2], [NaN, GiB]])(
+    "does not treat malformed capacity as healthy: %s / %s", async (total, free) => {
+      await expect(assertSharedTestPgStorageHeadroom(pg, {}, volume(total, free))).rejects.toThrow(/STORAGE UNKNOWN/);
     },
   );
+
+  it("fails closed when Docker source or mount metadata is unavailable", async () => {
+    const deps = volume(GiB, GiB);
+    deps.readMountInfo = async () => "";
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, deps)).rejects.toThrow(/STORAGE UNKNOWN/);
+    deps.inspectSource = async () => { throw new Error("inspect unavailable"); };
+    await expect(assertSharedTestPgStorageHeadroom(pg, {}, deps)).rejects.toThrow(/inspect unavailable/);
+  });
 });
 const BASELINE_SCHEMA_SOURCE = readFileSync(
   fileURLToPath(new URL("./baseline-schema-global-setup.ts", import.meta.url)),
