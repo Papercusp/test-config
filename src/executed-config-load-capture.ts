@@ -10,7 +10,8 @@ import { isMainThread, threadId } from 'node:worker_threads';
 import { pinModuleState } from '@papercusp/module-singleton';
 
 interface LoadedSource { path: string; sha256: string | null }
-interface Capture { sources: Map<string, Set<string | null>>; reasons: Set<string> }
+interface Preload { kind: 'import' | 'loader' | 'require'; path: string | null; capture: boolean }
+interface Capture { sources: Map<string, Set<string | null>>; reasons: Set<string>; preloads: Preload[] }
 const shared = pinModuleState<{ capture: Capture | null }>(
   '@papercusp/test-config.original-config-loads', () => ({ capture: null }));
 const hash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
@@ -50,32 +51,36 @@ export function configBundleSources(code: string): LoadedSource[] | null {
 function install(): void {
   if (shared.capture || process.env.PC_EXECUTED_SOURCE_MAP_PRELOAD !== '1' ||
       !process.env.PC_EXECUTED_SOURCE_MAP_OUT || !process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE) return;
-  const state: Capture = { sources: new Map(), reasons: new Set() };
+  const state: Capture = { sources: new Map(), reasons: new Set(), preloads: [] };
   shared.capture = state;
   // A later preload can wrap this hook and replace the bytes it observed.
   // Without a receipt for that layer, the intermediate bytes are not original
   // execution authority. Recognize only this preload, including symlink paths.
-  const preloads: string[] = [];
+  const preloads: Array<{ kind: Preload['kind']; specifier: string }> = [];
   const args = process.execArgv;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--eval' || args[i] === '-e') { i++; continue; }
-    if (args[i] === '--import') preloads.push(args[++i] ?? '');
-    else if (args[i].startsWith('--import=')) preloads.push(args[i].slice(9));
-    else if (/^(?:--(?:experimental-)?loader|--require|-r)(?:=|$)/.test(args[i]))
-      state.reasons.add('node-loader-chain-unmeasured');
+    const flag = /^(--import|--(?:experimental-)?loader|--require|-r)(?:=(.*))?$/.exec(args[i]);
+    if (flag) preloads.push({ kind: flag[1] === '--import' ? 'import' :
+      flag[1] === '--require' || flag[1] === '-r' ? 'require' : 'loader',
+      specifier: flag[2] ?? args[++i] ?? '' });
   }
   const options = process.env.NODE_OPTIONS ?? '';
-  const importFlags = [...options.matchAll(/(?:^|\s)--import(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s]+))/g)];
-  for (const match of importFlags) preloads.push(match[1] ?? match[2] ?? match[3]);
-  if ((options.match(/(?:^|\s)--import(?==|\s|$)/g)?.length ?? 0) !== importFlags.length ||
-      /(?:^|\s)(?:--(?:experimental-)?loader|--require|-r)(?:=|\s|$)/.test(options))
+  const preloadFlags = [...options.matchAll(/(?:^|\s)(--import|--(?:experimental-)?loader|--require|-r)(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s]+))/g)];
+  for (const match of preloadFlags) preloads.push({ kind: match[1] === '--import' ? 'import' :
+    match[1] === '--require' || match[1] === '-r' ? 'require' : 'loader',
+    specifier: match[2] ?? match[3] ?? match[4] });
+  if ((options.match(/(?:^|\s)(?:--import|--(?:experimental-)?loader|--require|-r)(?==|\s|$)/g)?.length ?? 0) !== preloadFlags.length)
     state.reasons.add('node-loader-chain-unmeasured');
   for (const preload of preloads) {
+    let path: string | null = null;
+    let capture = false;
     try {
-      const path = preload.startsWith('file:') ? fileURLToPath(preload) : resolve(preload);
-      if (realpathSync(path) !== realpathSync(fileURLToPath(import.meta.url)))
-        state.reasons.add('node-loader-chain-unmeasured');
+      path = preload.specifier.startsWith('file:') ? fileURLToPath(preload.specifier) : resolve(preload.specifier);
+      capture = preload.kind === 'import' && realpathSync(path) === realpathSync(fileURLToPath(import.meta.url));
     } catch { state.reasons.add('node-loader-chain-unmeasured'); }
+    state.preloads.push({ kind: preload.kind, path, capture });
+    if (!capture) state.reasons.add('node-loader-chain-unmeasured');
   }
   // npm, command routers and their descendants do not instantiate the Vitest
   // reporter. Retain each process's observed inputs beside that same OUT file.
@@ -114,7 +119,10 @@ function install(): void {
   }
   const record = ({ path, sha256 }: LoadedSource): void => {
     const seen = state.sources.get(path) ?? new Set<string | null>();
-    seen.add(state.reasons.has('node-loader-chain-unmeasured') ? null : sha256);
+    // Retain the bytes at this hook's boundary even when another hook can
+    // replace them later. Qualification below keeps those diagnostics separate
+    // from original-source authority; a preload list never closes a chain.
+    seen.add(sha256);
     state.sources.set(path, seen);
   };
   nodeModule.registerHooks({ load(url, context, nextLoad) {
@@ -154,7 +162,16 @@ export interface LoadedConfigSources {
   basis: 'node-load-hook';
   status: 'stable' | 'changed' | 'unknown';
   sources: Array<{ path: string; sha256: string | null; currentSha256: string | null }>;
+  /** Diagnostic bytes at this hook's boundary, including embedded config
+   * originals. Never proof of the final bytes returned by later loaders. */
+  observedSources: Array<{ path: string; observedSha256: string | null }>;
   reasons: string[];
+  loaderChain: {
+    scope: 'declared-node-preloads';
+    status: 'unknown';
+    preloads: Array<Preload & { observedSha256: string | null }>;
+    unresolved: string[];
+  };
 }
 
 /** The repository files observed by this main process, beyond bundled config
@@ -171,6 +188,7 @@ function qualifyLoadedSources(paths: string[] | null, repoRoot: string, prefix: 
   let changed = false;
   if (!paths?.length) reasons.add(`${prefix}-dependencies-unavailable`);
   const sources: LoadedConfigSources['sources'] = [];
+  const observedSources: LoadedConfigSources['observedSources'] = [];
   for (const absolute of paths ?? []) {
     const path = relative(repoRoot, absolute).split(/[\\/]/).join('/');
     if (!isAbsolute(absolute) || !path || path === '..' || path.startsWith('../') || isAbsolute(path) ||
@@ -179,7 +197,8 @@ function qualifyLoadedSources(paths: string[] | null, repoRoot: string, prefix: 
       continue;
     }
     const hashes = state?.sources.get(absolute);
-    const sha256 = hashes?.size === 1 ? [...hashes][0]! : null;
+    const observedSha256 = hashes?.size === 1 ? [...hashes][0]! : null;
+    const sha256 = state?.reasons.has('node-loader-chain-unmeasured') ? null : observedSha256;
     if (sha256 === null) reasons.add(`${prefix}-original-load-unavailable:${path}`);
     let currentSha256: string | null = null;
     try { currentSha256 = hash(readFileSync(resolve(repoRoot, path))); }
@@ -189,10 +208,19 @@ function qualifyLoadedSources(paths: string[] | null, repoRoot: string, prefix: 
       reasons.add(`${prefix}-loaded-source-changed:${path}`);
     }
     sources.push({ path, sha256, currentSha256 });
+    observedSources.push({ path, observedSha256 });
   }
   if (sources.length === 0) reasons.add(`${prefix}-loaded-sources-unavailable`);
   return { basis: 'node-load-hook', status: changed ? 'changed' : reasons.size ? 'unknown' : 'stable',
-    sources: sources.sort((a, b) => a.path.localeCompare(b.path)), reasons: [...reasons].sort() };
+    sources: sources.sort((a, b) => a.path.localeCompare(b.path)), reasons: [...reasons].sort(),
+    observedSources: observedSources.sort((a, b) => a.path.localeCompare(b.path)),
+    loaderChain: { scope: 'declared-node-preloads', status: 'unknown',
+      preloads: (state?.preloads ?? []).map(preload => {
+        const hashes = preload.path ? state?.sources.get(preload.path) : undefined;
+        return { ...preload, observedSha256: hashes?.size === 1 ? [...hashes][0]! : null };
+      }),
+      unresolved: ['node-loader-chain-not-closed', 'node-preload-self-unmeasured'] },
+  };
 }
 
 export function qualifyLoadedConfigSources(paths: string[] | null, repoRoot: string): LoadedConfigSources {

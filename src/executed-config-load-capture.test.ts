@@ -128,6 +128,15 @@ describe('original config load evidence', () => {
           unresolved: expect.arrayContaining(['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured']),
         });
         expect(child.status).toBe(kind === 'stable' || kind === 'mutated-argv' ? 'stable' : kind === 'self-restoring' ? 'changed' : 'unknown');
+        expect(child.observedSources).toEqual(expect.arrayContaining([{ path: `helper.${extension}`,
+          observedSha256: kind === 'commonjs' ? null : digest(loaded) }]));
+        if (kind === 'overriding-loader') expect(child.loaderChain).toMatchObject({
+          scope: 'declared-node-preloads', status: 'unknown',
+          preloads: expect.arrayContaining([expect.objectContaining({
+            kind: 'import', path: loader, capture: false,
+            observedSha256: digest(readFileSync(loader, 'utf8')),
+          })]),
+        });
       } finally { rmSync(root, { recursive: true, force: true }); }
     });
 
@@ -140,6 +149,78 @@ describe('original config load evidence', () => {
       status: 'unknown', sources: [], reasons: expect.arrayContaining(['main-process-node-load-capture-unavailable']),
     });
   });
+
+  it.each(['before', 'after'] as const)
+    ('retains observed preload bytes without closing a harmless loader chain (%s capture)', order => {
+      const root = mkdtempSync(join(tmpdir(), 'preload-original-load-'));
+      const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
+      const preload = join(root, 'preload.mjs');
+      const helper = join(root, 'helper.mjs');
+      const preloadSource = 'export const preload = true;\n';
+      const helperSource = 'export const value = 1;\n';
+      try {
+        writeFileSync(preload, preloadSource);
+        writeFileSync(helper, helperSource);
+        const script = `await import(${JSON.stringify(pathToFileURL(helper).href)});
+          const { qualifyLoadedConfigSources } = await import(${JSON.stringify(pathToFileURL(capture).href)});
+          console.log(JSON.stringify(qualifyLoadedConfigSources([${JSON.stringify(helper)}], ${JSON.stringify(root)})));`;
+        const env = { ...process.env };
+        delete env.NODE_OPTIONS;
+        const imports = order === 'before' ? [capture, preload] : [preload, capture];
+        const out = execFileSync(process.execPath, [...imports.flatMap(path => ['--import', path]),
+          '--input-type=module', '--eval', script], { cwd: root, encoding: 'utf8', timeout: 30000,
+          env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'preload-load-test',
+            PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json'), PC_EXECUTED_SOURCE_MAP_PRELOAD: '1' },
+        });
+        expect(JSON.parse(out.trim())).toMatchObject({ status: 'unknown',
+          reasons: expect.arrayContaining(['node-loader-chain-unmeasured']),
+          sources: [{ path: 'helper.mjs', sha256: null, currentSha256: digest(helperSource) }],
+          observedSources: [{ path: 'helper.mjs', observedSha256: digest(helperSource) }],
+          loaderChain: { status: 'unknown', scope: 'declared-node-preloads',
+            preloads: expect.arrayContaining([
+              { kind: 'import', path: capture, capture: true, observedSha256: null },
+              { kind: 'import', path: preload, capture: false,
+                observedSha256: order === 'before' ? digest(preloadSource) : null },
+            ]), unresolved: expect.arrayContaining(['node-loader-chain-not-closed', 'node-preload-self-unmeasured']) },
+        });
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+  it.each(['before', 'after'] as const)
+    ('keeps an overriding preload unknown even when its observed boundary matches disk (%s capture)', order => {
+      const root = mkdtempSync(join(tmpdir(), 'overriding-original-load-'));
+      const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
+      const loader = join(root, 'loader.mjs');
+      const helper = join(root, 'helper.mjs');
+      const original = 'export const value = 1;\n';
+      const replaced = 'export const value = 2;\n';
+      try {
+        writeFileSync(helper, original);
+        writeFileSync(loader, `import { registerHooks } from 'node:module';
+          registerHooks({ load(url, context, nextLoad) {
+            const result = nextLoad(url, context);
+            return url.endsWith('/helper.mjs') ? { ...result, source: ${JSON.stringify(replaced)} } : result;
+          } });\n`);
+        const script = `const { value } = await import(${JSON.stringify(pathToFileURL(helper).href)});
+          const { qualifyLoadedConfigSources } = await import(${JSON.stringify(pathToFileURL(capture).href)});
+          console.log(JSON.stringify({ value, evidence:
+            qualifyLoadedConfigSources([${JSON.stringify(helper)}], ${JSON.stringify(root)}) }));`;
+        const env = { ...process.env };
+        delete env.NODE_OPTIONS;
+        const imports = order === 'before' ? [capture, loader] : [loader, capture];
+        const out = execFileSync(process.execPath, [...imports.flatMap(path => ['--import', path]),
+          '--input-type=module', '--eval', script], { cwd: root, encoding: 'utf8', timeout: 30000,
+          env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'overriding-load-test',
+            PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json'), PC_EXECUTED_SOURCE_MAP_PRELOAD: '1' },
+        });
+        expect(JSON.parse(out.trim())).toMatchObject({ value: 2, evidence: { status: 'unknown',
+          reasons: expect.arrayContaining(['node-loader-chain-unmeasured']),
+          sources: [{ path: 'helper.mjs', sha256: null, currentSha256: digest(original) }],
+          observedSources: [{ path: 'helper.mjs', observedSha256: digest(order === 'before' ? original : replaced) }],
+          loaderChain: { status: 'unknown' },
+        } });
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
 
   it.each(['stable', 'self-restoring', 'commonjs', 'outside', 'reloaded'] as const)
     ('retains actual native main-process inputs separately from config inputs (%s)', kind => {
@@ -182,6 +263,56 @@ describe('original config load evidence', () => {
         }
       } finally { rmSync(base, { recursive: true, force: true }); }
     });
+
+  it('retains source and containment receipts with the actual calibration preloads', () => {
+    const root = mkdtempSync(join(tmpdir(), 'calibration-original-load-'));
+    const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
+    const committed = fileURLToPath(new URL('../../../scripts/lib/committed-source-loader.mjs', import.meta.url));
+    const containment = fileURLToPath(new URL('../../../scripts/lib/managed-test-cgroup-preload.mjs', import.meta.url));
+    const outPath = join(root, 'out.json');
+    const cgroups = join(root, 'cgroups.jsonl');
+    const entry = join(root, 'entry.mjs');
+    const entrySource = 'export const value = 1;\n';
+    try {
+      writeFileSync(entry, entrySource);
+      const cgroupPath = /^0::(.+)$/m.exec(readFileSync('/proc/self/cgroup', 'utf8'))?.[1];
+      expect(cgroupPath).toBeTruthy();
+      const env = { ...process.env };
+      delete env.NODE_OPTIONS;
+      const runGroup = 'capture-calibration-test';
+      const deadlineEpochMs = Date.now() + 30000;
+      execFileSync(process.execPath, ['--import', committed, entry], { cwd: root,
+        encoding: 'utf8', timeout: 30000,
+        env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'calibration-load-test',
+          PC_EXECUTED_SOURCE_MAP_ROOT: root, PC_EXECUTED_SOURCE_MAP_OUT: outPath,
+          PC_EXECUTED_SOURCE_MAP_PRELOAD: '1',
+          NODE_OPTIONS: `--import=${pathToFileURL(capture).href} --import=${pathToFileURL(containment).href}`,
+          PAPERCUSP_COMMITTED_SOURCE_AUDIT: join(root, 'committed.jsonl'),
+          PAPERCUSP_TEST_CGROUP_CONTEXT: JSON.stringify({ runGroup, deadlineEpochMs, cgroupPath, evidencePath: cgroups }),
+        },
+      });
+      const receipts = readdirSync(`${outPath}.processes`).map(file =>
+        JSON.parse(readFileSync(join(`${outPath}.processes`, file), 'utf8')));
+      const receipt = receipts.find(receipt => receipt.entrypoint === 'entry.mjs' && receipt.isMainThread);
+      expect(receipt).toMatchObject({ status: 'unknown', exitCode: 0,
+        sources: expect.arrayContaining([{ path: 'entry.mjs', sha256: null, currentSha256: digest(entrySource) }]),
+        observedSources: expect.arrayContaining([{ path: 'entry.mjs', observedSha256: digest(entrySource) }]),
+        loaderChain: { status: 'unknown', preloads: expect.arrayContaining([
+          expect.objectContaining({ path: committed, capture: false, observedSha256: expect.stringMatching(/^[a-f0-9]{64}$/) }),
+          expect.objectContaining({ path: containment, capture: false, observedSha256: expect.stringMatching(/^[a-f0-9]{64}$/) }),
+        ]) },
+        unresolved: expect.arrayContaining(['node-process-descendant-population-unmeasured', 'node-loader-chain-not-closed']),
+      });
+      const membership = readFileSync(cgroups, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const ownMembership = membership.filter(row => row.pid === receipt.pid && row.isMainThread);
+      expect(ownMembership.map(row => row.phase)).toEqual(['preload', 'exit']);
+      for (const row of ownMembership) expect(row).toMatchObject({ runGroup, deadlineEpochMs, cgroupPath });
+      const committedLoads = readFileSync(join(root, 'committed.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(committedLoads).toEqual(expect.arrayContaining([expect.objectContaining({
+        file: entry, returnedSha256: digest(entrySource), boundary: 'node-esm-load-return',
+      })]));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 
   it.each(['plain', 'shebang'] as const)('uses only embedded originals with exact Vite scope injection (%s)', (mode) => {
     const path = '/repo/config.mjs';
