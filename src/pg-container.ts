@@ -9,6 +9,7 @@ import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
 import { SubstrateCircuitBreaker } from "./substrate-circuit-breaker.ts";
+import { tmpdirHasCriticalHeadroom } from "./tmpdir-guard.ts";
 import {
   probePgReachable,
   RETRYABLE_PG_STARTUP_MSG,
@@ -58,6 +59,38 @@ function describeContainer(container: StartedPostgreSqlContainer): string {
   const host = safe(() => container.getHost());
   const port = safe(() => container.getMappedPort(5432));
   return `[testcontainer ${id} @ ${host}:${port}]`;
+}
+
+/** Check the PG volume, which need not share the host's guarded TMPDIR filesystem. */
+export async function assertSharedTestPgStorageHeadroom(
+  container: Pick<StartedPostgreSqlContainer, "exec" | "getId" | "getHost" | "getMappedPort">,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  // PID 1 is the postmaster. An exec child exiting nonzero can trigger crash
+  // recovery (EI-18680404964770187), so preserve df's error text but exit zero.
+  const result = await container.exec([
+    "sh", "-c", "df -Pk /var/lib/postgresql; exit 0",
+  ]);
+  const fields = result.output.trim().split("\n").at(-1)?.trim().split(/\s+/);
+  if (!fields || fields.length < 6 || !fields.slice(1, 4).every((v) => /^\d+$/.test(v))) {
+    throw new Error("TEST SUBSTRATE STORAGE UNKNOWN: cannot measure the shared PostgreSQL data volume; " + result.output.slice(0, 300));
+  }
+  const totalKiB = Number(fields[1]);
+  const freeKiB = Number(fields[3]);
+  if (totalKiB <= 0 || !Number.isSafeInteger(totalKiB) || !Number.isSafeInteger(freeKiB) || freeKiB > totalKiB) {
+    throw new Error("TEST SUBSTRATE STORAGE UNKNOWN: invalid PostgreSQL data-volume capacity");
+  }
+  if (!tmpdirHasCriticalHeadroom("/var/lib/postgresql", env, () => ({
+    blocks: totalKiB, bavail: freeKiB, bsize: 1024,
+  }))) {
+    throw new Error(
+      `TEST SUBSTRATE STORAGE LOW: testcontainer ${container.getId().slice(0, 12)} ` +
+      `@ ${container.getHost()}:${container.getMappedPort(5432)} has ${freeKiB * 1024} free bytes ` +
+      `of ${totalKiB * 1024} on its PostgreSQL data volume. Refusing new test writes before ENOSPC. ` +
+      "Reclaim owned storage or use a private test PG on a volume with headroom via PAPERCUSP_TEST_PG_ADMIN_URL; " +
+      "do not stop the shared container or delete another test's databases.",
+    );
+  }
 }
 
 /**
@@ -648,6 +681,9 @@ export async function getTestPg(): Promise<string> {
       });
   }
   const container = await containerPromise;
+  // Check even a cached container: fleet-wide writes can consume space after
+  // this worker's first acquisition. Never rotate/stop peers' PG for low space.
+  await assertSharedTestPgStorageHeadroom(container);
   return container.getConnectionUri();
 }
 
