@@ -118,6 +118,41 @@ describe('capture diagnostic evidence retention', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });
 
+  it.each([false, true])('persists exact engine observations without promoting diagnostic authority (source drift=%s)', drift => {
+    const f = fixture();
+    const engineScripts = {
+      schemaVersion: 'node-engine-script-observations-v1',
+      basis: 'v8-script-id-source-and-best-effort-coverage',
+      scope: 'observed-repository-engine-scripts', sourceEncoding: 'utf8-of-engine-source-text',
+      offsetUnits: 'utf16-code-units', populationStatus: 'unknown',
+      scripts: [
+        { scriptId: '201', url: 'file:///fixture/transformed.ts', path: 'transformed.ts',
+          sourceTextSha256: digest('() => "🌱"'), sourceTextLength: 10, execution: 'observed',
+          coverageRanges: [{ functionName: 'called', startOffset: 0, endOffset: 10, count: 1 },
+            { functionName: 'uncalled', startOffset: 2, endOffset: 8, count: 0 }] },
+        { scriptId: '202', url: 'file:///fixture/transformed.ts', path: 'transformed.ts',
+          sourceTextSha256: null, sourceTextLength: null, execution: 'unknown', coverageRanges: [] },
+      ],
+      reasons: ['engine-script-source-unavailable'],
+      unresolved: ['engine-script-population-unmeasured', 'node-loader-chain-not-closed'],
+    };
+    try {
+      writeFileSync(join(f.options.outPath + '.processes', '41-0.json'),
+        JSON.stringify({ ...f.source, engineScripts }));
+      const result = writeExecutedCaptureDiagnostic({ ...f.options,
+        verifySource: () => { if (drift) throw new Error('source drift'); },
+        details: { loaderChainAcceptance: 'closed', valid: true },
+      });
+      const saved = JSON.parse(readFileSync(f.options.summaryPath, 'utf8'));
+      expect(saved.receipts[0].engineScripts).toEqual(engineScripts);
+      expect(saved).toEqual(result);
+      expect(saved.valid).toBe(!drift);
+      expect(saved.loaderChainAcceptance).toBe('unknown');
+      expect(saved.receipts[0].engineScripts.populationStatus).toBe('unknown');
+      expect(saved.failures).toEqual(drift ? [{ label: 'post-run-source-guard', error: 'Error: source drift' }] : []);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
   it.each(['missing-source', 'malformed-source', 'null-source', 'parent-signal', 'parent-pid',
     'duplicate-parent', 'missing-parent', 'containment-context', 'containment-signal', 'test-skips', 'child-signal'] as const)
     ('rejects %s while persisting the complete failed diagnostic', mode => {
@@ -257,6 +292,19 @@ describe('original config load evidence', () => {
       expect(membership).toContainEqual(expect.objectContaining({ pid, vitestFork: true,
         phase: 'signal', signal: 'SIGTERM', cgroupPath,
       }));
+      // The diagnostic persists the actual transformed-script association even
+      // when a stopped worker leaves the diagnostic's acceptance checks invalid.
+      const summaryPath = join(dir, 'summary.json');
+      const result = writeExecutedCaptureDiagnostic({ outPath: out, cgroupsPath: cgroups,
+        auditPath: join(dir, 'absent-loader-audit.jsonl'), parentExitsPath: exits, summaryPath,
+        cgroupPath: cgroupPath!, runGroup: forks[0].runGroup, deadlineEpochMs: forks[0].deadlineEpochMs,
+        verifySource: () => {}, child: { code: 0, signal: null, resultLine: '' },
+      });
+      const saved = JSON.parse(readFileSync(summaryPath, 'utf8'));
+      expect(saved).toEqual(result);
+      expect(saved.valid).toBe(false);
+      expect(saved.loaderChainAcceptance).toBe('unknown');
+      expect(saved.receipts.find((row: { pid: number }) => row.pid === pid).engineScripts).toEqual(engine);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 120000);
 
