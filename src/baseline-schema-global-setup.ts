@@ -67,7 +67,7 @@ import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from './testcontainer-start-lock.ts';
-import { NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
+import { assertSharedTestPgStorageHeadroom, NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
 import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 import { dropDatabaseWithLock, type DropDatabaseWithLockOptions } from './pg-migrate.ts';
 
@@ -701,6 +701,9 @@ export default async function setup({ provide }: TestProject) {
         return c;
       }),
     );
+    // This separate container can use a different volume from test fixtures.
+    // Admit migration writes against its actual data filesystem too.
+    await runBaselineSetupStage('postgres-storage-headroom', () => assertSharedTestPgStorageHeadroom(container));
     dsn = container.getConnectionUri();
   }
 
