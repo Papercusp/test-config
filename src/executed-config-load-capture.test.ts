@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { configBundleSources, qualifyLoadedConfigSources, qualifyLoadedMainProcessSources } from './executed-config-load-capture.ts';
+import { configBundleSources, qualifyLoadedConfigSources, qualifyLoadedMainProcessSources,
+  writeExecutedCaptureDiagnostic } from './executed-config-load-capture.ts';
 
 const digest = (text: string): string => createHash('sha256').update(text).digest('hex');
 const prefix = (path: string): string => `const __vite_injected_original_dirname = ${JSON.stringify(dirname(path))};` +
@@ -14,6 +15,96 @@ const prefix = (path: string): string => `const __vite_injected_original_dirname
   `const __vite_injected_original_import_meta_url = ${JSON.stringify(pathToFileURL(path).href)};`;
 const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=data:application/json;base64,' +
   Buffer.from(JSON.stringify(map)).toString('base64');
+
+describe('capture diagnostic evidence retention', () => {
+  function fixture(mode: 'exit' | 'SIGTERM' | 'SIGINT' = 'SIGTERM') {
+    const root = mkdtempSync(join(tmpdir(), 'capture-diagnostic-'));
+    const outPath = join(root, 'sources.json');
+    const cgroupsPath = join(root, 'cgroups.jsonl');
+    const auditPath = join(root, 'committed.jsonl');
+    const parentExitsPath = join(root, 'parents.jsonl');
+    const summaryPath = join(root, 'summary.json');
+    const entry = '/fixture/node_modules/vitest/dist/workers/forks.js';
+    const context = { pid: 41, cgroupPath: '/task.scope', runGroup: 'diagnostic', deadlineEpochMs: 1234,
+      isMainThread: true, vitestFork: true, argv: [entry] };
+    const termination = mode === 'exit' ? { phase: 'exit', exitCode: 0, signal: null } :
+      { phase: 'signal', exitCode: null, signal: mode };
+    const source = { pid: 41, parentPid: 40, isMainThread: true, ...termination };
+    const parent = { pid: 41, parentPid: 40, entry, code: termination.exitCode, signal: termination.signal };
+    const reporter = { configLoadedSources: { observedSources: [{ path: 'vitest.config.ts', observedSha256: 'a' }] },
+      mainProcessLoadedSources: { observedSources: [{ path: 'runner.mjs', observedSha256: 'b' }] } };
+    mkdirSync(outPath + '.processes');
+    writeFileSync(outPath, JSON.stringify(reporter));
+    writeFileSync(join(outPath + '.processes', '41-0.json'), JSON.stringify(source));
+    writeFileSync(cgroupsPath, [context, { ...context, ...termination }].map(row => JSON.stringify(row)).join('\n'));
+    writeFileSync(parentExitsPath, JSON.stringify(parent));
+    writeFileSync(auditPath, JSON.stringify({ path: 'runner.mjs' }));
+    const options = { outPath, cgroupsPath, auditPath, parentExitsPath, summaryPath,
+      cgroupPath: context.cgroupPath, runGroup: context.runGroup, deadlineEpochMs: context.deadlineEpochMs,
+      verifySource: () => {}, child: { code: 0, signal: null,
+        resultLine: 'TEST_FILE_RESULT status=passed requested=1 executed=1 matched=1 skippedTests=0' } };
+    return { root, options, context, source, parent };
+  }
+
+  it.each(['exit', 'SIGTERM', 'SIGINT'] as const)('accepts independently agreeing %s receipts without closing the loader chain', mode => {
+    const f = fixture(mode);
+    try {
+      const result = writeExecutedCaptureDiagnostic(f.options);
+      expect(result.failures).toEqual([]);
+      expect(result.valid).toBe(true);
+      expect(result.forkProcessCoverage).toEqual([expect.objectContaining({ pid: 41, terminationVerified: true })]);
+      expect(JSON.parse(readFileSync(f.options.summaryPath, 'utf8'))).toEqual(result);
+      expect(result.loaderChainAcceptance).toBe('unknown');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  it.each(['missing-source', 'malformed-source', 'null-source', 'parent-signal', 'parent-pid',
+    'duplicate-parent', 'missing-parent', 'containment-context', 'containment-signal', 'test-skips', 'child-signal'] as const)
+    ('rejects %s while persisting the complete failed diagnostic', mode => {
+      const f = fixture();
+      try {
+        const sourcePath = join(f.options.outPath + '.processes', '41-0.json');
+        if (mode === 'missing-source') rmSync(sourcePath);
+        if (mode === 'malformed-source') writeFileSync(sourcePath, '{');
+        if (mode === 'null-source') writeFileSync(sourcePath, 'null');
+        if (mode === 'parent-signal') writeFileSync(f.options.parentExitsPath, JSON.stringify({ ...f.parent, signal: 'SIGINT' }));
+        if (mode === 'parent-pid') writeFileSync(f.options.parentExitsPath, JSON.stringify({ ...f.parent, parentPid: 39 }));
+        if (mode === 'duplicate-parent') writeFileSync(f.options.parentExitsPath,
+          [f.parent, f.parent].map(row => JSON.stringify(row)).join('\n'));
+        if (mode === 'missing-parent') rmSync(f.options.parentExitsPath);
+        if (mode === 'containment-context' || mode === 'containment-signal') writeFileSync(f.options.cgroupsPath,
+          [f.context, { ...f.context, ...f.source,
+            ...(mode === 'containment-context' ? { cgroupPath: '/other.scope' } : { signal: 'SIGINT' }) }]
+            .map(row => JSON.stringify(row)).join('\n'));
+        if (mode === 'test-skips') f.options.child.resultLine = f.options.child.resultLine.replace('skippedTests=0', 'skippedTests=1');
+        const child = mode === 'child-signal' ? { ...f.options.child, code: null, signal: 'SIGTERM' } : f.options.child;
+        const result = writeExecutedCaptureDiagnostic({ ...f.options, child });
+        expect(result.valid).toBe(false);
+        expect(result.failures.length).toBeGreaterThan(0);
+        const saved = JSON.parse(readFileSync(f.options.summaryPath, 'utf8'));
+        expect(saved).toEqual(result);
+        expect(saved.audit).toHaveLength(1);
+        expect(saved.reporter.configLoadedSources.observedSources).toHaveLength(1);
+      } finally { rmSync(f.root, { recursive: true, force: true }); }
+    });
+
+  it('records all unavailable artifacts, source drift and spawn failure before returning invalid', () => {
+    const f = fixture();
+    try {
+      rmSync(f.options.outPath); rmSync(f.options.cgroupsPath); rmSync(f.options.auditPath);
+      rmSync(f.options.parentExitsPath); rmSync(f.options.outPath + '.processes', { recursive: true });
+      const result = writeExecutedCaptureDiagnostic({ ...f.options,
+        verifySource: () => { throw new Error('source drift'); },
+        child: { code: null, signal: null, resultLine: '', spawnFailure: 'ENOENT' } });
+      expect(result.valid).toBe(false);
+      expect(result.failures.map(row => row.label)).toEqual(expect.arrayContaining([
+        'post-run-source-guard', 'child-spawn', 'cgroup-artifact', 'reporter-artifact',
+        'process-directory', 'committed-loader-artifact', 'parent-exit-artifact', 'test-result',
+      ]));
+      expect(JSON.parse(readFileSync(f.options.summaryPath, 'utf8'))).toEqual(result);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+});
 
 describe('original config load evidence', () => {
   it.skipIf(process.platform !== 'linux')('retains real Vitest fork termination receipts without changing its SIGTERM exit', () => {

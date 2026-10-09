@@ -2,7 +2,7 @@
  * Loaded with Node --import BEFORE Vite evaluates configs. Reporter-time disk
  * reads cannot recover these bytes. This never authorizes reusable test passes. */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import * as nodeModule from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -240,4 +240,86 @@ export function qualifyLoadedMainProcessSources(configPaths: string[] | null, re
     if (evidence.status === 'stable') evidence.status = 'unknown';
   }
   return { schemaVersion: 'node-loaded-main-process-sources-v1', scope: 'repository-node-main-process-sources', ...evidence };
+}
+
+type DiagnosticRow = Record<string, unknown>;
+
+/** Consume the existing capture channels after the runner closes. Keep the
+ * complete diagnostic summary even when an artifact or source guard fails.
+ * Matching termination receipts establish worker lifetime, never loader closure. */
+export function writeExecutedCaptureDiagnostic(options: {
+  outPath: string; cgroupsPath: string; auditPath: string; parentExitsPath: string; summaryPath: string;
+  cgroupPath: string; runGroup: string; deadlineEpochMs: number;
+  child: { code: number | null; signal: string | null; resultLine: string; spawnFailure?: string | null };
+  verifySource: () => void;
+  details?: Record<string, unknown>;
+}) {
+  const failures: Array<{ label: string; error: string }> = [];
+  const read = <T>(label: string, fn: () => T, fallback: T): T => {
+    try { return fn(); } catch (error) { failures.push({ label, error: String(error) }); return fallback; }
+  };
+  const object = (value: unknown): DiagnosticRow => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected artifact object');
+    return value as DiagnosticRow;
+  };
+  const jsonl = (path: string): DiagnosticRow[] => readFileSync(path, 'utf8').trim().split('\n')
+    .filter(Boolean).map(line => object(JSON.parse(line)));
+  const isForkEntry = (entry: unknown): boolean => typeof entry === 'string' &&
+    entry.replaceAll('\\', '/').endsWith('/vitest/dist/workers/forks.js');
+  const sourceUnchanged = read('post-run-source-guard', () => { options.verifySource(); return true; }, false);
+  if (options.child.spawnFailure) failures.push({ label: 'child-spawn', error: options.child.spawnFailure });
+  const membership = read('cgroup-artifact', () => jsonl(options.cgroupsPath), []);
+  const reporter = read('reporter-artifact', () => object(JSON.parse(readFileSync(options.outPath, 'utf8'))), {});
+  const processFiles = read('process-directory', () => readdirSync(options.outPath + '.processes').sort(), []);
+  const receipts = processFiles.map(file => read('process-artifact:' + file,
+    () => object(JSON.parse(readFileSync(join(options.outPath + '.processes', file), 'utf8'))), null))
+    .filter((row): row is DiagnosticRow => row !== null);
+  const audit = read('committed-loader-artifact', () => jsonl(options.auditPath), []);
+  const parentExits = read('parent-exit-artifact', () => jsonl(options.parentExitsPath), []);
+  const config = read('config-observations', () => object(reporter.configLoadedSources), {});
+  const mainProcess = read('main-process-observations', () => object(reporter.mainProcessLoadedSources), {});
+  if (!Array.isArray(config.observedSources) || !config.observedSources.length ||
+      !Array.isArray(mainProcess.observedSources) || !mainProcess.observedSources.length || !receipts.length || !audit.length)
+    failures.push({ label: 'armed-capture', error: 'config/process/loader receipts absent' });
+  const forks = membership.filter(row => row.phase === 'preload' && row.vitestFork === true &&
+    row.isMainThread === true && Array.isArray(row.argv) && row.argv.some(isForkEntry));
+  if (!forks.length || membership.some(row => !Number.isInteger(row.pid) || Number(row.pid) <= 0 ||
+      row.cgroupPath !== options.cgroupPath || row.runGroup !== options.runGroup ||
+      row.deadlineEpochMs !== options.deadlineEpochMs))
+    failures.push({ label: 'fork-containment', error: 'actual fork containment missing or mismatched' });
+  const forkProcessCoverage = forks.map(fork => {
+    const sources = receipts.filter(row => row.pid === fork.pid && row.isMainThread === true);
+    const parents = parentExits.filter(row => row.pid === fork.pid && isForkEntry(row.entry));
+    const source = sources.length === 1 ? sources[0] : undefined;
+    const parent = parents.length === 1 ? parents[0] : undefined;
+    const terminals = membership.filter(row => row.pid === fork.pid && row.isMainThread === true &&
+      (row.phase === 'exit' || row.phase === 'signal'));
+    const contained = terminals.length === 1 ? terminals[0] : undefined;
+    const parentMatches = Number.isInteger(parent?.parentPid) && Number(parent?.parentPid) > 0 &&
+      source?.parentPid === parent?.parentPid;
+    const cleanExit = source?.phase === 'exit' && source.exitCode === 0 && source.signal === null &&
+      parent?.code === 0 && parent.signal === null && contained?.phase === 'exit' &&
+      contained.exitCode === 0 && contained.signal === null;
+    const signalExit = source?.phase === 'signal' && source.exitCode === null &&
+      (source.signal === 'SIGTERM' || source.signal === 'SIGINT') && parent?.code === null &&
+      parent.signal === source.signal && contained?.phase === 'signal' &&
+      contained.exitCode === null && contained.signal === source.signal;
+    return { pid: fork.pid, receiptPresent: !!source, parentExit: parent ?? null,
+      sourcePhase: source?.phase ?? null, sourceSignal: source?.signal ?? null,
+      containmentTerminalPresent: !!contained, terminationVerified: !!(parentMatches && (cleanExit || signalExit)) };
+  });
+  if (forkProcessCoverage.some(row => !row.terminationVerified))
+    failures.push({ label: 'fork-termination', error: 'actual fork source/containment/parent terminal receipts missing or mismatched' });
+  const tokens = Object.fromEntries([...options.child.resultLine.matchAll(/([A-Za-z]+)=([^\s]+)/g)]
+    .map(match => [match[1], match[2]]));
+  if (options.child.code !== 0 || options.child.signal !== null || tokens.status !== 'passed' ||
+      tokens.requested !== '1' || tokens.executed !== '1' || tokens.matched !== '1' || tokens.skippedTests !== '0')
+    failures.push({ label: 'test-result', error: 'runner did not pass the exact single diagnostic file without skips' });
+  const summary = { ...options.details, schemaVersion: 'executed-capture-diagnostic-v1',
+    child: options.child, sourceUnchanged, failures, membership, reporter, receipts, audit, parentExits,
+    containedForkPids: [...new Set(forks.map(row => row.pid))], forkProcessCoverage,
+    valid: sourceUnchanged && failures.length === 0, loaderChainAcceptance: 'unknown' };
+  // Write before the caller converts a failed diagnostic into a failed task.
+  writeFileSync(options.summaryPath, JSON.stringify(summary) + '\n');
+  return summary;
 }
