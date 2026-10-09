@@ -25,7 +25,7 @@ describe('capture diagnostic evidence retention', () => {
     const parentExitsPath = join(root, 'parents.jsonl');
     const summaryPath = join(root, 'summary.json');
     const entry = '/fixture/node_modules/vitest/dist/workers/forks.js';
-    const context = { pid: 41, cgroupPath: '/task.scope', runGroup: 'diagnostic', deadlineEpochMs: 1234,
+    const context = { phase: 'preload', pid: 41, cgroupPath: '/task.scope', runGroup: 'diagnostic', deadlineEpochMs: 1234,
       isMainThread: true, vitestFork: true, argv: [entry] };
     const termination = mode === 'exit' ? { phase: 'exit', exitCode: 0, signal: null } :
       { phase: 'signal', exitCode: null, signal: mode };
