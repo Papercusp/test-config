@@ -418,8 +418,9 @@ describe('original config load evidence', () => {
       } finally { rmSync(root, { recursive: true, force: true }); }
     });
 
-  it.each(['stable', 'self-restoring', 'commonjs', 'outside', 'reloaded'] as const)
-    ('retains actual native main-process inputs separately from config inputs (%s)', kind => {
+  it.each((['stable', 'self-restoring', 'commonjs', 'outside', 'reloaded'] as const)
+    .flatMap(kind => [false, true].map(ambientPreload => ({ kind, ambientPreload }))))
+    ('retains actual native main-process inputs separately from config inputs ($kind, ambientPreload=$ambientPreload)', ({ kind, ambientPreload }) => {
       const base = mkdtempSync(join(tmpdir(), 'main-original-load-'));
       const root = join(base, 'repo');
       mkdirSync(root);
@@ -431,6 +432,12 @@ describe('original config load evidence', () => {
         writeFileSync(${JSON.stringify(helper)}, ${JSON.stringify(stable)});
         export const value = 2;\n` : stable;
       try {
+        const preload = join(base, 'ambient-preload.mjs');
+        writeFileSync(preload, 'export const ambient = true;\n');
+        const env = { ...process.env, ...(ambientPreload ? { NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` } : {}) };
+        // This control measures the plain native loader. Calibration and
+        // overriding-preload cases below exercise the instrumented alternatives.
+        delete env.NODE_OPTIONS;
         writeFileSync(config, 'export default {};\n');
         writeFileSync(helper, loaded);
         const script = `import { writeFileSync } from 'node:fs';
@@ -442,7 +449,7 @@ describe('original config load evidence', () => {
           console.log(JSON.stringify(qualifyLoadedMainProcessSources([${JSON.stringify(config)}], ${JSON.stringify(root)})));`;
         const out = execFileSync(process.execPath, ['--import', capture, '--input-type=module', '--eval', script], {
           encoding: 'utf8', timeout: 30000, cwd: root,
-          env: { ...process.env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'main-load-test', PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json'),
+          env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'main-load-test', PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json'),
             PC_EXECUTED_SOURCE_MAP_PRELOAD: '1' },
         });
         const evidence = JSON.parse(out.trim());
@@ -531,7 +538,9 @@ describe('original config load evidence', () => {
     { sourceRoot: '../relative/', sources: ['config.mjs'], sourcesContent: ['code'] }])
     ('rejects an incomplete source map %j', map => expect(configBundleSources(bundle(map))).toBeNull());
 
-  it.each(['native', 'native-ts', 'bundle', 'runner', 'commonjs-bundle'] as const)('observes actual Vite config evaluation (%s loader)', kind => {
+  it.each((['native', 'native-ts', 'bundle', 'runner', 'commonjs-bundle'] as const)
+    .flatMap(kind => [false, true].map(ambientPreload => ({ kind, ambientPreload }))))
+    ('observes actual Vite config evaluation ($kind loader, ambientPreload=$ambientPreload)', ({ kind, ambientPreload }) => {
     const root = mkdtempSync(join(tmpdir(), 'config-original-load-'));
     const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
     const vite = import.meta.resolve('vite');
@@ -541,6 +550,10 @@ describe('original config load evidence', () => {
     const original = cjs ? 'exports.count = 1;\n' : `export const count${kind === 'native-ts' ? ': number' : ''} = 1;\n`;
     const restored = cjs ? 'exports.count = 2;\n' : `export const count${kind === 'native-ts' ? ': number' : ''} = 2;\n`;
     try {
+      const preload = join(root, 'ambient-preload.mjs');
+      writeFileSync(preload, 'export const ambient = true;\n');
+      const env = { ...process.env, ...(ambientPreload ? { NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` } : {}) };
+      delete env.NODE_OPTIONS;
       const helper = join(root, `helper.${extension}`);
       const configPath = join(root, `config.${extension}`);
       writeFileSync(helper, original);
@@ -557,7 +570,7 @@ describe('original config load evidence', () => {
           evidence: qualifyLoadedConfigSources([${JSON.stringify(configPath)}, ${JSON.stringify(helper)}], ${JSON.stringify(root)}) }));`;
       const out = execFileSync(process.execPath, ['--import', capture, '--input-type=module', '--eval', script], {
         encoding: 'utf8', timeout: 30000, cwd: root,
-        env: { ...process.env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'load-test', PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json'),
+        env: { ...env, PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'load-test', PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json'),
           PC_EXECUTED_SOURCE_MAP_PRELOAD: '1' },
       });
       const result = JSON.parse(out.trim());
