@@ -2,6 +2,7 @@
  * Loaded with Node --import BEFORE Vite evaluates configs. Reporter-time disk
  * reads cannot recover these bytes. This never authorizes reusable test passes. */
 import { createHash } from 'node:crypto';
+import { Session } from 'node:inspector';
 import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import * as nodeModule from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -16,6 +17,90 @@ interface Capture { sources: Map<string, Set<string | null>>; reasons: Set<strin
 const shared = pinModuleState<{ capture: Capture | null }>(
   '@papercusp/test-config.original-config-loads', () => ({ capture: null }));
 const hash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
+
+/** Engine source text and execution ranges share a V8 script id. Neither a
+ * scriptParsed event nor getScriptSource alone establishes execution. Best
+ * effort coverage supplies positive observations only: GC can erase counters,
+ * so an absent/zero count stays unknown. No precise coverage, pauses or code
+ * rewriting are used, and this diagnostic never authorizes reusable passes. */
+export function observeEngineScriptExecution(repoRoot: string) {
+  const session = new Session();
+  const reasons = new Set<string>();
+  const scripts = new Map<string, { scriptId: string; url: string; path: string;
+    sourceTextSha256: string | null; sourceTextLength: number | null }>();
+  let connected = false;
+  const post = <T>(method: string, params: Record<string, unknown> = {}): T => {
+    let done = false;
+    let result: unknown;
+    let failure: Error | null = null;
+    session.post(method, params, (error, response) => { done = true; failure = error; result = response; });
+    // Exit/signal observers must finish synchronously. Never attest a pending
+    // protocol request; its eventual callback cannot repair an emitted receipt.
+    if (!done) throw new Error(`pending inspector request: ${method}`);
+    if (failure) throw failure;
+    return result as T;
+  };
+  session.on('Debugger.scriptParsed', ({ params }) => {
+    try {
+      const absolute = params.url.startsWith('file:') ? fileURLToPath(params.url) : params.url;
+      if (!isAbsolute(absolute)) return;
+      const path = relative(repoRoot, absolute).split(/[\\/]/).join('/');
+      if (!path || isAbsolute(path) || path === '..' || path.startsWith('../') ||
+          path.split('/').includes('node_modules')) return;
+      const { scriptSource } = post<{ scriptSource: string }>('Debugger.getScriptSource', { scriptId: params.scriptId });
+      if (typeof scriptSource !== 'string') throw new Error('engine source text unavailable');
+      const sourceTextSha256 = hash(scriptSource);
+      const prior = scripts.get(params.scriptId);
+      const changed = params.isLiveEdit || (prior && prior.sourceTextSha256 !== sourceTextSha256);
+      if (changed) reasons.add('engine-script-source-changed');
+      scripts.set(params.scriptId, { scriptId: params.scriptId, url: params.url, path,
+        sourceTextSha256: changed ? null : sourceTextSha256,
+        sourceTextLength: changed ? null : scriptSource.length });
+    } catch { reasons.add('engine-script-source-unavailable'); }
+  });
+  try {
+    session.connect(); connected = true;
+    post('Debugger.enable'); post('Profiler.enable');
+  } catch { reasons.add('engine-inspector-unavailable'); }
+  return {
+    snapshot() {
+      type Coverage = { scriptId: string; url: string; functions: Array<{ functionName: string;
+        ranges: Array<{ startOffset: number; endOffset: number; count: number }> }> };
+      let coverage: Coverage[] = [];
+      try { coverage = post<{ result: Coverage[] }>('Profiler.getBestEffortCoverage').result; }
+      catch { reasons.add('engine-execution-coverage-unavailable'); }
+      const byId = new Map(coverage.map(row => [row.scriptId, row]));
+      const observedScripts = [...scripts.values()].map(script => {
+        const row = byId.get(script.scriptId);
+        let sourceMatches = false;
+        try {
+          const { scriptSource } = post<{ scriptSource: string }>('Debugger.getScriptSource', { scriptId: script.scriptId });
+          sourceMatches = typeof scriptSource === 'string' && script.sourceTextSha256 !== null &&
+            hash(scriptSource) === script.sourceTextSha256;
+          if (!sourceMatches) reasons.add('engine-script-source-changed');
+        } catch { reasons.add('engine-script-source-unavailable'); }
+        const ranges = sourceMatches && row?.url === script.url ? row.functions.flatMap(fn =>
+          fn.ranges.filter(range => Number.isSafeInteger(range.count) && range.count >= 0 &&
+            Number.isSafeInteger(range.startOffset) && Number.isSafeInteger(range.endOffset) &&
+            range.startOffset >= 0 && range.endOffset > range.startOffset &&
+            range.endOffset <= script.sourceTextLength!).map(range => ({ functionName: fn.functionName, ...range }))) : [];
+        return { ...script, sourceTextSha256: sourceMatches ? script.sourceTextSha256 : null,
+          execution: ranges.some(range => range.count > 0) ? 'observed' as const : 'unknown' as const,
+          // Offsets address engine UTF-16 source text. A positive outer range
+          // does not establish execution of a nested function or every byte.
+          coverageRanges: ranges };
+      });
+      return { schemaVersion: 'node-engine-script-observations-v1', basis: 'v8-script-id-source-and-best-effort-coverage',
+        scope: 'observed-repository-engine-scripts', sourceEncoding: 'utf8-of-engine-source-text',
+        offsetUnits: 'utf16-code-units', populationStatus: 'unknown', scripts: observedScripts,
+        reasons: [...reasons].sort(), unresolved: ['engine-bootstrap-observation-window-unmeasured',
+          'engine-script-population-unmeasured', 'engine-best-effort-coverage-may-lose-gc-data',
+          'engine-url-original-source-association-unmeasured', 'node-external-native-runtime-unmeasured',
+          'node-process-descendant-population-unmeasured', 'node-loader-chain-not-closed'] };
+    },
+    disconnect() { if (connected) { session.disconnect(); connected = false; } },
+  };
+}
 
 /** Read the originals EMBEDDED IN THE ACTUALLY LOADED Vite ESM config bundle.
  * Vite prepends three file-scope constants to its esbuild inputs. Remove only
@@ -90,6 +175,7 @@ function install(): void {
   // A missing receipt (including SIGKILL) remains unknown.
   const repoRoot = process.env.PC_EXECUTED_SOURCE_MAP_ROOT;
   const outPath = process.env.PC_EXECUTED_SOURCE_MAP_OUT;
+  const engine = repoRoot && isAbsolute(repoRoot) ? observeEngineScriptExecution(repoRoot) : null;
   // argv and cwd are mutable application state. Capture the original entry
   // before the command body can rewrite them, rather than trusting them at exit.
   const entry = process.argv[1] ? resolve(process.argv[1]) : null;
@@ -109,6 +195,7 @@ function install(): void {
       writeFileSync(join(directory, `${process.pid}-${threadId}.json`), JSON.stringify({
         schemaVersion: 'node-loaded-process-sources-v1', scope: 'repository-node-process-sources',
         entrypoint, pid: process.pid, parentPid: process.ppid, isMainThread, threadId, ...termination, ...evidence,
+        engineScripts: engine?.snapshot() ?? null,
         // These are observed inputs, never a census of every descendant or a
         // complete runtime identity. The preload itself predates its own hook.
         unresolved: ['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured',
