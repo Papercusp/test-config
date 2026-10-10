@@ -266,6 +266,25 @@ export function isScratchConfigFile(configFile: string | false | undefined, repo
   return rel.startsWith('..') || isAbsolute(rel);
 }
 
+/**
+ * A pinned verifier source archive is an immutable source tree, but the default
+ * archive is materialized without `.git` below the outer checkout. Git probes
+ * from that nested directory therefore resolve to the OUTER checkout. If the
+ * outer checkout happens to be clean, its HEAD is still not the archive's
+ * source commit. Keep such rows out of commit-scoped attribution unless the
+ * verifier source is itself a Git checkout with its own `.git` root.
+ */
+function unversionedVerifierSourceReason(moduleId: string): string | null {
+  const sourceRoot = process.env.OPERATOR_SOURCE_ROOT?.trim();
+  const sourceReceipt = process.env.VERIFY_TAURI_SOURCE_RECEIPT?.trim();
+  if (!sourceRoot || !sourceReceipt || !isAbsolute(sourceRoot) || !isAbsolute(sourceReceipt)) return null;
+  const resolvedSourceRoot = resolve(sourceRoot);
+  const rel = relative(resolvedSourceRoot, resolve(moduleId));
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
+  if (classifyGitEntry(resolvedSourceRoot) === 'root') return null;
+  return 'test module is from a verifier source archive without Git metadata; enclosing checkout HEAD does not identify its source';
+}
+
 // ── inlined: resolveTestRunSource (was testing-run-source.ts). ──
 type TestRunSource = 'ci' | 'local' | 'admin-ui' | 'mutation-probe';
 const VALID_SOURCES: ReadonlySet<TestRunSource> = new Set(['ci', 'local', 'admin-ui', 'mutation-probe']);
@@ -1530,6 +1549,7 @@ type PendingExecutionDetails = Omit<
 > & Pick<NonNullable<TestRunRow['executionDetails']>, 'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed'>;
 type PendingTestRunRow = Omit<TestRunRow, 'worktreeDirty' | 'commitSha' | 'executionDetails'> & {
   executionDetails?: PendingExecutionDetails | null;
+  verifierSourceReason?: string | null;
 };
 
 type RuntimeEnvironmentCapture =
@@ -1656,6 +1676,7 @@ export default class AdminTestRunsReporter implements Reporter {
       this.failureDetails.push(...collectTestFailureDetails(testModule, filePath));
 
       const counts = collectModuleExecution(testModule, this.preferredPassedCasePattern);
+      const verifierSourceReason = unversionedVerifierSourceReason(testModule.moduleId);
       // Root and project configs may differ in a multi-project run. The module's
       // project wins; absence there stays unknown instead of inheriting a root label.
       const testLayer = testModule.project
@@ -1669,7 +1690,7 @@ export default class AdminTestRunsReporter implements Reporter {
         if (receipts) Object.assign(executionDetails, { isolatedRuntimeReceipts: receipts });
       }
       this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail,
-        isScratchConfig: this.isScratchConfig, executionDetails });
+        isScratchConfig: this.isScratchConfig, executionDetails, verifierSourceReason });
     } catch {
       /* swallow — D-007 */
     }
@@ -1693,6 +1714,17 @@ export default class AdminTestRunsReporter implements Reporter {
       // D-007: missing proof of stability is dirty, never a false clean.
       worktreeDirty = true;
       dirtReason = `snapshot threw: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    const verifierSourceReasons = [...new Set(this.pending
+      .map(row => row.verifierSourceReason)
+      .filter((reason): reason is string => Boolean(reason)))];
+    if (verifierSourceReasons.length > 0) {
+      // The outer checkout snapshot is not evidence for files loaded from an
+      // unversioned nested archive. Preserve the diagnostic row, but do not
+      // stamp it with the unrelated enclosing HEAD as if it were its source.
+      worktreeDirty = true;
+      commitSha = null;
+      dirtReason = [dirtReason, ...verifierSourceReasons].filter(Boolean).join('; ').slice(0, 1_200);
     }
     if (worktreeDirty && resolveTestRunSource() === 'ci') {
       // WI-10004076: the demotion erases every row of this invocation from source='ci'

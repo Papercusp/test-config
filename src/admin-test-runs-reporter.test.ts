@@ -1017,6 +1017,48 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(persisted[0].executionDetails).not.toHaveProperty('worktreeDirtyReason');
   });
 
+  it('does not attribute a nested unversioned verifier source archive to a clean enclosing checkout', async () => {
+    mkdirSync(join(process.cwd(), '.papercusp/tmp'), { recursive: true });
+    const scratchRoot = mkdtempSync(join(process.cwd(), '.papercusp/tmp/verify-tauri-headless.reporter-test.'));
+    const sourceRoot = join(scratchRoot, 'operator-source');
+    mkdirSync(sourceRoot, { recursive: true });
+    const receipt = join(scratchRoot, 'verifier-source-receipt.json');
+    writeFileSync(receipt, JSON.stringify({ schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40) }));
+    vi.stubEnv('OPERATOR_SOURCE_ROOT', sourceRoot);
+    vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', receipt);
+    const persisted: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(
+      async () => ({ commit: 'outer-checkout-sha', porcelain: '' }),
+      async row => { persisted.push(row); },
+    );
+    try {
+      reporter.onInit({
+        config: { root: process.cwd() },
+        vite: { config: { root: process.cwd(), configFile: join(process.cwd(), 'vitest.config.ts') } },
+      } as never);
+      reporter.onTestModuleEnd({
+        moduleId: join(sourceRoot, 'packages/operator-core/lib/reports-library-native.e2e.test.ts'),
+        state: () => 'passed',
+        diagnostic: () => ({ duration: 12 }),
+        errors: () => [],
+        children: { allTests: () => [{ fullName: 'immutable source archive run', result: () => ({ state: 'passed' }) }] },
+      } as never);
+
+      await reporter.onTestRunEnd();
+
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]).toMatchObject({
+        worktreeDirty: true,
+        commitSha: null,
+      });
+      expect(persisted[0].executionDetails?.worktreeDirtyReason)
+        .toContain('verifier source archive without Git metadata');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(scratchRoot, { recursive: true, force: true });
+    }
+  });
+
   it.each(['local', 'mutation-probe', 'ci'])('persists the dirty reason for %s receipts', async (source) => {
     vi.stubEnv('PAPERCUSP_TEST_RUN_SOURCE', source);
     vi.stubEnv('PAPERCUSP_MUTATION_PROBE', source === 'mutation-probe' ? '1' : '');
