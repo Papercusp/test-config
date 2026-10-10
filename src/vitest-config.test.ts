@@ -12,11 +12,12 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { availableParallelism } from 'node:os';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defineVitestConfig, isWritableDir } from './vitest-config.ts';
 import { recordedTestLayer } from './execution-details.ts';
+import { createServer, type Plugin } from 'vite';
 
 let savedArgv: string[];
 beforeEach(() => {
@@ -30,6 +31,46 @@ afterEach(() => {
 function withArgv(...tokens: string[]): void {
   process.argv = ['node', 'vitest', 'run', ...tokens];
 }
+
+describe('tsconfig discovery excludes archived and generated checkouts', () => {
+  it.each(['.papercusp', '_retired', 'dist', '.next'])(
+    'keeps live workspace aliases without discovering %s aliases', async excluded => {
+      withArgv();
+      const root = mkdtempSync(join(tmpdir(), 'vitest-config-discovery-'));
+      let server: Awaited<ReturnType<typeof createServer>> | undefined;
+      try {
+        writeFileSync(join(root, 'package.json'), JSON.stringify({ private: true, workspaces: ['live'] }));
+        const live = join(root, 'live');
+        const archived = join(root, excluded, 'checkout');
+        for (const [dir, alias] of [[live, 'live-alias'], [archived, 'archived-alias']]) {
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, 'tsconfig.json'), JSON.stringify({
+            compilerOptions: { baseUrl: '.', paths: { [alias]: ['./source.ts'] } },
+            include: ['**/*.ts'],
+          }));
+          writeFileSync(join(dir, 'source.ts'), 'export const value = 1;');
+          writeFileSync(join(dir, 'importer.ts'), `import '${alias}';`);
+        }
+        const plugin = defineVitestConfig({ layer: 'unit' }).plugins!.find(
+          candidate => candidate && typeof candidate === 'object'
+            && 'name' in candidate && candidate.name === 'vite-tsconfig-paths',
+        ) as Plugin;
+        expect(plugin).toBeDefined();
+        // Exercise the installed plugin's actual filesystem discovery and Vite
+        // resolution; a predicate-only assertion would miss ignored skip options.
+        server = await createServer({ configFile: false, root, plugins: [plugin],
+          server: { watch: null }, optimizeDeps: { noDiscovery: true } });
+        expect((await server.pluginContainer.resolveId('live-alias', join(live, 'importer.ts')))?.id)
+          .toBe(join(live, 'source.ts'));
+        expect(await server.pluginContainer.resolveId('archived-alias', join(archived, 'importer.ts')))
+          .toBeNull();
+      } finally {
+        await server?.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
 
 describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
   it('forwards the registered runtime reader to the reporter without measuring during config evaluation', () => {
