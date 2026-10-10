@@ -713,7 +713,12 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   }
 
   return defineConfig({
-    plugins: [tsconfigPaths({ ignoreConfigErrors: true }), ...gate.plugins],
+    // Test exclusion does not constrain vite-tsconfig-paths' independent
+    // workspace crawl. Apply the same artifact boundaries there so temporary
+    // and archived checkouts cannot add resolvers or delay every focused run.
+    plugins: [tsconfigPaths({ ignoreConfigErrors: true,
+      skip: dir => ['.papercusp', '_retired', 'dist', '.next'].includes(dir),
+    }), ...gate.plugins],
     // Use a project-local Vite cache dir instead of os.tmpdir() (which is
     // TMPDIR=/tmp/claude on this dev box — a read-only path that doesn't
     // exist, causing every vitest run to ENOENT on the ssr/ sub-directory
