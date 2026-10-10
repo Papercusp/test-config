@@ -135,7 +135,8 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { PAPERCUSP_TMPDIR_CANDIDATES } from './tmpdir-guard.js';
+// This source package is also imported by native Node CLI entry points.
+import { PAPERCUSP_TMPDIR_CANDIDATES } from './tmpdir-guard.ts';
 
 /** Never touch a dir younger than this — a peer may have just created it. */
 export const HERMETIC_SWEEP_MIN_AGE_MS = 60_000;

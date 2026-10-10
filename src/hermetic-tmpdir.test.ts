@@ -31,6 +31,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -56,6 +57,21 @@ let root: string;
 /** A pid that cannot be running: the kernel never allocates 0 as a user pid. */
 const DEAD_PID = 0;
 const ALIVE_PID = process.pid;
+
+describe('native Node loader (EI-25565858779815461)', () => {
+  it('loads the source helper without Vitest or a custom resolver', () => {
+    const result = spawnSync(process.execPath, [
+      '--input-type=module', '--eval',
+      'const helper = await import(process.argv[1]); console.log(typeof helper.affectedTestRunLogPath);',
+      new URL('./hermetic-tmpdir.ts', import.meta.url).href,
+    ], {
+      encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, NODE_OPTIONS: '', TMPDIR: root },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim()).toBe('function');
+  });
+});
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'hermetic-tmpdir-test-'));
