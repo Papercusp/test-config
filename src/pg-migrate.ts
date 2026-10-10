@@ -788,6 +788,7 @@ async function buildTemplate(
         // final name is only ever a COMPLETE schema (rename is atomic in PG).
         const bld = `tmpl_bld_${key}_${randomBytes(4).toString('hex')}`;
         await admin.unsafe(`CREATE DATABASE "${bld}"`);
+        await markManagedTestDatabase(admin, bld);
         const buildStartedAt = Date.now();
         try {
           const provisionResult = await provision(swapDbName(adminUri, bld)); // opens + CLOSES its own client ⇒ no lingering conn ⇒ renameable
