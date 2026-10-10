@@ -31,6 +31,7 @@ import {
   TEST_DB_MANAGED_MARKER,
   TEMPLATE_BUILDER_HEARTBEAT_STALE_MS,
   templateBuilderApplicationName,
+  markManagedTestDatabase,
 } from './pg-migrate.ts';
 import { getTestPg } from './pg-container.ts';
 import { acquireBaselineMigrationLock, dropBaselineDatabase } from './baseline-schema-global-setup.ts';
@@ -162,6 +163,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
     cleanupDbs.push(name);
     await dropLockHolder.unsafe(`SELECT pg_advisory_lock(hashtext($1::text))`, [TEST_DB_DROP_LOCK_KEY]);
     await dropLockHolder.unsafe(`CREATE DATABASE "${name}"`);
+    await markManagedTestDatabase(dropLockHolder, name);
 
     const startedAt = Date.now();
     try {
@@ -310,6 +312,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
     ]);
     await holder.unsafe(`SELECT pg_advisory_lock(hashtext($1::text))`, [lock]);
     await holder.unsafe(`CREATE DATABASE "${buildName}"`);
+    await markManagedTestDatabase(holder, buildName);
 
     const uri = new URL(await getTestPg());
     uri.pathname = `/${buildName}`;
@@ -365,6 +368,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
     // Simulate the old failure: a half-built template sitting under the final
     // name with NO readiness mark, containing schema a real build would not.
     await admin.unsafe(`CREATE DATABASE "${name}"`);
+    await markManagedTestDatabase(admin, name);
     {
       const uri = new URL(await getTestPg());
       uri.pathname = `/${name}`;
@@ -476,6 +480,7 @@ describe('baseline globalSetup migration lock deadline (EI-23130560676394847)', 
     const contender = await adminClient();
     const name = `papercusp_it_baseline_${randomBytes(6).toString('hex')}`;
     await holder.unsafe(`CREATE DATABASE "${name}"`);
+    await markManagedTestDatabase(holder, name);
     cleanupDbs.push(name);
     await holder.unsafe('SELECT pg_advisory_lock(hashtext($1))', [TEST_DB_DROP_LOCK_KEY]);
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
