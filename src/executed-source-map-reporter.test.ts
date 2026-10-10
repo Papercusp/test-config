@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,12 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TestModule } from 'vitest/node';
 
 import { inferWorkspaceRoot } from './admin-test-runs-reporter';
-import { PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
+import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
   EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS,
   appendExecutedSourceMapResult,
   captureConfigSources,
   collectExecutedModules,
+  completeModuleImports,
   executedSourceRunContext,
   executedSourceRunnerIdentity,
   isolatedByConfig,
@@ -24,6 +25,26 @@ import ExecutedSourceMapReporter, {
 } from './executed-source-map-reporter';
 
 // gate-test-reuse-yield-2026-10-01 P-001: the config that ran a file is one of its proof inputs.
+describe('final worker module handoff', () => {
+  it('unions body imports omitted from collection diagnostics, preserving external flags', () => {
+    const collection = { '/repo/static.ts': {} };
+    expect(completeModuleImports(collection, { testFile: '/repo/test.ts', reads: [], opaque: [],
+      moduleImports: { '/repo/test.ts': { external: false }, '/repo/dynamic.ts': { external: false },
+        '/repo/native.cjs': { external: true } },
+    })).toEqual({ imports: { ...collection, '/repo/test.ts': { external: false }, '/repo/dynamic.ts': { external: false },
+      '/repo/native.cjs': { external: true } }, reasons: [] });
+    expect(collection).toEqual({ '/repo/static.ts': {} });
+  });
+
+  it('leaves absent or malformed final observations explicitly opaque', () => {
+    for (const moduleImports of [undefined, null, [], {}, { '/repo/route.ts': { external: false } },
+      { '/repo/test.ts': { external: false }, '/repo/route.ts': { external: 'invalid' } }]) {
+      expect(completeModuleImports({ '/repo/static.ts': {} }, { testFile: '/repo/test.ts', reads: [], opaque: [],
+        moduleImports } as never).reasons).toEqual(['worker-module-imports-unavailable']);
+    }
+  });
+});
+
 describe('resolveConfigDependencies', () => {
   it('unions the root and per-project configFileDependencies, absolute paths only, sorted', () => {
     const ctx = {
@@ -212,7 +233,16 @@ describe('ExecutedSourceMapReporter', () => {
   const clean = { commit: 'c0ffee0000000000000000000000000000000000', porcelain: '' };
   const snapshot = (s: { commit: string | null; porcelain: string | null }) => async () => s;
 
-  function fakeModule(o: { state?: string; isolate?: boolean | undefined; imports?: Record<string, { external?: boolean }> | 'throw'; moduleId?: string }): TestModule {
+  function fakeModule(o: { state?: string; isolate?: boolean | undefined; imports?: Record<string, { external?: boolean }> | 'throw'; moduleId?: string; workerImports?: boolean }): TestModule {
+    if (o.workerImports) {
+      process.env[PC_EXECUTED_INPUTS_DIR_ENV] = tmp;
+      writeFileSync(inputsFilePath(tmp, o.moduleId ?? TEST_FILE), JSON.stringify({
+        testFile: o.moduleId ?? TEST_FILE, reads: [], opaque: [],
+        moduleImports: { [o.moduleId ?? TEST_FILE]: { external: false },
+          ...Object.fromEntries(Object.entries(typeof o.imports === 'object' ? o.imports : {})
+            .map(([path, info]) => [path, { external: info.external === true }])) },
+      }));
+    }
     return {
       moduleId: o.moduleId ?? TEST_FILE,
       state: () => o.state ?? 'passed',
@@ -295,7 +325,7 @@ describe('ExecutedSourceMapReporter', () => {
           // No input record for this module (capture not armed) => never reusable (D-004 rule 2).
           inputsCaptured: false,
           readPaths: [],
-          opaqueReasons: [],
+          opaqueReasons: ['worker-module-imports-unavailable'],
         },
       ],
     });
@@ -356,7 +386,7 @@ describe('ExecutedSourceMapReporter', () => {
     const nodes = new Map([self, source].map(id => [id, {
       id, transformResult: { map: { sources: [id], sourcesContent: [readFileSync(id, 'utf8')] } },
     }]));
-    const mod = Object.assign(fakeModule({ moduleId: self, imports: { [source]: {} } }), {
+    const mod = Object.assign(fakeModule({ moduleId: self, imports: { [source]: {} }, workerImports: true }), {
       viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
     });
     let n = 0;
@@ -414,7 +444,7 @@ describe('ExecutedSourceMapReporter', () => {
     const nodes = new Map([self, source].map(id => [id, {
       id, transformResult: { map: { sources: [id], sourcesContent: [readFileSync(id, 'utf8')] } },
     }]));
-    const mod = Object.assign(fakeModule({ state: 'failed', moduleId: self, imports: { [source]: {} } }), {
+    const mod = Object.assign(fakeModule({ state: 'failed', moduleId: self, imports: { [source]: {} }, workerImports: true }), {
       viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
     });
     const { r, flushes } = reporter();
@@ -448,7 +478,7 @@ describe('ExecutedSourceMapReporter', () => {
     const nodes = new Map(originals.map(({ id, code }) => [id, {
       id, transformResult: { map: { sources: [id], sourcesContent: [code] } },
     }]));
-    const mod = Object.assign(fakeModule({ state, moduleId: self, imports: { [source]: {} } }), {
+    const mod = Object.assign(fakeModule({ state, moduleId: self, imports: { [source]: {} }, workerImports: true }), {
       viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
       children: { allTests: () => [{
         result: () => ({ state }), diagnostic: () => ({ retryCount: 0, flaky: false }),
@@ -509,7 +539,7 @@ describe('ExecutedSourceMapReporter', () => {
       id, transformResult: { map: { sources: [id], sourcesContent: [readFileSync(id, 'utf8')] } },
     }]));
     const imports = { [source]: {} };
-    const mod = Object.assign(fakeModule({ moduleId: self, imports }), {
+    const mod = Object.assign(fakeModule({ moduleId: self, imports, workerImports: true }), {
       viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
     });
     const { r } = reporter();

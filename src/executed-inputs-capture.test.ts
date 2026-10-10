@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,
   beginFile,
+  captureModuleImports,
   currentRecorder,
   endFile,
   installCapture,
@@ -22,6 +23,23 @@ import {
 
 /** True when the setup file already installed capture on the real fs in this worker. */
 const armed = Boolean(process.env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim());
+
+describe('final worker module observation', () => {
+  it('retains body imports and external flags while excluding builtin and virtual IDs', () => {
+    expect(captureModuleImports({ moduleExecutionInfo: new Map([
+      ['/repo/dynamic-route.ts', {}],
+      ['/repo/native.cjs', { external: true }],
+      ['node:fs', { external: true }],
+    ]) })).toEqual({ '/repo/dynamic-route.ts': { external: false }, '/repo/native.cjs': { external: true } });
+  });
+
+  it('leaves missing, malformed and throwing worker state unknown', () => {
+    expect(captureModuleImports(undefined)).toBeNull();
+    expect(captureModuleImports({ moduleExecutionInfo: new Map() })).toBeNull();
+    expect(captureModuleImports({ moduleExecutionInfo: new Map([['/repo/route.ts', { external: 'invalid' }]]) })).toBeNull();
+    expect(captureModuleImports({ get moduleExecutionInfo() { throw new Error('unavailable'); } })).toBeNull();
+  });
+});
 
 describe('repoPathOf', () => {
   const repo = '/repo';

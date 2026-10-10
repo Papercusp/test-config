@@ -44,10 +44,14 @@ export function captureModuleImports(workerState: unknown): InputsRecord['module
     if (!(info instanceof Map)) return null;
     const imports: Record<string, { external: boolean }> = {};
     for (const [path, value] of info) {
-      if (typeof path !== 'string' || typeof value?.external !== 'boolean') return null;
-      imports[path] = { external: value.external };
+      if (typeof path !== 'string' || !value || typeof value !== 'object' ||
+          (value.external !== undefined && typeof value.external !== 'boolean')) return null;
+      // Builtins and virtual IDs are not repository source files.
+      if (!isAbsolute(path)) continue;
+      // Vitest's evaluator omits external for inlined modules.
+      imports[path] = { external: value.external === true };
     }
-    return imports;
+    return Object.keys(imports).length ? imports : null;
   } catch {
     return null;
   }

@@ -208,7 +208,8 @@ export function completeModuleImports(
 ): { imports: Record<string, ImportDurationLike>; reasons: string[] } {
   const imports = { ...collection };
   const final = inputs?.moduleImports;
-  if (!final || typeof final !== 'object' || Array.isArray(final)) {
+  if (!final || typeof final !== 'object' || Array.isArray(final) ||
+      !inputs?.testFile || final[inputs.testFile]?.external !== false) {
     return { imports, reasons: ['worker-module-imports-unavailable'] };
   }
   for (const [path, info] of Object.entries(final)) {
@@ -746,6 +747,11 @@ export default class ExecutedSourceMapReporter implements Reporter {
   onTestModuleEnd(testModule: TestModule): void {
     if (!this.armed) return;
     try {
+      let collectionImports: Record<string, ImportDurationLike> | undefined;
+      try { collectionImports = testModule.diagnostic().importDurations as typeof collectionImports; } catch { /* unknown */ }
+      const inputs = readInputsRecord(this.inputsDir, testModule.moduleId);
+      const observed = completeModuleImports(collectionImports, inputs);
+      let sourceEvidence: ExecutedSourceEvidence | undefined;
       let state = 'error';
       try {
         state = testModule.state();
@@ -757,10 +763,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
       if (this.armed.outPath) {
         const testFile = normalizeExecutedKey(testModule.moduleId, this.repoRoot);
         if (testFile) {
-          let imports: Record<string, ImportDurationLike> | undefined;
-          try { imports = testModule.diagnostic().importDurations as typeof imports; } catch { /* unknown */ }
-          const sourceEvidence = qualifyCollectedSources(this.collectedSources.get(testModule), imports,
+          sourceEvidence = qualifyCollectedSources(this.collectedSources.get(testModule), observed.imports,
             { repoRoot: this.repoRoot, testFile: testModule.moduleId });
+          if (observed.reasons.length) {
+            sourceEvidence.status = sourceEvidence.status === 'changed' ? 'changed' : 'unknown';
+            sourceEvidence.reasons.push(...observed.reasons);
+          }
           if (!moduleIsIsolated(testModule)) {
             sourceEvidence.status = sourceEvidence.status === 'changed' ? 'changed' : 'unknown';
             sourceEvidence.reasons.push('worker-not-isolated');
@@ -797,12 +805,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
         this.skipped += 1;
         return;
       }
-      let importDurations: Record<string, ImportDurationLike> | undefined;
-      try {
-        importDurations = testModule.diagnostic().importDurations as Record<string, ImportDurationLike> | undefined;
-      } catch {
-        importDurations = undefined;
-      }
+      const importDurations = observed.imports;
       const testFile = normalizeExecutedKey(testModule.moduleId, this.repoRoot);
       if (!testFile) return; // outside the repo — never a selectable test
       // No import record at all (limit not raised, or an unsupported pool) is a recording gap,
@@ -814,7 +817,6 @@ export default class ExecutedSourceMapReporter implements Reporter {
       }
       const executedModules = collectExecutedModules(importDurations, { repoRoot: this.repoRoot, testFile: testModule.moduleId });
       // P-009: the worker's runtime-inputs record. Absent = inputs unknown = never reusable.
-      const inputs = readInputsRecord(this.inputsDir, testModule.moduleId);
       this.discardInputs(testModule.moduleId);
       // P-001 (proof-v2): the config that ran this file is one of its inputs. Without it the
       // selector could not scope a nested vitest config change to the proofs it affects, so a
@@ -828,11 +830,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
         inputsCaptured: inputs !== null,
         // Absolute until flush, where classifyReadPaths relativises them against the tracked tree.
         readPaths: [...(inputs?.reads ?? []), ...(configDeps ?? [])],
-        opaqueReasons: [...(inputs?.opaque ?? []), ...(configDeps === null ? ['config-deps-unavailable'] : [])],
-        ...(this.armed.outPath ? { sourceEvidence: qualifyCollectedSources(
-          this.collectedSources.get(testModule), importDurations,
-          { repoRoot: this.repoRoot, testFile: testModule.moduleId },
-        ) } : {}),
+        opaqueReasons: [...(inputs?.opaque ?? []), ...observed.reasons,
+          ...(configDeps === null ? ['config-deps-unavailable'] : [])],
+        ...(sourceEvidence ? { sourceEvidence } : {}),
       });
     } catch {
       /* swallow — D-007 */
