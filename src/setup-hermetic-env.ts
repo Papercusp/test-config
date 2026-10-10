@@ -124,6 +124,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createHermeticDir, stateDirNeedsRedirect, sweepStaleTestScratch } from './hermetic-tmpdir.js';
+import { resolveTestRunWorkspaceId } from './admin-test-runs-reporter.js';
 
 // WI-38869: at least 17 OTHER test files each mint their own scratch dir directly
 // at the /tmp/pcv TOP LEVEL (mkdtempSync(join(tmpdir(), '<own-prefix>-'))) with no
@@ -246,6 +247,11 @@ delete process.env.PAPERCUSP_BIND_HOST;
 // launcher writes both.
 delete process.env.PAPERCUSP_OPERATOR_URL;
 delete process.env.PAPERCUSP_OPERATOR_URL_PROVENANCE;
+// The reporter runs in the parent, before this worker-only scrub. Preserve
+// its workspace in the existing ledger-only override so isolated source
+// receipts use the same attribution without restoring the live runtime pin.
+const testRunWorkspace = resolveTestRunWorkspaceId();
+if (testRunWorkspace) process.env.PAPERCUSP_TEST_RUN_WORKSPACE = testRunWorkspace;
 delete process.env.PAPERCUSP_WORKSPACE_ID;
 delete process.env.PAPERCUSP_POT_HOME_SLUG;
 delete process.env.PAPERCUSP_INTEGRATION_ROOT;
