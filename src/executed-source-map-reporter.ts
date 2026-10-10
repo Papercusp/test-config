@@ -200,6 +200,26 @@ export const EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS = 20_000;
 
 type ImportDurationLike = { external?: boolean } | undefined;
 
+/** Public Vitest diagnostics stop at collection. Union the final worker observation and
+ * make older/unavailable handoffs explicitly opaque rather than claiming a complete radius. */
+export function completeModuleImports(
+  collection: Record<string, ImportDurationLike> | undefined,
+  inputs: InputsRecord | null,
+): { imports: Record<string, ImportDurationLike>; reasons: string[] } {
+  const imports = { ...collection };
+  const final = inputs?.moduleImports;
+  if (!final || typeof final !== 'object' || Array.isArray(final)) {
+    return { imports, reasons: ['worker-module-imports-unavailable'] };
+  }
+  for (const [path, info] of Object.entries(final)) {
+    if (!isAbsolute(path) || typeof info?.external !== 'boolean') {
+      return { imports, reasons: ['worker-module-imports-unavailable'] };
+    }
+    imports[path] = info;
+  }
+  return { imports, reasons: [] };
+}
+
 /**
  * Normalise one `importDurations` key to a repo-root-relative POSIX path, or `null` when it
  * is not a repo-internal source module. Keys are absolute file paths as vitest's module

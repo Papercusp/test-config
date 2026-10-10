@@ -31,6 +31,26 @@ export interface InputsRecord {
   reads: string[];
   /** Why the file cannot be reused (child-process, worker-thread, socket, git-metadata, ...). */
   opaque: string[];
+  /** Final worker import observation. Vitest's public diagnostic covers collection only. */
+  moduleImports?: Record<string, { external: boolean }> | null;
+}
+
+/** Observe the live worker's complete execution map at teardown, including body imports.
+ * The internal seam is version-sensitive: unavailable or malformed state stays unknown.
+ * Never substitute a static graph or a later disk read for this execution observation. */
+export function captureModuleImports(workerState: unknown): InputsRecord['moduleImports'] {
+  try {
+    const info = (workerState as { moduleExecutionInfo?: unknown } | null)?.moduleExecutionInfo;
+    if (!(info instanceof Map)) return null;
+    const imports: Record<string, { external: boolean }> = {};
+    for (const [path, value] of info) {
+      if (typeof path !== 'string' || typeof value?.external !== 'boolean') return null;
+      imports[path] = { external: value.external };
+    }
+    return imports;
+  } catch {
+    return null;
+  }
 }
 
 export interface Recorder {

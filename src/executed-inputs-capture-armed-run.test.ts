@@ -90,7 +90,8 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       expect(existsSync(run.mapPath), run.output.slice(-4000)).toBe(true);
       const map = JSON.parse(readFileSync(run.mapPath, 'utf8')) as {
         workspaceName: string;
-        rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[] }>;
+        rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[];
+          executedModules?: string[]; sourceEvidence?: { status: string; reasons: string[] } }>;
       };
       expect(map.workspaceName).toBe(FIXTURE_WORKSPACE);
       expect(map.rows).toHaveLength(1);
@@ -100,6 +101,15 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       // in the out file, relativised at flush), so a change to it voids exactly this proof.
       expect(map.rows[0]?.readPaths).toContain(FIXTURE_CONFIG);
       expect(map.rows[0]?.opaqueReasons ?? []).not.toContain('config-deps-unavailable');
+
+      // Vitest's diagnostic importDurations is a collection-time snapshot. A route loaded
+      // in a test body after resetModules must still enter the dependency radius, and its
+      // absent prospective original-source receipt must keep that graph unknown.
+      const dynamicRoute = 'libs/test-config/src/__fixtures__/armed-capture/dynamic-route.fixture.ts';
+      expect(map.rows[0]?.executedModules).toContain(dynamicRoute);
+      expect(map.rows[0]?.sourceEvidence).toMatchObject({
+        status: 'unknown', reasons: expect.arrayContaining([`module-not-captured-at-collection:${dynamicRoute}`]),
+      });
 
       // The runner-readable result channel reports this flush. The database is unreachable, so
       // the outcome is never `written`; it must still describe the one row.

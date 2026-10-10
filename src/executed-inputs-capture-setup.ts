@@ -17,6 +17,7 @@ import { inferWorkspaceRoot } from './admin-test-runs-reporter';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,
   beginFile,
+  captureModuleImports,
   endFile,
   inputsFilePath,
   installCapture,
@@ -50,6 +51,9 @@ if (dir) {
         const filepath =
           (suite as { filepath?: string } | undefined)?.filepath ?? expect.getState().testPath ?? null;
         const record = endFile(filepath ?? '');
+        if (record) record.moduleImports = captureModuleImports(
+          (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__,
+        );
         if (filepath && record) writeFileSync(inputsFilePath(dir, filepath), JSON.stringify(record));
       } catch {
         /* no record = inputs unknown = never reused; never a test failure */
