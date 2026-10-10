@@ -135,6 +135,7 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { PAPERCUSP_TMPDIR_CANDIDATES } from './tmpdir-guard.js';
 
 /** Never touch a dir younger than this — a peer may have just created it. */
 export const HERMETIC_SWEEP_MIN_AGE_MS = 60_000;
@@ -342,8 +343,14 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
  */
 export function sweepStaleTestScratch(
   root: string,
-  opts: Omit<SweepOptions, 'ageOnly' | 'isAlive'> = {},
+  opts: Omit<SweepOptions, 'ageOnly' | 'isAlive'> & { requireSharedScratchRoot?: boolean } = {},
 ): SweepResult {
+  // Automatic test startup does not own a caller-selected TMPDIR. Only the
+  // maintained shared scratch namespaces grant it root-level cleanup authority.
+  // Explicit callers may still sweep a namespace they created themselves.
+  if (opts.requireSharedScratchRoot && !PAPERCUSP_TMPDIR_CANDIDATES.includes(resolve(root))) {
+    return { scanned: 0, removed: 0, keptAlive: 0, keptYoung: 0 };
+  }
   return sweepAbandonedHermeticDirs(root, {
     maxAgeMs: GENERIC_SCRATCH_SWEEP_MAX_AGE_MS,
     exclude: GENERIC_SCRATCH_SWEEP_EXCLUDE,

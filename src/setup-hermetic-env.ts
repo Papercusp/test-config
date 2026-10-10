@@ -134,7 +134,7 @@ import { createHermeticDir, stateDirNeedsRedirect, sweepStaleTestScratch } from 
 // (age-only — these dirs are not pid-stamped, see hermetic-tmpdir.ts). Best-effort;
 // never let a sweep failure block a test file from loading.
 try {
-  sweepStaleTestScratch(tmpdir());
+  sweepStaleTestScratch(tmpdir(), { requireSharedScratchRoot: true });
 } catch {
   /* best-effort — never let cleanup fail the process */
 }

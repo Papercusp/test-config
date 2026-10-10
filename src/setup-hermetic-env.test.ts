@@ -1,5 +1,6 @@
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -83,6 +84,25 @@ async function runSetupOn(values: Record<string, string>): Promise<Record<string
     }
   }
 }
+
+describe('setup-hermetic-env: caller TMPDIR cleanup authority', () => {
+  it('preserves an unrelated stale build tree when the real startup setup re-runs', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'caller-owned-'));
+    const build = join(root, 'portable-server-p058');
+    const artifact = join(build, 'product', 'retained.txt');
+    mkdirSync(join(build, 'product'), { recursive: true });
+    writeFileSync(artifact, 'independent retained build');
+    const old = (Date.now() - 24 * 60 * 60 * 1000) / 1000;
+    utimesSync(build, old, old);
+    try {
+      await runSetupOn({ TMPDIR: root });
+      expect(existsSync(artifact)).toBe(true);
+      expect(readFileSync(artifact, 'utf8')).toBe('independent retained build');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 /**
  * WI-10004341: a psu shell exports PAPERCUSP_OPERATOR_URL (+ its provenance marker), and

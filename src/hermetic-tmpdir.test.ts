@@ -292,6 +292,23 @@ describe('sweepStaleTestScratch', () => {
   // These dirs are NOT pid-stamped (17 real test files mint their own prefix
   // directly at the TMPDIR root — WI-38869), so every case here is a non-pid name.
 
+  it('automatic startup preserves unrelated old trees in a caller-selected TMPDIR', () => {
+    const build = seedNamed('portable-server-p058', GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000);
+    const payload = join(build, 'product', 'node_modules', 'package');
+    mkdirSync(payload, { recursive: true });
+    writeFileSync(join(payload, 'retained.txt'), 'independent build evidence');
+    const old = (Date.now() - GENERIC_SCRATCH_SWEEP_MAX_AGE_MS - 60_000) / 1000;
+    utimesSync(build, old, old);
+
+    expect(sweepStaleTestScratch(root, { requireSharedScratchRoot: true, startAt: 0 })).toEqual({
+      scanned: 0, removed: 0, keptAlive: 0, keptYoung: 0,
+    });
+    expect(readFileSync(join(payload, 'retained.txt'), 'utf8')).toBe('independent build evidence');
+    // Positive control: the explicit sweep still removes stale owned scratch.
+    expect(sweepStaleTestScratch(root, { startAt: 0 }).removed).toBe(1);
+    expect(existsSync(build)).toBe(false);
+  });
+
   it('KEEPS a non-pid-named dir under the age threshold, however long it has run', () => {
     // The property this function exists to hold: sweepAbandonedHermeticDirs would
     // reap this the moment it crosses 60s (no parseable pid ⇒ not alive). A live
