@@ -145,6 +145,29 @@ describe('durable module execution measurement', () => {
     expect(collectModuleExecution(module(['passed', 'passed', 'skipped', 'failed'], 'failed')))
       .toEqual({ passed: 2, failed: 1, skipped: 1, collectionFailed: false });
   });
+  it.each(['passed-first', 'failed-first'])('omits mixed-outcome duplicate names from proof while preserving counts (%s)', order => {
+    const mixed = ['passed', 'failed'];
+    if (order === 'failed-first') mixed.reverse();
+    const cases = [
+      ...mixed.map(state => ({ fullName: 'suite > duplicate', result: () => ({ state }) })),
+      { fullName: 'suite > positive', result: () => ({ state: 'passed' }) },
+      { fullName: 'suite > negative', result: () => ({ state: 'failed' }) },
+    ];
+    const measured = collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never, /duplicate/g);
+    expect(measured).toEqual({ passed: 2, failed: 2, skipped: 0, collectionFailed: false,
+      passedCaseTitles: ['suite > positive'], failedCaseTitles: ['suite > negative'] });
+  });
+  it('does not certify a duplicate failure when its passing case falls outside the recording cap', () => {
+    const cases = [
+      ...Array.from({ length: 70 }, (_, i) => ({ fullName: `suite > first-${i}`, result: () => ({ state: 'passed' }) })),
+      { fullName: 'suite > duplicate', result: () => ({ state: 'passed' }) },
+      { fullName: 'suite > duplicate', result: () => ({ state: 'failed' }) },
+    ];
+    const measured = collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never);
+    expect(measured).toMatchObject({ passed: 71, failed: 1, skipped: 0 });
+    expect(measured?.passedCaseTitles).toHaveLength(64);
+    expect(measured?.failedCaseTitles).toBeUndefined();
+  });
   it('records requested late passing identities within the cap without crediting skipped or failed cases', () => {
     const cases = Array.from({ length: 80 }, (_, i) => ({
       fullName: `suite > proof-${i}`,
@@ -197,6 +220,7 @@ describe('durable module execution measurement', () => {
   it('writes the captured run scope and counts on the same terminal row', async () => {
     vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'ca5fce52-7c67-4d38-8c26-96a952f6a2a2');
     vi.stubEnv('PAPERCUSP_WORKSPACE_ID', 'ws-count-proof');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_WORKSPACE', 'ws-count-proof');
     vi.stubEnv('PAPERCUSP_TEST_RUN_HARNESS', 'count-proof');
     const rows: TestRunRow[] = [];
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
