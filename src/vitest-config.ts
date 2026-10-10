@@ -831,14 +831,32 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         // EPIPE cost ~a day exactly this way. Make the class loud AT THE POINT OF FAILURE.
         // Purely additive: does not change the verdict, only prints a signpost. See fact
         // a-failure-that-fails-no-assertion-2026-07-12.
-        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        const diagnostics: string[] = [];
+        const seen = new Set<unknown>();
+        let cause: unknown = error;
+        for (let depth = 0; cause != null && depth < 6; depth++) {
+          if (seen.has(cause)) { diagnostics.push('   cause=[cycle]\n'); break; }
+          seen.add(cause);
+          const detail = cause as Error & { code?: string; cause?: unknown };
+          diagnostics.push(
+            `   ${depth ? `cause[${depth}] ` : ''}name=${detail?.name ?? '(unknown)'} code=${detail?.code ?? '(none)'}\n` +
+            `   message=${String(detail?.message ?? cause).slice(0, 600)}\n` +
+            (typeof detail?.stack === 'string'
+              ? `   stack=${detail.stack.split('\n').slice(0, 5).join('\n').slice(0, 1200)}\n` : ''),
+          );
+          cause = detail?.cause;
+        }
+        if (cause != null && diagnostics.length === 6) diagnostics.push('   cause=[depth limit]\n');
+        const workerStartup = /\[vitest-pool\].*(Failed to start|Timeout starting)/.test(String(error?.message));
         // eslint-disable-next-line no-console
         console.error(
           '\n⚠⚠ UNHANDLED ERROR failed this test file — NOT an assertion.\n' +
-            `   name=${error?.name ?? '(unknown)'} code=${code ?? '(none)'}\n` +
-            `   message=${String(error?.message ?? error).slice(0, 300)}\n` +
-            '   Every `expect` in this file may have PASSED. Look for an unhandled async/stream\n' +
-            '   error (EPIPE/ECONNRESET/unhandledRejection/child stdin), not a bad assertion.\n' +
+            diagnostics.join('') +
+            (workerStartup
+              ? '   Worker startup failed before test collection; no assertion result was produced.\n' +
+                '   Diagnose the inner cause and inherited Node preloads/IPC before retrying the test.\n'
+              : '   Every `expect` in this file may have PASSED. Look for an unhandled async/stream\n' +
+                '   error (EPIPE/ECONNRESET/unhandledRejection/child stdin), not a bad assertion.\n') +
             '   (test-config onUnhandledError · fact a-failure-that-fails-no-assertion-2026-07-12)\n',
         );
         return undefined; // still fail the run — diagnosability, not suppression.

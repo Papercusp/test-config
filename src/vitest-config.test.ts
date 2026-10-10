@@ -321,4 +321,33 @@ describe('defineVitestConfig unhandled-error diagnostics (EI-10766)', () => {
     expect(consoleError.mock.calls[0]?.[0]).toContain('code=EPIPE');
     expect(consoleError.mock.calls[0]?.[0]).toContain('Every `expect` in this file may have PASSED');
   });
+
+  it('retains the worker-start inner cause and stack without implying assertions passed', () => {
+    const cause = Object.assign(new Error('spawn EAGAIN'), { code: 'EAGAIN' });
+    const error = new Error('[vitest-pool]: Failed to start forks worker for test files example.test.ts.', { cause });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    expect(handler()(error)).toBeUndefined();
+    const message = consoleError.mock.calls[0]?.[0];
+    expect(message).toContain('cause[1] name=Error code=EAGAIN');
+    expect(message).toContain('message=spawn EAGAIN');
+    expect(message).toContain('stack=Error: spawn EAGAIN');
+    expect(message).toContain('no assertion result was produced');
+    expect(message).not.toContain('Every `expect` in this file may have PASSED');
+  });
+
+  it('bounds cyclic and long cause chains while retaining the failure verdict', () => {
+    const error = new Error('outer') as Error & { cause: unknown };
+    error.cause = error;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    expect(handler()(error)).toBeUndefined();
+    expect(consoleError.mock.calls[0]?.[0]).toContain('cause=[cycle]');
+
+    consoleError.mockClear();
+    let deep = new Error('hidden');
+    for (let i = 0; i < 10; i++) deep = new Error('x'.repeat(5000), { cause: deep });
+    expect(handler()(deep)).toBeUndefined();
+    expect(consoleError.mock.calls[0]?.[0]).toContain('cause=[depth limit]');
+    expect(String(consoleError.mock.calls[0]?.[0]).length).toBeLessThan(12_000);
+  });
 });
