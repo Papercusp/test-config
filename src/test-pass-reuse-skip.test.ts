@@ -60,6 +60,8 @@ describe('resolveReuseSkipExclude', () => {
       listFile({ ...here(), schema: 99, files: ['a.test.ts'] }),
       listFile({ ...here(), runContext: 'green-checkpoint', files: ['a.test.ts'] }),
       listFile({ ...here(), runnerIdentity: 'v0.0.0 plan9 mips', files: ['a.test.ts'] }),
+      listFile({ ...here(), runnerIdentity: `proof-v2 ${process.version} ${process.platform} ${process.arch}`,
+        files: ['a.test.ts'] }),
     ];
     for (const p of cases) {
       // runContext for an env WITHOUT GREEN_CHECKPOINT is clean-local, so a green-checkpoint list is foreign.
