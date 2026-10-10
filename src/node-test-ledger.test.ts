@@ -155,6 +155,19 @@ describe('buildNodeTestRunRows', () => {
     expect(row.outputTail).toBe('papercusp-desktop/test/guard.test.js: SyntaxError');
     expect(parseTestRunExecutionDetails(row.executionDetails)).toMatchObject({ collectionFailed: true, failed: 0 });
   });
+  it('preserves mixed-outcome counts and diagnostics without contradictory exact-title evidence', () => {
+    const [row] = buildNodeTestRunRows(summary([result({ passed: 2, failed: 2,
+      passedCaseTitles: ['guard > duplicate', 'guard > positive'],
+      failedCases: [
+        { title: 'guard > duplicate', message: 'mixed parameter', codeFailure: true },
+        { title: 'guard > negative', message: 'real failure', codeFailure: true },
+      ],
+    })]), ctx());
+    expect(row.status).toBe('fail');
+    expect(row.outputTail).toContain('guard > duplicate: mixed parameter');
+    expect(parseTestRunExecutionDetails(row.executionDetails)).toMatchObject({ passed: 2, failed: 2,
+      passedCaseTitles: ['guard > positive'], failedCaseTitles: ['guard > negative'] });
+  });
 
   it('carries a dirty tree and its reason, and records nothing for unmeasured or out-of-root files', () => {
     const rows = buildNodeTestRunRows(

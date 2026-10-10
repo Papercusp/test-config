@@ -105,14 +105,19 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
 
     const collectionFailed =
       result.fileLevelFailure !== null && result.passed === 0 && result.failed === 0 && result.skipped === 0;
-    const failedCaseTitles = collectionFailed
+    const failedTitles = collectionFailed
       ? []
       : [...new Set(result.failedCases.map((c) => c.title))]
           .filter((title) => isRecordedCaseTitle(title))
           .slice(0, Math.min(MAX_RECORDED_FAILED_CASES, result.failed));
-    const passedCaseTitles = Array.isArray(result.passedCaseTitles)
+    const passedTitles = Array.isArray(result.passedCaseTitles)
       ? [...new Set(result.passedCaseTitles.filter((title) => isRecordedCaseTitle(title)))].slice(0, MAX_RECORDED_PASSED_CASES)
       : [];
+    // A reused parameterized name with conflicting outcomes is not an exact
+    // assertion identity. Keep counts and diagnostics, but omit that proof.
+    const ambiguousTitles = new Set(passedTitles.filter(title => failedTitles.includes(title)));
+    const passedCaseTitles = passedTitles.filter(title => !ambiguousTitles.has(title));
+    const failedCaseTitles = failedTitles.filter(title => !ambiguousTitles.has(title));
 
     const durationMs = Math.max(0, Math.round(result.durationMs));
     const executionDetails: TestRunExecutionDetails = {

@@ -661,8 +661,14 @@ export function collectModuleExecution(testModule: TestModule, preferredPassedCa
     const failedCaseTitles = new Set<string>();
     const passedCaseTitles = new Set<string>();
     const preferredPassedCaseTitles = new Set<string>();
+    const titleOutcomes = new Map<string, string>();
     for (const test of testModule.children.allTests()) {
-      switch (test.result().state) {
+      const state = test.result().state;
+      if (isRecordedCaseTitle(test.fullName)) {
+        const prior = titleOutcomes.get(test.fullName);
+        titleOutcomes.set(test.fullName, prior === undefined || prior === state ? state : 'ambiguous');
+      }
+      switch (state) {
         case 'passed':
           passed++;
           if (isRecordedCaseTitle(test.fullName) && passedCaseTitles.size < MAX_RECORDED_PASSED_CASES) {
@@ -684,11 +690,15 @@ export function collectModuleExecution(testModule: TestModule, preferredPassedCa
         default: return null; // pending/unreadable is not a completed measurement
       }
     }
+    // Parameterized tests can reuse a fullName. Counts remain measurements, but
+    // a mixed-outcome name cannot identify a passing or failing assertion.
+    const recordedFailedCaseTitles = [...failedCaseTitles].filter(title => titleOutcomes.get(title) === 'failed');
     const recordedPassedCaseTitles = [...new Set([...preferredPassedCaseTitles, ...passedCaseTitles])]
+      .filter(title => titleOutcomes.get(title) === 'passed')
       .slice(0, MAX_RECORDED_PASSED_CASES);
     return {
       passed, failed, skipped, collectionFailed: status === 'fail' && failed === 0,
-      ...(failedCaseTitles.size > 0 ? { failedCaseTitles: [...failedCaseTitles] } : {}),
+      ...(recordedFailedCaseTitles.length > 0 ? { failedCaseTitles: recordedFailedCaseTitles } : {}),
       ...(recordedPassedCaseTitles.length > 0 ? { passedCaseTitles: recordedPassedCaseTitles } : {}),
     };
   } catch {
