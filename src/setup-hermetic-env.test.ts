@@ -66,7 +66,7 @@ describe('setup-hermetic-env: outbound telemetry is pinned off', () => {
 /** Re-run the setup module on an env carrying `values`, return those keys afterwards,
  *  then restore them. Used by every "the setup handles an inherited value" case below. */
 async function runSetupOn(values: Record<string, string>): Promise<Record<string, string | undefined>> {
-  const keys = Object.keys(values);
+  const keys = [...new Set([...Object.keys(values), 'PAPERCUSP_TEST_RUN_WORKSPACE'])];
   const saved = new Map(keys.map((k) => [k, process.env[k]] as const));
   try {
     Object.assign(process.env, values);
@@ -84,6 +84,30 @@ async function runSetupOn(values: Record<string, string>): Promise<Record<string
     }
   }
 }
+
+describe('setup-hermetic-env: original ledger workspace survives runtime isolation', () => {
+  it.each(['PAPERCUSP_WORKSPACE_ID', 'PAPERCUSP_WORKSPACE'])(
+    'preserves %s for proof attribution before scrubbing the runtime pin', async key => {
+      const result = await runSetupOn({ PAPERCUSP_TEST_RUN_WORKSPACE: '',
+        PAPERCUSP_WORKSPACE_ID: '', PAPERCUSP_WORKSPACE: '', [key]: 'original-ledger-workspace' });
+      expect(result.PAPERCUSP_TEST_RUN_WORKSPACE).toBe('original-ledger-workspace');
+      expect(result.PAPERCUSP_WORKSPACE_ID).toBeUndefined();
+    });
+
+  it('keeps an explicit ledger workspace ahead of a private runtime workspace', async () => {
+    const result = await runSetupOn({ PAPERCUSP_TEST_RUN_WORKSPACE: 'original-ledger-workspace',
+      PAPERCUSP_WORKSPACE_ID: 'test-runtime-private', PAPERCUSP_WORKSPACE: 'ambient-workspace' });
+    expect(result.PAPERCUSP_TEST_RUN_WORKSPACE).toBe('original-ledger-workspace');
+    expect(result.PAPERCUSP_WORKSPACE_ID).toBeUndefined();
+  });
+
+  it('leaves unattributed runs without a fabricated workspace', async () => {
+    const result = await runSetupOn({ PAPERCUSP_TEST_RUN_WORKSPACE: '',
+      PAPERCUSP_WORKSPACE_ID: '', PAPERCUSP_WORKSPACE: '' });
+    expect(result.PAPERCUSP_TEST_RUN_WORKSPACE).toBe('');
+    expect(result.PAPERCUSP_WORKSPACE_ID).toBeUndefined();
+  });
+});
 
 describe('setup-hermetic-env: caller TMPDIR cleanup authority', () => {
   it('preserves an unrelated stale build tree when the real startup setup re-runs', async () => {
