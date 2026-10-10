@@ -239,6 +239,8 @@ describe('ExecutedSourceMapReporter', () => {
       PC_EXECUTED_SOURCE_MAP_OUT_ENV,
       PC_EXECUTED_SOURCE_MAP_RESULT_ENV,
       'PAPERCUSP_TEST_RUN_GROUP',
+      'PAPERCUSP_MUTATION_PROBE',
+      'PAPERCUSP_MUTATION_PHASE',
       PC_EXECUTED_INPUTS_DIR_ENV,
       PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV,
     ]) {
@@ -248,6 +250,8 @@ describe('ExecutedSourceMapReporter', () => {
     // arms it no-persist on a rescue rerun of this very file).
     delete process.env[PC_EXECUTED_INPUTS_DIR_ENV];
     delete process.env[PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV];
+    delete process.env.PAPERCUSP_MUTATION_PROBE;
+    delete process.env.PAPERCUSP_MUTATION_PHASE;
     process.env[PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV] = '@papercusp/test-config';
     process.env[PC_EXECUTED_SOURCE_MAP_OUT_ENV] = join(tmp, 'out.json');
     process.env[PC_EXECUTED_SOURCE_MAP_RESULT_ENV] = join(tmp, 'result.jsonl');
@@ -429,6 +433,72 @@ describe('ExecutedSourceMapReporter', () => {
     expect(flushes[0]!.rows).toEqual([]);
     expect(flushes[0]!.retiredFiles).toEqual(['libs/test-config/src/executed-source-map-reporter.test.ts']);
     expect(flushes[0]).not.toHaveProperty('diagnostics');
+  });
+
+  it.each([
+    ['baseline', 'passed', 'pass'],
+    ['copy-baseline', 'passed', 'pass'],
+    ['mutant', 'failed', 'fail'],
+  ] as const)('captures %s mutation diagnostics without persisting or retiring proof', async (phase, state, verdict) => {
+    process.env.PAPERCUSP_MUTATION_PROBE = '1';
+    process.env.PAPERCUSP_MUTATION_PHASE = phase;
+    const self = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
+    const source = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.ts');
+    const originals = [self, source].map(id => ({ id, code: readFileSync(id, 'utf8') }));
+    const nodes = new Map(originals.map(({ id, code }) => [id, {
+      id, transformResult: { map: { sources: [id], sourcesContent: [code] } },
+    }]));
+    const mod = Object.assign(fakeModule({ state, moduleId: self, imports: { [source]: {} } }), {
+      viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
+      children: { allTests: () => [{
+        result: () => ({ state }), diagnostic: () => ({ retryCount: 0, flaky: false }),
+      }] },
+    });
+    const { r, flushes } = reporter();
+    r.onInit({} as never);
+    r.onTestModuleCollected(mod);
+    nodes.clear();
+    r.onTestModuleEnd(mod);
+    await r.onTestRunEnd();
+    await r.onExit();
+    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    expect(out.rows).toEqual([]);
+    expect(out.diagnostics).toEqual([{
+      testFile: 'libs/test-config/src/executed-source-map-reporter.test.ts', state,
+      sourceEvidence: {
+        schemaVersion: 'vite-collected-source-evidence-v1', scope: 'repository-worker-vite-original-sources',
+        status: 'stable', reasons: [], sources: originals.map(({ id, code }) => ({
+          path: normalizeExecutedKey(id, REPO_ROOT),
+          sha256: createHash('sha256').update(code).digest('hex'),
+          currentSha256: createHash('sha256').update(code).digest('hex'),
+        })),
+      },
+    }]);
+    expect(flushes).toEqual([]);
+    expect(results()).toEqual([expect.objectContaining({
+      outcome: 'nothing-to-record', rows: 0, retired: 0,
+      fileResults: expect.objectContaining({ files: [{
+        testFile: 'libs/test-config/src/executed-source-map-reporter.test.ts', verdict,
+      }] }),
+    })]);
+  });
+
+  it('keeps missing mutation source capture unknown instead of inferring loaded bytes', async () => {
+    process.env.PAPERCUSP_MUTATION_PROBE = '1';
+    const { r, flushes } = reporter();
+    r.onInit({} as never);
+    const mod = fakeModule({});
+    r.onTestModuleCollected(mod);
+    r.onTestModuleEnd(mod);
+    await r.onTestRunEnd();
+    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    expect(out.rows).toEqual([]);
+    expect(out.diagnostics).toEqual([expect.objectContaining({
+      sourceEvidence: expect.objectContaining({ status: 'unknown', reasons: expect.arrayContaining([
+        'collection-graph-unavailable',
+      ]) }),
+    })]);
+    expect(flushes).toEqual([]);
   });
 
   it('leaves a late import unknown even when another test already populated its server graph entry', async () => {

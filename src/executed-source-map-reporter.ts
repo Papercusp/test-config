@@ -704,7 +704,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   onTestModuleCollected(testModule: TestModule): void {
     // Fingerprinting has a cost. Only the existing optional diagnostic OUT channel requests it.
-    if (!this.armed?.outPath || isMutationProbeRun()) return;
+    if (!this.armed?.outPath) return;
     try {
       const imports = testModule.diagnostic().importDurations as Record<string, ImportDurationLike> | undefined;
       const reported = new Set(collectExecutedModules(imports, { repoRoot: this.repoRoot, testFile: testModule.moduleId }));
@@ -726,7 +726,6 @@ export default class ExecutedSourceMapReporter implements Reporter {
   onTestModuleEnd(testModule: TestModule): void {
     if (!this.armed) return;
     try {
-      if (isMutationProbeRun()) return;
       let state = 'error';
       try {
         state = testModule.state();
@@ -748,6 +747,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
           }
           this.diagnostics.push({ testFile, state, sourceEvidence });
         }
+      }
+      // Mutation phases can report optional diagnostics and named verdicts, but must never
+      // create reusable pass rows or retire ordinary proofs, including from clean baselines.
+      if (isMutationProbeRun()) {
+        this.discardInputs(testModule.moduleId);
+        return;
       }
       if (!shouldRecordModule(state)) {
         this.skipped += 1;
