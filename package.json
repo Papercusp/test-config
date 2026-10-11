@@ -76,6 +76,11 @@
       "import": "./src/execution-details.ts",
       "default": "./src/execution-details.ts"
     },
+    "./mutation-descriptor": {
+      "types": "./src/mutation-descriptor.ts",
+      "import": "./src/mutation-descriptor.ts",
+      "default": "./src/mutation-descriptor.ts"
+    },
     "./configuration-snapshot": {
       "types": "./src/configuration-snapshot.ts",
       "import": "./src/configuration-snapshot.ts",
