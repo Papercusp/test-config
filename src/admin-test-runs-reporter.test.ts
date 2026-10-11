@@ -195,7 +195,7 @@ describe('durable module execution measurement', () => {
     expect(measured?.passedCaseTitles).not.toContain('suite > proof-' + failedIndex);
     expect(measured?.failedCaseTitles).toEqual(['suite > proof-' + failedIndex]);
     expect(collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never)
-      ?.passedCaseTitles).not.toContain('suite > proof-70');
+      ?.passedCaseTitles).not.toContain('suite > proof-' + lateIndex);
   });
   it('persists a preferred late identity while running the whole module', async () => {
     vi.stubEnv('PAPERCUSP_TEST_RUN_CASE_TITLE_PATTERN', 'late-proof$');
