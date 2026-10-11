@@ -1066,6 +1066,12 @@ const sharedPg = pinModuleState('@papercusp/test-config.shared-pg', () => ({
   holders: 0,
 }));
 
+export function resolveTestRunsPgUrl(env: NodeJS.ProcessEnv = process.env): string {
+  return env.PAPERCUSP_TEST_RUNS_DB_URL?.trim()
+    || env.HARNESS_ADMIN_DATABASE_URL?.trim()
+    || 'postgresql://harness_admin:harness_admin_pwd@localhost:5432/papercusp';
+}
+
 export function tryGetPg(): Promise<PgHandle> {
   if (sharedPg.promise) return sharedPg.promise;
   sharedPg.promise = (async (): Promise<PgHandle> => {
@@ -1078,10 +1084,7 @@ export function tryGetPg(): Promise<PgHandle> {
       // HARNESS_ADMIN_DATABASE_URL at its throwaway database, so a run that must keep its
       // results points PAPERCUSP_TEST_RUNS_DB_URL at the shared ledger. Keep this order in
       // step with resolveExecutedMapPgUrl (scripts/lib/executed-source-map.mjs).
-      const url =
-        process.env.PAPERCUSP_TEST_RUNS_DB_URL ??
-        process.env.HARNESS_ADMIN_DATABASE_URL ??
-        'postgresql://harness_admin:harness_admin_pwd@localhost:5432/papercusp';
+      const url = resolveTestRunsPgUrl();
       const sql = pg(url, {
         max: 2,
         connect_timeout: reporterWriteBudget(process.env).connectTimeoutSec,
