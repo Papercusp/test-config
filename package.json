@@ -76,6 +76,11 @@
       "import": "./src/execution-details.ts",
       "default": "./src/execution-details.ts"
     },
+    "./configuration-snapshot": {
+      "types": "./src/configuration-snapshot.ts",
+      "import": "./src/configuration-snapshot.ts",
+      "default": "./src/configuration-snapshot.ts"
+    },
     "./console-noise-filter": {
       "types": "./src/console-noise-filter.ts",
       "import": "./src/console-noise-filter.ts",

@@ -14,6 +14,19 @@ export const MAX_RECORDED_FAILED_CASES = 64;
 export const MAX_RECORDED_PASSED_CASES = 64;
 export const MAX_RECORDED_CASE_TITLE_CHARS = 2_048;
 
+/**
+ * True when the persisted passed-title set is known to be incomplete. Older rows
+ * have no marker; a full 64-title list with a larger passed count is treated as
+ * incomplete by this helper so their omitted identities are never called absent.
+ */
+export function passedCaseTitlesIncomplete(
+  execution: Pick<TestRunExecutionDetails, 'passed' | 'passedCaseTitles' | 'passedCaseTitlesTruncated'>,
+): boolean {
+  const titles = execution.passedCaseTitles ?? [];
+  return execution.passedCaseTitlesTruncated === true
+    || (titles.length === MAX_RECORDED_PASSED_CASES && execution.passed > titles.length);
+}
+
 /** Exact identities, never clipped prefixes or assertion-message/DOM lines. */
 export function isRecordedCaseTitle(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
@@ -94,6 +107,8 @@ export interface TestRunExecutionDetails {
   failedCaseTitles?: string[];
   /** Measured TestCase.fullName identities for passed assertions; bounded, never caller-authored. */
   passedCaseTitles?: string[];
+  /** Present when the bounded list omitted one or more otherwise-recordable passed identities. */
+  passedCaseTitlesTruncated?: true;
   skipped: number;
   collectionFailed: boolean;
   mutationPhase: string | null;
@@ -166,7 +181,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'scenarioId', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
-  'passedCaseTitles', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
+  'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts',
 ]);
@@ -252,6 +267,9 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
       || (value.passedCaseTitles.length > 0 && value.collectionFailed !== false)
       || (value.failedCaseTitles !== undefined
         && value.passedCaseTitles.some(title => Array.isArray(value.failedCaseTitles) && value.failedCaseTitles.includes(title)))))
+    || (value.passedCaseTitlesTruncated !== undefined && (
+      value.passedCaseTitlesTruncated !== true
+      || (value.passed as number) <= MAX_RECORDED_PASSED_CASES))
     || !isNullableString(value.mutationPhase) || !isNullableString(value.commitSha)
     || typeof value.worktreeDirty !== 'boolean'
     || (value.worktreeDirtyReason !== undefined

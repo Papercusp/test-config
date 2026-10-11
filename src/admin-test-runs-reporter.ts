@@ -652,7 +652,7 @@ export interface TestRunRow {
 /** Read Vitest's completed cases, not module status or a truncated stdout tail. */
 export function collectModuleExecution(testModule: TestModule, preferredPassedCasePattern?: RegExp): Pick<
   NonNullable<TestRunRow['executionDetails']>,
-  'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'failedCaseTitles' | 'passedCaseTitles'
+  'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'failedCaseTitles' | 'passedCaseTitles' | 'passedCaseTitlesTruncated'
 > | null {
   try {
     const status = moduleStatus(testModule);
@@ -696,10 +696,13 @@ export function collectModuleExecution(testModule: TestModule, preferredPassedCa
     const recordedPassedCaseTitles = [...new Set([...preferredPassedCaseTitles, ...passedCaseTitles])]
       .filter(title => titleOutcomes.get(title) === 'passed')
       .slice(0, MAX_RECORDED_PASSED_CASES);
+    const allRecordedPassedCaseTitleCount = [...titleOutcomes.values()].filter(outcome => outcome === 'passed').length;
+    const passedCaseTitlesTruncated = allRecordedPassedCaseTitleCount > recordedPassedCaseTitles.length;
     return {
       passed, failed, skipped, collectionFailed: status === 'fail' && failed === 0,
       ...(recordedFailedCaseTitles.length > 0 ? { failedCaseTitles: recordedFailedCaseTitles } : {}),
       ...(recordedPassedCaseTitles.length > 0 ? { passedCaseTitles: recordedPassedCaseTitles } : {}),
+      ...(passedCaseTitlesTruncated ? { passedCaseTitlesTruncated: true as const } : {}),
     };
   } catch {
     return null;

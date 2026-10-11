@@ -166,6 +166,7 @@ describe('durable module execution measurement', () => {
     const measured = collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never);
     expect(measured).toMatchObject({ passed: 71, failed: 1, skipped: 0 });
     expect(measured?.passedCaseTitles).toHaveLength(64);
+    expect(measured?.passedCaseTitlesTruncated).toBe(true);
     expect(measured?.failedCaseTitles).toBeUndefined();
   });
   it('records requested late passing identities within the cap without crediting skipped or failed cases', () => {
@@ -178,6 +179,7 @@ describe('durable module execution measurement', () => {
     } as never, /proof-(70|78|79)$/g);
     expect(measured).toMatchObject({ passed: 78, failed: 1, skipped: 1, collectionFailed: false });
     expect(measured?.passedCaseTitles).toHaveLength(64);
+    expect(measured?.passedCaseTitlesTruncated).toBe(true);
     expect(measured?.passedCaseTitles?.[0]).toBe('suite > proof-70');
     expect(measured?.passedCaseTitles).not.toContain('suite > proof-78');
     expect(measured?.passedCaseTitles).not.toContain('suite > proof-79');
@@ -203,6 +205,7 @@ describe('durable module execution measurement', () => {
       await reporter.onTestRunEnd();
       expect(rows[0].executionDetails).toMatchObject({ passed: 80, failed: 0, skipped: 0, testNamePattern: null });
       expect(rows[0].executionDetails?.passedCaseTitles).toHaveLength(64);
+      expect(rows[0].executionDetails?.passedCaseTitlesTruncated).toBe(true);
       expect(rows[0].executionDetails?.passedCaseTitles?.[0]).toBe('suite > late-proof');
     } finally {
       vi.unstubAllEnvs();

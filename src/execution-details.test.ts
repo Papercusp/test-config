@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
   parseTestRunExecutionDetails,
+  passedCaseTitlesIncomplete,
   stableRecordedRuntimeEnvironment,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
@@ -150,6 +151,24 @@ describe('parseTestRunExecutionDetails — measured case identities', () => {
     expect(parseTestRunExecutionDetails(row)).toMatchObject({ passedCaseTitles: row.passedCaseTitles });
     expect(parseTestRunExecutionDetails(JSON.stringify(row))).toMatchObject({ passedCaseTitles: row.passedCaseTitles });
     expect(parseTestRunExecutionDetails(details())).toBeDefined();
+  });
+
+  it('marks capped passed-title sets incomplete and infers the same for legacy rows', () => {
+    const titles = Array.from({ length: 64 }, (_, index) => 'suite > case ' + index);
+    const marked = parseTestRunExecutionDetails(details({
+      passed: 65, passedCaseTitles: titles, passedCaseTitlesTruncated: true,
+    }));
+    expect(marked?.passedCaseTitlesTruncated).toBe(true);
+    expect(passedCaseTitlesIncomplete(marked!)).toBe(true);
+
+    const legacy = parseTestRunExecutionDetails(details({ passed: 65, passedCaseTitles: titles }));
+    expect(passedCaseTitlesIncomplete(legacy!)).toBe(true);
+    expect(parseTestRunExecutionDetails(details({
+      passed: 64, passedCaseTitles: titles, passedCaseTitlesTruncated: true,
+    }))).toBeUndefined();
+    expect(passedCaseTitlesIncomplete(parseTestRunExecutionDetails(details({
+      passed: 65, passedCaseTitlesTruncated: true,
+    }))!)).toBe(true);
   });
 
   it.each([

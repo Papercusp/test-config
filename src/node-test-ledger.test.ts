@@ -91,6 +91,18 @@ describe('node:test ledger collector fold', () => {
     expect(fold.summary().files).toEqual([]);
   });
 
+  it('marks a passed-title list incomplete when more than 64 exact names were observed', () => {
+    const fold = createNodeTestLedgerFold();
+    for (let index = 0; index < 66; index += 1) {
+      fold.push(ev('test:pass', { name: 'case ' + index, details: { type: 'test' } }));
+    }
+    expect(fold.summary().files[0]).toMatchObject({
+      passed: 66, passedCaseTitles: expect.arrayContaining(['case 0', 'case 63']),
+      passedCaseTitlesTruncated: true,
+    });
+    expect(fold.summary().files[0]?.passedCaseTitles).toHaveLength(64);
+  });
+
   it('flattens and bounds messages', () => {
     expect(oneLineMessage({ message: 'a\n\n b' })).toBe('a b');
     expect(oneLineMessage(undefined)).toBe('failed');
@@ -127,6 +139,17 @@ describe('buildNodeTestRunRows', () => {
     expect(parsed).toMatchObject({
       filePath: 'papercusp-desktop/test/guard.test.js', passed: 7, failed: 0, collectionFailed: false,
       passedCaseTitles: ['guard > passed'],
+    });
+  });
+
+  it('preserves passed-title truncation metadata in persisted execution details', () => {
+    const [row] = buildNodeTestRunRows(summary([result({
+      passed: 65,
+      passedCaseTitles: Array.from({ length: 64 }, (_, index) => 'suite > case ' + index),
+      passedCaseTitlesTruncated: true,
+    })]), ctx());
+    expect(parseTestRunExecutionDetails(row.executionDetails)).toMatchObject({
+      passed: 65, passedCaseTitlesTruncated: true,
     });
   });
 

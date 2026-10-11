@@ -58,6 +58,8 @@ export interface NodeTestFileResult {
   skipped: number;
   /** Bounded exact names of passed assertions; missing names remain unknown, not failed. */
   passedCaseTitles?: string[];
+  /** Present when the bounded passed-title list omitted at least one exact name. */
+  passedCaseTitlesTruncated?: true;
   failedCases: NodeTestFailedCase[];
   /** Set when the FILE failed (load error, crash) rather than an individual case. */
   fileLevelFailure: string | null;
@@ -165,9 +167,9 @@ export function createNodeTestLedgerFold(): {
         else {
           state.result.passed += 1;
           const passedCaseTitles = state.result.passedCaseTitles ?? (state.result.passedCaseTitles = []);
-          if (isRecordedCaseTitle(title) && passedCaseTitles.length < MAX_RECORDED_PASSED_CASES
-            && !passedCaseTitles.includes(title)) {
-            passedCaseTitles.push(title);
+          if (isRecordedCaseTitle(title) && !passedCaseTitles.includes(title)) {
+            if (passedCaseTitles.length < MAX_RECORDED_PASSED_CASES) passedCaseTitles.push(title);
+            else state.result.passedCaseTitlesTruncated = true;
           }
         }
         return;

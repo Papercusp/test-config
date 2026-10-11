@@ -110,9 +110,12 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
       : [...new Set(result.failedCases.map((c) => c.title))]
           .filter((title) => isRecordedCaseTitle(title))
           .slice(0, Math.min(MAX_RECORDED_FAILED_CASES, result.failed));
-    const passedTitles = Array.isArray(result.passedCaseTitles)
-      ? [...new Set(result.passedCaseTitles.filter((title) => isRecordedCaseTitle(title)))].slice(0, MAX_RECORDED_PASSED_CASES)
+    const allPassedTitles = Array.isArray(result.passedCaseTitles)
+      ? [...new Set(result.passedCaseTitles.filter((title) => isRecordedCaseTitle(title)))]
       : [];
+    const passedTitles = allPassedTitles.slice(0, MAX_RECORDED_PASSED_CASES);
+    const passedCaseTitlesTruncated = result.passedCaseTitlesTruncated === true
+      || allPassedTitles.length > passedTitles.length;
     // A reused parameterized name with conflicting outcomes is not an exact
     // assertion identity. Keep counts and diagnostics, but omit that proof.
     const ambiguousTitles = new Set(passedTitles.filter(title => failedTitles.includes(title)));
@@ -132,6 +135,7 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
       failed: result.failed,
       ...(failedCaseTitles.length > 0 ? { failedCaseTitles } : {}),
       ...(passedCaseTitles.length > 0 ? { passedCaseTitles } : {}),
+      ...(passedCaseTitlesTruncated ? { passedCaseTitlesTruncated: true as const } : {}),
       skipped: result.skipped,
       collectionFailed,
       mutationPhase: runContext.mutationPhase,
