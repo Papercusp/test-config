@@ -42,6 +42,7 @@ import {
   parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment, type RuntimeEnvironmentCaptureStatus,
   parseIsolatedRuntimeReceipts, type IsolatedRuntimeReceipt,
 } from './execution-details.ts';
+import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 
 /** Hash original bytes at recording time; a fixture-supplied digest is never trusted. */
 export function collectIsolatedRuntimeReceipts(testModule: TestModule): IsolatedRuntimeReceipt[] | undefined {
@@ -1189,11 +1190,27 @@ const TEST_RUN_INSERT_COLUMNS = [
   'is_scratch_config',
   'worktree_dirty',
   'execution_details',
+  // Plan verification-system-improvements-2026-10-10 P-011 (migration 1448): the configuration
+  // this test process ran under, so a bar that declares a production configuration can be judged.
+  'configuration_snapshot',
 ] as const;
 
-// 500 rows × 18 columns = 9,000 bind parameters, comfortably below Postgres's
+// 500 rows × 19 columns = 9,500 bind parameters, comfortably below Postgres's
 // 65,535-parameter ceiling even for a full unsharded workspace run.
 export const TEST_RUN_INSERT_BATCH_SIZE = 500;
+
+/**
+ * True when an insert failed only because the target database predates migration 1448
+ * (`test_runs.configuration_snapshot`). This package is consumed by checkouts whose ledger
+ * database can lag the migration; there the row is still written, without the snapshot, so a
+ * migration lag never costs a run its evidence (D-007 would otherwise swallow the whole batch).
+ */
+export function isMissingConfigurationSnapshotColumn(error: unknown): boolean {
+  const pgError = error as { code?: unknown; message?: unknown } | null | undefined;
+  return pgError?.code === '42703'
+    && typeof pgError.message === 'string'
+    && pgError.message.includes('configuration_snapshot');
+}
 
 /**
  * WI-10006245: a run whose rows are EVIDENCE (a mutation probe binding its
@@ -1256,6 +1273,8 @@ type TestRunInsertContext = {
   workspaceId: string | null;
   loopLagP95Ms: number | null;
   rssMb: number | null;
+  /** The configuration this test process ran under (one per process, like its env). */
+  configurationSnapshot?: ConfigurationSnapshot | null;
 };
 
 function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
@@ -1290,6 +1309,7 @@ export async function insertTestRunRowsWithSql(
 ): Promise<TestRunReceipt[]> {
   const receipts: TestRunReceipt[] = [];
   const deadline = Date.now() + budget.totalInsertMs;
+  let columns: readonly (typeof TEST_RUN_INSERT_COLUMNS)[number][] = TEST_RUN_INSERT_COLUMNS;
   for (let offset = 0; offset < rows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
@@ -1323,12 +1343,14 @@ export async function insertTestRunRowsWithSql(
         // encoded twice and stored as a jsonb STRING scalar; every
         // `execution_details->>'key'` read then returned NULL.
         execution_details: row.executionDetails ?? null,
+        // Same object-not-string rule as execution_details above.
+        configuration_snapshot: context.configurationSnapshot ?? null,
       }));
     let written: unknown;
     let failure: unknown = null;
     const query = Promise.resolve(sql`
       INSERT INTO harness_shared.test_runs
-        ${sql(batch, ...TEST_RUN_INSERT_COLUMNS)}
+        ${sql(batch, ...columns)}
       RETURNING id, file_path
     `).then(
       (value) => { written = value; },
@@ -1336,6 +1358,13 @@ export async function insertTestRunRowsWithSql(
     );
     const timeoutMs = Math.min(budget.insertTimeoutMs, remainingMs);
     const completed = await settleWithin(query, timeoutMs);
+    if (!completed && failure && columns.includes('configuration_snapshot') && isMissingConfigurationSnapshotColumn(failure)) {
+      // A database without migration 1448: retry this same batch, and every later one,
+      // without the snapshot column rather than lose the rows.
+      columns = columns.filter((column) => column !== 'configuration_snapshot');
+      offset -= TEST_RUN_INSERT_BATCH_SIZE;
+      continue;
+    }
     if (!completed) {
       receipts.push(
         ...(failure
@@ -1405,6 +1434,7 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
       workspaceId: resolveTestRunWorkspaceId(),
       loopLagP95Ms,
       rssMb,
+      configurationSnapshot: captureConfigurationSnapshot(process.env),
     });
     appendTestRunReceipts(process.env, receipts);
   } catch (error) {
