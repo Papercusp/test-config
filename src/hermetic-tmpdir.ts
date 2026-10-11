@@ -132,7 +132,7 @@
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
 import { randomUUID } from 'node:crypto';
-import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 // This source package is also imported by native Node CLI entry points.
@@ -254,7 +254,7 @@ export interface SweepOptions {
 export interface SweepResult {
   scanned: number;
   removed: number;
-  /** Entries left alone because their creator is still running. */
+  /** Entries kept by liveness, the age-only window, or independent source custody. */
   keptAlive: number;
   /** Entries left alone because they are younger than minAgeMs. */
   keptYoung: number;
@@ -301,6 +301,7 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
     result.scanned += 1;
     const path = join(root, name);
     let ageMs: number;
+    let isDirectory: boolean;
     try {
       // lstat, NOT stat: stat FOLLOWS a symlink, so a link whose target this
       // sweep already removed throws ENOENT here and takes the `continue` below —
@@ -308,12 +309,25 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
       // stat-able again. See "dangling symlinks" in the module doc. lstat is also
       // the right question regardless: we want the age of the ENTRY we may remove,
       // never the age of whatever it points at.
-      ageMs = now - lstatSync(path).mtimeMs;
+      const entry = lstatSync(path);
+      ageMs = now - entry.mtimeMs;
+      isDirectory = entry.isDirectory();
     } catch {
       continue; // vanished under us — a peer swept it first
     }
     if (ageMs < minAgeMs) {
       result.keptYoung += 1;
+      continue;
+    }
+    // EI-25707158668505432: generic test startup does not own source custody.
+    // The committed runner's collector checks live users and dependent-artifact
+    // holds; bypassing it here would erase retained build inputs at four hours.
+    // Its namespace also covers the clone-before-owner-marker window. Verifier
+    // archives carry the existing source-preview receipt and likewise outlive
+    // their writer; an age-only scratch rule cannot prove they are disposable.
+    if (ageOnly && isDirectory && (name.startsWith('papercusp-lint-as-committed-')
+      || existsSync(join(path, '.verifier-source.json')))) {
+      result.keptAlive += 1;
       continue;
     }
     const keep = ageMs <= maxAgeMs && (ageOnly || isAlive(pidFromEntryName(name)));

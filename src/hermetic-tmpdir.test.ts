@@ -308,6 +308,38 @@ describe('sweepStaleTestScratch', () => {
   // These dirs are NOT pid-stamped (17 real test files mint their own prefix
   // directly at the TMPDIR root — WI-38869), so every case here is a non-pid name.
 
+  it('leaves committed and verifier source custody to their maintained collectors', () => {
+    const old = (Date.now() - GENERIC_SCRATCH_SWEEP_MAX_AGE_MS - 60_000) / 1000;
+    const artifact = join(root, 'dependent-artifact');
+    mkdirSync(artifact);
+    for (const [name, marker, contents] of [
+      ['papercusp-lint-as-committed-fixture', '.git/lint-as-committed-owner.json',
+        { sha: 'a'.repeat(40), pid: 0, keep: true, retainedFor: [{ path: artifact, sha: 'a'.repeat(40) }] }],
+      ['tutorial-verifier-fixture', '.verifier-source.json',
+        { schemaVersion: 'verifier-source-v1', sourceCommit: 'a'.repeat(40) }],
+    ] as const) {
+      const source = join(root, name);
+      mkdirSync(join(source, '.git'), { recursive: true });
+      writeFileSync(join(source, marker), JSON.stringify(contents));
+      writeFileSync(join(source, 'source.txt'), 'retained source bytes');
+      utimesSync(source, old, old);
+    }
+    const scratch = seedNamed('unowned-expired-scratch', GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000);
+    const cloning = seedNamed('papercusp-lint-as-committed-before-marker', GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000);
+    const staleLink = join(root, 'papercusp-lint-as-committed-expired-link');
+    symlinkSync(join(root, 'missing-target'), staleLink);
+    lutimesSync(staleLink, old, old);
+
+    expect(sweepStaleTestScratch(root, { startAt: 0 }).removed).toBe(2);
+    expect(existsSync(scratch)).toBe(false);
+    expect(existsSync(cloning)).toBe(true);
+    expect(readdirSync(root)).not.toContain('papercusp-lint-as-committed-expired-link');
+    expect(readFileSync(join(root, 'papercusp-lint-as-committed-fixture', 'source.txt'), 'utf8'))
+      .toBe('retained source bytes');
+    expect(readFileSync(join(root, 'tutorial-verifier-fixture', 'source.txt'), 'utf8'))
+      .toBe('retained source bytes');
+  });
+
   it('automatic startup preserves unrelated old trees in a caller-selected TMPDIR', () => {
     const build = seedNamed('portable-server-p058', GENERIC_SCRATCH_SWEEP_MAX_AGE_MS + 60_000);
     const payload = join(build, 'product', 'node_modules', 'package');
