@@ -56,6 +56,34 @@ export function isRecordedTestLayer(value: unknown): value is RecordedTestLayer 
   return typeof value === 'string' && (RECORDED_TEST_LAYERS as readonly string[]).includes(value);
 }
 
+/** Explicit file routes shared by Vitest config and pre-execution BAR checks.
+ * These describe configured execution, not measured proof: only the runner can
+ * stamp a ledger row's testLayer. Keep exceptions here instead of inferring a
+ * unit layer from a filename that a maintained project routes to integration.
+ */
+export const REGISTERED_VITEST_FILE_PROJECTS = [
+  {
+    root: 'apps/operator-public',
+    name: 'treasury-integration',
+    layer: 'integration',
+    files: ['src/__tests__/treasury.test.ts', 'src/__tests__/transparency-routes.test.ts'],
+  },
+  {
+    root: 'apps/operator-public',
+    name: 'funded-turn-host-integration',
+    layer: 'integration',
+    files: ['src/__tests__/funded-turn-host.integration.test.ts', 'src/__tests__/identity-metered-usage.test.ts'],
+  },
+] as const;
+
+export function registeredVitestFileLayer(path: string): RecordedTestLayer | undefined {
+  const normalized = path.trim().replaceAll('\\', '/').toLowerCase();
+  for (const project of REGISTERED_VITEST_FILE_PROJECTS) {
+    if (project.files.some(file => `${project.root}/${file}` === normalized)) return project.layer;
+  }
+  return undefined;
+}
+
 /** Independently measured by a registered runtime reader, never a test assertion. */
 export interface RecordedRuntimeEnvironment {
   schemaVersion: 1;

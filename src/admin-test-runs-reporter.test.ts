@@ -56,8 +56,62 @@ import AdminTestRunsReporter, {
 } from './admin-test-runs-reporter';
 import { parseTestRunExecutionDetails } from './execution-details.ts';
 import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
+import { verifierSourceFiles } from '@papercusp/verification-harness/verifier-source';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+
+describe('receipt-backed native archive reporter', () => {
+  it.each([false, true])('records the archive identity and detects source mutation=%s', async mutate => {
+    const parent = mkdtempSync(join(tmpdir(), 'native-archive-reporter-'));
+    const root = join(parent, 'source');
+    const project = join(root, 'packages/operator-core');
+    mkdirSync(join(parent, '.git'));
+    mkdirSync(project, { recursive: true });
+    const file = join(project, 'journey.e2e.test.ts');
+    writeFileSync(file, 'export const journey = true;\n');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40),
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })), files };
+    const receiptPath = join(parent, 'receipt.json');
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', receiptPath);
+    vi.stubEnv('VERIFY_TAURI_SOURCE_REF', receipt.sourceCommit);
+    vi.stubEnv('OPERATOR_SOURCE_ROOT', root);
+    const persisted: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(captureWorktreeSnapshot, async row => { persisted.push(row); });
+    try {
+      await reporter.onInit({ config: { root: project, configFile: join(project, 'vitest.config.ts') } } as never);
+      expect(computeWorkspaceRootFrom(project)).toBe(root);
+      expect(toWorkspaceRel(file)).toBe('packages/operator-core/journey.e2e.test.ts');
+      reporter.onTestModuleEnd({ moduleId: file, state: () => 'passed', diagnostic: () => ({ duration: 1 }),
+        errors: () => [], children: { allTests: () => [{ fullName: 'native journey', result: () => ({ state: 'passed' }) }] } } as never);
+      if (mutate) writeFileSync(file, 'export const journey = false;\n');
+      await reporter.onTestRunEnd();
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]).toMatchObject({ filePath: 'packages/operator-core/journey.e2e.test.ts',
+        commitSha: mutate ? null : receipt.sourceCommit, worktreeDirty: mutate });
+      if (mutate) expect(persisted[0].executionDetails?.worktreeDirtyReason).toContain('changed packages/operator-core/journey.e2e.test.ts');
+    } finally { setRunRoot(null); vi.unstubAllEnvs(); rmSync(parent, { recursive: true, force: true }); }
+  });
+
+  it('keeps an explicitly unknown source null instead of substituting the parent or caller commit', async () => {
+    const captured: Record<string, unknown>[] = [];
+    const sql = ((first: unknown) => {
+      if (Array.isArray(first) && !('raw' in first)) { captured.push(...first); return {}; }
+      return Promise.resolve([]);
+    }) as PgSql;
+    sql.end = async () => undefined;
+    vi.stubEnv('PAPERCUSP_TEST_RUN_COMMIT', 'caller-commit');
+    try {
+      await insertTestRunRowsWithSql(sql, [{ filePath: 'journey.e2e.test.ts', status: 'fail', durationMs: 1,
+        startedAt: new Date(), finishedAt: new Date(), outputTail: null, isScratchConfig: false,
+        worktreeDirty: true, commitSha: null }], { branch: 'staging', inferredCommit: 'parent-head',
+        declaredSource: 'local', runGroupId: null, harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null });
+      expect(captured[0].commit_sha).toBeNull();
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
 
 describe('original isolated runtime receipt recording', () => {
   it('hashes the real bytes, refusing ordinary, partial and duplicate fixture claims', () => {
@@ -373,9 +427,35 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(r).toBeDefined();
   });
 
-  it('onInit is a no-op even with a bogus ctx', () => {
+  it('onInit resolves even with a bogus ctx', async () => {
     const r = new AdminTestRunsReporter();
-    expect(() => r.onInit(null as never)).not.toThrow();
+    await expect(r.onInit(null as never)).resolves.toBeUndefined();
+  });
+
+  it.each(['throw', 'reject'])('records dirty provenance when the snapshot reader fails by %s', async failure => {
+    const rows: TestRunRow[] = [];
+    const error = new ReferenceError('snapshot dependency missing');
+    const reporter = new AdminTestRunsReporter(
+      () => {
+        if (failure === 'throw') throw error;
+        return Promise.reject(error);
+      },
+      async row => { rows.push(row); },
+    );
+
+    await expect(reporter.onInit({
+      config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } },
+    } as never)).resolves.toBeUndefined();
+    reporter.onTestModuleEnd({
+      moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+      state: () => 'passed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+      children: { allTests: () => [{ result: () => ({ state: 'passed' }) }] },
+    } as never);
+    await expect(reporter.onTestRunEnd()).resolves.toBeUndefined();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].worktreeDirty).toBe(true);
+    expect(rows[0].executionDetails?.worktreeDirtyReason).toContain('snapshot dependency missing');
   });
 
   it('onTestModuleEnd swallows a TestModule whose state() throws', () => {

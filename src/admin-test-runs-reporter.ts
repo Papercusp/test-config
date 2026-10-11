@@ -31,11 +31,13 @@
 import type { Reporter, TestModule, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
 import { exec } from 'node:child_process';
-import { appendFileSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { defaultEvidenceRoot } from '@papercusp/verification-harness';
+// This verifier is built-ins only; do not load operator stores in a reporter.
+import { findVerifierSourceRoot, readVerifierSourceReceiptSync } from '@papercusp/verification-harness/verifier-source';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, isRecordedCaseTitle,
   MAX_RECORDED_FAILED_CASES, MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
@@ -181,6 +183,8 @@ const _rootState = pinModuleState('@papercusp/test-config.admin-test-runs-report
  * Pure (modulo fs) + exported for unit testing.
  */
 export function computeWorkspaceRootFrom(from: string): string {
+  const archive = findVerifierSourceRoot(from);
+  if (archive) return archive;
   let dir = resolve(from);
   while (true) {
     if (classifyGitEntry(dir) === 'root') return dir;
@@ -295,6 +299,7 @@ function unversionedVerifierSourceReason(moduleId: string): string | null {
   const rel = relative(resolvedSourceRoot, resolve(moduleId));
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
   if (classifyGitEntry(resolvedSourceRoot) === 'root') return null;
+  if (resolveRecordRoot() === resolvedSourceRoot && existsSync(join(resolvedSourceRoot, '.verifier-source.json'))) return null;
   return 'test module is from a verifier source archive without Git metadata; enclosing checkout HEAD does not identify its source';
 }
 
@@ -385,6 +390,7 @@ interface GitContext { branch: string | null; commit: string | null; }
 export interface WorktreeGitSnapshot {
   commit: string | null;
   porcelain: string | null;
+  provenanceError?: string;
 }
 
 /**
@@ -394,6 +400,8 @@ export interface WorktreeGitSnapshot {
  */
 export function describeWorktreeDirt(before: WorktreeGitSnapshot, after: WorktreeGitSnapshot): string | null {
   if (!before.commit || !after.commit) {
+    const errors = [before.provenanceError, after.provenanceError].filter(Boolean);
+    if (errors.length) return [...new Set(errors)].join('; ');
     return `HEAD unreadable (before=${before.commit ?? 'null'} after=${after.commit ?? 'null'})`;
   }
   if (before.commit !== after.commit) return `HEAD moved ${before.commit.slice(0, 12)} -> ${after.commit.slice(0, 12)}`;
@@ -488,6 +496,14 @@ export function resolveWorktreeSnapshotRoot(): string {
  */
 export async function captureWorktreeSnapshot(run: WorktreeGitRunner = runGit): Promise<WorktreeGitSnapshot> {
   const root = resolveWorktreeSnapshotRoot();
+  if (existsSync(join(root, '.verifier-source.json'))) {
+    try {
+      return { commit: readVerifierSourceReceiptSync(root).sourceCommit, porcelain: '' };
+    } catch (error) {
+      return { commit: null, porcelain: null,
+        provenanceError: `verifier source: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
   const [commit, porcelain] = await Promise.all([
     runGitWithRetry(run, 'git rev-parse HEAD', root),
     runGitWithRetry(run, 'git status --porcelain --untracked-files=all', root),
@@ -1343,7 +1359,7 @@ export async function insertTestRunRowsWithSql(
         run_group_id: context.runGroupId,
         source: resolveRecordedTestRunSource(context.declaredSource, row.worktreeDirty),
         branch: context.branch,
-        commit_sha: resolveTestRunCommit(row.commitSha ?? context.inferredCommit),
+        commit_sha: row.commitSha === null ? null : resolveTestRunCommit(row.commitSha ?? context.inferredCommit),
         harness_slug: context.harnessSlug,
         workspace_id: context.workspaceId,
         loop_lag_p95_ms: context.loopLagP95Ms,
@@ -1637,8 +1653,21 @@ export default class AdminTestRunsReporter implements Reporter {
     // Vitest constructs reporters with its options object. Keep that runtime
     // contract intact while allowing the unit suite to inject deterministic
     // snapshot/writer seams.
-    this.readWorktreeSnapshot =
+    const snapshotReader =
       typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
+    // Snapshot collection starts before any tests run. Handle synchronous
+    // throws and rejected promises immediately and retain dirty provenance.
+    this.readWorktreeSnapshot = async () => {
+      try {
+        return await snapshotReader();
+      } catch (error) {
+        return {
+          commit: null,
+          porcelain: null,
+          provenanceError: `snapshot reader: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    };
     this.writeRows =
       writeRows ??
       (writeRow
