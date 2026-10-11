@@ -7,6 +7,7 @@
  * those two paths on the same contract without pulling operator-only code into
  * the reporter.
  */
+import { parseMutationDescriptor, type MutationDescriptor } from './mutation-descriptor.ts';
 
 export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
 
@@ -151,6 +152,12 @@ export interface TestRunExecutionDetails {
   runtimeEnvironmentAfterCaptureStatus?: RuntimeEnvironmentCaptureStatus;
   /** Original reporter-hashed artifacts of workers which exist only inside a test. */
   isolatedRuntimeReceipts?: IsolatedRuntimeReceipt[];
+  /**
+   * What a mutation-probe leg tested (mutation-descriptor.ts). Expand-then-contract
+   * (plan mutation-probe-evidence-value-2026-10-11 D-001): parsed before the probe
+   * exports it, so the deployed operator never meets an unknown key.
+   */
+  mutation?: MutationDescriptor;
 }
 
 export interface IsolatedRuntimeReceipt {
@@ -185,7 +192,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
-  'isolatedRuntimeReceipts',
+  'isolatedRuntimeReceipts', 'mutation',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -286,7 +293,8 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
         || (value.runtimeEnvironmentBeforeCaptureStatus === 'captured') !== (value.runtimeEnvironmentBefore !== undefined)))
     || (value.runtimeEnvironmentAfterCaptureStatus !== undefined
       && (!isRuntimeEnvironmentCaptureStatus(value.runtimeEnvironmentAfterCaptureStatus)
-        || (value.runtimeEnvironmentAfterCaptureStatus === 'captured') !== (value.runtimeEnvironmentAfter !== undefined)))) {
+        || (value.runtimeEnvironmentAfterCaptureStatus === 'captured') !== (value.runtimeEnvironmentAfter !== undefined)))
+    || (value.mutation !== undefined && !parseMutationDescriptor(value.mutation))) {
     return undefined;
   }
   return value as unknown as TestRunExecutionDetails;

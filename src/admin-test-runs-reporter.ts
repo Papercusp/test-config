@@ -43,6 +43,18 @@ import {
   parseIsolatedRuntimeReceipts, type IsolatedRuntimeReceipt,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './configuration-snapshot.ts';
+import {
+  mutationDescriptorForRow, readMutationInvocationDescriptor, type MutationInvocationDescriptor,
+} from './mutation-descriptor.ts';
+
+/** sha256 of the test file a row ran (its execution_details.mutation.testFileSha256), or null. */
+export function sha256OfTestFile(absolutePath: string): string | null {
+  try {
+    return createHash('sha256').update(readFileSync(absolutePath)).digest('hex');
+  } catch {
+    return null;
+  }
+}
 
 /** Hash original bytes at recording time; a fixture-supplied digest is never trusted. */
 export function collectIsolatedRuntimeReceipts(testModule: TestModule): IsolatedRuntimeReceipt[] | undefined {
@@ -1613,6 +1625,8 @@ export default class AdminTestRunsReporter implements Reporter {
   private failureDetailsFlushed = false;
   private executionContext: Omit<NonNullable<TestRunRow['executionDetails']>,
     'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'commitSha' | 'worktreeDirty'> | null = null;
+  /** The probe's invocation-level descriptor, read once per run (mutation-descriptor.ts). */
+  private mutationInvocation: MutationInvocationDescriptor | null = null;
 
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
@@ -1695,6 +1709,7 @@ export default class AdminTestRunsReporter implements Reporter {
         testLayer: (ctx?.config?.provide as Record<string, unknown> | undefined)?.papercuspTestLayer }),
       mutationPhase: resolveMutationProbePhase(),
     };
+    this.mutationInvocation = readMutationInvocationDescriptor();
     const runtimeEnvironmentBefore = await this.captureRuntimeEnvironment();
     this.executionContext.runtimeEnvironmentBeforeCaptureStatus = runtimeEnvironmentBefore.status;
     if (runtimeEnvironmentBefore.status === 'captured')
@@ -1732,6 +1747,11 @@ export default class AdminTestRunsReporter implements Reporter {
         const receipts = collectIsolatedRuntimeReceipts(testModule);
         if (receipts) Object.assign(executionDetails, { isolatedRuntimeReceipts: receipts });
       }
+      const mutation = executionDetails && this.mutationInvocation
+        ? mutationDescriptorForRow(this.mutationInvocation, executionDetails.mutationPhase,
+          sha256OfTestFile(testModule.moduleId))
+        : undefined;
+      if (executionDetails && mutation) Object.assign(executionDetails, { mutation });
       this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail,
         isScratchConfig: this.isScratchConfig, executionDetails, verifierSourceReason });
     } catch {
