@@ -56,7 +56,7 @@ import AdminTestRunsReporter, {
 } from './admin-test-runs-reporter';
 import { parseTestRunExecutionDetails } from './execution-details.ts';
 import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
-import { verifierSourceFiles } from '@papercusp/verification-harness/verifier-source';
+import { verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
