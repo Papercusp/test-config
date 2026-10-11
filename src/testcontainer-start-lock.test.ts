@@ -4,9 +4,34 @@ import { tmpdir, hostname } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   ensureTestcontainersDockerClientTimeout,
+  resolveTestcontainerStartLockRoot,
   TESTCONTAINERS_DOCKER_CLIENT_TIMEOUT_MS,
   withTestcontainerStartLock,
 } from './testcontainer-start-lock.ts';
+
+// WI-6554700010008428: TMPDIR=/tmp/pcv (the test router) and TMPDIR unset (a host shell)
+// resolved two different roots, so reuse-generation rotations in one were invisible to the other.
+describe('resolveTestcontainerStartLockRoot', () => {
+  const writable = () => true;
+
+  it('resolves ONE root whatever the caller TMPDIR is', () => {
+    const viaRouter = resolveTestcontainerStartLockRoot({}, { platform: 'linux', tmpDir: '/tmp/pcv', isWritableDir: writable });
+    const viaShell = resolveTestcontainerStartLockRoot({}, { platform: 'linux', tmpDir: '/tmp', isWritableDir: writable });
+    expect(viaRouter).toBe('/tmp/pcv/testcontainers-locks');
+    expect(viaShell).toBe(viaRouter);
+  });
+
+  it('falls back to the caller tmpdir only when the stable root is not writable (read-only /tmp sandbox)', () => {
+    const root = resolveTestcontainerStartLockRoot({}, { platform: 'linux', tmpDir: '/tmp/claude', isWritableDir: () => false });
+    expect(root).toBe('/tmp/claude/pcv/testcontainers-locks');
+  });
+
+  it('honours the explicit override and uses the account home on Windows', () => {
+    expect(resolveTestcontainerStartLockRoot({ PAPERCUSP_TESTCONTAINERS_LOCK_DIR: '/x/locks' }, { isWritableDir: writable })).toBe('/x/locks');
+    expect(resolveTestcontainerStartLockRoot({}, { platform: 'win32', homeDir: '/home/u', isWritableDir: writable }))
+      .toBe(join('/home/u', '.papercusp', 'testcontainers-locks'));
+  });
+});
 
 const originalDir = process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR;
 const originalDockerClientTimeout = process.env.DOCKER_CLIENT_TIMEOUT;

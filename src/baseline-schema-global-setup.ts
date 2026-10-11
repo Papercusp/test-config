@@ -58,11 +58,11 @@
 // `await globalSetupFile.setup?.(this)`), which IS still exported from 'vitest/node' and
 // carries the same `provide` member this file destructures.
 import type { TestProject } from 'vitest/node';
-import { PostgreSqlContainer } from '@testcontainers/postgresql';
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { Wait } from 'testcontainers';
 import postgres from 'postgres';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -129,6 +129,145 @@ export async function replaceInvalidBaselineCandidate<T>(
   rotate: () => Promise<number>,
 ): Promise<T> {
   return (await isValid(candidate)) ? candidate : start(await rotate());
+}
+
+/**
+ * WI-6554700010008428 — a migration that fails on the REUSED container may be failing on
+ * what earlier runs left behind, not on its own SQL. The reused database accumulates every
+ * row integration tests wrote into it, and a migration whose guard reads DATA is evaluated
+ * against that residue. Observed 2026-10-11: migration 1444 refuses to build
+ * work_items_workspace_feature_id_uq while a same-workspace twin exists. Migration 1443,
+ * which clears twins, had already been applied on this container. A test that was later
+ * fixed then inserted one constant work-item id under several harnesses (default/WI-zzz-iv-impl).
+ * The runner never re-applies 1443, so every later integration run on the box failed in
+ * globalSetup until someone rotated the container by hand.
+ *
+ * Contract: a migration must apply to an EMPTY database; the reused container is only a
+ * cache of that result. On a migration failure the setup therefore rotates once to a fresh
+ * container and replays from empty. A failure that reproduces there is a real migration
+ * defect and fails the run. A pass means the residue was the cause and the run continues.
+ *
+ * Without this marker, a genuinely broken migration would rotate on EVERY run: each run
+ * would start a fresh container and replay the full corpus. The marker records the
+ * generation whose container was verified EMPTY and still failed. A later failure on that
+ * same generation is rethrown without rotating. Every successful setup clears it, and
+ * tests can only write to a container after a successful setup, so a marked generation
+ * still holds no test residue.
+ */
+const BASELINE_SCHEMA_FRESH_FAILURE_FILE = 'baseline-schema-fresh-migration-failure';
+
+/** The generation whose EMPTY container already failed a replay, or null. */
+export async function readBaselineFreshMigrationFailure(root = testcontainerStartLockRoot()): Promise<number | null> {
+  let raw: string;
+  try {
+    raw = await readFile(join(root, BASELINE_SCHEMA_FRESH_FAILURE_FILE), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  const generation = Number(raw.trim());
+  // An unreadable marker must never suppress recovery: treat it as absent.
+  return Number.isSafeInteger(generation) && generation >= 0 && raw.trim() === String(generation) ? generation : null;
+}
+
+export async function markBaselineFreshMigrationFailure(generation: number, root = testcontainerStartLockRoot()): Promise<void> {
+  const target = join(root, BASELINE_SCHEMA_FRESH_FAILURE_FILE);
+  const temporary = `${target}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  await writeFile(temporary, `${generation}\n`);
+  await rename(temporary, target);
+}
+
+/** Clear the marker only when it names `generation`; a peer's newer marker is left alone. */
+export async function clearBaselineFreshMigrationFailure(generation: number, root = testcontainerStartLockRoot()): Promise<void> {
+  if ((await readBaselineFreshMigrationFailure(root)) !== generation) return;
+  await unlink(join(root, BASELINE_SCHEMA_FRESH_FAILURE_FILE)).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+}
+
+/** Thrown when the migration RUNNER fails — the only failure class that triggers recovery. */
+export class BaselineMigrationApplyError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'BaselineMigrationApplyError';
+  }
+}
+
+export type ReusedMigrationFailureDecision =
+  | { kind: 'rotate' }
+  | { kind: 'adopt'; generation: number }
+  | { kind: 'rethrow'; generation: number };
+
+/**
+ * Read under BASELINE_SCHEMA_CONTAINER_START_LOCK. `adopt` means a peer process already
+ * rotated past the generation that failed, so its newer container is used instead of
+ * rotating a second time.
+ */
+export async function decideAfterReusedMigrationFailure(
+  failedGeneration: number,
+  root = testcontainerStartLockRoot(),
+): Promise<ReusedMigrationFailureDecision> {
+  const current = await readBaselineReuseGeneration(root);
+  if (current !== failedGeneration) return { kind: 'adopt', generation: current };
+  if ((await readBaselineFreshMigrationFailure(root)) === failedGeneration) return { kind: 'rethrow', generation: failedGeneration };
+  return { kind: 'rotate' };
+}
+
+export interface ReusedMigrationRecoveryDeps<T> {
+  failedGeneration: number;
+  root?: string;
+  withStartLock: <R>(action: () => Promise<R>) => Promise<R>;
+  start: (generation: number) => Promise<T>;
+  /** True when the container holds no migration ledger yet, i.e. nobody has replayed into it. */
+  isEmpty: (candidate: T) => Promise<boolean>;
+  apply: (candidate: T) => Promise<void>;
+  log?: (message: string) => void;
+}
+
+/**
+ * Called after `apply` failed on the reused container of `failedGeneration`. The container
+ * it rotates away from is left running, because other Vitest processes may still read it.
+ */
+export async function recoverFromReusedMigrationFailure<T>(
+  failure: unknown,
+  deps: ReusedMigrationRecoveryDeps<T>,
+): Promise<{ candidate: T; generation: number }> {
+  const root = deps.root ?? testcontainerStartLockRoot();
+  const log = deps.log ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const resolved = await deps.withStartLock(async () => {
+    const decision = await decideAfterReusedMigrationFailure(deps.failedGeneration, root);
+    if (decision.kind === 'rethrow') return decision;
+    const generation = decision.kind === 'adopt' ? decision.generation : await rotateBaselineReuseGeneration(root);
+    const candidate = await deps.start(generation);
+    // Probed under the start lock: no peer can select this generation's container before
+    // the lock is released, so an empty ledger here proves the replay below starts from empty.
+    const empty = await deps.isEmpty(candidate);
+    return { kind: decision.kind, generation, candidate, empty };
+  });
+  if (resolved.kind === 'rethrow') {
+    throw new BaselineMigrationApplyError(
+      `[baseline-schema-global-setup] migration failed on reuse generation ${resolved.generation}, whose container ` +
+        `was verified EMPTY and already failed a full replay. The migration itself is broken, so the container was ` +
+        `not rotated again (WI-6554700010008428). Cause: ${errorMessage(failure)}`,
+      { cause: failure },
+    );
+  }
+  log(
+    `[baseline-schema-global-setup] migration failed on reused container generation ${deps.failedGeneration}; ` +
+      `${resolved.kind === 'adopt' ? 'adopting' : 'rotated to'} generation ${resolved.generation} ` +
+      `(${resolved.empty ? 'empty' : 'NOT empty'}) and replaying, to separate leftover test data from a broken ` +
+      `migration (WI-6554700010008428). First failure: ${errorMessage(failure)}`,
+  );
+  try {
+    await deps.apply(resolved.candidate);
+  } catch (error) {
+    // Only a replay from EMPTY proves the migration broken. A non-empty container (a peer
+    // already replayed into it, or the generation file was reset onto an old container)
+    // leaves the next run free to rotate again.
+    if (resolved.empty) await markBaselineFreshMigrationFailure(resolved.generation, root);
+    throw error;
+  }
+  return { candidate: resolved.candidate, generation: resolved.generation };
 }
 
 /**
@@ -286,6 +425,23 @@ async function seedDependentViewProbe(sql: postgres.Sql): Promise<boolean> {
  */
 async function isBaselineContainerHealthy(dsn: string): Promise<boolean> {
   return (await probePgReachable(dsn, 15_000)).ok;
+}
+
+/**
+ * True when no migration ledger exists yet. Only a replay that started from this state
+ * may mark its migration as broken (recoverFromReusedMigrationFailure).
+ */
+async function isBaselineDatabaseEmpty(dsn: string): Promise<boolean> {
+  const sql = postgres(dsn, { max: 1, onnotice: () => {} });
+  try {
+    await sql.unsafe(`SET statement_timeout = '${BASELINE_SCHEMA_PROBE_STATEMENT_TIMEOUT_MS}ms'`);
+    const [row] = await sql.unsafe<{ ledger: string | null }[]>(
+      `SELECT to_regclass('harness_shared.schema_migrations')::text AS ledger`,
+    );
+    return row?.ledger == null;
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
 }
 
 /**
@@ -570,6 +726,9 @@ export default async function setup({ provide }: TestProject) {
   const existingAdminUrl = process.env.PAPERCUSP_TEST_PG_ADMIN_URL;
   let dsn: string;
   let dropDb: (() => Promise<void>) | null = null;
+  // Container path only: what migration-failure recovery needs to provision a fresh
+  // container. The escape hatch already replays into a brand-new database every run.
+  let reuse: { generation: number; start: (generation: number) => Promise<StartedPostgreSqlContainer> } | null = null;
 
   if (existingAdminUrl) {
     const dbName = `papercusp_it_baseline_${randomBytes(6).toString('hex')}`;
@@ -648,7 +807,7 @@ export default async function setup({ provide }: TestProject) {
         // entire 90s budget. The advisory lock below makes warm migrations safe.
         .withReuse()
         .start();
-    const container = await runBaselineSetupStage('container-resolve', () =>
+    const resolvedContainer = await runBaselineSetupStage('container-resolve', () =>
       withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, async () => {
         let generation = await readBaselineReuseGeneration();
         let c = await runBaselineSetupStage('container-start', () => startBaselineContainer(generation));
@@ -698,13 +857,15 @@ export default async function setup({ provide }: TestProject) {
             e,
           );
         }
-        return c;
+        return { c, generation };
       }),
     );
+    const container = resolvedContainer.c;
     // This separate container can use a different volume from test fixtures.
     // Admit migration writes against its actual data filesystem too.
     await runBaselineSetupStage('postgres-storage-headroom', () => assertSharedTestPgStorageHeadroom(container));
     dsn = container.getConnectionUri();
+    reuse = { generation: resolvedContainer.generation, start: startBaselineContainer };
   }
 
   // Exercise the real boot-path migration runner (resolved from the discovered
@@ -717,56 +878,84 @@ export default async function setup({ provide }: TestProject) {
     }>;
   };
 
-  // max:1 — the runner applies each migration in an explicit BEGIN/COMMIT block.
-  const sql = postgres(dsn, { max: 1, onnotice: () => {} });
-  try {
-    // Bound every non-transaction statement in this setup. The runner receives
-    // the same budget explicitly below because its production default is the
-    // deliberate unbounded migration opt-out (`SET LOCAL statement_timeout=0`).
-    await runBaselineSetupStage('database-deadlines', () => sql.unsafe(`SET statement_timeout = '${BASELINE_SCHEMA_STATEMENT_TIMEOUT_MS}ms'`).then(() => undefined));
-    // Multiple Vitest processes can attach to the reusable baseline container at
-    // once. Serialize the migration runner itself, not just Docker startup:
-    // otherwise two fresh readers can both observe the same pending file and race
-    // on its DDL/ledger insert.
-    await runBaselineSetupStage('migration-lock-acquire', () => acquireBaselineMigrationLock(sql));
+  const applyBaselineMigrations = async (targetDsn: string): Promise<void> => {
+    // max:1 — the runner applies each migration in an explicit BEGIN/COMMIT block.
+    const sql = postgres(targetDsn, { max: 1, onnotice: () => {} });
     try {
-      await runBaselineSetupStage('boot-prereqs', () => sql.unsafe(BOOT_PREREQS_DDL).then(() => undefined));
-      // EI-18748424931934157: seed the dependent-view probe BEFORE the runner, so pending
-      // migrations are applied against a REALISTIC schema graph rather than a bare
-      // harness_shared. See seedDependentViewProbe — this is the half that actually catches
-      // a 678-class regression.
-      await runBaselineSetupStage('dependent-view-probe-before', () => seedDependentViewProbe(sql));
-      const {
-        appliedCount,
-        totalKnown,
-        failed = [],
-      } = await runBaselineSetupStage('migration-apply', () =>
-        applyPendingMigrations({
-          client: sql,
-          sqlDir: SQL_DIR,
-          migrationStatementTimeoutMs: BASELINE_SCHEMA_STATEMENT_TIMEOUT_MS,
-        }),
-      );
-      if (failed.length > 0) {
-        throw new Error(
-          `baseline globalSetup: ${failed.length} migration(s) failed (${appliedCount}/${totalKnown} applied). ` +
-            `If the failure is "cannot drop ... because other objects depend on it" naming ` +
-            `${DEPENDENT_VIEW_PROBE_SCHEMA}.harness_features, that is the EI-18748424931934157 probe doing its job: ` +
-            `your migration breaks per-harness dependent views that exist on every real operator. Use ` +
-            `CREATE OR REPLACE VIEW (append-only), or DROP ... CASCADE plus an explicit recreate of the dependents.`,
-        );
+      // Bound every non-transaction statement in this setup. The runner receives
+      // the same budget explicitly below because its production default is the
+      // deliberate unbounded migration opt-out (`SET LOCAL statement_timeout=0`).
+      await runBaselineSetupStage('database-deadlines', () => sql.unsafe(`SET statement_timeout = '${BASELINE_SCHEMA_STATEMENT_TIMEOUT_MS}ms'`).then(() => undefined));
+      // Multiple Vitest processes can attach to the reusable baseline container at
+      // once. Serialize the migration runner itself, not just Docker startup:
+      // otherwise two fresh readers can both observe the same pending file and race
+      // on its DDL/ledger insert.
+      await runBaselineSetupStage('migration-lock-acquire', () => acquireBaselineMigrationLock(sql));
+      try {
+        await runBaselineSetupStage('boot-prereqs', () => sql.unsafe(BOOT_PREREQS_DDL).then(() => undefined));
+        // EI-18748424931934157: seed the dependent-view probe BEFORE the runner, so pending
+        // migrations are applied against a REALISTIC schema graph rather than a bare
+        // harness_shared. See seedDependentViewProbe — this is the half that actually catches
+        // a 678-class regression.
+        await runBaselineSetupStage('dependent-view-probe-before', () => seedDependentViewProbe(sql));
+        let outcome: { appliedCount: number; totalKnown: number; failed?: Array<unknown> };
+        try {
+          outcome = await runBaselineSetupStage('migration-apply', () =>
+            applyPendingMigrations({
+              client: sql,
+              sqlDir: SQL_DIR,
+              migrationStatementTimeoutMs: BASELINE_SCHEMA_STATEMENT_TIMEOUT_MS,
+            }),
+          );
+        } catch (error) {
+          throw new BaselineMigrationApplyError(errorMessage(error), { cause: error });
+        }
+        const { appliedCount, totalKnown, failed = [] } = outcome;
+        if (failed.length > 0) {
+          throw new BaselineMigrationApplyError(
+            `baseline globalSetup: ${failed.length} migration(s) failed (${appliedCount}/${totalKnown} applied). ` +
+              `If the failure is "cannot drop ... because other objects depend on it" naming ` +
+              `${DEPENDENT_VIEW_PROBE_SCHEMA}.harness_features, that is the EI-18748424931934157 probe doing its job: ` +
+              `your migration breaks per-harness dependent views that exist on every real operator. Use ` +
+              `CREATE OR REPLACE VIEW (append-only), or DROP ... CASCADE plus an explicit recreate of the dependents.`,
+          );
+        }
+        // And again AFTER, for the fresh-container case: on a brand-new database the base
+        // relation did not exist yet above, so the probe could not be created. Seeding it
+        // here means the container is guarded from its NEXT run onward — which is when new
+        // migrations actually land, since this container is reused across runs.
+        await runBaselineSetupStage('dependent-view-probe-after', () => seedDependentViewProbe(sql));
+      } finally {
+        await sql.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [BASELINE_SCHEMA_MIGRATION_LOCK_NAME]).catch(() => {});
       }
-      // And again AFTER, for the fresh-container case: on a brand-new database the base
-      // relation did not exist yet above, so the probe could not be created. Seeding it
-      // here means the container is guarded from its NEXT run onward — which is when new
-      // migrations actually land, since this container is reused across runs.
-      await runBaselineSetupStage('dependent-view-probe-after', () => seedDependentViewProbe(sql));
     } finally {
-      await sql.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [BASELINE_SCHEMA_MIGRATION_LOCK_NAME]).catch(() => {});
+      await sql.end({ timeout: 5 });
     }
-  } finally {
-    await sql.end({ timeout: 5 });
+  };
+
+  try {
+    await applyBaselineMigrations(dsn);
+  } catch (error) {
+    // Only the migration RUNNER failing triggers recovery. A lock-acquire timeout or a
+    // prerequisite failure is not evidence about the reused data, so it fails as before.
+    if (!reuse || !(error instanceof BaselineMigrationApplyError)) throw error;
+    const { start } = reuse;
+    const recovered = await recoverFromReusedMigrationFailure(error, {
+      failedGeneration: reuse.generation,
+      withStartLock: (action) =>
+        runBaselineSetupStage('container-reprovision-after-migration-failure', () =>
+          withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, action)),
+      start: (generation) => runBaselineSetupStage('container-start', () => start(generation)),
+      isEmpty: (candidate) => runBaselineSetupStage('container-empty-probe', () => isBaselineDatabaseEmpty(candidate.getConnectionUri())),
+      apply: async (candidate) => {
+        await runBaselineSetupStage('postgres-storage-headroom', () => assertSharedTestPgStorageHeadroom(candidate));
+        await applyBaselineMigrations(candidate.getConnectionUri());
+      },
+    });
+    dsn = recovered.candidate.getConnectionUri();
+    reuse = { generation: recovered.generation, start };
   }
+  if (reuse) await clearBaselineFreshMigrationFailure(reuse.generation);
 
   provide('baselineSchemaDsn', dsn);
 

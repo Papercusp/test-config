@@ -1,12 +1,19 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  BaselineMigrationApplyError,
+  clearBaselineFreshMigrationFailure,
+  decideAfterReusedMigrationFailure,
   dropBaselineDatabase,
+  markBaselineFreshMigrationFailure,
+  readBaselineFreshMigrationFailure,
   readBaselineReuseGeneration,
+  recoverFromReusedMigrationFailure,
   replaceInvalidBaselineCandidate,
   rotateBaselineReuseGeneration,
+  type ReusedMigrationRecoveryDeps,
 } from './baseline-schema-global-setup.ts';
 import { TEST_DB_DEFERRED_MARKER } from './pg-migrate.ts';
 
@@ -103,5 +110,103 @@ describe('baseline container reuse rotation', () => {
     expect(await replaceInvalidBaselineCandidate(fresh, async () => true, start, rotate)).toBe(fresh);
     expect(start).toHaveBeenCalledOnce();
     expect(rotate).toHaveBeenCalledOnce();
+  });
+});
+
+// WI-6554700010008428: migration 1444's twin guard failed on rows earlier runs left in the
+// REUSED container, and nothing recovered, so every integration run on the box failed.
+describe('baseline migration failure on a reused container', () => {
+  async function freshRoot(): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), 'baseline-migration-recovery-'));
+    roots.push(root);
+    return root;
+  }
+
+  interface Candidate { generation: number; empty: boolean; stop: () => void }
+
+  /** Containers by generation; `broken` makes every replay fail (a defective migration). */
+  function harness(root: string, opts: { broken?: boolean; nonEmpty?: number[] } = {}) {
+    const started: number[] = [];
+    const applied: number[] = [];
+    const deps: ReusedMigrationRecoveryDeps<Candidate> = {
+      failedGeneration: 0,
+      root,
+      withStartLock: async (action) => action(),
+      start: async (generation) => {
+        started.push(generation);
+        return { generation, empty: !(opts.nonEmpty ?? []).includes(generation), stop: vi.fn() };
+      },
+      isEmpty: async (candidate) => candidate.empty,
+      apply: async (candidate) => {
+        applied.push(candidate.generation);
+        if (opts.broken) throw new BaselineMigrationApplyError(`1444 FAILED on generation ${candidate.generation}`);
+      },
+      log: () => {},
+    };
+    return { deps, started, applied };
+  }
+
+  const firstFailure = new BaselineMigrationApplyError('1444: 1 same-workspace work-item twin set(s) remain (e.g. default/WI-zzz-iv-impl)');
+
+  it('rotates to a fresh container and continues when leftover data caused the failure', async () => {
+    const root = await freshRoot();
+    const { deps, started, applied } = harness(root);
+    const recovered = await recoverFromReusedMigrationFailure(firstFailure, deps);
+    expect(recovered.generation).toBe(1);
+    expect(recovered.candidate.generation).toBe(1);
+    expect(started).toEqual([1]);
+    expect(applied).toEqual([1]);
+    expect(await readBaselineReuseGeneration(root)).toBe(1);
+    expect(await readBaselineFreshMigrationFailure(root)).toBeNull();
+  });
+
+  it('marks a migration that also fails from EMPTY, and never mints another container for it', async () => {
+    const root = await freshRoot();
+    const first = harness(root, { broken: true });
+    await expect(recoverFromReusedMigrationFailure(firstFailure, first.deps)).rejects.toThrow('1444 FAILED on generation 1');
+    expect(await readBaselineFreshMigrationFailure(root)).toBe(1);
+
+    // The next run fails on generation 1 itself: rethrow, without starting a container.
+    const next = harness(root, { broken: true });
+    const error = await recoverFromReusedMigrationFailure(firstFailure, { ...next.deps, failedGeneration: 1 }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(BaselineMigrationApplyError);
+    expect((error as Error).message).toContain('verified EMPTY and already failed a full replay');
+    expect((error as Error).cause).toBe(firstFailure);
+    expect(next.started).toEqual([]);
+    expect(await readBaselineReuseGeneration(root)).toBe(1);
+  });
+
+  it('does not mark a failure on a container that was not empty, so the next run may rotate again', async () => {
+    const root = await freshRoot();
+    const { deps } = harness(root, { broken: true, nonEmpty: [1] });
+    await expect(recoverFromReusedMigrationFailure(firstFailure, deps)).rejects.toThrow('1444 FAILED');
+    expect(await readBaselineFreshMigrationFailure(root)).toBeNull();
+    expect(await decideAfterReusedMigrationFailure(1, root)).toEqual({ kind: 'rotate' });
+  });
+
+  it('adopts a container a peer already rotated to, instead of rotating twice', async () => {
+    const root = await freshRoot();
+    await rotateBaselineReuseGeneration(root);
+    await rotateBaselineReuseGeneration(root);
+    const { deps, started } = harness(root, { nonEmpty: [2] });
+    const recovered = await recoverFromReusedMigrationFailure(firstFailure, deps);
+    expect(recovered.generation).toBe(2);
+    expect(started).toEqual([2]);
+    expect(await readBaselineReuseGeneration(root)).toBe(2);
+  });
+
+  it('clears the marker only for its own generation and ignores a malformed one', async () => {
+    const root = await freshRoot();
+    await markBaselineFreshMigrationFailure(3, root);
+    await clearBaselineFreshMigrationFailure(2, root);
+    expect(await readBaselineFreshMigrationFailure(root)).toBe(3);
+    await clearBaselineFreshMigrationFailure(3, root);
+    expect(await readBaselineFreshMigrationFailure(root)).toBeNull();
+    await clearBaselineFreshMigrationFailure(3, root);
+
+    // A corrupt marker must never suppress recovery.
+    await writeFile(join(root, 'baseline-schema-fresh-migration-failure'), 'not-a-number\n');
+    expect(await readBaselineFreshMigrationFailure(root)).toBeNull();
+    expect(await decideAfterReusedMigrationFailure(0, root)).toEqual({ kind: 'rotate' });
   });
 });

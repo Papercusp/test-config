@@ -1,5 +1,6 @@
-import { hostname, tmpdir } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { accessSync, constants as fsConstants, mkdirSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 
 /**
@@ -47,8 +48,48 @@ function sleep(ms: number): Promise<void> {
 // perfectly writable. Deriving from tmpdir() (which honors TMPDIR/TMP/TEMP)
 // keeps this in sync with whatever writable tmp the rest of the test harness
 // already resolved, instead of re-guessing a second time.
+//
+// WI-6554700010008428 (2026-10-11): following tmpdir() alone split ONE box-level root in
+// two. The test router runs Vitest with TMPDIR=/tmp/pcv, so its processes used
+// /tmp/pcv/pcv/testcontainers-locks, while a host shell with TMPDIR unset used
+// /tmp/pcv/testcontainers-locks. Both directories held their own reuse-generation file, so
+// a rotation in one was invisible to the other, and the start lock did not serialize them.
+// scripts/lib/fs-mutex.mjs hit the same split for the npm-install mutex (WI-40965) and fixed
+// it with a host-stable default. Do the same here, and fall back to the tmpdir()-derived root
+// only when the stable one is not writable: that is the read-only-/tmp sandbox above.
+const STABLE_POSIX_LOCK_ROOT = '/tmp/pcv/testcontainers-locks';
+
+export interface TestcontainerStartLockRootOptions {
+  platform?: NodeJS.Platform;
+  homeDir?: string;
+  tmpDir?: string;
+  isWritableDir?: (dir: string) => boolean;
+}
+
+function isWritableDirSync(dir: string): boolean {
+  try {
+    mkdirSync(dir, { recursive: true });
+    accessSync(dir, fsConstants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveTestcontainerStartLockRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  opts: TestcontainerStartLockRootOptions = {},
+): string {
+  if (env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR) return resolve(env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR);
+  const stable = (opts.platform ?? process.platform) === 'win32'
+    ? join(opts.homeDir ?? homedir(), '.papercusp', 'testcontainers-locks')
+    : STABLE_POSIX_LOCK_ROOT;
+  if ((opts.isWritableDir ?? isWritableDirSync)(stable)) return stable;
+  return resolve(join(opts.tmpDir ?? tmpdir(), 'pcv', 'testcontainers-locks'));
+}
+
 export function testcontainerStartLockRoot(): string {
-  return resolve(process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR ?? join(tmpdir(), 'pcv', 'testcontainers-locks'));
+  return resolveTestcontainerStartLockRoot();
 }
 
 function safeName(name: string): string {
