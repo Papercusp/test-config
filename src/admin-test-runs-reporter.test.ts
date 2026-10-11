@@ -31,6 +31,7 @@ import AdminTestRunsReporter, {
   computeIsScratchConfig,
   inferWorkspaceRoot,
   insertTestRunRowsWithSql,
+  isMissingConfigurationSnapshotColumn,
   readRunConfigRoot,
   setRunRoot,
   toWorkspaceRel,
@@ -53,6 +54,7 @@ import AdminTestRunsReporter, {
   type TestRunRow,
 } from './admin-test-runs-reporter';
 import { parseTestRunExecutionDetails } from './execution-details.ts';
+import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
@@ -581,6 +583,85 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
+    });
+
+    describe('configuration_snapshot column (P-011, migration 1448)', () => {
+      const missingColumn = () => Object.assign(
+        new Error('column "configuration_snapshot" of relation "test_runs" does not exist'),
+        { code: '42703' },
+      );
+      /**
+       * A fake client that records each bulk helper's column list and rows, and runs
+       * `onStatement` with the columns of the helper interpolated into that statement.
+       */
+      const recordingSql = (onStatement: (columns: readonly unknown[]) => Promise<unknown> | null) => {
+        const helpers: Array<{ columns: readonly unknown[]; rows: Record<string, unknown>[] }> = [];
+        let statements = 0;
+        const sql = Object.assign(
+          (first: unknown, ...values: unknown[]) => {
+            if (Array.isArray(first) && !('raw' in (first as object))) {
+              const helper = { columns: values, rows: [...(first as Record<string, unknown>[])] };
+              helpers.push(helper);
+              return helper;
+            }
+            statements += 1;
+            const helper = values[0] as { columns: readonly unknown[]; rows: Record<string, unknown>[] };
+            return onStatement(helper.columns)
+              ?? Promise.resolve(helper.rows.map((r, i) => ({ id: `${statements}-${i}`, file_path: r.file_path })));
+          },
+          { end: async () => undefined },
+        ) as unknown as PgSql;
+        return { sql, helpers, statements: () => statements };
+      };
+
+      it('writes the process snapshot as an OBJECT into the configuration_snapshot column', async () => {
+        const snapshot = captureConfigurationSnapshot({ PAPERCUSP_FLAG_VIDEO_CHANNELS: '1', NODE_ENV: 'test' });
+        const fake = recordingSql(() => null);
+        const receipts = await insertTestRunRowsWithSql(fake.sql, [row('a.test.ts')], {
+          ...context, configurationSnapshot: snapshot,
+        });
+        expect(receipts.map((r) => r.outcome)).toEqual(['inserted']);
+        expect(fake.helpers[0].columns).toContain('configuration_snapshot');
+        expect(typeof fake.helpers[0].rows[0].configuration_snapshot).toBe('object');
+        expect(fake.helpers[0].rows[0].configuration_snapshot).toEqual(snapshot);
+      });
+
+      it('retries the same batch, and every later one, without the column on a ledger that predates 1448', async () => {
+        const fake = recordingSql((columns) => (
+          columns.includes('configuration_snapshot') ? Promise.reject(missingColumn()) : null
+        ));
+        const rows = Array.from({ length: TEST_RUN_INSERT_BATCH_SIZE + 1 }, (_, i) => row(`f-${i}.test.ts`));
+        const receipts = await insertTestRunRowsWithSql(fake.sql, rows, {
+          ...context, configurationSnapshot: captureConfigurationSnapshot({}),
+        }, { insertTimeoutMs: 1_000, totalInsertMs: 5_000 });
+
+        expect(receipts).toHaveLength(rows.length);
+        expect(receipts.every((r) => r.outcome === 'inserted')).toBe(true);
+        // One refused attempt, then the same first batch and the second batch without the column.
+        expect(fake.statements()).toBe(3);
+        expect(fake.helpers.map((h) => h.columns.includes('configuration_snapshot'))).toEqual([true, false, false]);
+        expect(fake.helpers.map((h) => h.rows.length)).toEqual([TEST_RUN_INSERT_BATCH_SIZE, TEST_RUN_INSERT_BATCH_SIZE, 1]);
+      });
+
+      it('does not retry an undefined-column error that names a different column', async () => {
+        const other = Object.assign(new Error('column "rss_mb" of relation "test_runs" does not exist'), { code: '42703' });
+        const fake = recordingSql(() => Promise.reject(other));
+        const receipts = await insertTestRunRowsWithSql(fake.sql, [row('a.test.ts')], context, {
+          insertTimeoutMs: 1_000, totalInsertMs: 1_000,
+        });
+        expect(fake.statements()).toBe(1);
+        expect(receipts).toEqual([
+          { filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: other.message },
+        ]);
+      });
+
+      it('recognizes only Postgres 42703 errors that name configuration_snapshot', () => {
+        expect(isMissingConfigurationSnapshotColumn(missingColumn())).toBe(true);
+        expect(isMissingConfigurationSnapshotColumn({ code: '42703', message: 'column "rss_mb" does not exist' })).toBe(false);
+        expect(isMissingConfigurationSnapshotColumn({ code: '42P01', message: 'configuration_snapshot' })).toBe(false);
+        expect(isMissingConfigurationSnapshotColumn(null)).toBe(false);
+        expect(isMissingConfigurationSnapshotColumn('configuration_snapshot')).toBe(false);
+      });
     });
 
     it('keeps the 1s fail-soft budget for ordinary runs and widens it only for evidence runs', () => {
