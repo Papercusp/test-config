@@ -45,6 +45,7 @@ import AdminTestRunsReporter, {
   resolveTestRunCommit,
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
+  resolveTestRunsPgUrl,
   resolveWorktreeSnapshotRoot,
   shouldRecordTestRunPath,
   TEST_RUN_INSERT_BATCH_SIZE,
@@ -59,6 +60,20 @@ import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
 import { verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+
+describe('reporter ledger endpoint selection', () => {
+  it.each(['', '  '])('ignores a blank explicit sink instead of selecting the operating-system user database (%j)', sink => {
+    expect(resolveTestRunsPgUrl({ PAPERCUSP_TEST_RUNS_DB_URL: sink, HARNESS_ADMIN_DATABASE_URL: 'postgresql://product.example/product' }))
+      .toBe('postgresql://product.example/product');
+    expect(new URL(resolveTestRunsPgUrl({ PAPERCUSP_TEST_RUNS_DB_URL: sink, HARNESS_ADMIN_DATABASE_URL: ' ' })).pathname)
+      .toBe('/papercusp');
+  });
+
+  it('preserves the explicit evidence sink ahead of the isolated product database', () => {
+    expect(resolveTestRunsPgUrl({ PAPERCUSP_TEST_RUNS_DB_URL: ' postgresql://ledger.example/evidence ',
+      HARNESS_ADMIN_DATABASE_URL: 'postgresql://private.example/disposable' })).toBe('postgresql://ledger.example/evidence');
+  });
+});
 
 describe('receipt-backed native archive reporter', () => {
   it.each([false, true])('records the archive identity and detects source mutation=%s', async mutate => {
