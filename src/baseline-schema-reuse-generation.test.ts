@@ -23,7 +23,7 @@ afterEach(async () => {
 });
 
 describe('baseline escape-hatch database cleanup', () => {
-  type DropMode = 'fast' | 'slow' | 'cancelled';
+  type DropMode = 'fast' | 'slow' | 'slow-sweep' | 'cancelled';
   function database(lockAvailable = true, dropMode: DropMode = 'fast') {
     const queries: string[] = [];
     let statementTimeout = '0';
@@ -32,11 +32,16 @@ describe('baseline escape-hatch database cleanup', () => {
       if (query.includes('pg_try_advisory_lock')) return Promise.resolve([{ acquired: lockAvailable }]);
       const set = /^SET statement_timeout = '([^']*)'$/.exec(query);
       if (set) statementTimeout = set[1];
+      if (dropMode === 'slow-sweep' && query.includes(`c.description = '${TEST_DB_DEFERRED_MARKER}'`)) {
+        return Promise.resolve([{ datname: 'papercusp_it_baseline_swept' }]);
+      }
       if (query.startsWith('DROP DATABASE')) {
         // WI-10003479: a server-side timeout can cancel a started drop AFTER
         // PostgreSQL has marked the database invalid — the leak itself.
         if (statementTimeout !== '0') return Promise.reject(new Error('cancellable database drop'));
-        if (dropMode === 'slow') return new Promise(() => {});
+        if (dropMode === 'slow' || (dropMode === 'slow-sweep' && query.includes('papercusp_it_baseline_swept'))) {
+          return new Promise(() => {});
+        }
         if (dropMode === 'cancelled') {
           return Promise.reject(Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' }));
         }
@@ -63,6 +68,18 @@ describe('baseline escape-hatch database cleanup', () => {
       await expect(dropBaselineDatabase(cleanup, 'papercusp_it_baseline_probe', { waitMs: 5 })).resolves.toBeUndefined();
       expect(warning).toHaveBeenCalledWith(expect.stringContaining('database cleanup detached: papercusp_it_baseline_probe'));
       expect(cleanup.queries.at(-1)).toBe('DROP DATABASE IF EXISTS "papercusp_it_baseline_probe" WITH (FORCE)');
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it('reports a detached sweep even after its requested database was dropped', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const cleanup = database(true, 'slow-sweep');
+      await expect(dropBaselineDatabase(cleanup, 'papercusp_it_baseline_probe', { sweepBudgetMs: 5 })).resolves.toBeUndefined();
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining('database cleanup detached: papercusp_it_baseline_probe'));
+      expect(cleanup.queries.at(-1)).toBe('DROP DATABASE IF EXISTS "papercusp_it_baseline_swept" WITH (FORCE)');
     } finally {
       warning.mockRestore();
     }

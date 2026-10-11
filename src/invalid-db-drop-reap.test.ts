@@ -168,7 +168,9 @@ describe('a cancelled database drop never leaks an INVALID database (WI-10003479
       },
     }, 'it_guarded', { sweepBudgetMs: 5 });
 
-    expect(result).toBe('dropped');
+    // A completed target does not make the connection usable while an
+    // uncancellable sweep DROP is still running on it.
+    expect(result).toBe('detached');
     expectNoDropUnderStatementTimeout(queries);
     expect(queries.at(-1)).toBe('DROP DATABASE IF EXISTS "papercusp_it_baseline_invalid" WITH (FORCE)');
   });

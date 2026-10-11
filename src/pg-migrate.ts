@@ -306,7 +306,7 @@ export interface DropDatabaseWithLockOptions {
  *
  * - 'dropped'  — the drop completed; the lock is released.
  * - 'deferred' — another process holds the lane; the database is marked for a later sweep.
- * - 'detached' — the drop is still executing server-side past the wait budget.
+ * - 'detached' — a target or sweep drop is still executing server-side past the wait budget.
  *   The connection is BUSY: the caller must not issue further queries on it and
  *   should close it (closing does not cancel the drop). Use
  *   dropDatabaseOnDedicatedConnection() unless the connection is disposable.
@@ -352,6 +352,10 @@ export async function dropDatabaseWithLock(
     if (!await sweepDeferredDatabaseDrops(admin, sweepDeadline)
       || !await sweepOrphanedTestDatabases(admin, sweepDeadline)) {
       connectionBusy = true;
+      // The requested database is gone, but an uncancellable janitor DROP
+      // still occupies this client and owns its advisory lock. Report that
+      // lifecycle state so callers close it rather than queue another query.
+      return 'detached';
     }
     return 'dropped';
   } finally {

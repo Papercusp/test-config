@@ -288,7 +288,9 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
       },
     }, 'it_guarded', { sweepBudgetMs: 5 });
 
-    expect(result).toBe('dropped');
+    // The target is gone, but the cleanup connection still has a sweep DROP
+    // in flight. Its result must tell callers to discard that busy connection.
+    expect(result).toBe('detached');
     expectNoDropUnderStatementTimeout(queries);
     expect(queries.at(-1)).toBe('DROP DATABASE IF EXISTS "papercusp_it_baseline_invalid" WITH (FORCE)');
   });

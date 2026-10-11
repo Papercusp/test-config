@@ -15,11 +15,13 @@
  *   4. does NOT cache a rejected build promise, so a transient failure is
  *      retryable within the same process.
  *
- * Requires Docker (shared testcontainers PG). Keys are random per test — they
- * never collide with the real migration-hash templates; every DB this file
- * creates is dropped in cleanup.
+ * Owns a dedicated PG cluster: catalog state and the global database-drop lane
+ * are part of these fixtures, so unrelated suite teardowns must not change them.
+ * Uses the maintained native helper when available, otherwise testcontainers.
+ * Contention is introduced explicitly by the tests; the cluster is stopped in
+ * cleanup, including any safely deferred build databases.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import postgres from 'postgres';
 import {
@@ -33,7 +35,8 @@ import {
   templateBuilderApplicationName,
   markManagedTestDatabase,
 } from './pg-migrate.ts';
-import { getTestPg } from './pg-container.ts';
+import { getTestPg, startDedicatedTestPg } from './pg-container.ts';
+import { resolveNativePgBinDir, startDedicatedNativePg } from './dedicated-native-pg.ts';
 import { acquireBaselineMigrationLock, dropBaselineDatabase } from './baseline-schema-global-setup.ts';
 
 const READY_MARK = 'pc-template-ready';
@@ -42,8 +45,20 @@ function freshKey(): string {
   return `zz${randomBytes(7).toString('hex')}`; // 16 chars, same shape as a migration-hash key
 }
 
-const cleanupDbs: string[] = [];
 const cleanupClients: postgres.Sql[] = [];
+let ownedPg: { getConnectionUri(): string; stop(): Promise<unknown> } | undefined;
+
+beforeAll(async () => {
+  let nativeAvailable = false;
+  try {
+    resolveNativePgBinDir();
+    nativeAvailable = true;
+  } catch { /* the maintained Docker helper covers hosts without native PG */ }
+  ownedPg = nativeAvailable
+    ? await startDedicatedNativePg({ settings: { fsync: 'off', synchronous_commit: 'off', full_page_writes: 'off' } })
+    : await startDedicatedTestPg({ command: ['postgres', '-c', 'fsync=off', '-c', 'synchronous_commit=off', '-c', 'full_page_writes=off'] });
+  vi.stubEnv('PAPERCUSP_TEST_PG_ADMIN_URL', ownedPg.getConnectionUri());
+}, 120_000);
 
 // Progress remains observable on stderr, without being treated as a test error.
 // Assert that no successful build/recovery emits console.error: suppressing it
@@ -67,15 +82,15 @@ async function adminClient(): Promise<postgres.Sql> {
 }
 
 afterAll(async () => {
-  const admin = postgres(await getTestPg(), { max: 1, onnotice: () => {} });
   try {
-    for (const name of cleanupDbs) {
-      await dropDatabaseWithLock(admin, name).catch(() => {});
-    }
+    for (const c of cleanupClients) await c.end({ timeout: 0 }).catch(() => {});
   } finally {
-    await admin.end({ timeout: 5 });
+    try {
+      await ownedPg?.stop();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   }
-  for (const c of cleanupClients) await c.end({ timeout: 5 }).catch(() => {});
 });
 
 async function templateState(admin: postgres.Sql, name: string): Promise<'absent' | 'unready' | 'ready'> {
@@ -93,7 +108,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
   it('a successful build lands under the final name WITH the readiness mark and is cloneable', async () => {
     const key = freshKey();
     const name = `tmpl_${key}`;
-    cleanupDbs.push(name);
     const admin = await adminClient();
 
     const built = await getOrBuildTemplate(key, async (url) => {
@@ -109,7 +123,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
 
     // And it clones: the clone carries the provisioned schema.
     const db = await createFreshTestDb({ prefix: 'zzhard', template: { key, provision: async () => {} } });
-    cleanupDbs.push(db.name);
     const cloneMark = await admin.unsafe(
       `SELECT shobj_description(oid, 'pg_database') AS description FROM pg_database WHERE datname = '${db.name}'`,
     ) as Array<{ description: string | null }>;
@@ -124,23 +137,40 @@ describe('buildTemplate hardening (WI-1992)', () => {
     await db.drop();
   });
 
-  it('a FAILED provision leaves NO servable template and is retryable in the same process', async () => {
+  it.each([false, true])('a FAILED provision leaves NO servable template and is retryable in the same process (cleanup held=%s)', async (cleanupHeld) => {
     const key = freshKey();
     const name = `tmpl_${key}`;
-    cleanupDbs.push(name);
     const admin = await adminClient();
 
-    await expect(
-      getOrBuildTemplate(key, async () => {
-        throw new Error('provision exploded mid-migration');
-      }),
-    ).rejects.toThrow('provision exploded mid-migration');
+    if (cleanupHeld) {
+      await admin.unsafe('SELECT pg_advisory_lock(hashtext($1))', [TEST_DB_DROP_LOCK_KEY]);
+    }
+    try {
+      await expect(
+        getOrBuildTemplate(key, async () => {
+          throw new Error('provision exploded mid-migration');
+        }),
+      ).rejects.toThrow('provision exploded mid-migration');
+    } finally {
+      if (cleanupHeld) {
+        await admin.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [TEST_DB_DROP_LOCK_KEY]);
+      }
+    }
 
     // Nothing servable under the final name.
     expect(await templateState(admin, name)).toBe('absent');
-    // No orphaned build DBs for this key.
-    const orphans = (await admin.unsafe(`SELECT datname FROM pg_database WHERE datname LIKE 'tmpl_bld_${key}_%'`)) as unknown[];
-    expect(orphans.length).toBe(0);
+    // A busy cleanup lane may retain a build database, but it must be
+    // unservable and marked for the existing sweeper. Force that branch so
+    // this guard cannot pass merely because today's DROP happened to be fast.
+    const orphans = (await admin.unsafe(
+      `SELECT datname, shobj_description(oid, 'pg_database') AS marker
+         FROM pg_database WHERE datname LIKE 'tmpl_bld_${key}_%'`,
+    )) as Array<{ datname: string; marker: string | null }>;
+    expect(orphans).toHaveLength(cleanupHeld ? 1 : 0);
+    for (const orphan of orphans) {
+      expect(orphan.marker).toBe(TEST_DB_DEFERRED_MARKER);
+      expect(await templateState(admin, orphan.datname)).toBe('unready');
+    }
 
     // The rejection was NOT cached: the same key rebuilds with a working provision.
     const built = await getOrBuildTemplate(key, async (url) => {
@@ -153,6 +183,7 @@ describe('buildTemplate hardening (WI-1992)', () => {
     });
     expect(built).toBe(name);
     expect(await templateState(admin, name)).toBe('ready');
+    expect(await admin.unsafe(`SELECT datname FROM pg_database WHERE datname LIKE 'tmpl_bld_${key}_%'`)).toEqual([]);
   });
 
   it('defers an unready-template drop without pinning the template lock', async () => {
@@ -160,7 +191,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const name = `tmpl_${key}`;
     const templateLock = `pc-test-template-${key}`;
     const dropLockHolder = await adminClient();
-    cleanupDbs.push(name);
     await dropLockHolder.unsafe(`SELECT pg_advisory_lock(hashtext($1::text))`, [TEST_DB_DROP_LOCK_KEY]);
     await dropLockHolder.unsafe(`CREATE DATABASE "${name}"`);
     await markManagedTestDatabase(dropLockHolder, name);
@@ -196,7 +226,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const key = freshKey();
     const name = `tmpl_${key}`;
     const lock = `pc-test-template-${key}`;
-    cleanupDbs.push(name);
     const holder = await adminClient();
 
     await holder.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
@@ -232,7 +261,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const key = freshKey();
     const name = `tmpl_${key}`;
     const lock = `pc-test-template-${key}`;
-    cleanupDbs.push(name);
     const holder = await adminClient();
 
     await holder.unsafe(`SELECT pg_advisory_lock(hashtext('${lock}'))`);
@@ -268,7 +296,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const key = freshKey();
     const name = `tmpl_${key}`;
     const lock = `pc-test-template-${key}`;
-    cleanupDbs.push(name);
     const holder = await adminClient();
     const staleApplicationName = templateBuilderApplicationName(
       key,
@@ -304,7 +331,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
     const name = `tmpl_${key}`;
     const buildName = `tmpl_bld_${key}_progress`;
     const lock = `pc-test-template-${key}`;
-    cleanupDbs.push(name, buildName);
     const holder = await adminClient();
     const holderPid = (await holder.unsafe(`SELECT pg_backend_pid() AS pid`)) as Array<{ pid: number }>;
     await holder.unsafe(`SELECT set_config('application_name', $1, false)`, [
@@ -362,7 +388,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
   it('a pre-hardening PARTIAL template (final name, no mark) is dropped and rebuilt, not served', async () => {
     const key = freshKey();
     const name = `tmpl_${key}`;
-    cleanupDbs.push(name);
     const admin = await adminClient();
 
     // Simulate the old failure: a half-built template sitting under the final
@@ -394,7 +419,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
 
     // Clones see the REBUILT schema, not the partial's.
     const db = await createFreshTestDb({ prefix: 'zzhard', template: { key, provision: async () => {} } });
-    cleanupDbs.push(db.name);
     const c = postgres(db.url, { max: 1, onnotice: () => {} });
     try {
       const good = (await c.unsafe(`SELECT 1 FROM information_schema.tables WHERE table_name = 'full_build_ok'`)) as unknown[];
@@ -410,7 +434,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
   it('a LEAKED provision connection cannot block the rename or later clones', async () => {
     const key = freshKey();
     const name = `tmpl_${key}`;
-    cleanupDbs.push(name);
     const admin = await adminClient();
 
     let leaked: postgres.Sql | null = null;
@@ -426,7 +449,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
 
     // Clone succeeds because the build terminated the leaked backend.
     const db = await createFreshTestDb({ prefix: 'zzhard', template: { key, provision: async () => {} } });
-    cleanupDbs.push(db.name);
     await db.drop();
   });
 });
@@ -434,7 +456,6 @@ describe('buildTemplate hardening (WI-1992)', () => {
 describe('managed test database lifecycle (WI-10003219)', () => {
   it('marks a fresh database so later cleanup can identify an orphan', async () => {
     const db = await createFreshTestDb({ prefix: 'zzmanaged' });
-    cleanupDbs.push(db.name);
     const admin = await adminClient();
     const rows = await admin.unsafe(
       `SELECT shobj_description(oid, 'pg_database') AS description FROM pg_database WHERE datname = '${db.name}'`,
@@ -446,7 +467,6 @@ describe('managed test database lifecycle (WI-10003219)', () => {
   it('reaps an old marked database during a later drop', async () => {
     const orphan = await createFreshTestDb({ prefix: 'zzorphan' });
     const trigger = await createFreshTestDb({ prefix: 'zztrigger' });
-    cleanupDbs.push(orphan.name, trigger.name);
     const admin = await adminClient();
     await admin.unsafe(
       `COMMENT ON DATABASE "${orphan.name}" IS '${TEST_DB_MANAGED_MARKER}${Date.now() - 2 * 24 * 60 * 60 * 1000}'`,
@@ -481,12 +501,11 @@ describe('baseline globalSetup migration lock deadline (EI-23130560676394847)', 
     const name = `papercusp_it_baseline_${randomBytes(6).toString('hex')}`;
     await holder.unsafe(`CREATE DATABASE "${name}"`);
     await markManagedTestDatabase(holder, name);
-    cleanupDbs.push(name);
     await holder.unsafe('SELECT pg_advisory_lock(hashtext($1))', [TEST_DB_DROP_LOCK_KEY]);
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       await dropBaselineDatabase(contender, name);
-      const rows = await contender.unsafe(
+      const rows = await holder.unsafe(
         'SELECT shobj_description(oid, \'pg_database\') AS marker FROM pg_database WHERE datname = $1', [name],
       );
       expect(rows).toEqual([{ marker: TEST_DB_DEFERRED_MARKER }]);
@@ -494,8 +513,17 @@ describe('baseline globalSetup migration lock deadline (EI-23130560676394847)', 
     } finally {
       await holder.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [TEST_DB_DROP_LOCK_KEY]);
     }
-    await dropBaselineDatabase(contender, name);
-    expect(await contender.unsafe('SELECT datname FROM pg_database WHERE datname = $1', [name])).toEqual([]);
+    // Cleanup connections are disposable even when the target drop completed:
+    // the bounded sweep may leave an unrelated DROP executing on that client.
+    // Match globalSetup's close-after-cleanup lifecycle and observe separately.
+    await contender.end({ timeout: 0 });
+    const cleanup = await adminClient();
+    try {
+      await dropBaselineDatabase(cleanup, name);
+    } finally {
+      await cleanup.end({ timeout: 0 });
+    }
+    expect(await holder.unsafe('SELECT datname FROM pg_database WHERE datname = $1', [name])).toEqual([]);
   });
 
   it('cancels the PostgreSQL backend wait and reports the exact stage under contention', async () => {
