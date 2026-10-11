@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  MAX_RECORDED_PASSED_CASES,
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
   parseTestRunExecutionDetails,
   passedCaseTitlesIncomplete,
@@ -154,17 +155,18 @@ describe('parseTestRunExecutionDetails — measured case identities', () => {
   });
 
   it('marks capped passed-title sets incomplete and infers the same for legacy rows', () => {
-    const titles = Array.from({ length: 64 }, (_, index) => 'suite > case ' + index);
+    const titles = Array.from({ length: MAX_RECORDED_PASSED_CASES }, (_, index) => 'suite > current case ' + index);
     const marked = parseTestRunExecutionDetails(details({
-      passed: 65, passedCaseTitles: titles, passedCaseTitlesTruncated: true,
+      passed: MAX_RECORDED_PASSED_CASES + 1, passedCaseTitles: titles, passedCaseTitlesTruncated: true,
     }));
     expect(marked?.passedCaseTitlesTruncated).toBe(true);
     expect(passedCaseTitlesIncomplete(marked!)).toBe(true);
 
-    const legacy = parseTestRunExecutionDetails(details({ passed: 65, passedCaseTitles: titles }));
+    const legacyTitles = Array.from({ length: 64 }, (_, index) => 'suite > legacy case ' + index);
+    const legacy = parseTestRunExecutionDetails(details({ passed: 65, passedCaseTitles: legacyTitles }));
     expect(passedCaseTitlesIncomplete(legacy!)).toBe(true);
     expect(parseTestRunExecutionDetails(details({
-      passed: 64, passedCaseTitles: titles, passedCaseTitlesTruncated: true,
+      passed: 64, passedCaseTitles: legacyTitles, passedCaseTitlesTruncated: true,
     }))).toBeUndefined();
     expect(passedCaseTitlesIncomplete(parseTestRunExecutionDetails(details({
       passed: 65, passedCaseTitlesTruncated: true,
@@ -178,7 +180,8 @@ describe('parseTestRunExecutionDetails — measured case identities', () => {
     { passed: 1, passedCaseTitles: [' leading space'] },
     { passed: 1, passedCaseTitles: ['multiline\nDOM'] },
     { passed: 1, passedCaseTitles: ['x'.repeat(2_049)] },
-    { passed: 65, passedCaseTitles: Array.from({ length: 65 }, (_, i) => `case ${i}`) },
+    { passed: MAX_RECORDED_PASSED_CASES + 1,
+      passedCaseTitles: Array.from({ length: MAX_RECORDED_PASSED_CASES + 1 }, (_, i) => 'case ' + i) },
     { passed: 1, passedCaseTitles: null },
     { failed: 1, failedCaseTitles: ['suite > case'], passedCaseTitles: ['suite > case'] },
   ])('rejects malformed or contradictory passing identities: %j', overrides => {

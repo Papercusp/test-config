@@ -11,20 +11,22 @@
 export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
 
 export const MAX_RECORDED_FAILED_CASES = 64;
-export const MAX_RECORDED_PASSED_CASES = 64;
+export const MAX_RECORDED_PASSED_CASES = 1_280;
+const LEGACY_RECORDED_PASSED_CASES = 64;
 export const MAX_RECORDED_CASE_TITLE_CHARS = 2_048;
 
 /**
  * True when the persisted passed-title set is known to be incomplete. Older rows
- * have no marker; a full 64-title list with a larger passed count is treated as
- * incomplete by this helper so their omitted identities are never called absent.
+ * have no marker; a list at either the current or legacy cap with a larger passed
+ * count is treated as incomplete so omitted identities are never called absent.
  */
 export function passedCaseTitlesIncomplete(
   execution: Pick<TestRunExecutionDetails, 'passed' | 'passedCaseTitles' | 'passedCaseTitlesTruncated'>,
 ): boolean {
   const titles = execution.passedCaseTitles ?? [];
   return execution.passedCaseTitlesTruncated === true
-    || (titles.length === MAX_RECORDED_PASSED_CASES && execution.passed > titles.length);
+    || ((titles.length === MAX_RECORDED_PASSED_CASES || titles.length === LEGACY_RECORDED_PASSED_CASES)
+      && execution.passed > titles.length);
 }
 
 /** Exact identities, never clipped prefixes or assertion-message/DOM lines. */
@@ -269,7 +271,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
         && value.passedCaseTitles.some(title => Array.isArray(value.failedCaseTitles) && value.failedCaseTitles.includes(title)))))
     || (value.passedCaseTitlesTruncated !== undefined && (
       value.passedCaseTitlesTruncated !== true
-      || (value.passed as number) <= MAX_RECORDED_PASSED_CASES))
+      || (value.passed as number) <= (Array.isArray(value.passedCaseTitles) ? value.passedCaseTitles.length : 0)))
     || !isNullableString(value.mutationPhase) || !isNullableString(value.commitSha)
     || typeof value.worktreeDirty !== 'boolean'
     || (value.worktreeDirtyReason !== undefined

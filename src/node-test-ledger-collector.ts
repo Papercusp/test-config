@@ -28,7 +28,8 @@ export const NODE_TEST_LEDGER_SUMMARY_SCHEMA_VERSION = 1 as const;
 export const NODE_TEST_NAME_SEPARATOR = ' > ';
 
 const MAX_MESSAGE_CHARS = 500;
-const MAX_RECORDED_PASSED_CASES = 64;
+// Kept aligned with execution-details.ts; this standalone Node reporter loads only built-ins.
+const MAX_RECORDED_PASSED_CASES = 1_280;
 const MAX_RECORDED_CASE_TITLE_CHARS = 2_048;
 
 function isRecordedCaseTitle(value: unknown): value is string {

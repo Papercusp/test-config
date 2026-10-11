@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runGit } from './admin-test-runs-reporter.ts';
 import type { TestRunRow, WorktreeGitSnapshot } from './admin-test-runs-reporter.ts';
-import { parseTestRunExecutionDetails } from './execution-details.ts';
+import { MAX_RECORDED_PASSED_CASES, parseTestRunExecutionDetails } from './execution-details.ts';
 import { createNodeTestLedgerFold, oneLineMessage } from './node-test-ledger-collector.ts';
 import type { NodeTestLedgerSummary } from './node-test-ledger-collector.ts';
 import {
@@ -91,16 +91,17 @@ describe('node:test ledger collector fold', () => {
     expect(fold.summary().files).toEqual([]);
   });
 
-  it('marks a passed-title list incomplete when more than 64 exact names were observed', () => {
+  it('marks a passed-title list incomplete when more than the shared cap of exact names were observed', () => {
     const fold = createNodeTestLedgerFold();
-    for (let index = 0; index < 66; index += 1) {
+    for (let index = 0; index < MAX_RECORDED_PASSED_CASES + 2; index += 1) {
       fold.push(ev('test:pass', { name: 'case ' + index, details: { type: 'test' } }));
     }
     expect(fold.summary().files[0]).toMatchObject({
-      passed: 66, passedCaseTitles: expect.arrayContaining(['case 0', 'case 63']),
+      passed: MAX_RECORDED_PASSED_CASES + 2,
+      passedCaseTitles: expect.arrayContaining(['case 0', 'case ' + (MAX_RECORDED_PASSED_CASES - 1)]),
       passedCaseTitlesTruncated: true,
     });
-    expect(fold.summary().files[0]?.passedCaseTitles).toHaveLength(64);
+    expect(fold.summary().files[0]?.passedCaseTitles).toHaveLength(MAX_RECORDED_PASSED_CASES);
   });
 
   it('flattens and bounds messages', () => {

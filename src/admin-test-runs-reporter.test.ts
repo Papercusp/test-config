@@ -16,6 +16,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MAX_RECORDED_PASSED_CASES } from './execution-details.ts';
 import AdminTestRunsReporter, {
   buildOutputTail,
   captureWorktreeSnapshot,
@@ -161,31 +162,38 @@ describe('durable module execution measurement', () => {
   });
   it('does not certify a duplicate failure when its passing case falls outside the recording cap', () => {
     const cases = [
-      ...Array.from({ length: 70 }, (_, i) => ({ fullName: `suite > first-${i}`, result: () => ({ state: 'passed' }) })),
+      ...Array.from({ length: MAX_RECORDED_PASSED_CASES + 10 }, (_, i) => ({
+        fullName: 'suite > first-' + i, result: () => ({ state: 'passed' }),
+      })),
       { fullName: 'suite > duplicate', result: () => ({ state: 'passed' }) },
       { fullName: 'suite > duplicate', result: () => ({ state: 'failed' }) },
     ];
     const measured = collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never);
-    expect(measured).toMatchObject({ passed: 71, failed: 1, skipped: 0 });
-    expect(measured?.passedCaseTitles).toHaveLength(64);
+    expect(measured).toMatchObject({ passed: MAX_RECORDED_PASSED_CASES + 11, failed: 1, skipped: 0 });
+    expect(measured?.passedCaseTitles).toHaveLength(MAX_RECORDED_PASSED_CASES);
     expect(measured?.passedCaseTitlesTruncated).toBe(true);
     expect(measured?.failedCaseTitles).toBeUndefined();
   });
   it('records requested late passing identities within the cap without crediting skipped or failed cases', () => {
-    const cases = Array.from({ length: 80 }, (_, i) => ({
-      fullName: `suite > proof-${i}`,
-      result: () => ({ state: i === 78 ? 'skipped' : i === 79 ? 'failed' : 'passed' }),
+    const lateIndex = MAX_RECORDED_PASSED_CASES + 10;
+    const skippedIndex = MAX_RECORDED_PASSED_CASES + 14;
+    const failedIndex = MAX_RECORDED_PASSED_CASES + 15;
+    const cases = Array.from({ length: MAX_RECORDED_PASSED_CASES + 16 }, (_, i) => ({
+      fullName: 'suite > proof-' + i,
+      result: () => ({ state: i === skippedIndex ? 'skipped' : i === failedIndex ? 'failed' : 'passed' }),
     }));
     const measured = collectModuleExecution({
       state: () => 'failed', children: { allTests: () => cases },
-    } as never, /proof-(70|78|79)$/g);
-    expect(measured).toMatchObject({ passed: 78, failed: 1, skipped: 1, collectionFailed: false });
-    expect(measured?.passedCaseTitles).toHaveLength(64);
+    } as never, new RegExp('proof-(' + [lateIndex, skippedIndex, failedIndex].join('|') + ')$', 'g'));
+    expect(measured).toMatchObject({
+      passed: MAX_RECORDED_PASSED_CASES + 14, failed: 1, skipped: 1, collectionFailed: false,
+    });
+    expect(measured?.passedCaseTitles).toHaveLength(MAX_RECORDED_PASSED_CASES);
     expect(measured?.passedCaseTitlesTruncated).toBe(true);
-    expect(measured?.passedCaseTitles?.[0]).toBe('suite > proof-70');
-    expect(measured?.passedCaseTitles).not.toContain('suite > proof-78');
-    expect(measured?.passedCaseTitles).not.toContain('suite > proof-79');
-    expect(measured?.failedCaseTitles).toEqual(['suite > proof-79']);
+    expect(measured?.passedCaseTitles?.[0]).toBe('suite > proof-' + lateIndex);
+    expect(measured?.passedCaseTitles).not.toContain('suite > proof-' + skippedIndex);
+    expect(measured?.passedCaseTitles).not.toContain('suite > proof-' + failedIndex);
+    expect(measured?.failedCaseTitles).toEqual(['suite > proof-' + failedIndex]);
     expect(collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never)
       ?.passedCaseTitles).not.toContain('suite > proof-70');
   });
@@ -196,8 +204,8 @@ describe('durable module execution measurement', () => {
       async row => { rows.push(row); });
     try {
       reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
-      const cases = Array.from({ length: 80 }, (_, i) => ({
-        fullName: i === 79 ? 'suite > late-proof' : `suite > case-${i}`,
+      const cases = Array.from({ length: MAX_RECORDED_PASSED_CASES + 16 }, (_, i) => ({
+        fullName: i === MAX_RECORDED_PASSED_CASES + 15 ? 'suite > late-proof' : 'suite > case-' + i,
         result: () => ({ state: 'passed' }),
       }));
       reporter.onTestModuleEnd({ state: () => 'passed', children: { allTests: () => cases },
@@ -205,8 +213,10 @@ describe('durable module execution measurement', () => {
         diagnostic: () => ({ duration: 1 }), errors: () => [],
       } as never);
       await reporter.onTestRunEnd();
-      expect(rows[0].executionDetails).toMatchObject({ passed: 80, failed: 0, skipped: 0, testNamePattern: null });
-      expect(rows[0].executionDetails?.passedCaseTitles).toHaveLength(64);
+      expect(rows[0].executionDetails).toMatchObject({
+        passed: MAX_RECORDED_PASSED_CASES + 16, failed: 0, skipped: 0, testNamePattern: null,
+      });
+      expect(rows[0].executionDetails?.passedCaseTitles).toHaveLength(MAX_RECORDED_PASSED_CASES);
       expect(rows[0].executionDetails?.passedCaseTitlesTruncated).toBe(true);
       expect(rows[0].executionDetails?.passedCaseTitles?.[0]).toBe('suite > late-proof');
     } finally {
