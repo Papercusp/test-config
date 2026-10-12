@@ -164,6 +164,11 @@ export function createNodeTestLedgerFold(): {
 
       if (event.type === 'test:pass') {
         if (isSuite) return;
+        // Node 25 emits a successful file wrapper when a name filter matches
+        // no cases. Its title is the file path and it has no source location.
+        // Process success is never evidence of a passing assertion.
+        if (nesting === 0 && typeof data.line !== 'number' &&
+          (name === file || name === basename(file))) return;
         if (isFlagSet(data.skip) || isFlagSet(data.todo)) state.result.skipped += 1;
         else {
           state.result.passed += 1;
