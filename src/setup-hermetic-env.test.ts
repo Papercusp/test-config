@@ -242,3 +242,27 @@ describe('setup-hermetic-env: the managed-pty state dir is redirected (WI-100048
     expect(stateDirNeedsRedirect(inherited, '/home/u/.papercusp/psu-pty')).toBe(expected);
   });
 });
+
+describe('setup-hermetic-env: result-door scratch is redirected (WI-10006961)', () => {
+  const liveDir = join(homedir(), '.papercusp', 'scratch');
+
+  it('gives this test process a scratch root outside the live operator corpus', () => {
+    expect(process.env.PAPERCUSP_SCRATCH_ROOT).toBeTruthy();
+    expect(stateDirNeedsRedirect(process.env.PAPERCUSP_SCRATCH_ROOT, liveDir)).toBe(false);
+    expect(resolve(process.env.PAPERCUSP_SCRATCH_ROOT!)).not.toBe(resolve(liveDir));
+    expect(resolve(process.env.PAPERCUSP_SCRATCH_ROOT!).startsWith(resolve(tmpdir()))).toBe(true);
+  });
+
+  it('redirects an inherited live scratch root', async () => {
+    const after = await runSetupOn({ PAPERCUSP_SCRATCH_ROOT: liveDir });
+    expect(after.PAPERCUSP_SCRATCH_ROOT).toBeTruthy();
+    expect(resolve(after.PAPERCUSP_SCRATCH_ROOT!)).not.toBe(resolve(liveDir));
+    expect(resolve(after.PAPERCUSP_SCRATCH_ROOT!).startsWith(resolve(tmpdir()))).toBe(true);
+  });
+
+  it('keeps a deliberate non-live scratch override', async () => {
+    const chosen = join(tmpdir(), `papercusp-scratch-chosen-${process.pid}`);
+    const after = await runSetupOn({ PAPERCUSP_SCRATCH_ROOT: chosen });
+    expect(after.PAPERCUSP_SCRATCH_ROOT).toBe(chosen);
+  });
+});

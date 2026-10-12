@@ -226,6 +226,25 @@ if (stateDirNeedsRedirect(process.env.PAPERCUSP_PSU_PTY_DIR, join(homedir(), '.p
     }
   });
 }
+// WI-10006961: result-door and ptool spill writers default to ~/.papercusp/scratch.
+// Test fixtures use synthetic workspace ids, so an unset or inherited live root
+// would pollute the operator's scratch corpus. Preserve deliberate non-live
+// overrides; redirect the default to a per-process dir that is swept after a
+// signal-killed fork and removed on a normal exit.
+if (stateDirNeedsRedirect(
+  process.env.PAPERCUSP_SCRATCH_ROOT,
+  join(homedir(), '.papercusp', 'scratch'),
+)) {
+  const scratchHermeticDir = createHermeticDir(join(tmpdir(), 'papercusp-scratch-hermetic'));
+  process.env.PAPERCUSP_SCRATCH_ROOT = scratchHermeticDir;
+  process.on('exit', () => {
+    try {
+      rmSync(scratchHermeticDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort — never let cleanup fail the process */
+    }
+  });
+}
 delete process.env.PAPERCUSP_BACKGROUND_WORKERS;
 delete process.env.PAPERCUSP_HONO_PORT;
 delete process.env.PAPERCUSP_SPAWNER_SIDECAR;
