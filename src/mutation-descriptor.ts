@@ -25,6 +25,7 @@ export type MutationProbeMode = (typeof MUTATION_PROBE_MODES)[number];
 export const MAX_MUTATION_EXPRESSION_CHARS = 2_000;
 export const MAX_MUTANT_DIFF_CHARS = 8_000;
 export const MAX_SUBJECT_PATH_CHARS = 1_024;
+export const MAX_TEST_COMMAND_CHARS = 8_000;
 
 /** Phases the probe runs the GUARD under before mutating: a pass here is the calibration leg. */
 export const CALIBRATION_LEGS: readonly string[] = ['baseline', 'copy-baseline'];
@@ -46,6 +47,9 @@ export interface MutationInvocationDescriptor {
   mutantDiff: string;
   mutantDiffTruncated: boolean;
   testCommandSha256: string;
+  /** Literal --test template, including inline subject-pointer environment.
+   * Optional for rows produced before command recording was introduced. */
+  testCommand?: string;
 }
 
 /** The per-row descriptor persisted at execution_details.mutation. */
@@ -57,7 +61,7 @@ export interface MutationDescriptor extends MutationInvocationDescriptor {
 
 const INVOCATION_KEYS = new Set<keyof MutationInvocationDescriptor>([
   'schemaVersion', 'probeInvocationId', 'mode', 'subjectPath', 'mutateExpression', 'againstCommit',
-  'subjectBeforeSha256', 'subjectAfterSha256', 'mutantDiff', 'mutantDiffTruncated', 'testCommandSha256',
+  'subjectBeforeSha256', 'subjectAfterSha256', 'mutantDiff', 'mutantDiffTruncated', 'testCommandSha256', 'testCommand',
 ]);
 const ROW_KEYS = new Set<string>([...INVOCATION_KEYS, 'leg', 'testFileSha256']);
 
@@ -89,6 +93,7 @@ function invocationFieldsValid(value: Record<string, unknown>): boolean {
     if (typeof value[key] !== 'string' || !SHA256.test(value[key] as string)) return false;
   }
   if (typeof value.mutantDiff !== 'string' || value.mutantDiff.length > MAX_MUTANT_DIFF_CHARS) return false;
+  if (value.testCommand !== undefined && !boundedString(value.testCommand, MAX_TEST_COMMAND_CHARS)) return false;
   return typeof value.mutantDiffTruncated === 'boolean';
 }
 

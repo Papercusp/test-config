@@ -145,6 +145,14 @@ describe('R-1 parser: strict execution_details.mutation', () => {
       .toBeDefined();
   });
 
+  it('preserves the literal command through the reporter and strict reader, while legacy rows stay readable', async () => {
+    const command = 'PROBE_SUBJECT={} npm run test:file -- guard.test.ts';
+    const recorded = await recordOneRow('mutant', JSON.stringify({ ...invocation, testCommand: command, testCommandSha256: sha(command) }));
+    expect(parseTestRunExecutionDetails(recorded.executionDetails)?.mutation?.testCommand).toBe(command);
+    expect(parseMutationDescriptor(row)).toBeDefined();
+    expect(parseMutationDescriptor(row)).not.toHaveProperty('testCommand');
+  });
+
   it.each([
     ['an unknown key', { ...row, extra: true }],
     ['a missing mode', (() => { const { mode: _mode, ...rest } = row; return rest; })()],
@@ -155,6 +163,9 @@ describe('R-1 parser: strict execution_details.mutation', () => {
     ['a malformed subject hash', { ...row, subjectBeforeSha256: 'xyz' }],
     ['a malformed leg', { ...row, leg: 'Mutant!' }],
     ['an over-long diff', { ...row, mutantDiff: 'x'.repeat(8_001) }],
+    ['an empty command', { ...row, testCommand: '' }],
+    ['an over-long command', { ...row, testCommand: 'x'.repeat(8_001) }],
+    ['a non-string command', { ...row, testCommand: 1 }],
   ])('refuses %s, so the whole row fails the strict parser', (_label, mutation) => {
     expect(parseMutationDescriptor(mutation)).toBeUndefined();
     expect(parseTestRunExecutionDetails({ ...baseDetails, mutation })).toBeUndefined();
