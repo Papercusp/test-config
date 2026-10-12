@@ -26,6 +26,16 @@ export const MAX_MUTATION_EXPRESSION_CHARS = 2_000;
 export const MAX_MUTANT_DIFF_CHARS = 8_000;
 export const MAX_SUBJECT_PATH_CHARS = 1_024;
 export const MAX_TEST_COMMAND_CHARS = 8_000;
+export const MAX_CONTROL_LITERAL_CHARS = 1_024;
+export const MAX_POSITIVE_CONTROLS = 32;
+
+/** Historical comparison preconditions, retained so replay need not invent them. */
+export interface MutationHistoricalControls {
+  mustBeAbsent: string;
+  positiveControls: string[];
+  calibrationCommand: string;
+  subjectMustBehave?: string;
+}
 
 /** Phases the probe runs the GUARD under before mutating: a pass here is the calibration leg. */
 export const CALIBRATION_LEGS: readonly string[] = ['baseline', 'copy-baseline'];
@@ -50,6 +60,8 @@ export interface MutationInvocationDescriptor {
   /** Literal --test template, including inline subject-pointer environment.
    * Optional for rows produced before command recording was introduced. */
   testCommand?: string;
+  /** Optional for legacy rows; valid only for historical mode. */
+  historicalControls?: MutationHistoricalControls;
 }
 
 /** The per-row descriptor persisted at execution_details.mutation. */
@@ -61,7 +73,7 @@ export interface MutationDescriptor extends MutationInvocationDescriptor {
 
 const INVOCATION_KEYS = new Set<keyof MutationInvocationDescriptor>([
   'schemaVersion', 'probeInvocationId', 'mode', 'subjectPath', 'mutateExpression', 'againstCommit',
-  'subjectBeforeSha256', 'subjectAfterSha256', 'mutantDiff', 'mutantDiffTruncated', 'testCommandSha256', 'testCommand',
+  'subjectBeforeSha256', 'subjectAfterSha256', 'mutantDiff', 'mutantDiffTruncated', 'testCommandSha256', 'testCommand', 'historicalControls',
 ]);
 const ROW_KEYS = new Set<string>([...INVOCATION_KEYS, 'leg', 'testFileSha256']);
 
@@ -76,6 +88,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function boundedString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max;
+}
+
+function historicalControlsValid(value: unknown): boolean {
+  if (!isRecord(value) || Object.keys(value).some((key) =>
+    !['mustBeAbsent', 'positiveControls', 'calibrationCommand', 'subjectMustBehave'].includes(key))) return false;
+  return boundedString(value.mustBeAbsent, MAX_CONTROL_LITERAL_CHARS) &&
+    Array.isArray(value.positiveControls) && value.positiveControls.length > 0 &&
+    value.positiveControls.length <= MAX_POSITIVE_CONTROLS &&
+    value.positiveControls.every((control) => boundedString(control, MAX_CONTROL_LITERAL_CHARS)) &&
+    boundedString(value.calibrationCommand, MAX_TEST_COMMAND_CHARS) && value.calibrationCommand.includes('{}') &&
+    (value.subjectMustBehave === undefined ||
+      (boundedString(value.subjectMustBehave, MAX_TEST_COMMAND_CHARS) && value.subjectMustBehave.includes('{}')));
 }
 
 function invocationFieldsValid(value: Record<string, unknown>): boolean {
@@ -94,6 +118,8 @@ function invocationFieldsValid(value: Record<string, unknown>): boolean {
   }
   if (typeof value.mutantDiff !== 'string' || value.mutantDiff.length > MAX_MUTANT_DIFF_CHARS) return false;
   if (value.testCommand !== undefined && !boundedString(value.testCommand, MAX_TEST_COMMAND_CHARS)) return false;
+  if (value.historicalControls !== undefined &&
+    (value.mode !== 'historical' || !historicalControlsValid(value.historicalControls))) return false;
   return typeof value.mutantDiffTruncated === 'boolean';
 }
 

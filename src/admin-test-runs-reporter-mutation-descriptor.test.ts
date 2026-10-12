@@ -153,6 +153,40 @@ describe('R-1 parser: strict execution_details.mutation', () => {
     expect(parseMutationDescriptor(row)).not.toHaveProperty('testCommand');
   });
 
+  const historical = {
+    ...row, mode: 'historical', mutateExpression: null, againstCommit: 'a'.repeat(40),
+    historicalControls: {
+      mustBeAbsent: 'fixed-path', positiveControls: ['stable-control', 'second control\nwith newline'],
+      calibrationCommand: 'PROBE_SUBJECT={} npm run test:file -- calibration.test.ts',
+      subjectMustBehave: 'node {} --help',
+    },
+  };
+
+  it('retains exact historical controls through the reporter and strict reader, including multiple literals', async () => {
+    const { leg: _leg, testFileSha256: _testFileSha256, ...descriptor } = historical;
+    const recorded = await recordOneRow('historical', JSON.stringify(descriptor));
+    expect(parseTestRunExecutionDetails(recorded.executionDetails)?.mutation?.historicalControls)
+      .toEqual(historical.historicalControls);
+    expect(parseMutationDescriptor({ ...row, mode: 'historical', mutateExpression: null, againstCommit: 'a'.repeat(40) }))
+      .not.toHaveProperty('historicalControls');
+  });
+
+  it.each([
+    ['controls on a non-historical row', { ...row, historicalControls: historical.historicalControls }],
+    ['unknown control key', { ...historical, historicalControls: { ...historical.historicalControls, extra: true } }],
+    ['missing absence control', { ...historical, historicalControls: { ...historical.historicalControls, mustBeAbsent: '' } }],
+    ['over-long absence control', { ...historical, historicalControls: { ...historical.historicalControls, mustBeAbsent: 'x'.repeat(1_025) } }],
+    ['no positive controls', { ...historical, historicalControls: { ...historical.historicalControls, positiveControls: [] } }],
+    ['too many positive controls', { ...historical, historicalControls: { ...historical.historicalControls, positiveControls: Array(33).fill('control') } }],
+    ['malformed positive control', { ...historical, historicalControls: { ...historical.historicalControls, positiveControls: [1] } }],
+    ['calibration without a subject pointer', { ...historical, historicalControls: { ...historical.historicalControls, calibrationCommand: 'true' } }],
+    ['over-long calibration', { ...historical, historicalControls: { ...historical.historicalControls, calibrationCommand: '{}'.padEnd(8_001, 'x') } }],
+    ['behavior control without a subject pointer', { ...historical, historicalControls: { ...historical.historicalControls, subjectMustBehave: 'true' } }],
+  ])('refuses %s', (_label, mutation) => {
+    expect(parseMutationDescriptor(mutation)).toBeUndefined();
+    expect(parseTestRunExecutionDetails({ ...baseDetails, mutation })).toBeUndefined();
+  });
+
   it.each([
     ['an unknown key', { ...row, extra: true }],
     ['a missing mode', (() => { const { mode: _mode, ...rest } = row; return rest; })()],
