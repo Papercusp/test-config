@@ -54,3 +54,6 @@ if (process.env.PAPERCUSP_LIVE_PG_GUARD_INITIALIZED !== '1') {
 }
 
 process.env.PAPERCUSP_FORBID_LIVE_PG = '1';
+
+// This side-effect setup is also imported by its regression suite.
+export {};

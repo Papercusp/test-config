@@ -61,6 +61,90 @@ import { verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
+describe('Vitest run-level ledger verdict', () => {
+  async function recordRun(
+    outcomes: Array<{ name: string; passed: number; failed: number; skipped: number }>,
+    errors: Array<{ message: string; code?: string }>,
+    reason: 'passed' | 'failed',
+  ) {
+    const rows: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(
+      async () => ({ commit: 'abc', porcelain: '' }),
+      async row => { rows.push(row); },
+    );
+    await reporter.onInit({ config: { root: TEST_CONFIG_ROOT,
+      configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } as never);
+    const modules = outcomes.map(outcome => ({
+      moduleId: join(TEST_CONFIG_ROOT, `src/${outcome.name}.test.ts`),
+      state: () => outcome.failed ? 'failed' : outcome.passed ? 'passed' : 'skipped',
+      diagnostic: () => ({ duration: 1 }),
+      errors: () => [],
+      children: { allTests: () => ['passed', 'failed', 'skipped'].flatMap(state =>
+        Array.from({ length: outcome[state as 'passed' | 'failed' | 'skipped'] }, (_, index) => ({
+          fullName: `${outcome.name} ${state} ${index}`,
+          result: () => ({ state, ...(state === 'failed'
+            ? { errors: [{ message: 'assertion mismatch' }] } : {}) }),
+        }))) },
+    }));
+    for (const module of modules) reporter.onTestModuleEnd(module as never);
+    await reporter.onTestRunEnd(modules as never, errors as never, reason);
+    await reporter.onExit(); // Vitest's fallback must neither duplicate nor erase the error row.
+    return rows;
+  }
+
+  it('records an unhandled run error despite eight passing assertions and preserves their counts', async () => {
+    const rows = await recordRun([{ name: 'stop', passed: 8, failed: 0, skipped: 76 }],
+      [{ message: 'write after end', code: 'ERR_STREAM_WRITE_AFTER_END' }], 'failed');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe('error');
+    expect(rows[0].executionDetails).toMatchObject({ passed: 8, failed: 0, skipped: 76, collectionFailed: false });
+    expect(rows[0].outputTail).toContain('run-level');
+    expect(rows[0].outputTail).toContain('ERR_STREAM_WRITE_AFTER_END');
+    expect(rows[0].outputTail).toContain('write after end');
+    expect(parseTestRunExecutionDetails(rows[0].executionDetails)?.passed).toBe(8);
+  });
+
+  it('marks every passing module unproven while retaining an actual assertion failure and its diagnostic', async () => {
+    const rows = await recordRun([
+      { name: 'first', passed: 1, failed: 0, skipped: 0 },
+      { name: 'second', passed: 1, failed: 0, skipped: 0 },
+      { name: 'assertion', passed: 0, failed: 1, skipped: 0 },
+      { name: 'skipped', passed: 0, failed: 0, skipped: 1 },
+    ], [{ message: 'uncaught rejection' }], 'failed');
+    expect(rows.map(row => row.status)).toEqual(['error', 'error', 'fail', 'error']);
+    expect(rows.every(row => row.outputTail?.includes('uncaught rejection'))).toBe(true);
+    expect(rows[2].outputTail).toContain('assertion mismatch');
+    expect(rows[2].executionDetails).toMatchObject({ passed: 0, failed: 1, collectionFailed: false });
+    expect(rows[3].executionDetails).toMatchObject({ passed: 0, failed: 0, skipped: 1, collectionFailed: false });
+  });
+
+  it('preserves a clean successful invocation', async () => {
+    const rows = await recordRun([{ name: 'clean', passed: 1, failed: 0, skipped: 0 }], [], 'passed');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe('pass');
+    expect(rows[0].outputTail).toBeNull();
+  });
+
+  it('preserves successful modules when another module only fails assertions', async () => {
+    const rows = await recordRun([
+      { name: 'clean', passed: 1, failed: 0, skipped: 0 },
+      { name: 'assertion', passed: 0, failed: 1, skipped: 0 },
+    ], [], 'failed');
+    expect(rows.map(row => row.status)).toEqual(['pass', 'fail']);
+    expect(rows[0].outputTail).toBeNull();
+    expect(rows[1].outputTail).toContain('assertion mismatch');
+  });
+
+  it('keeps run-level diagnostics bounded while recording the full error count', async () => {
+    const rows = await recordRun([{ name: 'many-errors', passed: 1, failed: 0, skipped: 0 }],
+      Array.from({ length: 30 }, () => ({ message: 'x'.repeat(8_000), code: 'EPIPE' })), 'failed');
+    expect(rows[0].status).toBe('error');
+    expect(rows[0].outputTail).toContain('30 unhandled error');
+    expect(rows[0].outputTail).toContain('EPIPE');
+    expect(rows[0].outputTail!.length).toBeLessThanOrEqual(4_000);
+  });
+});
+
 describe('reporter ledger endpoint selection', () => {
   it.each(['', '  '])('ignores a blank explicit sink instead of selecting the operating-system user database (%j)', sink => {
     expect(resolveTestRunsPgUrl({ PAPERCUSP_TEST_RUNS_DB_URL: sink, HARNESS_ADMIN_DATABASE_URL: 'postgresql://product.example/product' }))
