@@ -659,6 +659,52 @@ describe('original config load evidence', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('does not break test:file TypeScript loading when capture is supplied through NODE_OPTIONS', () => {
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+    const root = mkdtempSync(join(tmpdir(), 'committed-source-capture-order-'));
+    const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
+    const committed = resolve(repoRoot, 'scripts/lib/committed-source-loader.mjs');
+    const source = resolve(repoRoot, 'libs/test-config/src/tmpdir-guard.ts');
+    const entry = join(root, 'entry.mjs');
+    const outPath = join(root, 'sources.json');
+    try {
+      const testFileScript = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).scripts['test:file'];
+      expect(testFileScript).toContain(
+        'NODE_OPTIONS="--import=$(pwd -P)/scripts/lib/committed-source-loader.mjs${NODE_OPTIONS:+ $NODE_OPTIONS}"',
+      );
+      writeFileSync(entry, `import { tmpdirNeedsOverride } from ${JSON.stringify(pathToFileURL(source).href)};
+        if (typeof tmpdirNeedsOverride !== 'function') throw new Error('TypeScript module was not loaded');
+        console.log('committed-source TypeScript load succeeded');\n`);
+      const env = { ...process.env };
+      for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
+          /^(PC_|VITEST|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_|AFFECTED_)/.test(key) || key === 'NODE_OPTIONS') delete env[key];
+      const launch = (withCapture: boolean) => spawnSync(process.execPath, ['--import', committed, entry], {
+        cwd: repoRoot, encoding: 'utf8', timeout: 30000,
+        env: { ...env,
+          NODE_OPTIONS: `--import=${committed} --import=tsx${withCapture ? ` --import=${pathToFileURL(capture).href}` : ''}`,
+          ...(withCapture ? { PC_EXECUTED_SOURCE_MAP_PRELOAD: '1',
+            PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'capture-order-regression',
+            PC_EXECUTED_SOURCE_MAP_ROOT: repoRoot, PC_EXECUTED_SOURCE_MAP_OUT: outPath } : {}),
+        },
+      });
+      const control = launch(false);
+      const captured = launch(true);
+      expect(control.status, control.stderr).toBe(0);
+      expect(captured.status, captured.stderr).toBe(0);
+      expect(captured.stdout).toContain('committed-source TypeScript load succeeded');
+      const receipts = readdirSync(`${outPath}.processes`).map(file =>
+        JSON.parse(readFileSync(join(`${outPath}.processes`, file), 'utf8')));
+      const receipt = receipts.find(row => row.isMainThread &&
+        row.observedSources?.some((loaded: { path: string }) => loaded.path === 'libs/test-config/src/tmpdir-guard.ts'));
+      expect(receipt).toMatchObject({ status: 'unknown',
+        reasons: expect.arrayContaining(['node-loader-chain-unmeasured']),
+        observedSources: expect.arrayContaining([expect.objectContaining({
+          path: 'libs/test-config/src/tmpdir-guard.ts', observedSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        })]),
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(['plain', 'shebang'] as const)('uses only embedded originals with exact Vite scope injection (%s)', (mode) => {
     const path = '/repo/config.mjs';
     const original = (mode === 'shebang' ? '#!/usr/bin/env node\n' : '') + 'export default {};\n';
