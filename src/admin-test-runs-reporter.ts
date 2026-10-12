@@ -58,6 +58,17 @@ export function sha256OfTestFile(absolutePath: string): string | null {
   }
 }
 
+// The reader below needs TaskMeta.papercuspIsolatedRuntimeRunId. It is declared
+// here as well as in index.ts because programs that import this reporter directly
+// (the scripts and operator-vite tsc legs) never load index.ts, and without its
+// augmentation `test.meta()?.papercuspIsolatedRuntimeRunId` fails with TS2339.
+// (Declaration-merges with the identical augmentation in index.ts.)
+declare module 'vitest' {
+  interface TaskMeta {
+    papercuspIsolatedRuntimeRunId?: string;
+  }
+}
+
 /** Hash original bytes at recording time; a fixture-supplied digest is never trusted. */
 export function collectIsolatedRuntimeReceipts(testModule: TestModule): IsolatedRuntimeReceipt[] | undefined {
   try {
@@ -676,6 +687,67 @@ export interface TestRunRow {
   commitSha: string | null;
   /** Measured per-file proof; absent/NULL is unknown, never zero skipped tests. */
   executionDetails?: TestRunExecutionDetails | null;
+  /**
+   * Every completed case in this module (harness_shared.test_case_runs, migration 1478).
+   * Absent/NULL means the cases could not be read (a collection error, a pending case),
+   * never "this file has no cases".
+   */
+  cases?: readonly TestCaseRecord[] | null;
+}
+
+/** One Vitest case result, written to harness_shared.test_case_runs under its file row. */
+export interface TestCaseRecord {
+  /** Position in module order (0-based); with the parent row id, the primary key. */
+  caseIndex: number;
+  /** Vitest fullName: the describe/it title path joined with " > ". */
+  caseKey: string;
+  /** 1-based ordinal among cases sharing caseKey in this module (parameterized tests). */
+  occurrence: number;
+  status: 'pass' | 'fail' | 'skip';
+  durationMs: number | null;
+  /** The first error of a failed case, at most TEST_CASE_ERROR_TAIL_MAX_CHARS. */
+  errorTail: string | null;
+}
+
+export const TEST_CASE_ERROR_TAIL_MAX_CHARS = 1_000;
+export const TEST_CASE_KEY_MAX_CHARS = 2_000;
+
+/**
+ * Read every case Vitest completed in a module, in module order. Returns null rather
+ * than a partial list when the module failed to collect or any case is still pending,
+ * so a recorded case list is always the module's complete set. Never throws (D-007).
+ */
+export function collectTestCases(testModule: TestModule): TestCaseRecord[] | null {
+  try {
+    if (moduleStatus(testModule) === 'error' || typeof testModule.children?.allTests !== 'function') return null;
+    const cases: TestCaseRecord[] = [];
+    const seen = new Map<string, number>();
+    for (const test of testModule.children.allTests()) {
+      const result = test.result();
+      const status = result.state === 'passed' ? 'pass'
+        : result.state === 'failed' ? 'fail'
+        : result.state === 'skipped' ? 'skip'
+        : null;
+      if (status === null) return null; // pending/unreadable: not a completed measurement
+      const rawKey = typeof test.fullName === 'string' && test.fullName.trim() ? test.fullName : '(unnamed test)';
+      const caseKey = rawKey.slice(0, TEST_CASE_KEY_MAX_CHARS);
+      const occurrence = (seen.get(caseKey) ?? 0) + 1;
+      seen.set(caseKey, occurrence);
+      let durationMs: number | null = null;
+      try {
+        const duration = test.diagnostic()?.duration;
+        if (typeof duration === 'number' && Number.isFinite(duration) && duration >= 0) durationMs = Math.round(duration);
+      } catch { /* fail-soft: duration unknown */ }
+      const firstError = status === 'fail' ? result.errors?.[0] : undefined;
+      const errorTail = firstError === undefined
+        ? null
+        : formatTestCaseError(firstError).slice(0, TEST_CASE_ERROR_TAIL_MAX_CHARS) || null;
+      cases.push({ caseIndex: cases.length, caseKey, occurrence, status, durationMs, errorTail });
+    }
+    return cases;
+  } catch {
+    return null;
+  }
 }
 
 /** Read Vitest's completed cases, not module status or a truncated stdout tail. */
@@ -1349,15 +1421,30 @@ export async function insertTestRunRowsWithSql(
   rows: readonly TestRunRow[],
   context: TestRunInsertContext,
   budget: Pick<ReturnType<typeof reporterWriteBudget>, 'insertTimeoutMs' | 'totalInsertMs'> = reporterWriteBudget(process.env),
+  onCaseOutcome?: (outcome: TestCaseInsertOutcome) => void,
 ): Promise<TestRunReceipt[]> {
   const receipts: TestRunReceipt[] = [];
   const deadline = Date.now() + budget.totalInsertMs;
   let columns: readonly (typeof TEST_RUN_INSERT_COLUMNS)[number][] = TEST_RUN_INSERT_COLUMNS;
+  // Case rows ride behind their file rows: collected per inserted batch, written once
+  // every file row has been attempted, inside whatever remains of the same deadline.
+  const caseParents: Array<{ testRunId: string; cases: readonly TestCaseRecord[] }> = [];
+  const finish = async (): Promise<TestRunReceipt[]> => {
+    if (caseParents.length > 0) {
+      try {
+        const outcome = await insertTestCaseRowsWithSql(sql, caseParents, {
+          deadline, insertTimeoutMs: budget.insertTimeoutMs,
+        });
+        onCaseOutcome?.(outcome);
+      } catch { /* swallow — D-007: case rows never cost the file rows */ }
+    }
+    return receipts;
+  };
   for (let offset = 0; offset < rows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
       receipts.push(...unwrittenReceipts(rows.slice(offset), 'timeout', `flush_deadline_${budget.totalInsertMs}ms`));
-      return receipts;
+      return finish();
     }
     const sourceRows = rows.slice(offset, offset + TEST_RUN_INSERT_BATCH_SIZE);
     const batch = sourceRows
@@ -1416,10 +1503,17 @@ export async function insertTestRunRowsWithSql(
         // Later batches are never attempted once one has not completed.
         ...unwrittenReceipts(rows.slice(offset + TEST_RUN_INSERT_BATCH_SIZE), 'timeout', 'not_attempted_after_failed_batch'),
       );
+      // A timed-out query may still be in flight; queueing case rows behind it would
+      // break the one-in-flight-query invariant above, so case rows are dropped here.
       return receipts;
     }
     receipts.push(...insertedReceipts(sourceRows, written));
+    pairInsertedIds(sourceRows, written).forEach((testRunId, index) => {
+      const cases = sourceRows[index]?.cases;
+      if (testRunId !== undefined && cases && cases.length > 0) caseParents.push({ testRunId, cases });
+    });
   }
+  return finish();
   return receipts;
 }
 
@@ -1428,6 +1522,17 @@ export async function insertTestRunRowsWithSql(
  * position: Postgres does not promise RETURNING order for a multi-row insert.
  */
 function insertedReceipts(sourceRows: readonly TestRunRow[], written: unknown): TestRunReceipt[] {
+  const ids = pairInsertedIds(sourceRows, written);
+  return sourceRows.map((row, index): TestRunReceipt => {
+    const id = ids[index];
+    return id === undefined
+      ? { filePath: row.filePath, status: row.status, outcome: 'failed', reason: 'insert_returned_no_id' }
+      : { filePath: row.filePath, status: row.status, outcome: 'inserted', id };
+  });
+}
+
+/** The test_runs id RETURNING produced for each source row, index-aligned (undefined = none). */
+function pairInsertedIds(sourceRows: readonly TestRunRow[], written: unknown): Array<string | undefined> {
   const returned = Array.isArray(written) ? (written as Array<{ id?: unknown; file_path?: unknown }>) : [];
   const idsByPath = new Map<string, string[]>();
   for (const row of returned) {
@@ -1436,12 +1541,74 @@ function insertedReceipts(sourceRows: readonly TestRunRow[], written: unknown): 
     ids.push(String(row.id));
     idsByPath.set(row.file_path, ids);
   }
-  return sourceRows.map((row): TestRunReceipt => {
-    const id = idsByPath.get(row.filePath)?.shift();
-    return id === undefined
-      ? { filePath: row.filePath, status: row.status, outcome: 'failed', reason: 'insert_returned_no_id' }
-      : { filePath: row.filePath, status: row.status, outcome: 'inserted', id };
-  });
+  return sourceRows.map((row) => idsByPath.get(row.filePath)?.shift());
+}
+
+// 4,000 rows × 7 columns = 28,000 bind parameters, below Postgres's 65,535 ceiling.
+export const TEST_CASE_INSERT_BATCH_SIZE = 4_000;
+
+const TEST_CASE_INSERT_COLUMNS = [
+  'test_run_id', 'case_index', 'case_key', 'occurrence', 'status', 'duration_ms', 'error_tail',
+] as const;
+
+export type TestCaseInsertOutcome = {
+  /** Case rows the database acknowledged. */
+  written: number;
+  /** Case rows not written (deadline, timeout, failure, or a ledger without migration 1478). */
+  unwritten: number;
+  reason: string | null;
+};
+
+/** True when the ledger database predates migration 1478 (no test_case_runs table). */
+export function isMissingTestCaseRunsTable(error: unknown): boolean {
+  const pgError = error as { code?: unknown; message?: unknown } | null | undefined;
+  return pgError?.code === '42P01'
+    && typeof pgError.message === 'string'
+    && pgError.message.includes('test_case_runs');
+}
+
+/**
+ * Write the case rows of already-inserted test_runs rows, sequentially and inside the
+ * caller's deadline. Case rows are secondary evidence: they are attempted only after
+ * every file row, and a failure here never touches the file rows' receipts (D-007).
+ */
+export async function insertTestCaseRowsWithSql(
+  sql: PgSql,
+  parents: ReadonlyArray<{ testRunId: string; cases: readonly TestCaseRecord[] }>,
+  limits: { deadline: number; insertTimeoutMs: number },
+): Promise<TestCaseInsertOutcome> {
+  const rows = parents.flatMap(({ testRunId, cases }) => cases.map((testCase) => ({
+    test_run_id: testRunId,
+    case_index: testCase.caseIndex,
+    case_key: testCase.caseKey.slice(0, TEST_CASE_KEY_MAX_CHARS),
+    occurrence: testCase.occurrence,
+    status: testCase.status,
+    duration_ms: testCase.durationMs,
+    error_tail: testCase.errorTail === null ? null : testCase.errorTail.slice(0, TEST_CASE_ERROR_TAIL_MAX_CHARS),
+  })));
+  let written = 0;
+  for (let offset = 0; offset < rows.length; offset += TEST_CASE_INSERT_BATCH_SIZE) {
+    const remainingMs = limits.deadline - Date.now();
+    if (remainingMs <= 0) return { written, unwritten: rows.length - offset, reason: 'flush_deadline' };
+    const batch = rows.slice(offset, offset + TEST_CASE_INSERT_BATCH_SIZE);
+    let failure: unknown = null;
+    const query = Promise.resolve(sql`
+      INSERT INTO harness_shared.test_case_runs
+        ${sql(batch, ...TEST_CASE_INSERT_COLUMNS)}
+    `).then(
+      () => undefined,
+      (error) => { failure = error ?? new Error('insert_rejected'); throw failure; },
+    );
+    const timeoutMs = Math.min(limits.insertTimeoutMs, remainingMs);
+    if (!(await settleWithin(query, timeoutMs))) {
+      const reason = failure
+        ? (isMissingTestCaseRunsTable(failure) ? 'test_case_runs_missing' : receiptReason(failure))
+        : `pg_insert_timeout_${timeoutMs}ms`;
+      return { written, unwritten: rows.length - offset, reason };
+    }
+    written += batch.length;
+  }
+  return { written, unwritten: 0, reason: null };
 }
 
 /**
@@ -1799,7 +1966,8 @@ export default class AdminTestRunsReporter implements Reporter {
         : undefined;
       if (executionDetails && mutation) Object.assign(executionDetails, { mutation });
       this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail,
-        isScratchConfig: this.isScratchConfig, executionDetails, verifierSourceReason });
+        isScratchConfig: this.isScratchConfig, executionDetails, verifierSourceReason,
+        cases: collectTestCases(testModule) });
     } catch {
       /* swallow — D-007 */
     }
