@@ -24,11 +24,11 @@
  * adequacy evidence can bind to a real test_runs id; health/gate readers exclude
  * that source explicitly.
  *
- * Vitest 4 API: onTestModuleEnd (per file) + onTestRunEnd (flush). Older
+ * Vitest 4 API: onTestModuleEnd (per file) + onTestRunEnd (run errors + flush). Older
  * onFinished/onTaskUpdate names from Vitest 1-3 are NOT called.
  */
 
-import type { Reporter, TestModule, Vitest } from 'vitest/node';
+import type { Reporter, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
 import { exec } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -792,7 +792,7 @@ function stringifyFailureValue(value: unknown): string {
   }
 }
 
-function errorField(error: unknown, field: 'message' | 'actual' | 'expected'): unknown {
+function errorField(error: unknown, field: 'message' | 'actual' | 'expected' | 'code'): unknown {
   try {
     if (error && typeof error === 'object') return (error as Record<string, unknown>)[field];
   } catch {
@@ -1865,8 +1865,29 @@ export default class AdminTestRunsReporter implements Reporter {
     writeFailureDetails(details);
   }
 
-  async onTestRunEnd(): Promise<void> {
+  async onTestRunEnd(
+    _testModules?: ReadonlyArray<TestModule>,
+    unhandledErrors: ReadonlyArray<unknown> = [],
+    reason?: TestRunEndReason,
+  ): Promise<void> {
     try {
+      // WI-6554700010008757: Vitest can pass every assertion yet fail the
+      // invocation with an unhandled async/stream error. Module counts remain
+      // measured assertion outcomes, but those rows cannot claim passing proof.
+      // Reuse the existing error status/output_tail contract so deployed readers
+      // see the failure without encountering an unknown execution-details key.
+      if (!this.flushed && unhandledErrors.length > 0) {
+        const messages = unhandledErrors.slice(0, 8).map(error => {
+          const code = errorField(error, 'code');
+          return `${code === undefined ? '' : `[${boundFailureText(stringifyFailureValue(code), 100)}] `}${formatTestCaseError(error)}`;
+        }).join('\n').slice(0, 2_600);
+        const runError = `Vitest run-level: ${unhandledErrors.length} unhandled error(s) (reason=${reason ?? 'unknown'}).\n${messages}`;
+        for (const row of this.pending) {
+          const moduleVerdict = row.status;
+          if (row.status === 'pass' || row.status === 'skip') row.status = 'error';
+          row.outputTail = `${runError}\nModule verdict: ${moduleVerdict}${row.outputTail ? `\n${row.outputTail.slice(-1_000)}` : ''}`.slice(0, 4_000);
+        }
+      }
       await this.flushPending();
     } catch {
       /* swallow — D-007 */
