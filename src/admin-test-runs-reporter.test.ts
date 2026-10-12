@@ -213,6 +213,40 @@ describe('receipt-backed native archive reporter', () => {
 });
 
 describe('original isolated runtime receipt recording', () => {
+  it.each(['integration', 'e2e', 'unit', 'browser', undefined] as const)(
+    'persists original worker receipts only for an isolated-capable project layer (%s)', async layer => {
+      const dir = mkdtempSync(join(tmpdir(), 'isolated-reporter-layer-'));
+      vi.stubEnv('VH_EVIDENCE_ROOT_BASE', dir);
+      const runId = '20261008T000000Z-100';
+      const base = join(dir, 'isolated-integration', runId);
+      const rows: TestRunRow[] = [];
+      try {
+        for (const file of ['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json']) {
+          mkdirSync(join(base, file, '..'), { recursive: true });
+          writeFileSync(join(base, file), '{}');
+        }
+        const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+          async row => { rows.push(row); }, undefined, async () => null);
+        // A root layer cannot upgrade a project's unit or unknown layer.
+        await reporter.onInit({ config: { root: TEST_CONFIG_ROOT,
+          provide: { papercuspTestLayer: 'e2e' } } } as never);
+        reporter.onTestModuleEnd({ state: () => 'passed',
+          project: { config: { provide: layer ? { papercuspTestLayer: layer } : {} } },
+          children: { allTests: () => [{ fullName: 'suite > isolated worker',
+            result: () => ({ state: 'passed' }), meta: () => ({ papercuspIsolatedRuntimeRunId: runId }) }] },
+          moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+          diagnostic: () => ({ duration: 1 }), errors: () => [],
+        } as never);
+        await reporter.onTestRunEnd();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].executionDetails?.testLayer).toBe(layer);
+        const hash = createHash('sha256').update('{}').digest('hex');
+        expect(rows[0].executionDetails?.isolatedRuntimeReceipts)
+          .toEqual(layer === 'integration' || layer === 'e2e'
+            ? [{ runId, resultSha256: hash, sourceSha256: hash, lifecycleSha256: hash }] : undefined);
+      } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it('hashes the real bytes, refusing ordinary, partial and duplicate fixture claims', () => {
     const dir = mkdtempSync(join(tmpdir(), 'isolated-reporter-'));
     vi.stubEnv('VH_EVIDENCE_ROOT_BASE', dir);

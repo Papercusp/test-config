@@ -1775,7 +1775,9 @@ export default class AdminTestRunsReporter implements Reporter {
         : this.executionContext?.testLayer;
       const executionDetails = counts && this.executionContext
         ? { ...this.executionContext, testLayer, filePath, ...counts } : null;
-      if (executionDetails && testLayer === 'integration') {
+      // The receipt describes the isolated worker lifetime, independently of
+      // whether the owning test exercises an integration seam or an e2e journey.
+      if (executionDetails && (testLayer === 'integration' || testLayer === 'e2e')) {
         const receipts = collectIsolatedRuntimeReceipts(testModule);
         if (receipts) Object.assign(executionDetails, { isolatedRuntimeReceipts: receipts });
       }

@@ -49,6 +49,15 @@ function ev(type: string, data: Record<string, unknown>) {
 }
 
 describe('node:test ledger collector fold', () => {
+  it('excludes a successful file wrapper when no selected assertion ran', () => {
+    const fold = createNodeTestLedgerFold();
+    fold.push(ev('test:pass', { name: FILE, details: { type: 'test' } }));
+    expect(fold.summary().files[0]).toMatchObject({ passed: 0, failed: 0 });
+    // A real case with a file-looking title has a source location and still counts.
+    fold.push(ev('test:pass', { name: FILE, line: 10, details: { type: 'test' } }));
+    expect(fold.summary().files[0]).toMatchObject({ passed: 1 });
+  });
+
   it('names nested cases by their ancestors and counts pass / fail / skip / todo per file', () => {
     const fold = createNodeTestLedgerFold();
     fold.push(ev('test:start', { name: 'suite' }));

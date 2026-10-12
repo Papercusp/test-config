@@ -162,6 +162,8 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
 export interface NodeTestLedgerOutcome {
   recorded: number;
   reason: string | null;
+  /** Actual case counts from the collector, independent of persistence success. */
+  counts?: { executed: number; skipped: number };
   /**
    * Cases whose test body threw, in the shape scripts/test-files.mjs prints as
    * TEST_FILE_ASSERTION_FAILURE lines (formatFailedAssertionDiagnostics). Without them a
@@ -230,6 +232,7 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
     ],
     async record(opts = {}) {
       let assertionFailures: NodeTestLedgerOutcome['assertionFailures'] = [];
+      let counts: NodeTestLedgerOutcome['counts'];
       try {
         let text: string;
         try {
@@ -240,6 +243,10 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
         const summary = parseNodeTestLedgerSummary(text);
         if (!summary) return { recorded: 0, reason: 'collector summary is malformed', assertionFailures };
         assertionFailures = nodeTestAssertionFailures(summary);
+        counts = summary.files.reduce((total, file) => ({
+          executed: total.executed + file.passed + file.failed,
+          skipped: total.skipped + file.skipped,
+        }), { executed: 0, skipped: 0 });
 
         let worktreeDirty = true;
         let worktreeDirtyReason: string | null = 'snapshot not taken';
@@ -268,11 +275,12 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
           mutationPhase: resolveMutationProbePhase(),
           testNamePattern: opts.testNamePattern ?? null,
         });
-        if (rows.length === 0) return { recorded: 0, reason: 'no recordable file executed a case', assertionFailures };
+        if (rows.length === 0) return { recorded: 0, reason: 'no recordable file executed a case', assertionFailures, counts };
         await writeRows(rows);
-        return { recorded: rows.length, reason: worktreeDirty ? `worktree_dirty: ${worktreeDirtyReason}` : null, assertionFailures };
+        return { recorded: rows.length, reason: worktreeDirty ? `worktree_dirty: ${worktreeDirtyReason}` : null, assertionFailures, counts };
       } catch (err) {
-        return { recorded: 0, reason: `recording failed: ${err instanceof Error ? err.message : String(err)}`, assertionFailures };
+        return { recorded: 0, reason: `recording failed: ${err instanceof Error ? err.message : String(err)}`, assertionFailures,
+          ...(counts ? { counts } : {}) };
       } finally {
         rmSync(dir, { recursive: true, force: true });
         if (!options.writeRows) await closeSharedPgIfUnheld().catch(() => undefined);
