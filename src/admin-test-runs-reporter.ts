@@ -727,11 +727,17 @@ export function collectModuleExecution(testModule: TestModule, preferredPassedCa
       .slice(0, MAX_RECORDED_PASSED_CASES);
     const allRecordedPassedCaseTitleCount = [...titleOutcomes.values()].filter(outcome => outcome === 'passed').length;
     const passedCaseTitlesTruncated = allRecordedPassedCaseTitleCount > recordedPassedCaseTitles.length;
+    // A suite hook can fail after its assertions passed. Keep its measured
+    // counts and red verdict, but omit assertion proof the shared parser
+    // deliberately refuses for a failed collection/suite lifecycle.
+    const collectionFailed = status === 'fail' && failed === 0;
     return {
-      passed, failed, skipped, collectionFailed: status === 'fail' && failed === 0,
-      ...(recordedFailedCaseTitles.length > 0 ? { failedCaseTitles: recordedFailedCaseTitles } : {}),
-      ...(recordedPassedCaseTitles.length > 0 ? { passedCaseTitles: recordedPassedCaseTitles } : {}),
-      ...(passedCaseTitlesTruncated ? { passedCaseTitlesTruncated: true as const } : {}),
+      passed, failed, skipped, collectionFailed,
+      ...(collectionFailed ? {} : {
+        ...(recordedFailedCaseTitles.length > 0 ? { failedCaseTitles: recordedFailedCaseTitles } : {}),
+        ...(recordedPassedCaseTitles.length > 0 ? { passedCaseTitles: recordedPassedCaseTitles } : {}),
+        ...(passedCaseTitlesTruncated ? { passedCaseTitlesTruncated: true as const } : {}),
+      }),
     };
   } catch {
     return null;

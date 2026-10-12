@@ -414,6 +414,32 @@ describe('durable module execution measurement', () => {
     expect(collectModuleExecution(module(['skipped'], 'failed')))
       .toEqual({ passed: 0, failed: 0, skipped: 1, collectionFailed: true });
   });
+  it.each([14, 47, MAX_RECORDED_PASSED_CASES + 1])(
+    'preserves readable red metadata after a suite hook fails following %i passing cases', async passed => {
+      const rows: TestRunRow[] = [];
+      const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+        async row => { rows.push(row); });
+      reporter.onInit({ config: { root: TEST_CONFIG_ROOT },
+        vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
+      reporter.onTestModuleEnd({ state: () => 'failed',
+        children: { allTests: () => Array.from({ length: passed }, (_, index) => ({
+          fullName: `suite > passed-${index}`, result: () => ({ state: 'passed' }),
+        })) },
+        moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+        diagnostic: () => ({ duration: 1 }), errors: () => [{ message: 'afterAll cleanup failed' }],
+      } as never);
+      await reporter.onTestRunEnd();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].status).toBe('fail');
+      expect(rows[0].outputTail).toContain('afterAll cleanup failed');
+      const execution = parseTestRunExecutionDetails(rows[0].executionDetails);
+      expect(execution).toMatchObject({ root: computeWorkspaceRootFrom(TEST_CONFIG_ROOT), commitSha: 'abc',
+        passed, failed: 0, skipped: 0, collectionFailed: true });
+      expect(execution).not.toHaveProperty('passedCaseTitles');
+      expect(execution).not.toHaveProperty('failedCaseTitles');
+      expect(execution).not.toHaveProperty('passedCaseTitlesTruncated');
+    },
+  );
   it('does not invent measurements for pending or unreadable cases', () => {
     expect(collectModuleExecution(module(['passed', 'pending']))).toBeNull();
     expect(collectModuleExecution({ state: () => 'passed' } as never)).toBeNull();
