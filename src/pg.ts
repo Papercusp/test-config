@@ -22,6 +22,7 @@ export {
   TEST_PG_IMAGE,
   NON_DESTRUCTIVE_PG_HEALTHCHECK,
   startDedicatedTestPg,
+  SHARED_TEST_PG_DURABILITY_OFF,
 } from './pg-container.ts';
 export type { TestSchemaHandle } from './pg-container.ts';
 export { startDedicatedNativePg, resolveNativePgBinDir } from './dedicated-native-pg.ts';
