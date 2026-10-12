@@ -104,13 +104,46 @@ async function readOwner(lockDir: string): Promise<string> {
   }
 }
 
+type LinuxProcessIdentity = {
+  tgid: number;
+  startTicks: string;
+  bootId: string;
+};
+
+/**
+ * Return the kernel identity for a Linux process, or null where /proc is not
+ * available. PID alone can refer to a different process after reuse; the
+ * start ticks and boot id distinguish that new process from the lock owner.
+ */
+async function readLinuxProcessIdentity(pid: number): Promise<LinuxProcessIdentity | null> {
+  try {
+    const [status, stat, bootIdText] = await Promise.all([
+      readFile(`/proc/${pid}/status`, 'utf8'),
+      readFile(`/proc/${pid}/stat`, 'utf8'),
+      readFile('/proc/sys/kernel/random/boot_id', 'utf8'),
+    ]);
+    const tgid = Number(/^Tgid:\s*(\d+)$/m.exec(status)?.[1]);
+    // The comm field is parenthesized and may contain spaces or parentheses;
+    // parse fields only after its final closing parenthesis. Field 22 is index
+    // 19 when the remaining fields start at field 3.
+    const startTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+    const bootId = bootIdText.trim();
+    if (!Number.isSafeInteger(tgid) || tgid <= 0 || !/^\d+$/.test(startTicks ?? '') || !bootId) return null;
+    return { tgid, startTicks, bootId };
+  } catch {
+    // Non-Linux platforms and restricted /proc mounts retain kill(pid, 0)'s
+    // conservative behavior: inability to inspect identity never proves death.
+    return null;
+  }
+}
+
 /**
  * True only when we can POSITIVELY confirm the lock's recorded owner process is
  * dead: same host (a cross-host pid means nothing — never claim dead across
- * hosts) AND `process.kill(pid, 0)` reports ESRCH (no such process). Any other
- * outcome (different host, unparseable owner.json, EPERM/alive, or any other
- * error) returns false — this must never produce a false "dead" that reclaims a
- * live holder's lock.
+ * hosts), `process.kill(pid, 0)` reports ESRCH, or a live numeric PID now has a
+ * different recorded Linux kernel identity. Any other outcome (different host,
+ * legacy/malformed identity, EPERM/alive, or any other error) returns false —
+ * this must never produce a false "dead" that reclaims a live holder's lock.
  */
 async function isOwnerProcessConfirmedDead(lockDir: string): Promise<boolean> {
   let raw: string;
@@ -119,7 +152,13 @@ async function isOwnerProcessConfirmedDead(lockDir: string): Promise<boolean> {
   } catch {
     return false;
   }
-  let owner: { pid?: unknown; host?: unknown };
+  let owner: {
+    pid?: unknown;
+    host?: unknown;
+    tgid?: unknown;
+    startTicks?: unknown;
+    bootId?: unknown;
+  };
   try {
     owner = JSON.parse(raw);
   } catch {
@@ -129,7 +168,17 @@ async function isOwnerProcessConfirmedDead(lockDir: string): Promise<boolean> {
   if (owner.host !== hostname()) return false;
   try {
     process.kill(owner.pid, 0);
-    return false; // no throw ⇒ signal delivered ⇒ process exists (or we lack permission ⇒ assume alive)
+    const completeIdentity = Number.isSafeInteger(owner.tgid) && owner.tgid === owner.pid &&
+      typeof owner.startTicks === 'string' && /^\d+$/.test(owner.startTicks) &&
+      typeof owner.bootId === 'string' && owner.bootId.length > 0;
+    if (completeIdentity) {
+      const current = await readLinuxProcessIdentity(owner.pid);
+      if (current && (current.tgid !== owner.pid || current.tgid !== owner.tgid ||
+          current.startTicks !== owner.startTicks || current.bootId !== owner.bootId)) {
+        return true; // this PID is live, but it is not the recorded lock owner
+      }
+    }
+    return false; // no throw ⇒ process exists; unknown or matching identity stays held
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ESRCH';
   }
@@ -171,11 +220,13 @@ export async function withTestcontainerStartLock<T>(
   );
   const retryMs = opts.retryMs ?? intEnv('PAPERCUSP_TESTCONTAINERS_START_LOCK_RETRY_MS', DEFAULT_RETRY_MS);
   const startedAt = Date.now();
+  const kernelIdentity = await readLinuxProcessIdentity(process.pid);
   const owner = {
     pid: process.pid,
     host: hostname(),
     startedAt: new Date(startedAt).toISOString(),
     name,
+    ...(kernelIdentity ?? {}),
   };
 
   await mkdir(root, { recursive: true });

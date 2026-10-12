@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -204,5 +204,62 @@ describe('withTestcontainerStartLock', () => {
     ).rejects.toThrow(/Timed out after 300ms/);
 
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform !== 'linux')('records kernel identity and keeps a lock held when the live owner identity matches', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'pc-testcontainers-lock-'));
+    process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR = dir;
+    const lockName = 'live-kernel-owner';
+    const lockDir = join(dir, `${lockName}.lock`);
+
+    try {
+      await withTestcontainerStartLock(lockName, async () => {
+        const owner = JSON.parse(await readFile(join(lockDir, 'owner.json'), 'utf8')) as {
+          pid: number;
+          tgid: number;
+          startTicks: string;
+          bootId: string;
+        };
+        expect(owner.pid).toBe(process.pid);
+        expect(owner.tgid).toBe(process.pid);
+        expect(owner.startTicks).toMatch(/^\d+$/);
+        expect(owner.bootId).toBeTruthy();
+
+        await expect(withTestcontainerStartLock(lockName, async () => 'unexpected entry', {
+          timeoutMs: 500,
+          retryMs: 10,
+        })).rejects.toThrow(/Timed out after 500ms/);
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('reclaims a live numeric pid when its recorded start ticks belong to an older process', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'pc-testcontainers-lock-'));
+    process.env.PAPERCUSP_TESTCONTAINERS_LOCK_DIR = dir;
+    const lockName = 'recycled-kernel-owner';
+    const lockDir = join(dir, `${lockName}.lock`);
+    const currentBootId = (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
+
+    try {
+      await mkdir(lockDir, { recursive: true });
+      await writeFile(join(lockDir, 'owner.json'), JSON.stringify({
+        pid: process.pid,
+        host: hostname(),
+        tgid: process.pid,
+        startTicks: '0',
+        bootId: currentBootId,
+        startedAt: new Date().toISOString(),
+        name: lockName,
+      }));
+
+      await expect(withTestcontainerStartLock(lockName, async () => 'started', {
+        timeoutMs: 1_000,
+        retryMs: 5,
+      })).resolves.toBe('started');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
