@@ -1224,6 +1224,40 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(buildOutputTail(passing, 'pass')).toBeNull();
   });
 
+  it('preserves the originating stack of a serialized teardown error after cases passed', () => {
+    const error = {
+      message: 'templateLockName is not defined',
+      stack: 'ReferenceError: templateLockName is not defined\n    at sweepIdleTemplates (pg-migrate.ts:400:18)\n    at cleanup (_pg-helpers.ts:91:7)',
+    };
+    const module = {
+      errors: () => [error],
+      children: { allTests: () => [{ fullName: 'claim is released', result: () => ({ state: 'passed' }) }] },
+    } as unknown as Parameters<typeof buildOutputTail>[0];
+    expect(buildOutputTail(module, 'fail')).toContain('templateLockName is not defined');
+    expect(buildOutputTail(module, 'fail')).toContain('at sweepIdleTemplates (pg-migrate.ts:400:18)');
+    expect(buildOutputTail(module, 'fail')).toContain('at cleanup (_pg-helpers.ts:91:7)');
+    expect(formatTestCaseError(error)).toBe(error.message);
+  });
+
+  it('bounds a file-error stack while retaining its originating frame and structured values', () => {
+    const error = {
+      message: 'fixture failed',
+      stack: 'Error: fixture failed\n    at fixtureCleanup (fixture.ts:5:1)\n' + '    at later (runner.ts:1:1)\n'.repeat(500),
+      actual: 'broken', expected: 'healthy',
+    };
+    const module = { errors: () => [error] } as unknown as Parameters<typeof buildOutputTail>[0];
+    const tail = buildOutputTail(module, 'fail')!;
+    expect(tail).toContain('at fixtureCleanup (fixture.ts:5:1)');
+    expect(tail).toContain('actual: broken\nexpected: healthy');
+    expect(tail.length).toBeLessThan(2_000);
+  });
+
+  it('retains the file-error message when a stack getter throws', () => {
+    const error = { message: 'teardown failed', get stack(): string { throw new Error('stack unavailable'); } };
+    const module = { errors: () => [error] } as unknown as Parameters<typeof buildOutputTail>[0];
+    expect(buildOutputTail(module, 'fail')).toBe('teardown failed');
+  });
+
   it('buildOutputTail is fail-soft when the test walk throws', () => {
     const explosive = {
       errors: () => [],
