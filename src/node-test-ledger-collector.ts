@@ -79,6 +79,8 @@ interface ReporterEvent {
 
 interface FileState {
   result: NodeTestFileResult;
+  /** A file-scoped terminal summary can precede Node's successful file wrapper. */
+  zeroCaseSummary: boolean;
   /** Names of the tests currently open at each nesting level (from test:start). */
   stack: string[];
 }
@@ -130,6 +132,7 @@ export function createNodeTestLedgerFold(): {
           fileLevelFailure: null, durationMs: 0,
         },
         stack: [],
+        zeroCaseSummary: false,
       };
       files.set(file, state);
     }
@@ -148,6 +151,11 @@ export function createNodeTestLedgerFold(): {
       const nesting = typeof data.nesting === 'number' && data.nesting >= 0 ? data.nesting : 0;
       const state = stateFor(file);
 
+      if (event.type === 'test:summary') {
+        const counts = record(data.counts);
+        state.zeroCaseSummary = counts?.tests === 0 && counts?.suites === 0;
+        return;
+      }
       if (event.type === 'test:start') {
         state.stack.length = nesting;
         state.stack.push(name);
@@ -165,10 +173,11 @@ export function createNodeTestLedgerFold(): {
       if (event.type === 'test:pass') {
         if (isSuite) return;
         // Node 25 emits a successful file wrapper when a name filter matches
-        // no cases. Its title is the file path and it has no source location.
+        // no cases. Node 25 gives that wrapper line=1, so use its preceding
+        // file-scoped zero-case summary; retain the older no-location shape.
         // Process success is never evidence of a passing assertion.
-        if (nesting === 0 && typeof data.line !== 'number' &&
-          (name === file || name === basename(file))) return;
+        if (nesting === 0 && (state.zeroCaseSummary || typeof data.line !== 'number') &&
+          (name === file || name === basename(file) || file.endsWith(`/${name}`))) return;
         if (isFlagSet(data.skip) || isFlagSet(data.todo)) state.result.skipped += 1;
         else {
           state.result.passed += 1;

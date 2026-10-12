@@ -53,9 +53,20 @@ describe('node:test ledger collector fold', () => {
     const fold = createNodeTestLedgerFold();
     fold.push(ev('test:pass', { name: FILE, details: { type: 'test' } }));
     expect(fold.summary().files[0]).toMatchObject({ passed: 0, failed: 0 });
-    // A real case with a file-looking title has a source location and still counts.
-    fold.push(ev('test:pass', { name: FILE, line: 10, details: { type: 'test' } }));
-    expect(fold.summary().files[0]).toMatchObject({ passed: 1 });
+    // Measured Node 25 shape: a zero-case per-file summary, then a wrapper
+    // with a source location. The location alone cannot prove an assertion.
+    fold.push(ev('test:summary', { counts: { tests: 0, suites: 0 } }));
+    for (const name of [FILE, 'papercusp-desktop/test/guard.test.js', 'guard.test.js']) {
+      fold.push(ev('test:pass', { name, line: 1, column: 1, details: { type: 'test' } }));
+    }
+    expect(fold.summary().files[0]).toMatchObject({ passed: 0, failed: 0 });
+  });
+
+  it('counts a file-looking assertion when real cases ran', () => {
+    const fold = createNodeTestLedgerFold();
+    fold.push(ev('test:pass', { name: FILE, line: 1, column: 1, details: { type: 'test' } }));
+    fold.push(ev('test:summary', { counts: { tests: 1, suites: 0 } }));
+    expect(fold.summary().files[0]).toMatchObject({ passed: 1, failed: 0, passedCaseTitles: [FILE] });
   });
 
   it('names nested cases by their ancestors and counts pass / fail / skip / todo per file', () => {
