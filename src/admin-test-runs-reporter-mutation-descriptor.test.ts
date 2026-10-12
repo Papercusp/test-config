@@ -4,7 +4,7 @@
  * execution_details.mutation, completed with that row's leg and the sha256 of the test
  * file it ran, and the strict execution-details parser accepts exactly that shape.
  * The probe half (every leg receives the export) lives in
- * packages/operator-core/lib/agent-tools/testing/mutation-descriptor.test.ts.
+ * packages/operator-core/lib/agent-tools/testing/mutation-probe-descriptor-export.test.ts.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
@@ -44,14 +44,16 @@ afterEach(() => {
   }
 });
 
-async function recordOneRow(phase: string, descriptor: string | undefined): Promise<TestRunRow> {
+async function recordOneRow(
+  phase: string, descriptor: string | undefined,
+  state: 'passed' | 'failed' = phase === 'mutant' ? 'failed' : 'passed',
+): Promise<TestRunRow> {
   process.env.PAPERCUSP_MUTATION_PROBE = '1';
   process.env.PAPERCUSP_MUTATION_PHASE = phase;
   if (descriptor === undefined) delete process.env.PAPERCUSP_MUTATION_DESCRIPTOR;
   else process.env.PAPERCUSP_MUTATION_DESCRIPTOR = descriptor;
   const rows: TestRunRow[] = [];
   const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }), async (row) => { rows.push(row); });
-  const state = phase === 'mutant' ? 'failed' : 'passed';
   const fakeModule = {
     state: () => state,
     children: { allTests: () => [{ result: () => ({ state }) }] },
@@ -84,6 +86,29 @@ describe('R-1 reporter: execution_details.mutation', () => {
     const legs = [baseline, mutant].map((row) => (row.executionDetails as { mutation: { leg: string; probeInvocationId: string } }).mutation);
     expect(legs.map((m) => m.leg)).toEqual(['baseline', 'mutant']);
     expect(new Set(legs.map((m) => m.probeInvocationId))).toEqual(new Set([invocation.probeInvocationId]));
+  });
+
+  it.each([
+    ['copy-out', invocation, 'mutant'],
+    ['historical', { ...invocation, mode: 'historical', mutateExpression: null, againstCommit: 'a'.repeat(40) }, 'historical'],
+  ])('persists a surviving %s mutant and its consumption-control with the baseline invocation descriptor', async (_mode, descriptor, mutantPhase) => {
+    const rows = [
+      await recordOneRow('baseline', JSON.stringify(descriptor), 'passed'),
+      await recordOneRow(mutantPhase, JSON.stringify(descriptor), 'passed'),
+      await recordOneRow('consumption-control', JSON.stringify(descriptor), 'failed'),
+    ];
+    const details = rows.map((row) => parseTestRunExecutionDetails(row.executionDetails));
+    expect(details.map((row) => ({ passed: row?.passed, failed: row?.failed }))).toEqual([
+      { passed: 1, failed: 0 }, { passed: 1, failed: 0 }, { passed: 0, failed: 1 },
+    ]);
+    expect(details.map((row) => row?.mutation?.leg)).toEqual(['baseline', mutantPhase, 'consumption-control']);
+    for (const row of details) {
+      expect(row?.mutation).toEqual({
+        ...descriptor, leg: row!.mutation!.leg,
+        testFileSha256: createHash('sha256').update(readFileSync(TEST_FILE)).digest('hex'),
+      });
+    }
+    expect(new Set(details.map((row) => row?.mutation?.probeInvocationId))).toEqual(new Set([invocation.probeInvocationId]));
   });
 
   it('omits the key, and keeps the row parseable, when the export is absent or malformed', async () => {
