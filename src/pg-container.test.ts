@@ -25,7 +25,9 @@
  * Docker — a regression here should fail fast, not wait for someone to hit
  * the crash again.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { getContainerRuntimeClient } from "testcontainers";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
@@ -191,6 +193,150 @@ describe("getTestPg framework-role ensure (EI-18680404964770187)", () => {
     expect(SOURCE).toMatch(/in recovery mode/);
     expect(SOURCE).toMatch(/not yet accepting connections/);
     expect(SOURCE).toMatch(/RETRYABLE_PG_STARTUP_MSG\.test\(msg\)/);
+  });
+});
+
+describe("reusable PG container lifecycle (WI-10008196)", () => {
+  const label = TEST_PG_REUSE_GENERATION_LABEL;
+  const labels = (generation: string) => ({
+    [label]: generation,
+    "org.testcontainers": "true",
+    "org.testcontainers.container-hash": "reuse-hash",
+  });
+  function fixture() {
+    const list = vi.fn().mockResolvedValue([]);
+    const inspect = vi.fn().mockResolvedValue({ State: { Running: true }, Config: { Labels: labels("0") } });
+    const stop = vi.fn().mockResolvedValue(undefined);
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const runtime = {
+      container: { dockerode: { listContainers: list }, getById: (id: string) => ({ id }), inspect, stop, remove },
+    } as unknown as Awaited<ReturnType<typeof getContainerRuntimeClient>>;
+    class Probe extends CappedLogPostgreSqlContainer {
+      protected override runtimeClient() { return Promise.resolve(runtime); }
+      created(id: string) { return this.containerCreated(id); }
+    }
+    const probe = new Probe("pgvector/pgvector:pg18");
+    return { probe, list, inspect, stop, remove };
+  }
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  it("removes a newly-created cluster and its anonymous volume when start fails before readiness", async () => {
+    const f = fixture();
+    const failure = new Error("Docker port inspection failed");
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockImplementation(async function (this: PostgreSqlContainer) {
+      await (this as typeof f.probe).created("new-pg");
+      throw failure;
+    });
+    await expect(f.probe.start()).rejects.toBe(failure);
+    expect(f.stop).toHaveBeenCalledWith({ id: "new-pg" }, { timeout: 0 });
+    expect(f.remove).toHaveBeenCalledWith({ id: "new-pg" }, { removeVolumes: true });
+  });
+
+  it("never cleans up a borrowed reused cluster on startup failure", async () => {
+    const f = fixture();
+    const failure = new Error("reused PG unavailable");
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockRejectedValue(failure);
+    await expect(f.probe.start()).rejects.toBe(failure);
+    expect(f.inspect).not.toHaveBeenCalled();
+    expect(f.stop).not.toHaveBeenCalled();
+    expect(f.remove).not.toHaveBeenCalled();
+  });
+
+  it("preserves a successful newly-created cluster", async () => {
+    const f = fixture();
+    const started = { getId: () => "healthy" } as StartedPostgreSqlContainer;
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockImplementation(async function (this: PostgreSqlContainer) {
+      await (this as typeof f.probe).created("healthy");
+      return started;
+    });
+    await expect(f.probe.start()).resolves.toBe(started);
+    expect(f.remove).not.toHaveBeenCalled();
+  });
+
+  it("preserves the startup error when the upstream readiness waiter already removed the container", async () => {
+    const f = fixture();
+    const failure = new Error("readiness timeout");
+    f.inspect.mockRejectedValue({ statusCode: 404 });
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockImplementation(async function (this: PostgreSqlContainer) {
+      await (this as typeof f.probe).created("already-removed");
+      throw failure;
+    });
+    await expect(f.probe.start()).rejects.toBe(failure);
+    expect(f.remove).not.toHaveBeenCalled();
+  });
+
+  it("reports both failures when owned-container removal fails", async () => {
+    const f = fixture();
+    const failure = new Error("start failed");
+    const cleanup = new Error("remove failed");
+    f.remove.mockRejectedValue(cleanup);
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockImplementation(async function (this: PostgreSqlContainer) {
+      await (this as typeof f.probe).created("leaked");
+      throw failure;
+    });
+    const result = await f.probe.start().catch((error: AggregateError) => error);
+    expect(result).toBeInstanceOf(AggregateError);
+    expect((result as AggregateError).errors).toEqual([failure, cleanup]);
+  });
+
+  it("removes only stopped older generations and rechecks live state before removal", async () => {
+    const f = fixture();
+    f.list.mockResolvedValue([
+      { Id: "retired", Labels: labels("0") },
+      { Id: "restarted", Labels: labels("1") },
+      { Id: "current", Labels: labels("2") },
+      { Id: "future", Labels: labels("3") },
+      { Id: "invalid", Labels: labels("01") },
+      { Id: "missing", Labels: {} },
+    ]);
+    f.inspect.mockImplementation(async ({ id }: { id: string }) => ({
+      State: { Running: id === "restarted", Restarting: false }, Config: { Labels: labels(id === "retired" ? "0" : "1") },
+    }));
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockResolvedValue({} as StartedPostgreSqlContainer);
+    await f.probe.withReuseGeneration(label, 2).withReuse().start();
+    expect(f.list).toHaveBeenCalledWith({ all: true, filters: {
+      label: ["org.testcontainers=true", "org.testcontainers.container-hash", label], status: ["created", "exited", "dead"],
+    } });
+    expect(f.inspect).toHaveBeenCalledTimes(2);
+    expect(f.remove.mock.calls).toEqual([[{ id: "retired" }, { removeVolumes: true }]]);
+    expect(f.stop).not.toHaveBeenCalled();
+  });
+
+  it.each(["changed-generation", "foreign", "not-reused", "restarting"])("preserves a candidate whose inspected ownership/state changed: %s", async (reason) => {
+    const f = fixture();
+    f.list.mockResolvedValue([{ Id: reason, Labels: labels("0") }]);
+    f.inspect.mockResolvedValue({ State: { Running: false, Restarting: reason === "restarting" }, Config: { Labels: {
+      ...labels(reason === "changed-generation" ? "2" : "0"),
+      "org.testcontainers": reason === "foreign" ? "false" : "true",
+      "org.testcontainers.container-hash": reason === "not-reused" ? "" : "hash",
+    } } });
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockResolvedValue({} as StartedPostgreSqlContainer);
+    await f.probe.withReuseGeneration(label, 2).withReuse().start();
+    expect(f.remove).not.toHaveBeenCalled();
+  });
+
+  it("does not collect reusable caches when reuse is disabled", async () => {
+    const f = fixture();
+    vi.stubEnv("TESTCONTAINERS_REUSE_ENABLE", "false");
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockResolvedValue({} as StartedPostgreSqlContainer);
+    await f.probe.withReuseGeneration(label, 2).withReuse().start();
+    expect(f.list).not.toHaveBeenCalled();
+  });
+
+  it("preserves the baseline reuse configuration while adopting lifecycle ownership", () => {
+    class LabelProbe extends CappedLogPostgreSqlContainer {
+      config() { return { labels: this.createOpts.Labels, log: this.hostConfig.LogConfig }; }
+    }
+    const baselineLabel = "org.papercusp.baseline-schema.generation";
+    const probe = new LabelProbe("pgvector/pgvector:pg18").withReuseGeneration(baselineLabel, 3);
+    expect(probe.config()).toEqual({ labels: { [baselineLabel]: "3" }, log: undefined });
+    expect(BASELINE_SCHEMA_SOURCE).not.toContain(".withCappedJsonLog()");
+  });
+
+  it("wires both shared and baseline cluster families through the same lifecycle builder", () => {
+    expect(SOURCE).toMatch(/withReuseGeneration\(TEST_PG_REUSE_GENERATION_LABEL, await readTestPgReuseGeneration\(\)\)/);
+    expect(BASELINE_SCHEMA_SOURCE).toMatch(/new CappedLogPostgreSqlContainer\(/);
+    expect(BASELINE_SCHEMA_SOURCE).toMatch(/withReuseGeneration\(BASELINE_SCHEMA_REUSE_GENERATION_LABEL, generation\)/);
   });
 });
 

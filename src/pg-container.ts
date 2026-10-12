@@ -388,6 +388,79 @@ export async function rotateTestPgReuseGeneration(root = testcontainerStartLockR
 
 /** `PostgreSqlContainer` with a capped json-file log (HostConfig is protected). */
 export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
+  private ownedStartupId?: string;
+  private reuseGeneration?: { label: string; generation: number };
+
+  /** Call under the family startup lock, just like generation rotation. */
+  withReuseGeneration(label: string, generation: number): this {
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new Error("invalid PostgreSQL reuse generation");
+    }
+    this.reuseGeneration = { label, generation };
+    return this.withLabels({ [label]: String(generation) });
+  }
+
+  protected runtimeClient(): ReturnType<typeof getContainerRuntimeClient> {
+    return getContainerRuntimeClient();
+  }
+
+  protected override async containerCreated(id: string): Promise<void> {
+    // This hook only runs for a NEW container, never a reused peer's cluster.
+    this.ownedStartupId = id;
+  }
+
+  override async start(): Promise<StartedPostgreSqlContainer> {
+    this.ownedStartupId = undefined;
+    if (this.reuse && this.reuseGeneration && process.env.TESTCONTAINERS_REUSE_ENABLE !== "false") {
+      const { label, generation } = this.reuseGeneration;
+      const client = await this.runtimeClient();
+      // Ryuk deliberately does not own reused containers. Remove only stopped
+      // generations that can no longer be selected by this family. Running
+      // retired clusters may still serve peers and remain the host actor's lane.
+      const candidates = await client.container.dockerode.listContainers({
+        all: true,
+        filters: { label: ["org.testcontainers=true", "org.testcontainers.container-hash", label], status: ["created", "exited", "dead"] },
+      });
+      for (const candidate of candidates) {
+        const old = candidate.Labels[label];
+        const oldGeneration = Number(old);
+        if (!Number.isSafeInteger(oldGeneration) || oldGeneration < 0 || String(oldGeneration) !== old || oldGeneration >= generation) continue;
+        const container = client.container.getById(candidate.Id);
+        try {
+          const current = await client.container.inspect(container);
+          if (current.State.Running || current.State.Restarting ||
+              current.Config.Labels[label] !== old ||
+              current.Config.Labels["org.testcontainers"] !== "true" ||
+              !current.Config.Labels["org.testcontainers.container-hash"]) continue;
+          // No force: Docker refuses if a concurrent caller starts the candidate.
+          await client.container.remove(container, { removeVolumes: true });
+        } catch (error) {
+          if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+        }
+      }
+    }
+    try {
+      return await super.start();
+    } catch (startupError) {
+      if (!this.ownedStartupId) throw startupError;
+      try {
+        const client = await this.runtimeClient();
+        const container = client.container.getById(this.ownedStartupId);
+        const current = await client.container.inspect(container);
+        if (current.State.Running) await client.container.stop(container, { timeout: 0 });
+        await client.container.remove(container, { removeVolumes: true });
+      } catch (cleanupError) {
+        // waitForContainer may already have removed this exact owned container.
+        if ((cleanupError as { statusCode?: number }).statusCode !== 404) {
+          throw new AggregateError([startupError, cleanupError],
+            `PostgreSQL startup failed and owned container ${this.ownedStartupId} could not be removed`,
+            { cause: startupError });
+        }
+      }
+      throw startupError;
+    }
+  }
+
   withCappedJsonLog(): this {
     this.hostConfig.LogConfig = {
       Type: "json-file",
@@ -512,7 +585,7 @@ export async function getTestPg(): Promise<string> {
               .withDatabase("papercusp_test")
               .withEnvironment({ POSTGRES_INITDB_ARGS: TEST_PG_INITDB_ARGS })
               .withCappedJsonLog()
-              .withLabels({ [TEST_PG_REUSE_GENERATION_LABEL]: String(await readTestPgReuseGeneration()) })
+              .withReuseGeneration(TEST_PG_REUSE_GENERATION_LABEL, await readTestPgReuseGeneration())
               // WI-4133: this ONE container is `.withReuse()`d by EVERY vitest
               // process on the box (all forks, all packages, ~30+ fleet agents at
               // once) — each opening its own client pool (createFreshPgDb: max 4;

@@ -58,7 +58,7 @@
 // `await globalSetupFile.setup?.(this)`), which IS still exported from 'vitest/node' and
 // carries the same `provide` member this file destructures.
 import type { TestProject } from 'vitest/node';
-import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { Wait } from 'testcontainers';
 import postgres from 'postgres';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
@@ -67,7 +67,7 @@ import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from './testcontainer-start-lock.ts';
-import { assertSharedTestPgStorageHeadroom, NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
+import { assertSharedTestPgStorageHeadroom, CappedLogPostgreSqlContainer, NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
 import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 import { dropDatabaseWithLock, type DropDatabaseWithLockOptions } from './pg-migrate.ts';
 
@@ -778,7 +778,7 @@ export default async function setup({ provide }: TestProject) {
     // rationale (PG16 silently allowed a DELETE PG18 rejects; WI-2914 shipped
     // uncaught because CI tested the wrong major).
     const startBaselineContainer = (generation: number) =>
-      new PostgreSqlContainer('pgvector/pgvector:pg18')
+      new CappedLogPostgreSqlContainer('pgvector/pgvector:pg18')
         .withDatabase('papercusp_it')
         .withUsername('it_admin')
         .withPassword('it_admin')
@@ -800,7 +800,7 @@ export default async function setup({ provide }: TestProject) {
         // rotate the reuse generation when it is not serving papercusp_it.
         .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
         .withWaitStrategy(Wait.forListeningPorts())
-        .withLabels({ [BASELINE_SCHEMA_REUSE_GENERATION_LABEL]: String(generation) })
+        .withReuseGeneration(BASELINE_SCHEMA_REUSE_GENERATION_LABEL, generation)
         // Reuse the baseline container across Vitest processes. The previous
         // ephemeral container replayed ~476 migrations for every focused file;
         // under checkpoint concurrency that startup alone could consume the test's
