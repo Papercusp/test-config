@@ -176,6 +176,7 @@ export const GENERIC_SCRATCH_SWEEP_EXCLUDE: ReadonlySet<string> = new Set([
   'fs-mutex-locks',
   'testcontainers-locks',
   'papercusp-voice-ipc-hermetic',
+  'papercusp-scratch-hermetic',
   'papercusp-affected-tests',
 ]);
 
