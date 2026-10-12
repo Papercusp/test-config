@@ -176,7 +176,8 @@ export async function withContainerRecoveryReResolution<T>(
   let container = await runStage("resolve", 1, resolve);
   for (let resolution = 1; ; resolution++) {
     try {
-      await runStage("ensure", resolution, () => ensure(container));
+      await runStage("ensure", resolution, () =>
+        CappedLogPostgreSqlContainer.validateStartup(container, () => ensure(container)));
       return container;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -390,6 +391,44 @@ export async function rotateTestPgReuseGeneration(root = testcontainerStartLockR
 export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
   private ownedStartupId?: string;
   private reuseGeneration?: { label: string; generation: number };
+  private static readonly unpublished = new WeakMap<object, () => Promise<void>>();
+
+  /** Must run under the family start lock, before any caller can borrow a new cluster. */
+  static async validateStartup<T>(candidate: T, ensure: () => Promise<void>): Promise<void> {
+    const key = candidate !== null && (typeof candidate === "object" || typeof candidate === "function")
+      ? candidate : undefined;
+    const cleanup = key ? this.unpublished.get(key) : undefined;
+    // Consume the ownership once. A successfully published or borrowed cluster
+    // must never be reclaimed by a later failure in this process.
+    if (key) this.unpublished.delete(key);
+    try {
+      await ensure();
+    } catch (startupError) {
+      if (cleanup) {
+        try {
+          await cleanup();
+        } catch (cleanupError) {
+          throw new AggregateError([startupError, cleanupError],
+            "PostgreSQL SQL readiness failed and its unpublished container could not be removed",
+            { cause: startupError });
+        }
+      }
+      throw startupError;
+    }
+  }
+
+  private async removeOwnedStartup(id: string): Promise<void> {
+    try {
+      const client = await this.runtimeClient();
+      const container = client.container.getById(id);
+      const current = await client.container.inspect(container);
+      if (current.State.Running || current.State.Restarting) await client.container.stop(container, { timeout: 0 });
+      await client.container.remove(container, { removeVolumes: true });
+    } catch (error) {
+      // The upstream waiter may already have removed this exact owned container.
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+  }
 
   /** Call under the family startup lock, just like generation rotation. */
   withReuseGeneration(label: string, generation: number): this {
@@ -440,22 +479,20 @@ export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
       }
     }
     try {
-      return await super.start();
+      const started = await super.start();
+      if (this.ownedStartupId) {
+        const id = this.ownedStartupId;
+        CappedLogPostgreSqlContainer.unpublished.set(started, () => this.removeOwnedStartup(id));
+      }
+      return started;
     } catch (startupError) {
       if (!this.ownedStartupId) throw startupError;
       try {
-        const client = await this.runtimeClient();
-        const container = client.container.getById(this.ownedStartupId);
-        const current = await client.container.inspect(container);
-        if (current.State.Running) await client.container.stop(container, { timeout: 0 });
-        await client.container.remove(container, { removeVolumes: true });
+        await this.removeOwnedStartup(this.ownedStartupId);
       } catch (cleanupError) {
-        // waitForContainer may already have removed this exact owned container.
-        if ((cleanupError as { statusCode?: number }).statusCode !== 404) {
-          throw new AggregateError([startupError, cleanupError],
-            `PostgreSQL startup failed and owned container ${this.ownedStartupId} could not be removed`,
-            { cause: startupError });
-        }
+        throw new AggregateError([startupError, cleanupError],
+          `PostgreSQL startup failed and owned container ${this.ownedStartupId} could not be removed`,
+          { cause: startupError });
       }
       throw startupError;
     }

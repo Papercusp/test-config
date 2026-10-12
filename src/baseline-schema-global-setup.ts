@@ -128,7 +128,19 @@ export async function replaceInvalidBaselineCandidate<T>(
   start: (generation: number) => Promise<T>,
   rotate: () => Promise<number>,
 ): Promise<T> {
-  return (await isValid(candidate)) ? candidate : start(await rotate());
+  const invalid = new Error('baseline PostgreSQL candidate failed host SQL readiness');
+  const validate = (current: T) => CappedLogPostgreSqlContainer.validateStartup(current, async () => {
+    if (!(await isValid(current))) throw invalid;
+  });
+  try {
+    await validate(candidate);
+  } catch (error) {
+    if (error !== invalid) throw error;
+    candidate = await start(await rotate());
+    // The replacement is also unpublished until SQL readiness succeeds.
+    await validate(candidate);
+  }
+  return candidate;
 }
 
 /**

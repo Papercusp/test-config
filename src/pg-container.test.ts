@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { assertSharedTestPgStorageHeadroom, NON_DESTRUCTIVE_PG_HEALTHCHECK } from "./pg-container.ts";
 import { withContainerRecoveryReResolution } from "./pg-container.ts";
+import { replaceInvalidBaselineCandidate } from "./baseline-schema-global-setup.ts";
 import {
   CappedLogPostgreSqlContainer,
   TEST_PG_INITDB_ARGS,
@@ -219,6 +220,129 @@ describe("reusable PG container lifecycle (WI-10008196)", () => {
     return { probe, list, inspect, stop, remove };
   }
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  function mockStarted(f: ReturnType<typeof fixture>, borrowed = false) {
+    let count = 0;
+    vi.spyOn(PostgreSqlContainer.prototype, "start").mockImplementation(async function (this: PostgreSqlContainer) {
+      const id = `sql-candidate-${++count}`;
+      if (!borrowed) await (this as typeof f.probe).created(id);
+      return { getId: () => id } as StartedPostgreSqlContainer;
+    });
+  }
+
+  it.each(["password authentication failed", "FATAL: the database system is in recovery mode"])(
+    "SQL-readiness cleans an unpublished final candidate on %s", async (message) => {
+      const f = fixture();
+      mockStarted(f);
+      const failure = new Error(message);
+      const retire = vi.fn();
+      await expect(withContainerRecoveryReResolution(
+        () => f.probe.start(), async () => { throw failure; }, retire, { maxResolutions: 1 },
+      )).rejects.toBe(failure);
+      expect(f.stop).toHaveBeenCalledWith({ id: "sql-candidate-1" }, { timeout: 0 });
+      expect(f.remove).toHaveBeenCalledWith({ id: "sql-candidate-1" }, { removeVolumes: true });
+      expect(retire).not.toHaveBeenCalled();
+    },
+  );
+
+  it("SQL-readiness cleans both new candidates when recovery exhausts", async () => {
+    const f = fixture();
+    mockStarted(f);
+    const failure = new Error("ECONNREFUSED");
+    const retire = vi.fn(async () => { expect(f.remove).toHaveBeenCalledTimes(1); });
+    await expect(withContainerRecoveryReResolution(
+      () => f.probe.start(), async () => { throw failure; }, retire,
+    )).rejects.toBe(failure);
+    expect(retire).toHaveBeenCalledOnce();
+    expect(f.remove.mock.calls).toEqual([
+      [{ id: "sql-candidate-1" }, { removeVolumes: true }],
+      [{ id: "sql-candidate-2" }, { removeVolumes: true }],
+    ]);
+  });
+
+  it("SQL-readiness preserves borrowed running clusters through recovery and final failure", async () => {
+    const f = fixture();
+    mockStarted(f, true);
+    await expect(withContainerRecoveryReResolution(
+      () => f.probe.start(), async () => { throw new Error("ECONNREFUSED"); }, async () => {},
+    )).rejects.toThrow("ECONNREFUSED");
+    expect(f.inspect).not.toHaveBeenCalled();
+    expect(f.stop).not.toHaveBeenCalled();
+    expect(f.remove).not.toHaveBeenCalled();
+  });
+
+  it("SQL-readiness releases ownership after publication so a later failure preserves readers", async () => {
+    const f = fixture();
+    mockStarted(f);
+    const started = await withContainerRecoveryReResolution(
+      () => f.probe.start(), async () => {}, async () => {},
+    );
+    await expect(CappedLogPostgreSqlContainer.validateStartup(started, async () => {
+      throw new Error("later reader failure");
+    })).rejects.toThrow("later reader failure");
+    expect(f.stop).not.toHaveBeenCalled();
+    expect(f.remove).not.toHaveBeenCalled();
+  });
+
+  it("SQL-readiness surfaces failed reclamation and preserves the readiness cause", async () => {
+    const f = fixture();
+    mockStarted(f);
+    const failure = new Error("password authentication failed");
+    const cleanup = new Error("Docker remove failed");
+    f.remove.mockRejectedValue(cleanup);
+    const result = await withContainerRecoveryReResolution(
+      () => f.probe.start(), async () => { throw failure; }, async () => {},
+    ).catch((error: unknown) => error);
+    expect(result).toBeInstanceOf(AggregateError);
+    expect((result as AggregateError).errors).toEqual([failure, cleanup]);
+    expect((result as AggregateError).cause).toBe(failure);
+  });
+
+  it("SQL-readiness preserves the original failure when the new candidate is already removed", async () => {
+    const f = fixture();
+    mockStarted(f);
+    f.inspect.mockRejectedValue({ statusCode: 404 });
+    const failure = new Error("password authentication failed");
+    await expect(withContainerRecoveryReResolution(
+      () => f.probe.start(), async () => { throw failure; }, async () => {},
+    )).rejects.toBe(failure);
+    expect(f.remove).not.toHaveBeenCalled();
+  });
+
+  it("SQL-readiness baseline reclaims an invalid new cluster and validates its replacement", async () => {
+    const f = fixture();
+    mockStarted(f);
+    const original = await f.probe.start();
+    const check = vi.fn(async (candidate: StartedPostgreSqlContainer) => candidate.getId() === "sql-candidate-2");
+    const result = await replaceInvalidBaselineCandidate(original, check, () => f.probe.start(), async () => 1);
+    expect(result.getId()).toBe("sql-candidate-2");
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(f.remove.mock.calls).toEqual([[{ id: "sql-candidate-1" }, { removeVolumes: true }]]);
+  });
+
+  it("SQL-readiness baseline reclaims the final failed replacement and preserves a borrowed original", async () => {
+    const f = fixture();
+    mockStarted(f);
+    const borrowed = { getId: () => "borrowed-running" } as StartedPostgreSqlContainer;
+    const rotate = vi.fn(async () => 1);
+    await expect(replaceInvalidBaselineCandidate(borrowed, async () => false,
+      () => f.probe.start(), rotate)).rejects.toThrow("failed host SQL readiness");
+    expect(rotate).toHaveBeenCalledOnce();
+    expect(f.stop.mock.calls).toEqual([[{ id: "sql-candidate-1" }, { timeout: 0 }]]);
+    expect(f.remove.mock.calls).toEqual([[{ id: "sql-candidate-1" }, { removeVolumes: true }]]);
+  });
+
+  it("SQL-readiness baseline reclaims an unpublished cluster when its health probe throws", async () => {
+    const f = fixture();
+    mockStarted(f);
+    const original = await f.probe.start();
+    const failure = new Error("health probe disconnected");
+    const rotate = vi.fn();
+    await expect(replaceInvalidBaselineCandidate(original, async () => { throw failure; },
+      () => f.probe.start(), rotate)).rejects.toBe(failure);
+    expect(f.remove).toHaveBeenCalledWith({ id: "sql-candidate-1" }, { removeVolumes: true });
+    expect(rotate).not.toHaveBeenCalled();
+  });
 
   it("removes a newly-created cluster and its anonymous volume when start fails before readiness", async () => {
     const f = fixture();

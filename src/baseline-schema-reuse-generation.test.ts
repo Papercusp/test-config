@@ -119,7 +119,7 @@ describe('baseline container reuse rotation', () => {
       return fresh;
     });
     const rotate = vi.fn(async () => 1);
-    expect(await replaceInvalidBaselineCandidate(old, async () => false, start, rotate)).toBe(fresh);
+    expect(await replaceInvalidBaselineCandidate(old, async (candidate) => candidate === fresh, start, rotate)).toBe(fresh);
     expect(old.stop).not.toHaveBeenCalled();
     expect(start).toHaveBeenCalledOnce();
     expect(rotate).toHaveBeenCalledOnce();
