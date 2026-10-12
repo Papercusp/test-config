@@ -34,6 +34,8 @@ import {
   TEMPLATE_BUILDER_HEARTBEAT_STALE_MS,
   templateBuilderApplicationName,
   markManagedTestDatabase,
+  sweepIdleTemplates,
+  sweepUnmarkedTestDatabases,
 } from './pg-migrate.ts';
 import { getTestPg, startDedicatedTestPg } from './pg-container.ts';
 import { resolveNativePgBinDir, startDedicatedNativePg } from './dedicated-native-pg.ts';
@@ -491,6 +493,131 @@ describe('managed test database lifecycle (WI-10003219)', () => {
       `SELECT datname FROM pg_database WHERE datname = '${orphan.name}'`,
     ) as Array<{ datname: string }>;
     expect(rows).toEqual([]);
+  });
+});
+
+/** Restrict the janitor's `FROM pg_database d` scan to this test's own databases. */
+function scopedTo(admin: postgres.Sql, names: string[], rewrite: (q: string) => string = (q) => q) {
+  const list = names.map((n) => `'${n}'`).join(', ');
+  return {
+    unsafe: (query: string) => admin.unsafe(rewrite(query.replace(
+      'FROM pg_database d',
+      `FROM (SELECT * FROM pg_database WHERE datname IN (${list})) d`,
+    ))),
+  };
+}
+
+async function databaseExists(admin: postgres.Sql, name: string): Promise<boolean> {
+  const rows = await admin.unsafe(`SELECT 1 FROM pg_database WHERE datname = '${name}'`) as unknown[];
+  return rows.length > 0;
+}
+
+const sleepMs = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+describe('test database janitor (WI-6554700010008843)', () => {
+  it('collects an idle superseded template, keeps the newest and a recently cloned one, and never races its build lock', async () => {
+    const family = `gcfam${randomBytes(3).toString('hex').replace(/[0-9]/g, 'q')}`;
+    const keys = [0, 1, 2].map(() => `${family}_${randomBytes(8).toString('hex')}`);
+    const [oldest, cloned, newest] = keys.map((k) => `tmpl_${k}`) as [string, string, string];
+    for (const key of keys) {
+      await getOrBuildTemplate(key, async (url) => {
+        const sql = postgres(url, { max: 1, onnotice: () => {} });
+        try { await sql.unsafe(`CREATE TABLE janitor_marker (id int)`); } finally { await sql.end({ timeout: 5 }); }
+      });
+      await sleepMs(30); // distinct PG_VERSION mtimes, so "newest" is well defined
+    }
+    const admin = await adminClient();
+    // Every template was built before the cutoff; only `cloned` is used after it.
+    await sleepMs(1_500);
+    const cutoff = Date.now();
+    await sleepMs(50);
+    const db = await createFreshTestDb({ prefix: 'zzjanclone', template: { key: keys[1]!, provision: async () => {} } });
+    await db.drop();
+    const stamp = await admin.unsafe(
+      `SELECT cfg FROM pg_db_role_setting s, unnest(s.setconfig) cfg
+        WHERE s.setdatabase = (SELECT oid FROM pg_database WHERE datname = '${cloned}')
+          AND cfg LIKE 'papercusp.template_last_used=%'`,
+    ) as Array<{ cfg: string }>;
+    expect(Number(stamp[0]?.cfg.split('=')[1])).toBeGreaterThan(cutoff);
+    const scoped = scopedTo(admin, [oldest, cloned, newest]);
+    const opts = { nowMs: cutoff, templateIdleMs: 0, templateKeepPerFamily: 1, limit: 10 };
+
+    // A held build lock means a builder owns the key: the janitor must skip it.
+    const builder = await adminClient();
+    await builder.unsafe(`SELECT pg_advisory_lock(hashtext('pc-test-template-${keys[0]}'))`);
+    try {
+      expect(await sweepIdleTemplates(scoped, Date.now() + 30_000, opts)).toBe(true);
+      expect(await databaseExists(admin, oldest)).toBe(true);
+    } finally {
+      await builder.unsafe(`SELECT pg_advisory_unlock(hashtext('pc-test-template-${keys[0]}'))`);
+    }
+
+    expect(await sweepIdleTemplates(scoped, Date.now() + 30_000, opts)).toBe(true);
+    expect(await databaseExists(admin, oldest)).toBe(false);
+    expect(await databaseExists(admin, cloned)).toBe(true);
+    expect(await databaseExists(admin, newest)).toBe(true);
+    // The janitor released the build lock it took for the drop.
+    const lockRows = await admin.unsafe(
+      `SELECT pg_try_advisory_lock(hashtext('pc-test-template-${keys[0]}')) AS ok`,
+    ) as Array<{ ok: boolean }>;
+    expect(lockRows[0]?.ok).toBe(true);
+    await admin.unsafe(`SELECT pg_advisory_unlock(hashtext('pc-test-template-${keys[0]}'))`);
+
+    // This process cached `oldest` as built; a clone after the janitor dropped it
+    // rebuilds the template instead of failing.
+    const rebuilt = await createFreshTestDb({
+      prefix: 'zzjanrebuild',
+      template: {
+        key: keys[0]!,
+        provision: async (url) => {
+          const sql = postgres(url, { max: 1, onnotice: () => {} });
+          try { await sql.unsafe(`CREATE TABLE janitor_marker (id int)`); } finally { await sql.end({ timeout: 5 }); }
+        },
+      },
+    });
+    const client = postgres(rebuilt.url, { max: 1, onnotice: () => {} });
+    try {
+      expect(await client.unsafe(`SELECT to_regclass('public.janitor_marker') AS t`)).toEqual([{ t: 'janitor_marker' }]);
+    } finally {
+      await client.end({ timeout: 5 });
+    }
+    await rebuilt.drop();
+    expect(await templateState(admin, oldest)).toBe('ready');
+  });
+
+  it('collects an aged unmarked per-test database but keeps young, connected, commented, and durable-cluster ones', async () => {
+    const admin = await adminClient();
+    const name = (p: string) => `zzunm${p}_${randomBytes(5).toString('hex')}`;
+    const aged = name('aged');
+    const connected = name('conn');
+    const commented = name('cmt');
+    const young = name('young');
+    for (const n of [aged, connected, commented]) await admin.unsafe(`CREATE DATABASE "${n}"`);
+    await admin.unsafe(`COMMENT ON DATABASE "${commented}" IS 'not a papercusp test database'`);
+    await sleepMs(1_500);
+    const cutoff = Date.now();
+    await sleepMs(1_500);
+    await admin.unsafe(`CREATE DATABASE "${young}"`);
+    const uri = new URL(await getTestPg());
+    uri.pathname = `/${connected}`;
+    const holder = postgres(uri.toString(), { max: 1, onnotice: () => {} });
+    cleanupClients.push(holder);
+    await holder.unsafe('SELECT 1');
+    const all = [aged, connected, commented, young];
+    const opts = { nowMs: cutoff, unmarkedMinAgeMs: 0, limit: 10 };
+    try {
+      // A cluster with durability on is never treated as disposable.
+      const durable = scopedTo(admin, all, (q) => q.replace(`current_setting('fsync')`, `'on'`));
+      expect(await sweepUnmarkedTestDatabases(durable, Date.now() + 30_000, opts)).toBe(true);
+      expect(await databaseExists(admin, aged)).toBe(true);
+
+      expect(await sweepUnmarkedTestDatabases(scopedTo(admin, all), Date.now() + 30_000, opts)).toBe(true);
+      expect(await databaseExists(admin, aged)).toBe(false);
+      for (const kept of [connected, commented, young]) expect(await databaseExists(admin, kept)).toBe(true);
+    } finally {
+      await holder.end({ timeout: 5 }).catch(() => {});
+      for (const n of all) await admin.unsafe(`DROP DATABASE IF EXISTS "${n}" WITH (FORCE)`).catch(() => {});
+    }
   });
 });
 

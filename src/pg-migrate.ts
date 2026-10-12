@@ -135,6 +135,30 @@ export const PG_INVALID_DATABASE_CONNLIMIT = -2;
 export const TEST_DB_DEFERRED_MARKER = 'papercusp-test-db-drop-deferred';
 export const TEST_DB_MANAGED_MARKER = 'papercusp-test-db:';
 export const TEST_DB_ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+/**
+ * WI-6554700010008843: two classes of test databases were never collected and
+ * grew the shared cluster to 22 GB (1,371 databases) on 2026-10-12:
+ *  - ready `tmpl_<key>` templates whose key a later migration set superseded
+ *    (each schema change leaked one ~47 MB template forever), and
+ *  - per-test databases created by helpers that issue their own CREATE DATABASE
+ *    and never call markManagedTestDatabase (~1,100 of them, ~11.5 GB).
+ * The janitor below collects both. Template age is the last clone recorded in
+ * TEMPLATE_LAST_USED_SETTING, falling back to the build time; the newest
+ * TEST_TEMPLATE_GC_KEEP_PER_FAMILY templates per family are always kept.
+ */
+export const TEST_TEMPLATE_GC_IDLE_MS = 48 * 60 * 60 * 1000;
+export const TEST_TEMPLATE_GC_KEEP_PER_FAMILY = 4;
+export const TEST_DB_UNMARKED_MIN_AGE_MS = 48 * 60 * 60 * 1000;
+/**
+ * Per-database setting that records a template's last clone (epoch ms). Stored in
+ * pg_db_role_setting, so it never touches the readiness COMMENT that older
+ * checkouts compare exactly, and CREATE DATABASE does not copy it into clones.
+ */
+export const TEMPLATE_LAST_USED_SETTING = 'papercusp.template_last_used';
+const TEMPLATE_USE_STAMP_INTERVAL_MS = 10 * 60 * 1000;
+const TEMPLATE_USE_STAMP_TIMEOUT_MS = 2_000;
+/** Random-suffix shape every per-test database helper uses (`<prefix>_<hex>`). */
+const UNMARKED_TEST_DB_NAME_PATTERN = '^[a-z][a-z0-9_]*_[0-9a-f]{8,}$';
 
 const TEST_DB_DEFER_MARK_TIMEOUT_MS = 2_000;
 
@@ -294,6 +318,180 @@ async function sweepOrphanedTestDatabases(admin: SqlExecutor, deadline: number):
   return sweepRows(admin, rows, deadline);
 }
 
+export interface TestDbJanitorOptions {
+  /** Reference clock for the age predicates (default: now). */
+  nowMs?: number;
+  /** A template idle (no recorded clone, else since its build) longer than this is collectable. */
+  templateIdleMs?: number;
+  /** Newest templates per family (name minus its hex key) that are never collected. */
+  templateKeepPerFamily?: number;
+  /** An unmarked per-test database created longer ago than this is collectable. */
+  unmarkedMinAgeMs?: number;
+  /** Maximum databases dropped per sweep. */
+  limit?: number;
+}
+
+/** Creation time of a database: the mtime of the PG_VERSION file CREATE DATABASE writes. */
+const DATABASE_CREATED_AT_SQL =
+  `(pg_stat_file('base/' || d.oid || '/PG_VERSION', true)).modification`;
+
+/**
+ * Drop ready templates nobody has cloned recently (WI-6554700010008843). Each drop
+ * holds that template's build lock (`pc-test-template-<key>`), so it can never race
+ * a builder; a clone that loses the race to a drop rebuilds the template (see
+ * createFreshTestDb). Exported for the integration test; the janitor in
+ * dropDatabaseWithLock calls it with the default thresholds.
+ * @returns false when a drop detached (the connection is busy — stop issuing queries).
+ */
+export async function sweepIdleTemplates(
+  admin: SqlExecutor,
+  deadline: number,
+  opts: TestDbJanitorOptions = {},
+): Promise<boolean> {
+  const nowMs = opts.nowMs ?? Date.now();
+  const cutoffMs = Math.floor(nowMs - (opts.templateIdleMs ?? TEST_TEMPLATE_GC_IDLE_MS));
+  const keep = Math.max(1, Math.floor(opts.templateKeepPerFamily ?? TEST_TEMPLATE_GC_KEEP_PER_FAMILY));
+  const limit = Math.max(1, Math.floor(opts.limit ?? TEST_DB_DEFERRED_SWEEP_LIMIT));
+  let rows: Array<{ datname: string }>;
+  try {
+    rows = (await admin.unsafe(
+      `WITH ready AS MATERIALIZED (
+         SELECT d.datname,
+                regexp_replace(d.datname, '_[0-9a-f]{8,}$', '') AS family,
+                ${DATABASE_CREATED_AT_SQL} AS created_at,
+                (SELECT substring(cfg FROM '=([0-9]{13})$')
+                   FROM pg_db_role_setting s, unnest(s.setconfig) AS cfg
+                  WHERE s.setdatabase = d.oid AND s.setrole = 0
+                    AND cfg LIKE ${quoteLiteral(`${TEMPLATE_LAST_USED_SETTING}=%`)}
+                  LIMIT 1)::bigint AS last_used_ms
+           FROM pg_database d
+           JOIN pg_shdescription c
+             ON c.objoid = d.oid
+            AND c.classoid = 'pg_database'::regclass
+          WHERE c.description = ${quoteLiteral(TEMPLATE_READY_MARK)}
+            AND d.datname LIKE 'tmpl\\_%'
+            AND d.datname NOT LIKE 'tmpl\\_bld\\_%'
+       ), ranked AS (
+         SELECT r.*,
+                row_number() OVER (
+                  PARTITION BY r.family
+                  ORDER BY r.created_at DESC NULLS FIRST, r.datname DESC
+                ) AS newest_rank,
+                COALESCE(r.last_used_ms, (extract(epoch from r.created_at) * 1000)::bigint) AS idle_since_ms
+           FROM ready r
+       )
+       SELECT k.datname
+         FROM ranked k
+        WHERE k.newest_rank > ${keep}
+          AND k.idle_since_ms IS NOT NULL
+          AND k.idle_since_ms <= ${cutoffMs}
+          AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = k.datname)
+        ORDER BY k.idle_since_ms, k.datname
+        LIMIT ${limit}`,
+    )) as Array<{ datname: string }>;
+  } catch {
+    // pg_stat_file needs superuser or pg_read_server_files; without it there is
+    // no age signal, so collect nothing rather than guess.
+    return true;
+  }
+  for (const row of rows) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const lock = templateLockName(row.datname.slice('tmpl_'.length));
+    let acquired = false;
+    try {
+      const lockRows = (await admin.unsafe(
+        `SELECT pg_try_advisory_lock(hashtext(${quoteLiteral(lock)})) AS acquired`,
+      )) as Array<{ acquired?: boolean }>;
+      acquired = lockRows[0]?.acquired === true;
+    } catch {
+      break;
+    }
+    // A held build lock means a builder is inspecting this key right now.
+    if (!acquired) continue;
+    let outcome: UncancellableDropOutcome;
+    try {
+      outcome = await runUncancellableDrop(admin, row.datname, remaining);
+    } catch {
+      await admin.unsafe(`SELECT pg_advisory_unlock(hashtext(${quoteLiteral(lock)}))`).catch(() => {});
+      break;
+    }
+    // A detached drop keeps this backend (and the build lock) until it finishes;
+    // PostgreSQL releases the session lock when that backend exits.
+    if (outcome === 'detached') return false;
+    await admin.unsafe(`SELECT pg_advisory_unlock(hashtext(${quoteLiteral(lock)}))`).catch(() => {});
+  }
+  return true;
+}
+
+/**
+ * Drop per-test databases that were created without the managed marker and
+ * abandoned (WI-6554700010008843). Only runs on a disposable cluster
+ * (fsync=off — the shared test container and every dedicated test cluster),
+ * so a PAPERCUSP_TEST_PG_ADMIN_URL that points at a real cluster is never swept.
+ * Selects only uncommented, connection-free `<prefix>_<hex>` databases older
+ * than the age threshold.
+ * @returns false when a drop detached (the connection is busy — stop issuing queries).
+ */
+export async function sweepUnmarkedTestDatabases(
+  admin: SqlExecutor,
+  deadline: number,
+  opts: TestDbJanitorOptions = {},
+): Promise<boolean> {
+  const nowMs = opts.nowMs ?? Date.now();
+  const cutoffMs = Math.floor(nowMs - (opts.unmarkedMinAgeMs ?? TEST_DB_UNMARKED_MIN_AGE_MS));
+  const limit = Math.max(1, Math.floor(opts.limit ?? TEST_DB_DEFERRED_SWEEP_LIMIT));
+  let rows: Array<{ datname: string }>;
+  try {
+    rows = (await admin.unsafe(
+      `WITH candidate AS MATERIALIZED (
+         SELECT d.datname, d.oid
+           FROM pg_database d
+          WHERE current_setting('fsync') = 'off'
+            AND NOT d.datistemplate
+            AND d.datname ~ ${quoteLiteral(UNMARKED_TEST_DB_NAME_PATTERN)}
+            AND d.datname NOT LIKE 'tmpl\\_%'
+            AND NOT EXISTS (
+              SELECT 1 FROM pg_shdescription c
+               WHERE c.objoid = d.oid AND c.classoid = 'pg_database'::regclass
+            )
+            AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)
+       )
+       SELECT c.datname
+         FROM candidate c
+        WHERE (pg_stat_file('base/' || c.oid || '/PG_VERSION', true)).modification
+              <= to_timestamp(${cutoffMs} / 1000.0)
+        ORDER BY c.datname
+        LIMIT ${limit}`,
+    )) as Array<{ datname: string }>;
+  } catch {
+    return true;
+  }
+  return sweepRows(admin, rows, deadline);
+}
+
+/**
+ * Record that `template` was just cloned (best effort, at most once per
+ * TEMPLATE_USE_STAMP_INTERVAL_MS per process), so sweepIdleTemplates keeps a
+ * template that is still in use however old its build is.
+ */
+const templateUseStampedAt = new Map<string, number>();
+async function stampTemplateUse(admin: SqlExecutor, template: string): Promise<void> {
+  const now = Date.now();
+  const last = templateUseStampedAt.get(template);
+  if (last !== undefined && now - last < TEMPLATE_USE_STAMP_INTERVAL_MS) return;
+  templateUseStampedAt.set(template, now);
+  try {
+    await admin.unsafe(`SET statement_timeout = '${TEMPLATE_USE_STAMP_TIMEOUT_MS}ms'`);
+    await admin.unsafe(
+      `ALTER DATABASE ${quoteIdentifier(template)} SET ${TEMPLATE_LAST_USED_SETTING} = ${quoteLiteral(String(now))}`,
+    );
+  } catch {
+    // Concurrent stamps can collide on the same pg_db_role_setting row; the
+    // build-time fallback and the keep-newest floor still protect the template.
+  }
+}
+
 export interface DropDatabaseWithLockOptions {
   /** How long the caller waits for its own drop before detaching it. */
   waitMs?: number;
@@ -350,7 +548,9 @@ export async function dropDatabaseWithLock(
 
     const sweepDeadline = Date.now() + sweepBudgetMs;
     if (!await sweepDeferredDatabaseDrops(admin, sweepDeadline)
-      || !await sweepOrphanedTestDatabases(admin, sweepDeadline)) {
+      || !await sweepOrphanedTestDatabases(admin, sweepDeadline)
+      || !await sweepUnmarkedTestDatabases(admin, sweepDeadline)
+      || !await sweepIdleTemplates(admin, sweepDeadline)) {
       connectionBusy = true;
       // The requested database is gone, but an uncancellable janitor DROP
       // still occupies this client and owns its advisory lock. Report that
@@ -504,6 +704,11 @@ function templateLockTimeoutMs(value?: number): number | null {
     throw new Error(`getOrBuildTemplate: lockTimeoutMs must be a positive finite number (received ${value})`);
   }
   return Math.ceil(value);
+}
+
+/** Advisory lock serializing every build (and janitor drop) of the template for `key`. */
+function templateLockName(key: string): string {
+  return `pc-test-template-${key}`;
 }
 
 function templateBuilderKeyToken(key: string): string {
@@ -711,7 +916,7 @@ async function buildTemplate(
 ): Promise<string> {
   const adminUri = await getTestPg();
   const name = `tmpl_${key}`;
-  const lock = `pc-test-template-${key}`;
+  const lock = templateLockName(key);
   const lockTimeoutMs = templateLockTimeoutMs(opts.lockTimeoutMs);
   // EI-10571: connect + the first query (the advisory-lock acquire) with retry —
   // this is where a fresh connect against the shared, fleet-hammered container
@@ -865,12 +1070,19 @@ async function createDbFromTemplate(prefix: string, template: string): Promise<{
       // its connection, and nothing connects to a template directly. Serial integration
       // runs never overlap clones; Postgres serializes them defensively regardless.
       await admin.unsafe(`CREATE DATABASE "${name}" TEMPLATE "${template}"`);
+      await stampTemplateUse(admin, template);
     } finally {
       await admin.end({ timeout: 5 });
     }
   });
   await markOrDropUntrackedDatabase(adminUri, name);
   return { url: swapDbName(adminUri, name), name, adminUri };
+}
+
+/** PostgreSQL's `template database "x" does not exist` (SQLSTATE 3D000) on CREATE DATABASE … TEMPLATE. */
+function isMissingTemplate(e: unknown): boolean {
+  const x = e as { code?: string; message?: string } | null;
+  return x?.code === '3D000' && /template database/i.test(x?.message ?? '');
 }
 
 /**
@@ -888,11 +1100,20 @@ async function createDbFromTemplate(prefix: string, template: string): Promise<{
 export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Promise<MigratedTestDb> {
   // Template-clone path: build the schema ONCE into a cached template, then clone.
   if (opts.template) {
-    const tmpl = await getOrBuildTemplate(opts.template.key, opts.template.provision, {
-      lockTimeoutMs: opts.template.lockTimeoutMs,
-    });
-    const { url, name, adminUri } = await createDbFromTemplate(opts.prefix ?? 'it', tmpl);
-    return { url, name, drop: makeDrop(adminUri, name) };
+    const { key, provision, lockTimeoutMs } = opts.template;
+    const prefix = opts.prefix ?? 'it';
+    const tmpl = await getOrBuildTemplate(key, provision, { lockTimeoutMs });
+    let created: { url: string; name: string; adminUri: string };
+    try {
+      created = await createDbFromTemplate(prefix, tmpl);
+    } catch (e) {
+      // The template janitor (sweepIdleTemplates) may have dropped a template this
+      // process cached as built. Forget the cached build and rebuild it once.
+      if (!isMissingTemplate(e)) throw e;
+      if (templateBuilds.has(key)) templateBuilds.delete(key);
+      created = await createDbFromTemplate(prefix, await getOrBuildTemplate(key, provision, { lockTimeoutMs }));
+    }
+    return { url: created.url, name: created.name, drop: makeDrop(created.adminUri, created.name) };
   }
   const { url, name, adminUri } = await createFreshDb(opts.prefix);
   if (opts.provision) {
