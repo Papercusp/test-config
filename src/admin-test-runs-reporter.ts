@@ -792,7 +792,7 @@ function stringifyFailureValue(value: unknown): string {
   }
 }
 
-function errorField(error: unknown, field: 'message' | 'actual' | 'expected' | 'code'): unknown {
+function errorField(error: unknown, field: 'message' | 'actual' | 'expected' | 'code' | 'stack'): unknown {
   try {
     if (error && typeof error === 'object') return (error as Record<string, unknown>)[field];
   } catch {
@@ -806,7 +806,7 @@ function errorField(error: unknown, field: 'message' | 'actual' | 'expected' | '
  * The structured values are deliberately appended after the message so the
  * module-level 4KB tail retains them when a stack is long.
  */
-export function formatTestCaseError(error: unknown): string {
+export function formatTestCaseError(error: unknown, options: { includeStack?: boolean } = {}): string {
   let message: string | undefined;
   try {
     const raw = error instanceof Error ? error.message : errorField(error, 'message');
@@ -815,6 +815,12 @@ export function formatTestCaseError(error: unknown): string {
     /* fail-soft */
   }
   const lines = message ? [message] : [];
+  if (options.includeStack) {
+    // File errors include afterAll failures, where a message alone cannot locate
+    // the broken fixture. Keep the originating frames, within the existing tail.
+    const stack = errorField(error, 'stack');
+    if (typeof stack === 'string' && stack.trim()) lines.push(`stack: ${boundFailureText(stack, 1_500)}`);
+  }
   for (const field of ['actual', 'expected'] as const) {
     const value = errorField(error, field);
     if (value === undefined) continue;
@@ -1493,7 +1499,7 @@ export function buildOutputTail(
     const errs = testModule.errors?.() ?? [];
     if (errs.length > 0) {
       tail = errs
-        .map((e: unknown) => formatTestCaseError(e))
+        .map((e: unknown) => formatTestCaseError(e, { includeStack: true }))
         .join('\n')
         .slice(-4000);
     }
@@ -1586,7 +1592,7 @@ function collectTestFailureDetails(testModule: TestModule, file: string): TestFa
       if (moduleStatus(testModule) === 'fail') {
         const errs = testModule.errors?.() ?? [];
         if (errs.length > 0) {
-          const message = formatTestCaseError(errs[0]);
+          const message = formatTestCaseError(errs[0], { includeStack: true });
           if (message) {
             details.push({ file, test: COLLECTION_FAILURE_TEST, message: boundFailureText(message) });
           }
