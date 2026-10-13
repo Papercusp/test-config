@@ -239,13 +239,14 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     dir = null;
   });
 
-  async function runChild(fixture: string) {
+  async function runChild(fixture: string, readExecutedSource?: Parameters<typeof beginNodeTestLedger>[0]['readExecutedSource']) {
     dir = mkdtempSync(join(tmpdir(), 'node-test-ledger-fixture-'));
     writeFileSync(join(dir, 'fx.test.mjs'), fixture);
     const written: TestRunRow[] = [];
     const snapshot: WorktreeGitSnapshot = { commit: 'feedface00', porcelain: '' };
     const session = await beginNodeTestLedger({
       repoRoot: dir,
+      ...(readExecutedSource ? { readExecutedSource } : {}),
       readSnapshot: async () => snapshot,
       writeRows: async (rows) => {
         written.push(...rows);
@@ -297,6 +298,43 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     expect(outcome.recorded).toBe(0);
     expect(outcome.reason).toMatch(/no collector summary/);
     expect(written).toEqual([]);
+  });
+
+  it('keeps a real child verdict but refuses a clean commit stamp when the loader substituted source', async () => {
+    const { session, child, written } = await runChild(
+      "import { test } from 'node:test'; test('committed behavior', () => {});",
+      () => ({ records: [{ kind: 'substituted', via: 'esm', rel: 'scripts/provider.mjs' }],
+        malformed: 0, unreadable: false }));
+    expect(child.status).toBe(0);
+    const outcome = await session.record();
+    expect(outcome).toMatchObject({ recorded: 1, counts: { executed: 1, skipped: 0 } });
+    expect(written[0]).toMatchObject({ status: 'pass', worktreeDirty: true, commitSha: null });
+    expect(parseTestRunExecutionDetails(written[0].executionDetails)).toMatchObject({
+      commitSha: null, worktreeDirty: true,
+      worktreeDirtyReason: expect.stringContaining('substituted esm scripts/provider.mjs'),
+    });
+  });
+
+  it.each(['unreadable', 'malformed', 'throws'] as const)
+    ('fails provenance closed while preserving measured outcomes when child notices are %s', async mode => {
+      const { session, written } = await runChild(
+        "import { test } from 'node:test'; test('measured case', () => {});",
+        () => {
+          if (mode === 'throws') throw new Error('notice read failed');
+          return { records: [], malformed: mode === 'malformed' ? 1 : 0, unreadable: mode === 'unreadable' };
+        });
+      await session.record();
+      expect(written[0]).toMatchObject({ status: 'pass', commitSha: null, worktreeDirty: true });
+      expect(parseTestRunExecutionDetails(written[0].executionDetails)?.worktreeDirtyReason)
+        .toContain('executed source unmeasured');
+    });
+
+  it('retains a clean stamp for an observed empty child notice channel', async () => {
+    const { session, written } = await runChild(
+      "import { test } from 'node:test'; test('measured case', () => {});",
+      () => ({ records: [], malformed: 0, unreadable: false }));
+    await session.record();
+    expect(written[0]).toMatchObject({ status: 'pass', commitSha: 'feedface00', worktreeDirty: false });
   });
 });
 

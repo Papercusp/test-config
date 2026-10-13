@@ -193,6 +193,12 @@ export interface NodeTestLedgerSession {
 
 export interface BeginNodeTestLedgerOptions {
   repoRoot: string;
+  /** Child-loader observations scoped to this spawn, not a later disk fingerprint. */
+  readExecutedSource?: () => {
+    records: Array<{ kind: string; rel: string; via?: string }>;
+    malformed: number;
+    unreadable: boolean;
+  };
   /** Test seams; production uses the real snapshot and the shared ledger writer. */
   readSnapshot?: () => Promise<WorktreeSnapshot>;
   writeRows?: (rows: readonly TestRunRow[]) => Promise<void>;
@@ -261,6 +267,34 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
           // Missing proof of stability is dirty, never a false clean (same rule as Vitest).
           worktreeDirty = true;
           worktreeDirtyReason = `snapshot threw: ${err instanceof Error ? err.message : String(err)}`;
+        }
+
+        // A stable disk snapshot cannot prove what a child loaded: the committed-source
+        // loader can substitute HEAD while the worktree stays unchanged (or is restored).
+        // Reuse its notice channel; retain the observed case outcomes, but do not stamp
+        // a filesystem commit as the identity of a mixed or unmeasured execution.
+        if (options.readExecutedSource) {
+          let sourceReason: string | null = null;
+          try {
+            const source = options.readExecutedSource();
+            if (source.unreadable || source.malformed || source.records.some(record =>
+              !['substituted', 'refused'].includes(record.kind) || !record.rel)) {
+              sourceReason = 'executed source unmeasured: child-loader notices unreadable or malformed';
+            } else if (source.records.length) {
+              const identities = [...new Set(source.records.map(record =>
+                `${record.kind} ${record.via ?? '?'} ${record.rel}`))];
+              sourceReason = 'executed source differs from worktree (committed-source loader): '
+                + identities.slice(0, 32).join('; ')
+                + (identities.length > 32 ? `; ${identities.length - 32} more module identities` : '');
+            }
+          } catch (error) {
+            sourceReason = `executed source unmeasured: ${error instanceof Error ? error.message : String(error)}`;
+          }
+          if (sourceReason) {
+            worktreeDirty = true;
+            worktreeDirtyReason = [worktreeDirtyReason, sourceReason].filter(Boolean).join('; ');
+            commitSha = null;
+          }
         }
 
         const rows = buildNodeTestRunRows(summary, {
