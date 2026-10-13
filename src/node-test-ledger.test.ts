@@ -7,10 +7,11 @@
  * drives it, so a change in node:test's event stream fails here rather than silently
  * dropping ledger rows again.
  */
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runGit } from './admin-test-runs-reporter.ts';
 import type { TestRunRow, WorktreeGitSnapshot } from './admin-test-runs-reporter.ts';
@@ -336,6 +337,42 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     await session.record();
     expect(written[0]).toMatchObject({ status: 'pass', commitSha: 'feedface00', worktreeDirty: false });
   });
+
+  it('records a real loader substitution even after the disk is restored before the after-snapshot', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'node-test-ledger-loaded-source-'));
+    const committed = "export const value = 'HEAD';\n";
+    writeFileSync(join(dir, 'behavior.mjs'), committed);
+    writeFileSync(join(dir, 'fx.test.mjs'), [
+      "import { test } from 'node:test'; import assert from 'node:assert/strict';",
+      "import { value } from './behavior.mjs'; test('HEAD behavior ran', () => assert.equal(value, 'HEAD'));",
+    ].join('\n'));
+    const git = (args: string[]) => execFileSync('git', args, { cwd: dir!, encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
+    git(['init', '-q']); git(['add', 'behavior.mjs', 'fx.test.mjs']);
+    git(['-c', 'user.name=Ledger fixture', '-c', 'user.email=ledger@example.test', 'commit', '-qm', 'source fixture']);
+    const commit = git(['rev-parse', 'HEAD']).trim();
+    const noticePath = join(dir, 'notices.jsonl');
+    const written: TestRunRow[] = [];
+    const session = await beginNodeTestLedger({ repoRoot: dir,
+      readSnapshot: async () => ({ commit, porcelain: '' }),
+      writeRows: async rows => { written.push(...rows); },
+      readExecutedSource: () => ({ records: readFileSync(noticePath, 'utf8').trim().split('\n').map(line => JSON.parse(line)),
+        malformed: 0, unreadable: false }),
+    });
+    writeFileSync(join(dir, 'behavior.mjs'), "export const value = 'working tree';\n");
+    const loader = fileURLToPath(new URL('../../../scripts/lib/committed-source-loader.mjs', import.meta.url));
+    const child = spawnSync(process.execPath, ['--import', loader, '--test', ...session.reporterArgs, 'fx.test.mjs'], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '', PAPERCUSP_COMMITTED_SOURCE_NOTICES: noticePath },
+    });
+    writeFileSync(join(dir, 'behavior.mjs'), committed);
+    expect(child.status, child.stderr).toBe(0);
+    // node:test's spec reporter forwards the worker's stderr onto its stdout.
+    expect(child.stdout + child.stderr).toContain('COMMITTED_SOURCE substituted behavior.mjs');
+    await session.record();
+    expect(written[0]).toMatchObject({ status: 'pass', worktreeDirty: true, commitSha: null });
+    expect(parseTestRunExecutionDetails(written[0].executionDetails)?.worktreeDirtyReason)
+      .toContain('substituted esm behavior.mjs');
+  });
 });
 
 // The router spawns `node --test` with spawnSync, which blocks the event loop for the whole run.
@@ -386,7 +423,8 @@ describe('the before-snapshot survives a caller that blocks the event loop (EI-2
         cwd: dir, encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' },
       });
       const outcome = await session.record();
-      expect(outcome).toEqual({ recorded: 1, reason: 'worktree_dirty: snapshot threw: git unavailable', assertionFailures: [] });
+      expect(outcome).toEqual({ recorded: 1, reason: 'worktree_dirty: snapshot threw: git unavailable', assertionFailures: [],
+        counts: { executed: 1, skipped: 0 } });
       expect(written[0]).toMatchObject({ status: 'pass', worktreeDirty: true, commitSha: null });
     } finally {
       rmSync(dir, { recursive: true, force: true });
