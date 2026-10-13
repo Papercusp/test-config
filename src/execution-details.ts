@@ -186,6 +186,64 @@ export interface TestRunExecutionDetails {
    * exports it, so the deployed operator never meets an unknown key.
    */
   mutation?: MutationDescriptor;
+  /**
+   * The executed rubric check this row records (framework 'rubric-check'): plan
+   * test-rubric-unification-2026-10-12 D-004 rule 1. Absent on test-file rows.
+   */
+  check?: RecordedRubricCheck;
+}
+
+/** Ledger framework value for rows that record an executed rubric probe or instrument check. */
+export const RUBRIC_CHECK_FRAMEWORK = 'rubric-check' as const;
+
+export const RECORDED_RUBRIC_CHECK_KINDS = ['probe', 'instrument'] as const;
+export type RecordedRubricCheckKind = typeof RECORDED_RUBRIC_CHECK_KINDS[number];
+
+/** One executed probe or instrument check: its id, the measured value, and that value's unit. */
+export interface RecordedRubricCheck {
+  /** Stable within the rubric: `<criterionKey>:<childIndex>` for a probe, `<criterionKey>:instrument` for an instrument. */
+  id: string;
+  rubricRef: string;
+  criterionKey: string;
+  kind: RecordedRubricCheckKind;
+  /** null when nothing was measured (the row's status is then 'error'), never a silent 0. */
+  value: number | string | boolean | null;
+  /** null when the check reports no unit (a boolean or text probe). */
+  unit: string | null;
+  /**
+   * The instrument threshold the row's pass/fail status was judged against, recorded so a later
+   * threshold change cannot silently reinterpret history. Absent when the check carried none.
+   */
+  expect?: RecordedRubricCheckExpect;
+}
+
+export const RECORDED_RUBRIC_CHECK_OPS = ['lt', 'lte', 'gt', 'gte', 'eq'] as const;
+export interface RecordedRubricCheckExpect {
+  op: typeof RECORDED_RUBRIC_CHECK_OPS[number];
+  value: number;
+}
+
+const recordedRubricCheckKeys = new Set(['id', 'rubricRef', 'criterionKey', 'kind', 'value', 'unit', 'expect']);
+
+function isRecordedRubricCheckExpect(value: unknown): value is RecordedRubricCheckExpect {
+  return isRecord(value)
+    && Object.keys(value).every((key) => key === 'op' || key === 'value')
+    && RECORDED_RUBRIC_CHECK_OPS.includes(value.op as RecordedRubricCheckExpect['op'])
+    && typeof value.value === 'number' && Number.isFinite(value.value);
+}
+
+export function parseRecordedRubricCheck(value: unknown): RecordedRubricCheck | undefined {
+  if (!isRecord(value) || Object.keys(value).some((key) => !recordedRubricCheckKeys.has(key))) return undefined;
+  const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+  if (!nonEmpty(value.id) || !nonEmpty(value.rubricRef) || !nonEmpty(value.criterionKey)) return undefined;
+  if (!RECORDED_RUBRIC_CHECK_KINDS.includes(value.kind as RecordedRubricCheckKind)) return undefined;
+  const v = value.value;
+  if (!(v === null || typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)))) {
+    return undefined;
+  }
+  if (!(value.unit === null || nonEmpty(value.unit))) return undefined;
+  if (value.expect !== undefined && !isRecordedRubricCheckExpect(value.expect)) return undefined;
+  return value as unknown as RecordedRubricCheck;
 }
 
 export interface IsolatedRuntimeReceipt {
@@ -220,7 +278,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
-  'isolatedRuntimeReceipts', 'mutation',
+  'isolatedRuntimeReceipts', 'mutation', 'check',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -322,7 +380,8 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.runtimeEnvironmentAfterCaptureStatus !== undefined
       && (!isRuntimeEnvironmentCaptureStatus(value.runtimeEnvironmentAfterCaptureStatus)
         || (value.runtimeEnvironmentAfterCaptureStatus === 'captured') !== (value.runtimeEnvironmentAfter !== undefined)))
-    || (value.mutation !== undefined && !parseMutationDescriptor(value.mutation))) {
+    || (value.mutation !== undefined && !parseMutationDescriptor(value.mutation))
+    || (value.check !== undefined && !parseRecordedRubricCheck(value.check))) {
     return undefined;
   }
   return value as unknown as TestRunExecutionDetails;
