@@ -48,7 +48,8 @@ import {
   type PgHandle,
   type WorktreeGitSnapshot,
 } from './admin-test-runs-reporter';
-import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META } from './vitest-config';
+import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META, readExecutedSourceOriginals,
+  type ExecutedOriginalSource } from './vitest-config';
 import { qualifyLoadedConfigSources, qualifyLoadedMainProcessSources } from './executed-config-load-capture.ts';
 
 export interface ExecutedSourceRow {
@@ -441,17 +442,31 @@ export function captureCollectedSources(
   return { modules, reasons };
 }
 
-/** Compare captured ORIGINAL bytes with disk; late imports and repository externals are gaps. */
+/** Compare captured originals with disk; late imports require prospective transform receipts. */
 export function qualifyCollectedSources(
   collected: CollectedSourceEvidence | undefined,
   importDurations: Record<string, ImportDurationLike> | undefined,
-  o: { repoRoot: string; testFile: string; readSource?: (absolutePath: string) => Buffer },
+  o: { repoRoot: string; testFile: string; readSource?: (absolutePath: string) => Buffer;
+    originals?: readonly ExecutedOriginalSource[] },
 ): ExecutedSourceEvidence {
   const reasons = new Set(collected?.reasons ?? ['collection-evidence-unavailable']);
   const fingerprints = new Map<string, SourceFingerprint>();
   const readSource = o.readSource ?? readFileSync;
   if (!importDurations || Object.keys(importDurations).length === 0) reasons.add('import-record-unavailable');
   const modules = collectExecutedModules(importDurations, o);
+  const executed = new Set(modules);
+  const originals = new Map<string, SourceFingerprint[]>();
+  for (const receipt of o.originals ?? []) {
+    const path = normalizeExecutedKey(receipt.id, o.repoRoot);
+    if (!path || !executed.has(path)) continue; // transformed is not evidence of executed
+    if (receipt.version !== 1 || !/^[a-f0-9]{64}$/.test(receipt.sha256)) {
+      reasons.add(`invalid-transform-receipt:${path}`);
+      continue;
+    }
+    const sources = originals.get(path) ?? [];
+    sources.push({ path, sha256: receipt.sha256, basis: 'vite-pre-transform' });
+    originals.set(path, sources);
+  }
   if (modules.length === 0) reasons.add('repository-modules-unavailable');
   for (const [key, info] of Object.entries(importDurations ?? {})) {
     const path = normalizeExecutedKey(key, o.repoRoot);
@@ -459,12 +474,13 @@ export function qualifyCollectedSources(
   }
   for (const path of modules) {
     const entry = collected?.modules.get(path);
-    if (!entry) {
+    const prospective = originals.get(path) ?? [];
+    if (!entry && prospective.length === 0) {
       reasons.add(`module-not-captured-at-collection:${path}`);
       continue;
     }
-    for (const reason of entry.reasons) reasons.add(reason);
-    for (const source of entry.sources) {
+    for (const reason of entry?.reasons ?? []) reasons.add(reason);
+    for (const source of [...(entry?.sources ?? []), ...prospective]) {
       const previous = fingerprints.get(source.path);
       if (previous && previous.sha256 !== source.sha256) reasons.add(`conflicting-source-maps:${source.path}`);
       else fingerprints.set(source.path, source);
@@ -763,8 +779,10 @@ export default class ExecutedSourceMapReporter implements Reporter {
       if (this.armed.outPath) {
         const testFile = normalizeExecutedKey(testModule.moduleId, this.repoRoot);
         if (testFile) {
+          let originals: readonly ExecutedOriginalSource[] | undefined;
+          try { originals = readExecutedSourceOriginals(testModule.viteEnvironment); } catch { /* retain collection-only gaps */ }
           sourceEvidence = qualifyCollectedSources(this.collectedSources.get(testModule), observed.imports,
-            { repoRoot: this.repoRoot, testFile: testModule.moduleId });
+            { repoRoot: this.repoRoot, testFile: testModule.moduleId, originals });
           if (observed.reasons.length) {
             sourceEvidence.status = sourceEvidence.status === 'changed' ? 'changed' : 'unknown';
             sourceEvidence.reasons.push(...observed.reasons);

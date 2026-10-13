@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { captureCollectedSources, qualifyCollectedSources } from './executed-source-map-reporter';
-import { executedSourceOriginalsPlugin, PC_EXECUTED_SOURCE_ORIGINAL_META } from './vitest-config';
+import { executedSourceOriginalsPlugin, PC_EXECUTED_SOURCE_ORIGINAL_META, readExecutedSourceOriginals } from './vitest-config';
 
 const ROOT = '/repo';
 const SELF = '/repo/test.test.ts';
@@ -89,6 +89,75 @@ describe('prospective Vite source fingerprints (EI-24827847586322829)', () => {
     expect(qualifyCollectedSources(captured, {}, options).status).toBe('unknown');
     expect(qualifyCollectedSources(undefined, { [DEP]: {} }, options).status).toBe('unknown');
   });
+
+  it('uses only prospective receipts for executed late imports, retaining native and missing gaps', () => {
+    const captured = captureCollectedSources([node(SELF)], options);
+    const originals = [{ version: 1 as const, id: DEP, sha256: hash(contents.get(DEP)!) },
+      { version: 1 as const, id: '/repo/not-executed.ts', sha256: hash('unreached') }];
+    const evidence = qualifyCollectedSources(captured, { [DEP]: {} }, { ...options, originals });
+    expect(evidence.status).toBe('stable');
+    expect(evidence.sources.map(source => source.path)).toEqual(['dep.ts', 'test.test.ts']);
+    expect(evidence.sources[0]).toMatchObject({ sha256: hash(contents.get(DEP)!), basis: 'vite-pre-transform' });
+    expect(qualifyCollectedSources(captured, { [DEP]: {} }, { ...options, originals: [] }).status).toBe('unknown');
+    expect(qualifyCollectedSources(captured, { [DEP]: { external: true } }, { ...options, originals }))
+      .toMatchObject({ status: 'unknown', reasons: ['repository-external:dep.ts'] });
+    expect(qualifyCollectedSources(captured, { [DEP]: {} }, { ...options, originals: [
+      { version: 1, id: DEP, sha256: 'not-a-hash' },
+    ] }).reasons).toContain('invalid-transform-receipt:dep.ts');
+  });
+
+  it('keeps conflicting prospective versions unknown rather than selecting the end graph version', () => {
+    const captured = captureCollectedSources([node(SELF)], options);
+    const evidence = qualifyCollectedSources(captured, { [DEP]: {} }, { ...options, originals: [
+      { version: 1, id: DEP, sha256: hash(contents.get(DEP)!) },
+      { version: 1, id: `${DEP}?v=2`, sha256: hash('replacement') },
+    ] });
+    expect(evidence).toMatchObject({ status: 'unknown', reasons: ['conflicting-source-maps:dep.ts'] });
+    expect(evidence.sources[0]!.sha256).toBe(hash(contents.get(DEP)!));
+  });
+
+  it('retains real late-transform originals after graph replacement and detects invalidated versions', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'prospective-lazy-sources-'));
+    const self = join(root, 'test.test.ts');
+    const dep = join(root, 'lazy.ts');
+    const original = 'export const answer: number = 42;\n';
+    writeFileSync(self, 'export const initial = true;\n');
+    writeFileSync(dep, original);
+    const { createServer } = await import('vite');
+    const server = await createServer({
+      root, configFile: false, server: { middlewareMode: true, watch: null },
+      plugins: [executedSourceOriginalsPlugin()],
+      optimizeDeps: { noDiscovery: true }, logLevel: 'silent',
+    });
+    try {
+      const environment = server.environments.ssr!;
+      await environment.transformRequest(self);
+      const captured = captureCollectedSources(environment.moduleGraph.idToModuleMap.values(), { repoRoot: root });
+      expect(readExecutedSourceOriginals(environment)?.some(receipt => receipt.id === dep)).toBe(false);
+      await environment.transformRequest(dep); // first reached after the collection snapshot
+      const receipts = readExecutedSourceOriginals(environment)!;
+      expect(Object.isFrozen(receipts)).toBe(true);
+      expect(receipts.every(Object.isFrozen)).toBe(true);
+      const lateNode = environment.moduleGraph.getModuleById(dep)!;
+      lateNode.transformResult = null; // final graph no longer carries any originals
+      const scope = { repoRoot: root, testFile: self, originals: receipts };
+      expect(qualifyCollectedSources(captured, { [dep]: {} }, scope)).toMatchObject({ status: 'stable', reasons: [] });
+      writeFileSync(dep, 'export const answer: number = 99;\n');
+      expect(qualifyCollectedSources(captured, { [dep]: {} }, scope))
+        .toMatchObject({ status: 'changed', reasons: ['source-changed:lazy.ts'] });
+      environment.moduleGraph.invalidateModule(lateNode);
+      await environment.transformRequest(dep);
+      expect(receipts.filter(receipt => receipt.id === dep)).toHaveLength(1); // snapshot is immutable
+      writeFileSync(dep, original);
+      expect(qualifyCollectedSources(captured, { [dep]: {} }, {
+        ...scope, originals: readExecutedSourceOriginals(environment),
+      })).toMatchObject({ status: 'unknown', reasons: ['conflicting-source-maps:lazy.ts'] });
+      expect(readExecutedSourceOriginals({})).toBeUndefined(); // another environment cannot donate proof
+    } finally {
+      await server.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('reports unreadable collection/end sources without fabricating a hash', () => {
     const unreadable = { ...options, readSource: () => { throw new Error('gone'); } };

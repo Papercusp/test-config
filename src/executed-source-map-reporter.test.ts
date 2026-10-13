@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TestModule } from 'vitest/node';
+import { executedSourceOriginalsPlugin } from './vitest-config';
 
 import { inferWorkspaceRoot } from './admin-test-runs-reporter';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
@@ -418,6 +419,40 @@ describe('ExecutedSourceMapReporter', () => {
     r.onTestModuleCollected(mod);
     r.onTestModuleEnd(mod);
     await r.onTestRunEnd();
+    expect(flushes[0]!.rows[0]).not.toHaveProperty('sourceEvidence');
+  });
+
+  it('uses prospective late-transform receipts without reading the final graph or persisting diagnostics', async () => {
+    const self = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
+    const late = join(REPO_ROOT, 'libs/test-config/src/executed-source-fingerprints.test.ts');
+    const unreached = join(REPO_ROOT, 'libs/test-config/src/vitest-config.test.ts');
+    const imports = { [self]: {} };
+    const environment = { moduleGraph: { idToModuleMap: new Map([[self, {
+      id: self, transformResult: { map: { sources: [self], sourcesContent: [readFileSync(self, 'utf8')] } },
+    }]]) } };
+    const mod = Object.assign(fakeModule({ moduleId: self, imports, workerImports: true }), { viteEnvironment: environment });
+    const { r, flushes } = reporter();
+    r.onInit({} as never);
+    r.onTestModuleCollected(mod);
+    const transform = executedSourceOriginalsPlugin().transform as
+      (this: { environment: object }, code: string, id: string) => unknown;
+    for (const id of [late, unreached]) transform.call({ environment }, readFileSync(id, 'utf8'), id);
+    // The worker really reached only late. Another file's transform is not its evidence.
+    writeFileSync(inputsFilePath(tmp, self), JSON.stringify({ testFile: self, reads: [], opaque: [],
+      moduleImports: { [self]: { external: false }, [late]: { external: false } },
+    }));
+    Object.defineProperty(environment, 'moduleGraph', { get: () => { throw new Error('final graph is mutable'); } });
+    r.onTestModuleEnd(mod);
+    await r.onTestRunEnd();
+    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    expect(out.rows[0].sourceEvidence).toMatchObject({ status: 'stable', reasons: [],
+      sources: expect.arrayContaining([expect.objectContaining({
+        path: 'libs/test-config/src/executed-source-fingerprints.test.ts', basis: 'vite-pre-transform',
+        sha256: createHash('sha256').update(readFileSync(late)).digest('hex'),
+      })]),
+    });
+    expect(out.rows[0].sourceEvidence.sources).toHaveLength(2);
+    expect(out.rows[0].executedModules).not.toContain('libs/test-config/src/vitest-config.test.ts');
     expect(flushes[0]!.rows[0]).not.toHaveProperty('sourceEvidence');
   });
 

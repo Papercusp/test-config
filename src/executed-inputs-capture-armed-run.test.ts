@@ -19,6 +19,7 @@
  * test_runs or pass-proof rows and never touches the parent gate's result files.
  */
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -91,7 +92,8 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       const map = JSON.parse(readFileSync(run.mapPath, 'utf8')) as {
         workspaceName: string;
         rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[];
-          executedModules?: string[]; sourceEvidence?: { status: string; reasons: string[] } }>;
+          executedModules?: string[]; sourceEvidence?: { status: string; reasons: string[];
+            sources: Array<{ path: string; sha256: string; basis?: string }> } }>;
       };
       expect(map.workspaceName).toBe(FIXTURE_WORKSPACE);
       expect(map.rows).toHaveLength(1);
@@ -104,12 +106,14 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
 
       // Vitest's diagnostic importDurations is a collection-time snapshot. A route loaded
       // in a test body after resetModules must still enter the dependency radius, and its
-      // absent prospective original-source receipt must keep that graph unknown.
+      // original bytes must now come from the prospective transform receipt, not end disk.
       const dynamicRoute = 'libs/test-config/src/__fixtures__/armed-capture/dynamic-route.fixture.ts';
       expect(map.rows[0]?.executedModules).toContain(dynamicRoute);
-      expect(map.rows[0]?.sourceEvidence).toMatchObject({
-        status: 'unknown', reasons: expect.arrayContaining([`module-not-captured-at-collection:${dynamicRoute}`]),
-      });
+      expect(map.rows[0]?.sourceEvidence?.reasons).not.toContain(`module-not-captured-at-collection:${dynamicRoute}`);
+      expect(map.rows[0]?.sourceEvidence?.sources).toContainEqual(expect.objectContaining({
+        path: dynamicRoute, basis: 'vite-pre-transform',
+        sha256: createHash('sha256').update(readFileSync(join(FIXTURE, 'dynamic-route.fixture.ts'))).digest('hex'),
+      }));
 
       // The runner-readable result channel reports this flush. The database is unreachable, so
       // the outcome is never `written`; it must still describe the one row.

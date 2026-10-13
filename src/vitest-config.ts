@@ -156,14 +156,51 @@ const EXECUTED_SOURCE_MAP_REPORTER = resolve(__dirname, 'executed-source-map-rep
 /** Vite's existing module metadata carries the original transform input, including erased TS. */
 export const PC_EXECUTED_SOURCE_ORIGINAL_META = 'papercuspExecutedOriginalSource';
 
+export interface ExecutedOriginalSource {
+  readonly version: 1;
+  readonly id: string;
+  readonly sha256: string;
+}
+
+// The config loader and reporter can evaluate this module separately. Put the reader on
+// their shared Vite environment, rather than relying on module-instance identity. The
+// closure retains hashes captured at transform time, never mutable final graph entries.
+const ORIGINAL_SOURCE_RECEIPTS = Symbol.for('@papercusp/test-config.original-source-receipts');
+
+export function readExecutedSourceOriginals(environment: object | undefined): readonly ExecutedOriginalSource[] | undefined {
+  const read = environment && (environment as Record<symbol, unknown>)[ORIGINAL_SOURCE_RECEIPTS];
+  return typeof read === 'function' ? read() : undefined;
+}
+
 export function executedSourceOriginalsPlugin(): Plugin {
+  const journals = new WeakMap<object, Map<string, readonly string[]>>();
   return {
     name: 'papercusp-executed-source-originals',
     enforce: 'pre',
     transform(code, id) {
       // Metadata only: no code/map replacement and no source text retained in memory.
+      const sha256 = createHash('sha256').update(code).digest('hex');
+      const environment = this.environment;
+      if (environment) {
+        try {
+          let journal = journals.get(environment);
+          if (!journal) {
+            journal = new Map();
+            const entries = journal;
+            Object.defineProperty(environment, ORIGINAL_SOURCE_RECEIPTS, {
+              value: () => Object.freeze([...entries].flatMap(([id, hashes]) => hashes.map(sha256 =>
+                Object.freeze({ version: 1 as const, id, sha256 })))),
+            });
+            journals.set(environment, journal);
+          }
+          const hashes = journal.get(id) ?? [];
+          // Two distinct versions already make this module ambiguous. Bound retained
+          // versions while keeping the first receipt immutable across invalidation.
+          if (!hashes.includes(sha256) && hashes.length < 2) journal.set(id, Object.freeze([...hashes, sha256]));
+        } catch { /* Optional diagnostics fail closed when the environment cannot retain receipts. */ }
+      }
       return { meta: { [PC_EXECUTED_SOURCE_ORIGINAL_META]: {
-        version: 1, id, sha256: createHash('sha256').update(code).digest('hex'),
+        version: 1, id, sha256,
       } } };
     },
   };
