@@ -187,6 +187,25 @@ describe('setup-hermetic-env: per-host spawner rollout is scrubbed', () => {
     expect(after.PAPERCUSP_SPAWNER_SIDECAR).toBeUndefined();
     expect(after.PAPERCUSP_SPAWNER_SIDECAR_MODE).toBeUndefined();
   });
+
+  it.each([
+    'PAPERCUSP_GIT_PIPELINE_SPAWN_SIDECAR',
+    'PAPERCUSP_PLAN_AUDIT_SPAWN_SIDECAR',
+    'PAPERCUSP_POT_GIT_SPAWN_SIDECAR',
+    'PAPERCUSP_FUTURE_SITE_SPAWN_SIDECAR',
+  ])('removes inherited %s even when the global controls are absent', async key => {
+    const after = await runSetupOn({ [key]: '1' });
+    expect(after[key]).toBeUndefined();
+  });
+
+  it('keeps controls outside the per-site override family', async () => {
+    const after = await runSetupOn({
+      PAPERCUSP_HERMETIC_ENV_CONTROL_UNLISTED: 'kept',
+      OTHER_GIT_PIPELINE_SPAWN_SIDECAR: 'kept',
+      PAPERCUSP_GIT_PIPELINE_SPAWN_SIDECAR_EXTRA: 'kept',
+    });
+    expect(Object.values(after).filter(value => value === 'kept')).toHaveLength(3);
+  });
 });
 
 /**

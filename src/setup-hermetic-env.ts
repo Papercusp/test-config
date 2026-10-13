@@ -73,10 +73,11 @@
  *    beforeEach/test body, which runs after this module-level scrub and so still wins.
  *
  *  - PAPERCUSP_SPAWNER_SIDECAR / PAPERCUSP_SPAWNER_SIDECAR_MODE — per-host rollout
- *    controls. Inherited `=1` enables managed sidecar processes during tests, which can
- *    start systemd scopes and leave delayed lifecycle callbacks after the triggering test.
- *    The rollout is opt-in in production, so tests that exercise it set these vars
- *    explicitly after this scrub.
+ *    controls, plus PAPERCUSP_*_SPAWN_SIDECAR per-site overrides. The latter take
+ *    precedence even in an unmarked test worker, so scrubbing only the global controls
+ *    still lets inherited Git pipeline / plan-audit overrides start a real sidecar.
+ *    Scrub the override family so newly added sites stay hermetic too. Tests that exercise
+ *    sidecar routing set their controls explicitly after this scrub.
  *
  *  - PORT — the operator's own listen port, and the ONLY entry here that is not
  *    PAPERCUSP_-prefixed. Every su/psu agent shell on this box carries `PORT` (3070 for
@@ -249,6 +250,9 @@ delete process.env.PAPERCUSP_BACKGROUND_WORKERS;
 delete process.env.PAPERCUSP_HONO_PORT;
 delete process.env.PAPERCUSP_SPAWNER_SIDECAR;
 delete process.env.PAPERCUSP_SPAWNER_SIDECAR_MODE;
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith('PAPERCUSP_') && key.endsWith('_SPAWN_SIDECAR')) delete process.env[key];
+}
 // EI-25164235306950609: a fixture host shares the test runner's pc scope.
 // Inheriting the parent agent's headless flag falsely authorizes sweeping that
 // scope on teardown, killing sibling workers and esbuild. Headless fixtures
