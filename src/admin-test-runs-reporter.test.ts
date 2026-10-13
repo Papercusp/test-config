@@ -47,6 +47,7 @@ import AdminTestRunsReporter, {
   resolveTestRunWorkspaceId,
   resolveTestRunsPgUrl,
   resolveWorktreeSnapshotRoot,
+  runGit,
   shouldRecordTestRunPath,
   TEST_RUN_INSERT_BATCH_SIZE,
   TEST_RUN_RECEIPT_ENV,
@@ -54,6 +55,7 @@ import AdminTestRunsReporter, {
   reporterWriteBudget,
   type PgSql,
   type TestRunRow,
+  type WorktreeGitRunner,
 } from './admin-test-runs-reporter';
 import { parseTestRunExecutionDetails } from './execution-details.ts';
 import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
@@ -2044,6 +2046,75 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
   it('a HEAD read that times out once is retried too', async () => {
     const { run } = fakeGit({ 'git rev-parse HEAD': [null, 'abc123'], [STATUS]: [''] });
     expect(await captureWorktreeSnapshot(run)).toEqual({ commit: 'abc123', porcelain: '' });
+  });
+
+  it('retains both failed status attempts when HEAD is readable (EI-25879692352233544)', async () => {
+    const run: WorktreeGitRunner = async (cmd, _cwd, budget, failed) => {
+      if (cmd !== STATUS) return 'abc123';
+      failed?.(`status budget=${budget} code=128 stderr=permission denied`);
+      return null;
+    };
+    const snap = await captureWorktreeSnapshot(run);
+    const reason = describeWorktreeDirt(snap, snap);
+    expect(snap).toMatchObject({ commit: 'abc123', porcelain: null });
+    expect(reason).toContain('git status unreadable before the run');
+    for (const budget of WORKTREE_SNAPSHOT_GIT_BUDGETS_MS) expect(reason).toContain(`budget=${budget}`);
+    expect(reason).toContain('code=128 stderr=permission denied');
+    expect(computeWorktreeDirty(snap, snap)).toBe(true);
+  });
+
+  it('discards failed-attempt diagnostics when the retry proves clean', async () => {
+    let attempts = 0;
+    const run: WorktreeGitRunner = async (cmd, _cwd, _budget, failed) => {
+      if (cmd !== STATUS) return 'abc123';
+      if (++attempts === 1) { failed?.('first attempt timed out'); return null; }
+      return '';
+    };
+    const snap = await captureWorktreeSnapshot(run);
+    expect(snap).toEqual({ commit: 'abc123', porcelain: '' });
+    expect(describeWorktreeDirt(snap, snap)).toBeNull();
+  });
+
+  it('persists the failure diagnostic in the ledger row', async () => {
+    const rows: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(
+      async () => ({ commit: 'abc', porcelain: null, provenanceError: 'status code=128 stderr=denied' }),
+      async row => { rows.push(row); },
+    );
+    await reporter.onInit({ config: { root: TEST_CONFIG_ROOT,
+      configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } as never);
+    reporter.onTestModuleEnd({ moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+      state: () => 'passed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+      children: { allTests: () => [{ fullName: 'Git diagnostic persistence', result: () => ({ state: 'passed' }) }] },
+    } as never);
+    await reporter.onTestRunEnd();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].executionDetails).toMatchObject({ worktreeDirty: true,
+      worktreeDirtyReason: 'git status unreadable before the run: status code=128 stderr=denied' });
+  });
+});
+
+describe('runGit failure diagnostics (EI-25879692352233544)', () => {
+  it('retains a real Git exit code and bounded stderr without changing null semantics', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'git-diagnostic-'));
+    try {
+      const failures: string[] = [];
+      expect(await runGit('git status --porcelain', root, 5_000, detail => failures.push(detail))).toBeNull();
+      expect(failures).toHaveLength(1);
+      expect(JSON.parse(failures[0])).toMatchObject({ command: 'git status --porcelain',
+        timeoutMs: 5_000, code: 128, killed: false, stderr: expect.stringContaining('not a git repository') });
+      expect(JSON.parse(failures[0]).stderr.length).toBeLessThanOrEqual(512);
+      expect(await runGit('git status --porcelain', root, 5_000, () => { throw new Error('sink unavailable'); })).toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('retains a missing working-directory spawn error once', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'git-missing-cwd-'));
+    rmSync(root, { recursive: true, force: true });
+    const failures: string[] = [];
+    expect(await runGit('git --version', root, 5_000, detail => failures.push(detail))).toBeNull();
+    expect(failures).toHaveLength(1);
+    expect(JSON.parse(failures[0])).toMatchObject({ code: 'ENOENT', killed: false });
   });
 });
 

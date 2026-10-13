@@ -417,7 +417,11 @@ export function describeWorktreeDirt(before: WorktreeGitSnapshot, after: Worktre
   }
   if (before.commit !== after.commit) return `HEAD moved ${before.commit.slice(0, 12)} -> ${after.commit.slice(0, 12)}`;
   if (before.porcelain === null || after.porcelain === null) {
-    return `git status unreadable ${before.porcelain === null ? 'before' : 'after'} the run`;
+    const errors = [before, after]
+      .filter(snapshot => snapshot.porcelain === null)
+      .map(snapshot => snapshot.provenanceError).filter(Boolean);
+    const reason = `git status unreadable ${before.porcelain === null ? 'before' : 'after'} the run`;
+    return errors.length ? `${reason}: ${[...new Set(errors)].join('; ')}` : reason;
   }
   for (const [when, porcelain] of [['before', before.porcelain], ['after', after.porcelain]] as const) {
     const lines = porcelain.split('\n').filter((line) => line.trim().length > 0);
@@ -440,15 +444,35 @@ let _gitCache: { value: GitContext; expiresAt: number } | null = null;
  * signal that survives the race, so it maps to null (unreadable) like any other failure.
  * Exported for the regression test only.
  */
-export function runGit(cmd: string, cwd: string, timeoutMs: number): Promise<string | null> {
+export function runGit(
+  cmd: string, cwd: string, timeoutMs: number, onFailure?: (diagnostic: string) => void,
+): Promise<string | null> {
   return new Promise((resolveP) => {
+    const startedAt = Date.now();
+    let settled = false;
+    const finish = (error: unknown, stdout: string, stderr: string, child?: ReturnType<typeof exec>) => {
+      if (settled) return;
+      settled = true;
+      if (error || child?.killed) {
+        const failure = error as { code?: string | number; signal?: string; message?: string } | null;
+        try {
+          onFailure?.(JSON.stringify({ command: cmd, timeoutMs, elapsedMs: Date.now() - startedAt,
+            code: failure?.code ?? child?.exitCode ?? null,
+            signal: failure?.signal ?? child?.signalCode ?? null, killed: child?.killed ?? false,
+            message: (failure?.message ?? String(error ?? '')).slice(0, 512),
+            stderr: stderr.trim().slice(-512) }));
+        } catch { /* Diagnostics must obey the reporter's fail-soft contract too. */ }
+        resolveP(null);
+      } else {
+        resolveP(stdout.trim());
+      }
+    };
     try {
-      const child = exec(cmd, { cwd, timeout: timeoutMs }, (err, stdout) => {
-        resolveP(err || child.killed ? null : stdout.trim());
+      const child = exec(cmd, { cwd, timeout: timeoutMs }, (err, stdout, stderr) => {
+        finish(err, stdout, stderr, child);
       });
-      child.on('error', () => resolveP(null));
-    } catch {
-      resolveP(null);
+    } catch (error) {
+      finish(error, '', '');
     }
   });
 }
@@ -515,13 +539,16 @@ export async function captureWorktreeSnapshot(run: WorktreeGitRunner = runGit): 
         provenanceError: `verifier source: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
+  const errors: string[] = [];
+  const failed = (diagnostic: string) => errors.push(diagnostic);
   const [commit, porcelain] = await Promise.all([
-    runGitWithRetry(run, 'git rev-parse HEAD', root),
-    runGitWithRetry(run, 'git status --porcelain --untracked-files=all', root),
+    runGitWithRetry(run, 'git rev-parse HEAD', root, failed),
+    runGitWithRetry(run, 'git status --porcelain --untracked-files=all', root, failed),
   ]);
-  if (!porcelain) return { commit, porcelain };
+  const snapshot = { commit, porcelain, ...(errors.length ? { provenanceError: errors.join('; ') } : {}) };
+  if (!porcelain) return snapshot;
   const exemption = await resolveProbeSubjectExemption(root, run);
-  return { commit, porcelain: exemption ? exemptProbeSubject(porcelain, exemption) : porcelain };
+  return { ...snapshot, porcelain: exemption ? exemptProbeSubject(porcelain, exemption) : porcelain };
 }
 
 /**
@@ -659,13 +686,20 @@ export function resolveProbeSubjectExemptionSync(
  */
 export const WORKTREE_SNAPSHOT_GIT_BUDGETS_MS: readonly number[] = [2_000, 8_000];
 
-export type WorktreeGitRunner = (cmd: string, cwd: string, timeoutMs: number) => Promise<string | null>;
+export type WorktreeGitRunner = (
+  cmd: string, cwd: string, timeoutMs: number, onFailure?: (diagnostic: string) => void,
+) => Promise<string | null>;
 
-async function runGitWithRetry(run: WorktreeGitRunner, cmd: string, cwd: string): Promise<string | null> {
+async function runGitWithRetry(
+  run: WorktreeGitRunner, cmd: string, cwd: string, onFailure?: (diagnostic: string) => void,
+): Promise<string | null> {
+  const failures: string[] = [];
   for (const budget of WORKTREE_SNAPSHOT_GIT_BUDGETS_MS) {
-    const out = await run(cmd, cwd, budget);
+    const out = await run(cmd, cwd, budget, diagnostic => failures.push(diagnostic));
     if (out !== null) return out;
   }
+  // Recovered retries still prove readability; only terminal failures taint the snapshot.
+  if (failures.length) onFailure?.(failures.join('; '));
   return null;
 }
 

@@ -432,6 +432,7 @@ describe('the before-snapshot survives a caller that blocks the event loop (EI-2
   });
 
   it('runGit reports a git child killed by its timeout as unreadable (null), never as empty output', async () => {
+    const failures: string[] = [];
     // Control: an unblocked loop reads the real output.
     expect(await runGit('git --version', process.cwd(), 5_000)).toMatch(/^git version /);
     // Block the loop past the timeout while the child is in flight: exec's timeout handler then
@@ -441,11 +442,13 @@ describe('the before-snapshot survives a caller that blocks the event loop (EI-2
     // iteration runs the expired timeout (timers phase) before it reads the pipe (poll phase).
     const pending = await new Promise<Promise<string | null>>((resolve) => {
       setImmediate(() => {
-        const read = runGit('git --version', process.cwd(), 100);
+        const read = runGit('git --version', process.cwd(), 100, detail => failures.push(detail));
         spawnSync('sleep', ['0.5']);
         resolve(read);
       });
     });
     expect(await pending).toBeNull();
+    expect(failures).toHaveLength(1);
+    expect(JSON.parse(failures[0])).toMatchObject({ command: 'git --version', timeoutMs: 100, killed: true });
   });
 });
