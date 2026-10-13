@@ -2,6 +2,7 @@ import { homedir, hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { accessSync, constants as fsConstants, mkdirSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { recordTestcontainerUse, resolveTestcontainerLastUsedRoot } from './testcontainer-last-used.ts';
 
 /**
  * The default wait budget is part of the test-fixture contract: callers that
@@ -208,11 +209,19 @@ export async function withTestcontainerStartLock<T>(
   // Dockerode client. Without it, docker-modem has no response timeout: a
   // single fetch/create/start request can hold this fleet-wide lock forever.
   ensureTestcontainersDockerClientTimeout();
+  const root = testcontainerStartLockRoot();
+  // WI-6554700010009309: stamp every container this start resolved (created or
+  // reused) so the hourly docker reclaim can tell a used container from a
+  // leaked one. Best-effort; never fails the start.
+  const startAndRecordUse = async (): Promise<T> => {
+    const result = await start();
+    await recordTestcontainerUse(result, resolveTestcontainerLastUsedRoot(root));
+    return result;
+  };
   if (process.env.PAPERCUSP_DISABLE_TESTCONTAINERS_START_LOCK === '1') {
-    return start();
+    return startAndRecordUse();
   }
 
-  const root = testcontainerStartLockRoot();
   const lockDir = join(root, `${safeName(name)}.lock`);
   const timeoutMs = opts.timeoutMs ?? intEnv(
     'PAPERCUSP_TESTCONTAINERS_START_LOCK_TIMEOUT_MS',
@@ -261,7 +270,7 @@ export async function withTestcontainerStartLock<T>(
   }
 
   try {
-    return await start();
+    return await startAndRecordUse();
   } finally {
     await rm(lockDir, { recursive: true, force: true });
   }
