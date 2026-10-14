@@ -50,6 +50,25 @@ function ev(type: string, data: Record<string, unknown>) {
 }
 
 describe('node:test ledger collector fold', () => {
+  it('coalesces absolute assertions with relative terminal metadata, without phantom diagnostic files', () => {
+    const fold = createNodeTestLedgerFold('/repo');
+    fold.push(ev('test:pass', { name: 'real assertion', details: { type: 'test' } }));
+    fold.push(ev('test:summary', { file: 'papercusp-desktop/test/guard.test.js', counts: { tests: 1, suites: 0 } }));
+    fold.push(ev('test:diagnostic', { file: 'unexecuted.test.js', message: 'metadata only' }));
+    expect(fold.summary().files).toHaveLength(1);
+    expect(fold.summary().files[0]).toMatchObject({ file: FILE, passed: 1, failed: 0 });
+  });
+
+  it('keeps different directories with the same basename separate and preserves zero-case summaries', () => {
+    const fold = createNodeTestLedgerFold('/repo');
+    fold.push(ev('test:pass', { file: 'a/shared.test.js', name: 'case', details: { type: 'test' } }));
+    fold.push(ev('test:summary', { file: 'b/shared.test.js', counts: { tests: 0, suites: 0 } }));
+    fold.push(ev('test:pass', { file: '/repo/b/shared.test.js', name: 'b/shared.test.js', line: 1,
+      column: 1, details: { type: 'test' } }));
+    expect(fold.summary().files.map(row => ({ file: row.file, passed: row.passed }))).toEqual([
+      { file: '/repo/a/shared.test.js', passed: 1 }, { file: '/repo/b/shared.test.js', passed: 0 },
+    ]);
+  });
   it('excludes a successful file wrapper when no selected assertion ran', () => {
     const fold = createNodeTestLedgerFold();
     fold.push(ev('test:pass', { name: FILE, details: { type: 'test' } }));
@@ -68,6 +87,15 @@ describe('node:test ledger collector fold', () => {
     fold.push(ev('test:pass', { name: FILE, line: 1, column: 1, details: { type: 'test' } }));
     fold.push(ev('test:summary', { counts: { tests: 1, suites: 0 } }));
     expect(fold.summary().files[0]).toMatchObject({ passed: 1, failed: 0, passedCaseTitles: [FILE] });
+  });
+
+  it('does not credit an ambiguous empty-file wrapper from a file-less global summary', () => {
+    const fold = createNodeTestLedgerFold();
+    fold.push(ev('test:start', { name: 'guard.test.js', line: 1, column: 1 }));
+    fold.push(ev('test:pass', { name: 'guard.test.js', line: 1, column: 1,
+      details: { type: 'test' } }));
+    fold.push({ type: 'test:summary', data: { counts: { tests: 1, passed: 1, suites: 0 } } });
+    expect(fold.summary().files[0]).toMatchObject({ passed: 0, failed: 0 });
   });
 
   it('names nested cases by their ancestors and counts pass / fail / skip / todo per file', () => {
@@ -253,11 +281,50 @@ describe('beginNodeTestLedger — a real node --test child', () => {
         written.push(...rows);
       },
     });
-    const child = spawnSync(process.execPath, ['--test', ...session.reporterArgs, 'fx.test.mjs'], {
+    // Keep actual native ordering when a collector assertion fails; synthetic
+    // summary-before-wrapper events alone do not cover Node's protocol.
+    const tracePath = join(dir, 'events.json');
+    const tee = join(dir, 'tee-reporter.mjs');
+    writeFileSync(tee, `import collector from ${JSON.stringify(new URL('./node-test-ledger-collector.ts', import.meta.url).href)};
+      import { writeFileSync } from 'node:fs';
+      export default async function* (events) {
+        const rows = [];
+        async function* input() {
+          for await (const event of events) {
+            const d = event.data ?? {};
+            if (['test:start','test:pass','test:fail','test:summary'].includes(event.type))
+              rows.push({ type:event.type, file:d.file, name:d.name, nesting:d.nesting,
+                line:d.line, column:d.column, details:d.details, counts:d.counts });
+            yield event;
+          }
+          writeFileSync(${JSON.stringify(tracePath)}, JSON.stringify(rows));
+        }
+        yield* collector(input());
+      }`);
+    const reporterArgs = session.reporterArgs.map(arg =>
+      arg.startsWith('--test-reporter=') && arg !== '--test-reporter=spec' ? `--test-reporter=${tee}` : arg);
+    const child = spawnSync(process.execPath, ['--test', ...reporterArgs, 'fx.test.mjs'], {
       cwd: dir, encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' },
     });
-    return { session, child, written };
+    const summaryArg = session.reporterArgs.find(arg => arg.startsWith('--test-reporter-destination=') && arg.endsWith('summary.json'));
+    const summary = summaryArg ? JSON.parse(readFileSync(summaryArg.split('=').slice(1).join('='), 'utf8')) : null;
+    const events = JSON.parse(readFileSync(tracePath, 'utf8'));
+    return { session, child, written, summary, events };
   }
+
+  it.each([
+    { body: "import { test } from 'node:test'; test('one', () => {});", exit: 0, passed: 1, failed: 0 },
+    { body: "import { test } from 'node:test'; test('fx.test.mjs', () => {});", exit: 0, passed: 1, failed: 0 },
+    { body: "import { test } from 'node:test'; test('one', () => { throw new Error('native failure'); });", exit: 1, passed: 0, failed: 1 },
+    { body: '// genuinely zero assertions', exit: 0, passed: 0, failed: 0 },
+  ])('retains one canonical native file population with passed=$passed failed=$failed', async expected => {
+    const { session, child, summary, events } = await runChild(expected.body);
+    expect(child.status).toBe(expected.exit);
+    expect(summary.files).toHaveLength(1);
+    expect(summary.files[0], JSON.stringify(events)).toMatchObject({ file: join(dir!, 'fx.test.mjs'),
+      passed: expected.passed, failed: expected.failed });
+    await session.record();
+  });
 
   it('keeps the spec output on stdout and records a failing mutant run with its failed case', async () => {
     const { session, child, written } = await runChild([

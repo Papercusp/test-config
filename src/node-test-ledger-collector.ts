@@ -20,7 +20,7 @@
  * Node strips the types natively when it loads this file, so it must stay ERASABLE-ONLY
  * TypeScript (no enums, namespaces or parameter properties) and import only node builtins.
  */
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
 
 export const NODE_TEST_LEDGER_SUMMARY_SCHEMA_VERSION = 1 as const;
 
@@ -83,6 +83,8 @@ interface FileState {
   zeroCaseSummary: boolean;
   /** Names of the tests currently open at each nesting level (from test:start). */
   stack: string[];
+  pendingFileWrapperPasses: number;
+  pendingFileWrapperTitle: string | null;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -117,7 +119,7 @@ function isFileLevelFailure(file: string, name: string, nesting: number, error: 
   return name === file || file.endsWith(name) || name.endsWith(basename(file));
 }
 
-export function createNodeTestLedgerFold(): {
+export function createNodeTestLedgerFold(cwd: string = process.cwd()): {
   push(event: ReporterEvent): void;
   summary(): NodeTestLedgerSummary;
 } {
@@ -133,6 +135,8 @@ export function createNodeTestLedgerFold(): {
         },
         stack: [],
         zeroCaseSummary: false,
+        pendingFileWrapperPasses: 0,
+        pendingFileWrapperTitle: null,
       };
       files.set(file, state);
     }
@@ -141,11 +145,15 @@ export function createNodeTestLedgerFold(): {
 
   return {
     push(event) {
+      // Node can attach a relative file to late summary/diagnostic events while
+      // assertions name the same file absolutely. Admit only ledger-bearing
+      // events and use one stable lexical identity; never merge by basename.
+      if (!['test:summary', 'test:start', 'test:pass', 'test:fail'].includes(event?.type)) return;
       const data = record(event?.data);
       if (!data) return;
       // A file-less event cannot be attributed to a ledger row; dropping it is the honest
       // outcome (no row) rather than inventing a path.
-      const file = typeof data.file === 'string' && data.file.length > 0 ? data.file : null;
+      const file = typeof data.file === 'string' && data.file.length > 0 ? resolve(cwd, data.file) : null;
       if (!file) return;
       const name = typeof data.name === 'string' ? data.name : '';
       const nesting = typeof data.nesting === 'number' && data.nesting >= 0 ? data.nesting : 0;
@@ -154,6 +162,23 @@ export function createNodeTestLedgerFold(): {
       if (event.type === 'test:summary') {
         const counts = record(data.counts);
         state.zeroCaseSummary = counts?.tests === 0 && counts?.suites === 0;
+        // A filename-shaped line=1,column=1 pass can be Node's empty-file
+        // wrapper. Only a FILE-scoped summary can qualify it as an assertion;
+        // the global summary counts wrappers too and proves nothing here.
+        const observed = state.result.passed + state.result.failed + state.result.skipped;
+        const confirmed = typeof counts?.tests === 'number' && Number.isSafeInteger(counts.tests)
+          ? Math.min(state.pendingFileWrapperPasses, Math.max(0, counts.tests - observed)) : 0;
+        if (confirmed > 0) {
+          state.result.passed += confirmed;
+          const title = state.pendingFileWrapperTitle;
+          const titles = state.result.passedCaseTitles ??= [];
+          if (title && isRecordedCaseTitle(title) && !titles.includes(title)) {
+            if (titles.length < MAX_RECORDED_PASSED_CASES) titles.push(title);
+            else state.result.passedCaseTitlesTruncated = true;
+          }
+        }
+        state.pendingFileWrapperPasses = 0;
+        state.pendingFileWrapperTitle = null;
         return;
       }
       if (event.type === 'test:start') {
@@ -178,6 +203,13 @@ export function createNodeTestLedgerFold(): {
         // Process success is never evidence of a passing assertion.
         if (nesting === 0 && (state.zeroCaseSummary || typeof data.line !== 'number') &&
           (name === file || name === basename(file) || file.endsWith(`/${name}`))) return;
+        if (nesting === 0 && data.line === 1 && data.column === 1 &&
+            (name === file || name === basename(file) || file.endsWith(`/${name}`)) &&
+            !isFlagSet(data.skip) && !isFlagSet(data.todo)) {
+          state.pendingFileWrapperPasses += 1;
+          state.pendingFileWrapperTitle = title;
+          return;
+        }
         if (isFlagSet(data.skip) || isFlagSet(data.todo)) state.result.skipped += 1;
         else {
           state.result.passed += 1;
