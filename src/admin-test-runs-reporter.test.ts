@@ -10,12 +10,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import { MAX_RECORDED_PASSED_CASES } from './execution-details.ts';
 import AdminTestRunsReporter, {
   buildOutputTail,
@@ -162,6 +164,126 @@ describe('reporter ledger endpoint selection', () => {
 });
 
 describe('receipt-backed native archive reporter', () => {
+  it('distinguishes real Vitest fork-stop callback starvation from worker handles', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'native-archive-stop-ipc-'));
+    const root = join(parent, 'source');
+    mkdirSync(root);
+    writeFileSync(join(root, 'probe.test.ts'), 'test("tiny fork", () => expect(true).toBe(true));\n');
+    const git = (args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
+    const identity = ['-c', 'user.name=Archive Test', '-c', 'user.email=archive@example.invalid'];
+    git(['init', '--quiet']);
+    git([...identity, 'commit', '--allow-empty', '--quiet', '-m', 'parent']);
+    git(['add', 'probe.test.ts']);
+    git([...identity, 'commit', '--quiet', '-m', 'source']);
+    const sourceCommit = git(['rev-parse', 'HEAD']);
+    const files = verifierSourceFiles(root, { gitMetadataPaths: ['.git'] });
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })), files,
+      gitCheckout: verifierGitCheckoutSync(root, sourceCommit) };
+    const receiptPath = join(parent, 'receipt.json');
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    const require = createRequire(import.meta.url);
+    const probePath = join(parent, 'stop-ipc.mjs');
+    // Run the real Vitest pool in an owned child. Only reporter-side Git is
+    // slowed, identically in both modes; the passing test worker has no handles.
+    writeFileSync(probePath, `
+      import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+      import { Writable } from 'node:stream';
+      import { join } from 'node:path';
+      const { createVitest, ForksPoolWorker } = await import(${JSON.stringify(pathToFileURL(require.resolve('vitest/node')).href)});
+      const { readVerifierSourceReceiptSync } = await import(${JSON.stringify(new URL('./verifier-source.ts', import.meta.url).href)});
+      const { captureWorktreeSnapshot, setRunRoot } = await import(${JSON.stringify(new URL('./admin-test-runs-reporter.ts', import.meta.url).href)});
+      const [root, receiptPath, mode, parent] = process.argv.slice(2);
+      const events = [];
+      const logs = [];
+      let notifyStop;
+      const stopRequested = new Promise(resolve => { notifyStop = resolve; });
+      const originalPath = process.env.PATH;
+      const shim = join(parent, 'slow-git-' + mode);
+      const exitedPath = join(parent, 'kernel-exited-' + mode);
+      mkdirSync(shim);
+      writeFileSync(join(shim, 'git'), '#!' + process.execPath + '\\n' +
+        'const { spawnSync } = require("node:child_process");\\n' +
+        'const { readFileSync, writeFileSync } = require("node:fs");\\n' +
+        'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);\\n' +
+        'if (process.platform === "linux") { try {\\n' +
+        '  const stat = readFileSync("/proc/" + process.env.STOP_IPC_PROBE_FORK_PID + "/stat", "utf8");\\n' +
+        '  if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")) writeFileSync(' + JSON.stringify(exitedPath) + ', "exited");\\n' +
+        '} catch (error) { if (error.code === "ENOENT") writeFileSync(' + JSON.stringify(exitedPath) + ', "exited"); else throw error; } }\\n' +
+        'const result = spawnSync("git", process.argv.slice(2), { stdio: "inherit", env: { ...process.env, PATH: ' + JSON.stringify(originalPath) + ' } });\\n' +
+        'process.exit(result.status ?? 1);\\n', { mode: 0o755 });
+      let snapshot;
+      const stream = new Writable({ write(chunk, _encoding, done) { logs.push(String(chunk)); done(); } });
+      const runner = await createVitest('test', { root, config: false, watch: false,
+        globals: true, include: ['probe.test.ts'], maxWorkers: 1, teardownTimeout: 300,
+        pool: { name: 'receipt-forks', createPoolWorker(options) {
+          events.push('pool-created');
+          const worker = new ForksPoolWorker(options);
+          const send = worker.send.bind(worker);
+          worker.send = message => {
+            if (message.type === 'stop') {
+              events.push('stop-request'); send(message); notifyStop();
+            } else send(message);
+          };
+          const start = worker.start.bind(worker);
+          worker.start = async () => { await start();
+            process.env.STOP_IPC_PROBE_FORK_PID = String(worker._fork.pid);
+            worker.on('message', message => {
+            if (message?.type === 'stopped') events.push('stopped-ipc');
+          }); };
+          const stop = worker.stop.bind(worker);
+          worker.stop = async () => { events.push('worker-stop'); await stop(); events.push('worker-exited'); };
+          return worker;
+        } },
+        reporters: [{ async onTestRunEnd(modules, errors, reason) {
+          if (reason !== 'passed' || errors.length || modules.length !== 1) throw new Error('tiny test did not pass');
+          if (!events.includes('pool-created')) throw new Error('instrumented pool was not selected');
+          // Vitest may enter its reporter before schedule() resumes. Synchronize
+          // this probe to the real stop request, not an assumed microtask order.
+          await stopRequested;
+          events.push('reporter-start');
+          process.env.PATH = shim + ':' + originalPath;
+          process.env.VERIFY_TAURI_SOURCE_RECEIPT = receiptPath;
+          process.env.VERIFY_TAURI_SOURCE_REF = ${JSON.stringify(sourceCommit)};
+          setRunRoot(root);
+          try {
+            snapshot = mode === 'sync' ? { commit: readVerifierSourceReceiptSync(root).sourceCommit, porcelain: '' }
+              : await captureWorktreeSnapshot();
+            events.push('snapshot-end');
+          } finally { process.env.PATH = originalPath; setRunRoot(null); }
+        } }],
+      }, undefined, { stdout: stream, stderr: stream });
+      try { await runner.start(); } finally { await runner.close(); }
+      console.log(JSON.stringify({ mode, events, snapshot, osExitObserved: existsSync(exitedPath),
+        warning: logs.join('').includes('Timeout terminating receipt-forks worker') }));
+    `);
+    try {
+      const results = [];
+      for (const mode of ['sync', 'async']) {
+        const { stdout } = await promisify(execFile)(process.execPath,
+          ['--import', require.resolve('tsx'), probePath, root, receiptPath, mode, parent],
+          { timeout: 20_000, maxBuffer: 1024 * 1024 });
+        results.push(JSON.parse(stdout.trim().split('\n').at(-1)!));
+      }
+      const [sync, async] = results;
+      for (const result of results) {
+        expect(result.snapshot, JSON.stringify(result)).toEqual({ commit: sourceCommit, porcelain: '' });
+        expect(result.events, JSON.stringify(result)).toContain('pool-created');
+        expect(result.events, JSON.stringify(result)).toContain('worker-exited');
+        if (process.platform === 'linux') expect(result.osExitObserved, JSON.stringify(result)).toBe(true);
+        expect(result.events.indexOf('stop-request'), JSON.stringify(result)).toBeLessThan(result.events.indexOf('reporter-start'));
+      }
+      expect(sync.warning, JSON.stringify(sync)).toBe(true);
+      expect(sync.events.indexOf('snapshot-end'), JSON.stringify(sync)).toBeLessThan(sync.events.indexOf('worker-exited'));
+      expect(async.warning, JSON.stringify(async)).toBe(false);
+      expect(async.events.indexOf('stopped-ipc'), JSON.stringify(async)).toBeLessThan(async.events.indexOf('snapshot-end'));
+      expect(async.events.indexOf('worker-exited'), JSON.stringify(async)).toBeLessThan(async.events.indexOf('snapshot-end'));
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   it('keeps worker-stop IPC responsive while validating an archive snapshot', async () => {
     const parent = mkdtempSync(join(tmpdir(), 'native-archive-responsive-'));
     const root = join(parent, 'source');
@@ -189,7 +311,7 @@ describe('receipt-backed native archive reporter', () => {
     try {
       const snapshot = await captureWorktreeSnapshot();
       expect(snapshot).toEqual({ commit: receipt.sourceCommit, porcelain: '' });
-      // Vitest starts fork termination before reporter finalization. Its IPC
+      // Vitest fork termination can overlap reporter finalization. Its IPC
       // callbacks must run while census/Git work is pending, even on a tiny tree.
       expect(heartbeat).toBe(true);
       git(['checkout', '--detach', '--quiet', 'HEAD^']);
