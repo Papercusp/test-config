@@ -88,6 +88,11 @@ describe('prospective evaluator inputs', () => {
     const observed = endFile('/repo/test.ts')?.moduleEvaluations;
     expect(observed?.entries).toEqual([]);
     expect(observed?.reasons).toContain('invalid-evaluator-input');
+    beginFile(); installModuleEvaluationCapture({ moduleRunner: { evaluator } });
+    expect(() => evaluator.runInlinedModule({}, 'source', {
+      get id() { throw new Error('observation unavailable'); },
+    })).not.toThrow();
+    expect(endFile('/repo/test.ts')?.moduleEvaluations?.reasons).toContain('invalid-evaluator-input');
   });
 
   it('correlates concurrent evaluator calls with the actual asynchronous VM arguments', async () => {

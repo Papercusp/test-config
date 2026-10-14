@@ -217,25 +217,23 @@ export function installModuleEvaluationCapture(mocker: unknown, artifactRoot?: s
     if (!evaluator || typeof evaluator.runInlinedModule !== 'function') throw new Error('unavailable');
     wrap(evaluator, 'runInlinedModule', () => {}, (original, receiver, args) => {
       const recorder = state.current, observation = recorder?.moduleEvaluations;
-      const code = args[1], id = (args[2] as { id?: unknown } | null)?.id;
-      if (!recorder || !observation) return original.apply(receiver, args);
-      if (typeof code !== 'string' || typeof id !== 'string' || id.length === 0) {
-        if (!observation.reasons.includes('invalid-evaluator-input')) observation.reasons.push('invalid-evaluator-input');
-        return original.apply(receiver, args);
-      }
-      if (observation.entries.length >= 100_000) {
-        if (!observation.reasons.includes('evaluator-observation-limit')) observation.reasons.push('evaluator-observation-limit');
-        return original.apply(receiver, args);
-      }
-      let inputIndex: number | undefined;
+      let active: { recorder: Recorder; inputIndex: number; id: string; code: string } | undefined;
       try {
-        observation.entries.push({ id, ...retainEvaluationCode(code, recorder, observation) });
-        inputIndex = observation.entries.length - 1;
+        const code = args[1], id = (args[2] as { id?: unknown } | null)?.id;
+        if (recorder && observation) {
+          if (typeof code !== 'string' || typeof id !== 'string' || id.length === 0) {
+            if (!observation.reasons.includes('invalid-evaluator-input')) observation.reasons.push('invalid-evaluator-input');
+          } else if (observation.entries.length >= 100_000) {
+            if (!observation.reasons.includes('evaluator-observation-limit')) observation.reasons.push('evaluator-observation-limit');
+          } else {
+            observation.entries.push({ id, ...retainEvaluationCode(code, recorder, observation) });
+            active = { recorder, inputIndex: observation.entries.length - 1, id, code };
+          }
+        }
       } catch {
-        if (!observation.reasons.includes('invalid-evaluator-input')) observation.reasons.push('invalid-evaluator-input');
+        if (observation && !observation.reasons.includes('invalid-evaluator-input')) observation.reasons.push('invalid-evaluator-input');
       }
-      return inputIndex === undefined ? original.apply(receiver, args) :
-        state.evaluationContext.run({ recorder, inputIndex, id, code }, () => original.apply(receiver, args));
+      return active ? state.evaluationContext.run(active, () => original.apply(receiver, args)) : original.apply(receiver, args);
     });
     if (!(evaluator.runInlinedModule as unknown as Record<symbol, unknown>)[WRAPPED]) throw new Error('unavailable');
     for (const api of ['runInThisContext', 'runInContext'] as const) {
