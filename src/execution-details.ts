@@ -193,10 +193,15 @@ export interface TestRunExecutionDetails {
   check?: RecordedRubricCheck;
 }
 
-/** Ledger framework value for rows that record an executed rubric probe or instrument check. */
+/** Ledger framework value for rows that record an executed rubric probe, instrument or tests check. */
 export const RUBRIC_CHECK_FRAMEWORK = 'rubric-check' as const;
 
-export const RECORDED_RUBRIC_CHECK_KINDS = ['probe', 'instrument'] as const;
+/**
+ * `tests` records a verdict JUDGED from the test-run ledger (the latest row of each named
+ * test file), as the spec-conformance run does for a requirement whose check is a tests check.
+ * Its value is the count of passing files; the deciding test-file rows stay in the same ledger.
+ */
+export const RECORDED_RUBRIC_CHECK_KINDS = ['probe', 'instrument', 'tests'] as const;
 export type RecordedRubricCheckKind = typeof RECORDED_RUBRIC_CHECK_KINDS[number];
 
 /** One executed probe or instrument check: its id, the measured value, and that value's unit. */
