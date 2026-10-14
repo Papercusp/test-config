@@ -59,7 +59,7 @@ import AdminTestRunsReporter, {
 } from './admin-test-runs-reporter';
 import { parseTestRunExecutionDetails } from './execution-details.ts';
 import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
-import { verifierSourceFiles } from './verifier-source.ts';
+import { verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
@@ -162,6 +162,47 @@ describe('reporter ledger endpoint selection', () => {
 });
 
 describe('receipt-backed native archive reporter', () => {
+  it('keeps worker-stop IPC responsive while validating an archive snapshot', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'native-archive-responsive-'));
+    const root = join(parent, 'source');
+    mkdirSync(root);
+    writeFileSync(join(root, 'source.ts'), 'export const source = true;\n');
+    const git = (args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
+    const identity = ['-c', 'user.name=Archive Test', '-c', 'user.email=archive@example.invalid'];
+    git(['init', '--quiet']);
+    git([...identity, 'commit', '--allow-empty', '--quiet', '-m', 'parent']);
+    git(['add', 'source.ts']);
+    git([...identity, 'commit', '--quiet', '-m', 'source']);
+    const sourceCommit = git(['rev-parse', 'HEAD']);
+    const files = verifierSourceFiles(root, { gitMetadataPaths: ['.git'] });
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })), files,
+      gitCheckout: verifierGitCheckoutSync(root, sourceCommit) };
+    const receiptPath = join(parent, 'receipt.json');
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', receiptPath);
+    vi.stubEnv('VERIFY_TAURI_SOURCE_REF', receipt.sourceCommit);
+    setRunRoot(root);
+    let heartbeat = false;
+    const tick = new Promise<void>(resolve => setImmediate(() => { heartbeat = true; resolve(); }));
+    try {
+      const snapshot = await captureWorktreeSnapshot();
+      expect(snapshot).toEqual({ commit: receipt.sourceCommit, porcelain: '' });
+      // Vitest starts fork termination before reporter finalization. Its IPC
+      // callbacks must run while census/Git work is pending, even on a tiny tree.
+      expect(heartbeat).toBe(true);
+      git(['checkout', '--detach', '--quiet', 'HEAD^']);
+      expect(await captureWorktreeSnapshot()).toMatchObject({ commit: null, porcelain: null,
+        provenanceError: expect.stringContaining('verification Git checkout differs') });
+    } finally {
+      await tick;
+      setRunRoot(null);
+      vi.unstubAllEnvs();
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   it.each([false, true])('records the archive identity and detects source mutation=%s', async mutate => {
     const parent = mkdtempSync(join(tmpdir(), 'native-archive-reporter-'));
     const root = join(parent, 'source');
