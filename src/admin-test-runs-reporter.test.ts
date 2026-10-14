@@ -34,7 +34,9 @@ import AdminTestRunsReporter, {
   computeIsScratchConfig,
   inferWorkspaceRoot,
   insertTestRunRowsWithSql,
+  isDefinitePreSubmitFailure,
   isMissingConfigurationSnapshotColumn,
+  missingTestRunReceiptPaths,
   readRunConfigRoot,
   setRunRoot,
   toWorkspaceRel,
@@ -56,6 +58,7 @@ import AdminTestRunsReporter, {
   appendTestRunReceipts,
   reporterWriteBudget,
   type PgSql,
+  type TestRunReceipt,
   type TestRunRow,
   type WorktreeGitRunner,
 } from './admin-test-runs-reporter';
@@ -946,20 +949,22 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         { id: '901', file_path: 'a.test.ts' },
       ]);
       const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts'), row('b.test.ts', 'pass')], context);
-      expect(receipts).toEqual([
+      expect(receipts).toMatchObject([
         { filePath: 'a.test.ts', status: 'fail', outcome: 'inserted', id: '901' },
         { filePath: 'b.test.ts', status: 'pass', outcome: 'inserted', id: '902' },
       ]);
     });
 
     it('reports a batch that outlives its budget as timeout instead of silently dropping it', async () => {
-      const sql = fakeSql(() => new Promise(() => {}));
+      const statement = vi.fn(() => new Promise(() => {}));
+      const sql = fakeSql(statement);
       const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts')], context, {
         insertTimeoutMs: 20, totalInsertMs: 1_000,
       });
-      expect(receipts).toEqual([
+      expect(receipts).toMatchObject([
         { filePath: 'a.test.ts', status: 'fail', outcome: 'timeout', reason: 'pg_insert_timeout_20ms' },
       ]);
+      expect(statement).toHaveBeenCalledTimes(1);
     });
 
     it('reports a rejected insert as failed with the reason', async () => {
@@ -967,9 +972,68 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts')], context, {
         insertTimeoutMs: 1_000, totalInsertMs: 1_000,
       });
-      expect(receipts).toEqual([
+      expect(receipts).toMatchObject([
         { filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: 'remaining connection slots are reserved' },
       ]);
+    });
+
+    it('replays one definite pre-submit timeout with the same receipt id and execution details', async () => {
+      const details = { schemaVersion: 1, filePath: 'a.test.ts', passed: 1 };
+      const rows: TestRunRow[] = [{ ...row('a.test.ts', 'pass'),
+        executionDetails: details as unknown as TestRunRow['executionDetails'] }];
+      const statement = vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('connect timeout'), { code: 'CONNECT_TIMEOUT' }))
+        .mockResolvedValueOnce([{ id: '901', file_path: 'a.test.ts' }]);
+      const sql = fakeSql(statement);
+
+      const receipts = await insertTestRunRowsWithSql(sql, rows, context, {
+        insertTimeoutMs: 1_000, totalInsertMs: 2_000,
+      });
+
+      expect(isDefinitePreSubmitFailure(Object.assign(new Error('connect timeout'), { code: 'CONNECT_TIMEOUT' }))).toBe(true);
+      expect(isDefinitePreSubmitFailure(Object.assign(new Error('wait timeout'), { code: 'ETIMEDOUT' }))).toBe(false);
+      expect(statement).toHaveBeenCalledTimes(2);
+      expect(receipts.map(receipt => ({ outcome: receipt.outcome, attempt: receipt.attempt, receiptId: receipt.receiptId }))).toEqual([
+        { outcome: 'failed', attempt: 0, receiptId: receipts[0]?.receiptId },
+        { outcome: 'inserted', attempt: 1, receiptId: receipts[0]?.receiptId },
+      ]);
+      expect(receipts[0]).toMatchObject({ outcome: 'failed', replayable: true, errorCode: 'CONNECT_TIMEOUT' });
+      expect(receipts[1]).toMatchObject({ outcome: 'inserted', id: '901', row: { executionDetails: details } });
+    });
+
+    it('does not replay a CONNECT_TIMEOUT more than once', async () => {
+      const statement = vi.fn(async () => {
+        throw Object.assign(new Error('connect timeout'), { code: 'CONNECT_TIMEOUT' });
+      });
+      const receipts = await insertTestRunRowsWithSql(fakeSql(statement), [row('a.test.ts')], context, {
+        insertTimeoutMs: 1_000, totalInsertMs: 2_000,
+      });
+
+      expect(statement).toHaveBeenCalledTimes(2);
+      expect(receipts.map(receipt => [receipt.outcome, receipt.attempt,
+        receipt.outcome === 'inserted' ? null : receipt.replayable])).toEqual([
+        ['failed', 0, true], ['failed', 1, false],
+      ]);
+    });
+
+    it('requires a canonical inserted receipt for each expected file and accepts a later attempt', () => {
+      const rowReceipt = {
+        filePath: 'apps/operator/a.test.ts', status: 'pass',
+        row: { filePath: 'apps/operator/a.test.ts', startedAt: '2026-10-06T01:15:00.000Z', finishedAt: '2026-10-06T01:15:01.000Z' },
+        receiptId: 'receipt-a', attempt: 0,
+      };
+      const log = [
+        { ...rowReceipt, outcome: 'failed', reason: 'connect timeout', replayable: true },
+        { ...rowReceipt, attempt: 1, outcome: 'inserted', id: '901' },
+        { ...rowReceipt, receiptId: 'receipt-b', filePath: 'apps/operator/b.test.ts', row: {
+          ...rowReceipt.row, filePath: 'apps/operator/b.test.ts',
+        }, outcome: 'timeout', reason: 'waiter expired', replayable: false },
+        '{malformed receipt',
+      ].map(entry => typeof entry === 'string' ? entry : JSON.stringify(entry)).join('\n');
+
+      expect(missingTestRunReceiptPaths(log, [
+        'apps/operator/a.test.ts', 'apps/operator/b.test.ts', 'apps/operator/c.test.ts',
+      ])).toEqual(['apps/operator/b.test.ts', 'apps/operator/c.test.ts']);
     });
 
     it('records late RETURNING ids on the original receipt sink without retrying the insert', async () => {
@@ -988,7 +1052,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         vi.stubEnv(TEST_RUN_RECEIPT_ENV, otherFile);
         resolveInsert([{ id: '902', file_path: 'b.test.ts' }, { id: '901', file_path: 'a.test.ts' }]);
         await vi.waitFor(() => {
-          expect(readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line)).slice(2)).toEqual([
+          expect(readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line)).slice(2)).toMatchObject([
             { filePath: 'a.test.ts', status: 'fail', outcome: 'inserted', id: '901' },
             { filePath: 'b.test.ts', status: 'pass', outcome: 'inserted', id: '902' },
           ]);
@@ -1014,7 +1078,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         expect(receipts[0]?.outcome).toBe('timeout');
         rejectInsert(new Error('connection closed after timeout'));
         await vi.waitFor(() => {
-          expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
+          expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({
             filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: 'connection closed after timeout',
           });
         });
@@ -1028,7 +1092,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     it('marks a returned row set that omits a file as failed, never as inserted', async () => {
       const sql = fakeSql(async () => []);
       const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts')], context);
-      expect(receipts).toEqual([
+      expect(receipts).toMatchObject([
         { filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: 'insert_returned_no_id' },
       ]);
     });
@@ -1037,7 +1101,13 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       const dir = mkdtempSync(join(tmpdir(), 'test-run-receipts-'));
       try {
         const file = join(dir, 'receipts.jsonl');
-        const receipt = { filePath: 'a.test.ts', status: 'fail', outcome: 'inserted' as const, id: '7' };
+        const receiptRow = row('a.test.ts');
+        const receipt: TestRunReceipt = {
+          receiptId: 'receipt-a', attempt: 0, filePath: 'a.test.ts', status: 'fail',
+          row: { ...receiptRow, receiptId: 'receipt-a', receiptAttempt: 0,
+            startedAt: receiptRow.startedAt.toISOString(), finishedAt: receiptRow.finishedAt.toISOString() },
+          outcome: 'inserted', id: '7',
+        };
         appendTestRunReceipts({}, [receipt]);
         expect(() => readFileSync(file, 'utf8')).toThrow();
         appendTestRunReceipts({ [TEST_RUN_RECEIPT_ENV]: file }, [receipt, { ...receipt, id: '8' }]);
@@ -1117,7 +1187,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           insertTimeoutMs: 1_000, totalInsertMs: 1_000,
         });
         expect(fake.statements()).toBe(1);
-        expect(receipts).toEqual([
+        expect(receipts).toMatchObject([
           { filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: other.message },
         ]);
       });

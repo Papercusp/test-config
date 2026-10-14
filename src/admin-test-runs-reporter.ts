@@ -34,7 +34,7 @@ import { exec } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { defaultEvidenceRoot } from '@papercusp/verification-harness';
 // This verifier is built-ins only; do not load operator stores in a reporter.
 import { findVerifierSourceRoot, readVerifierSourceReceipt } from './verifier-source.ts';
@@ -1371,9 +1371,95 @@ export function isMissingConfigurationSnapshotColumn(error: unknown): boolean {
  */
 export const TEST_RUN_RECEIPT_ENV = 'PAPERCUSP_TEST_RUN_RECEIPT_FILE';
 
+type ReceiptIdentifiedTestRunRow = TestRunRow & { receiptId: string; receiptAttempt: number };
+export type SerializedTestRunReceiptRow = Omit<ReceiptIdentifiedTestRunRow, 'startedAt' | 'finishedAt'> & {
+  startedAt: string;
+  finishedAt: string;
+};
+
+type TestRunReceiptBase = {
+  receiptId: string;
+  attempt: number;
+  filePath: string;
+  status: string;
+  row: SerializedTestRunReceiptRow;
+};
+
 export type TestRunReceipt =
-  | { filePath: string; status: string; outcome: 'inserted'; id: string }
-  | { filePath: string; status: string; outcome: 'timeout' | 'failed'; reason: string };
+  | (TestRunReceiptBase & { outcome: 'inserted'; id: string })
+  | (TestRunReceiptBase & {
+      outcome: 'timeout' | 'failed';
+      reason: string;
+      errorCode?: string;
+      replayable: boolean;
+    });
+
+function receiptIdentifiedRows(rows: readonly TestRunRow[]): ReceiptIdentifiedTestRunRow[] {
+  return rows.map(row => {
+    const prior = row as TestRunRow & { receiptId?: unknown; receiptAttempt?: unknown };
+    return {
+      ...row,
+      receiptId: typeof prior.receiptId === 'string' && prior.receiptId.length > 0 ? prior.receiptId : randomUUID(),
+      receiptAttempt: Number.isSafeInteger(prior.receiptAttempt) && Number(prior.receiptAttempt) >= 0
+        ? Number(prior.receiptAttempt) : 0,
+    };
+  });
+}
+
+function serializedReceiptRow(row: ReceiptIdentifiedTestRunRow): SerializedTestRunReceiptRow {
+  return { ...row, startedAt: row.startedAt.toISOString(), finishedAt: row.finishedAt.toISOString() };
+}
+
+function receiptBase(row: ReceiptIdentifiedTestRunRow): TestRunReceiptBase {
+  return {
+    receiptId: row.receiptId,
+    attempt: row.receiptAttempt,
+    filePath: row.filePath,
+    status: row.status,
+    row: serializedReceiptRow(row),
+  };
+}
+
+function errorCode(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  return typeof code === 'string' && code.length > 0 ? code.slice(0, 80) : undefined;
+}
+
+/** postgres-js raises CONNECT_TIMEOUT before it sends a queued statement to PostgreSQL. */
+export function isDefinitePreSubmitFailure(error: unknown): boolean {
+  return errorCode(error) === 'CONNECT_TIMEOUT';
+}
+
+function isTestRunReceipt(value: unknown): value is TestRunReceipt {
+  if (!value || typeof value !== 'object') return false;
+  const receipt = value as Partial<TestRunReceipt>;
+  if (typeof receipt.receiptId !== 'string' || typeof receipt.filePath !== 'string' ||
+      typeof receipt.status !== 'string' || !Number.isSafeInteger(receipt.attempt) ||
+      !receipt.row || typeof receipt.row !== 'object' ||
+      typeof receipt.row.filePath !== 'string' || typeof receipt.row.startedAt !== 'string' ||
+      typeof receipt.row.finishedAt !== 'string') return false;
+  if (receipt.outcome === 'inserted') return typeof receipt.id === 'string' && receipt.id.length > 0;
+  return (receipt.outcome === 'failed' || receipt.outcome === 'timeout') &&
+    typeof receipt.reason === 'string' && typeof receipt.replayable === 'boolean';
+}
+
+/** Return paths without a canonical inserted receipt; inserted acknowledgements dominate timeouts. */
+export function missingTestRunReceiptPaths(receiptLog: string, expectedPaths: readonly string[]): string[] {
+  const latest = new Map<string, TestRunReceipt>();
+  for (const line of receiptLog.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { continue; }
+    if (!isTestRunReceipt(parsed)) continue;
+    const prior = latest.get(parsed.receiptId);
+    if (prior?.outcome === 'inserted') continue;
+    if (parsed.outcome === 'inserted' || !prior || parsed.attempt >= prior.attempt) latest.set(parsed.receiptId, parsed);
+  }
+  const inserted = new Set([...latest.values()]
+    .filter((receipt): receipt is Extract<TestRunReceipt, { outcome: 'inserted' }> => receipt.outcome === 'inserted')
+    .map(receipt => receipt.filePath.replaceAll('\\', '/')));
+  return [...new Set(expectedPaths.map(path => path.replaceAll('\\', '/')))].filter(path => !inserted.has(path));
+}
 
 export function appendTestRunReceipts(env: NodeJS.ProcessEnv, receipts: readonly TestRunReceipt[]): void {
   const file = env[TEST_RUN_RECEIPT_ENV]?.trim();
@@ -1409,8 +1495,20 @@ function receiptReason(error: unknown): string {
   return message.slice(0, 200) || 'unknown';
 }
 
-function unwrittenReceipts(rows: readonly TestRunRow[], outcome: 'timeout' | 'failed', reason: string): TestRunReceipt[] {
-  return rows.map((row) => ({ filePath: row.filePath, status: row.status, outcome, reason }));
+function unwrittenReceipts(
+  rows: readonly TestRunRow[],
+  outcome: 'timeout' | 'failed',
+  reason: string,
+  options: { error?: unknown; replayable?: boolean } = {},
+): TestRunReceipt[] {
+  const code = options.error === undefined ? undefined : errorCode(options.error);
+  return receiptIdentifiedRows(rows).map(row => ({
+    ...receiptBase(row),
+    outcome,
+    reason,
+    ...(code ? { errorCode: code } : {}),
+    replayable: options.replayable === true && row.receiptAttempt === 0,
+  }));
 }
 
 type TestRunInsertContext = {
@@ -1458,6 +1556,7 @@ export async function insertTestRunRowsWithSql(
   onCaseOutcome?: (outcome: TestCaseInsertOutcome) => void,
 ): Promise<TestRunReceipt[]> {
   const receipts: TestRunReceipt[] = [];
+  const identifiedRows = receiptIdentifiedRows(rows);
   // Keep delayed settlement on the evidence sink that belonged to this run,
   // even if another in-process runner changes its environment meanwhile.
   const receiptEnv = { [TEST_RUN_RECEIPT_ENV]: process.env[TEST_RUN_RECEIPT_ENV] };
@@ -1477,42 +1576,40 @@ export async function insertTestRunRowsWithSql(
     }
     return receipts;
   };
-  for (let offset = 0; offset < rows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) {
-      receipts.push(...unwrittenReceipts(rows.slice(offset), 'timeout', `flush_deadline_${budget.totalInsertMs}ms`));
-      return finish();
+  const insertBatch = (sourceRows: readonly ReceiptIdentifiedTestRunRow[]) => sourceRows
+    .map((row) => ({
+      file_path: row.filePath,
+      framework: 'vitest',
+      status: row.status,
+      duration_ms: row.durationMs,
+      // postgres-js's multi-row helper rejects Date objects. ISO strings retain
+      // the same timestamptz value while keeping the helper's type inference valid.
+      started_at: row.startedAt.toISOString(),
+      finished_at: row.finishedAt.toISOString(),
+      output_tail: row.outputTail,
+      run_group_id: context.runGroupId,
+      source: resolveRecordedTestRunSource(context.declaredSource, row.worktreeDirty),
+      branch: context.branch,
+      commit_sha: row.commitSha === null ? null : resolveTestRunCommit(row.commitSha ?? context.inferredCommit),
+      harness_slug: context.harnessSlug,
+      workspace_id: context.workspaceId,
+      loop_lag_p95_ms: context.loopLagP95Ms,
+      rss_mb: context.rssMb,
+      is_scratch_config: row.isScratchConfig,
+      worktree_dirty: row.worktreeDirty,
+      // EI-24799048791133095: pass the OBJECT. This client keeps postgres-js's
+      // default jsonb serializer (JSON.stringify), so a pre-stringified value was
+      // encoded twice and stored as a jsonb STRING scalar; every
+      // `execution_details->>'key'` read then returned NULL.
+      execution_details: row.executionDetails ?? null,
+      // Same object-not-string rule as execution_details above.
+      configuration_snapshot: context.configurationSnapshot ?? null,
+    }));
+  const executeBatch = async (batch: ReturnType<typeof insertBatch>) => {
+    const remainingMs = Math.max(0, deadline - Date.now());
+    if (remainingMs === 0) {
+      return { completed: false, failure: null, timeoutMs: 0, readWritten: () => undefined, query: null };
     }
-    const sourceRows = rows.slice(offset, offset + TEST_RUN_INSERT_BATCH_SIZE);
-    const batch = sourceRows
-      .map((row) => ({
-        file_path: row.filePath,
-        framework: 'vitest',
-        status: row.status,
-        duration_ms: row.durationMs,
-        // postgres-js's multi-row helper rejects Date objects. ISO strings retain
-        // the same timestamptz value while keeping the helper's type inference valid.
-        started_at: row.startedAt.toISOString(),
-        finished_at: row.finishedAt.toISOString(),
-        output_tail: row.outputTail,
-        run_group_id: context.runGroupId,
-        source: resolveRecordedTestRunSource(context.declaredSource, row.worktreeDirty),
-        branch: context.branch,
-        commit_sha: row.commitSha === null ? null : resolveTestRunCommit(row.commitSha ?? context.inferredCommit),
-        harness_slug: context.harnessSlug,
-        workspace_id: context.workspaceId,
-        loop_lag_p95_ms: context.loopLagP95Ms,
-        rss_mb: context.rssMb,
-        is_scratch_config: row.isScratchConfig,
-        worktree_dirty: row.worktreeDirty,
-        // EI-24799048791133095: pass the OBJECT. This client keeps postgres-js's
-        // default jsonb serializer (JSON.stringify), so a pre-stringified value was
-        // encoded twice and stored as a jsonb STRING scalar; every
-        // `execution_details->>'key'` read then returned NULL.
-        execution_details: row.executionDetails ?? null,
-        // Same object-not-string rule as execution_details above.
-        configuration_snapshot: context.configurationSnapshot ?? null,
-      }));
     let written: unknown;
     let failure: unknown = null;
     const query = Promise.resolve(sql`
@@ -1525,33 +1622,71 @@ export async function insertTestRunRowsWithSql(
     );
     const timeoutMs = Math.min(budget.insertTimeoutMs, remainingMs);
     const completed = await settleWithin(query, timeoutMs);
-    if (!completed && failure && columns.includes('configuration_snapshot') && isMissingConfigurationSnapshotColumn(failure)) {
-      // A database without migration 1448: retry this same batch, and every later one,
-      // without the snapshot column rather than lose the rows.
-      columns = columns.filter((column) => column !== 'configuration_snapshot');
-      offset -= TEST_RUN_INSERT_BATCH_SIZE;
-      continue;
+    return { completed, failure, timeoutMs, readWritten: () => written, query };
+  };
+  for (let offset = 0; offset < identifiedRows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      receipts.push(...unwrittenReceipts(identifiedRows.slice(offset), 'timeout', `flush_deadline_${budget.totalInsertMs}ms`));
+      return finish();
     }
+    let sourceRows = identifiedRows.slice(offset, offset + TEST_RUN_INSERT_BATCH_SIZE);
+    let attempt = await executeBatch(insertBatch(sourceRows));
+    let replayed = false;
+    while (!attempt.completed) {
+      if (attempt.failure && columns.includes('configuration_snapshot') && isMissingConfigurationSnapshotColumn(attempt.failure)) {
+        // A database without migration 1448: retry this same batch, and every later one,
+        // without the snapshot column rather than lose the rows.
+        columns = columns.filter((column) => column !== 'configuration_snapshot');
+        attempt = await executeBatch(insertBatch(sourceRows));
+        continue;
+      }
+      // postgres-js raises CONNECT_TIMEOUT before submission. That rejection is the
+      // only failure that proves replay cannot duplicate an INSERT whose outcome is
+      // ambiguous. Keep one receipt per attempt with the same receiptId so consumers
+      // can see the failed attempt and the final acknowledgement together.
+      if (!replayed && attempt.failure && isDefinitePreSubmitFailure(attempt.failure) &&
+          sourceRows.every((row) => row.receiptAttempt === 0) && Date.now() < deadline) {
+        receipts.push(...unwrittenReceipts(sourceRows, 'failed', receiptReason(attempt.failure), {
+          error: attempt.failure, replayable: true,
+        }));
+        sourceRows = sourceRows.map((row) => ({ ...row, receiptAttempt: row.receiptAttempt + 1 }));
+        replayed = true;
+        attempt = await executeBatch(insertBatch(sourceRows));
+        continue;
+      }
+      break;
+    }
+    const { completed, failure, timeoutMs, query } = attempt;
     if (!completed) {
+      const replayable = Boolean(failure && isDefinitePreSubmitFailure(failure));
       receipts.push(
         ...(failure
-          ? unwrittenReceipts(sourceRows, 'failed', receiptReason(failure))
+          ? unwrittenReceipts(sourceRows, 'failed', receiptReason(failure), {
+              error: failure, replayable,
+            })
           : unwrittenReceipts(sourceRows, 'timeout', `pg_insert_timeout_${timeoutMs}ms`)),
         // Later batches are never attempted once one has not completed.
-        ...unwrittenReceipts(rows.slice(offset + TEST_RUN_INSERT_BATCH_SIZE), 'timeout', 'not_attempted_after_failed_batch'),
+        ...unwrittenReceipts(
+          identifiedRows.slice(offset + TEST_RUN_INSERT_BATCH_SIZE),
+          'failed',
+          replayable ? 'not_attempted_after_pre_submit_failure' : 'not_attempted_after_failed_batch',
+          { replayable },
+        ),
       );
       // A timed-out query may still be in flight; queueing case rows behind it would
       // break the one-in-flight-query invariant above, so case rows are dropped here.
-      if (!failure) {
+      if (!failure && query) {
         // The wait expired, not the INSERT. Preserve its eventual RETURNING ids
         // without retrying the statement or extending the foreground budget.
         void query.then(
-          () => appendTestRunReceipts(receiptEnv, insertedReceipts(sourceRows, written)),
+          () => appendTestRunReceipts(receiptEnv, insertedReceipts(sourceRows, attempt.readWritten())),
           (error) => appendTestRunReceipts(receiptEnv, unwrittenReceipts(sourceRows, 'failed', receiptReason(error))),
         );
       }
       return receipts;
     }
+    const written = attempt.readWritten();
     receipts.push(...insertedReceipts(sourceRows, written));
     pairInsertedIds(sourceRows, written).forEach((testRunId, index) => {
       const cases = sourceRows[index]?.cases;
@@ -1566,13 +1701,16 @@ export async function insertTestRunRowsWithSql(
  * Pair RETURNING rows back to the rows we sent. Matched by file_path (multiset), not
  * position: Postgres does not promise RETURNING order for a multi-row insert.
  */
-function insertedReceipts(sourceRows: readonly TestRunRow[], written: unknown): TestRunReceipt[] {
+function insertedReceipts(sourceRows: readonly ReceiptIdentifiedTestRunRow[], written: unknown): TestRunReceipt[] {
   const ids = pairInsertedIds(sourceRows, written);
   return sourceRows.map((row, index): TestRunReceipt => {
     const id = ids[index];
     return id === undefined
-      ? { filePath: row.filePath, status: row.status, outcome: 'failed', reason: 'insert_returned_no_id' }
-      : { filePath: row.filePath, status: row.status, outcome: 'inserted', id };
+      ? {
+          ...receiptBase(row),
+          outcome: 'failed', reason: 'insert_returned_no_id', replayable: false,
+        }
+      : { ...receiptBase(row), outcome: 'inserted', id };
   });
 }
 
