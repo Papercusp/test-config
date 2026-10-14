@@ -21,6 +21,7 @@ import {
   endFile,
   inputsFilePath,
   installCapture,
+  installModuleEvaluationCapture,
 } from './executed-inputs-capture';
 
 const dir = process.env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim();
@@ -41,6 +42,10 @@ if (dir) {
       inferWorkspaceRoot(),
     );
     beginFile();
+    if (process.env.PC_EXECUTED_SOURCE_MAP_OUT?.trim()) {
+      installModuleEvaluationCapture((globalThis as { __vitest_mocker__?: unknown }).__vitest_mocker__,
+        `${process.env.PC_EXECUTED_SOURCE_MAP_OUT}.modules`);
+    }
     // Vitest 4 hands a suite hook (context, suite) and PARSES the first parameter as a fixture
     // pattern: anything but an object pattern throws FixtureParseError ("received \"suite\"").
     // That failed every armed test file at teardown (green-checkpoint round 4 on eb3fa7fe,

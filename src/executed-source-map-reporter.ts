@@ -66,6 +66,8 @@ export interface ExecutedSourceRow {
   opaqueReasons?: string[];
   /** Optional OUT-only diagnostics; never a replacement for the clean-checkout reuse stamp. */
   sourceEvidence?: ExecutedSourceEvidence;
+  /** Prospective evaluator argument hashes. Explicit gaps prevent a full-closure claim. */
+  moduleEvaluations?: InputsRecord['moduleEvaluations'];
 }
 
 export interface ExecutedSourceFlush {
@@ -693,7 +695,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private collectedSources = new WeakMap<TestModule, CollectedSourceEvidence>();
   // OUT diagnostics describe executions, including failed or incomplete ones.
   // They never enter the reusable-pass table or the selector's rows.
-  private diagnostics: Array<{ testFile: string; state: string; sourceEvidence: ExecutedSourceEvidence }> = [];
+  private diagnostics: Array<{ testFile: string; state: string; sourceEvidence: ExecutedSourceEvidence;
+    moduleEvaluations?: InputsRecord['moduleEvaluations'] }> = [];
   private fileResults: NonNullable<ExecutedSourceMapResult['fileResults']>['files'] = [];
 
   private discardInputs(moduleId: string): void {
@@ -791,7 +794,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
             sourceEvidence.status = sourceEvidence.status === 'changed' ? 'changed' : 'unknown';
             sourceEvidence.reasons.push('worker-not-isolated');
           }
-          this.diagnostics.push({ testFile, state, sourceEvidence });
+          this.diagnostics.push({ testFile, state, sourceEvidence,
+            ...(inputs?.moduleEvaluations ? { moduleEvaluations: inputs.moduleEvaluations } : {}) });
         }
       }
       // Mutation phases can report optional diagnostics and named verdicts, but must never
@@ -851,6 +855,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
         opaqueReasons: [...(inputs?.opaque ?? []), ...observed.reasons,
           ...(configDeps === null ? ['config-deps-unavailable'] : [])],
         ...(sourceEvidence ? { sourceEvidence } : {}),
+        ...(this.armed.outPath && inputs?.moduleEvaluations ? { moduleEvaluations: inputs.moduleEvaluations } : {}),
       });
     } catch {
       /* swallow — D-007 */
@@ -945,7 +950,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     const settled = await Promise.race<{ outcome: ExecutedSourceMapOutcome; error: string | null }>([
       this.writeRows({
         // Source diagnostics belong only to OUT. Preserve the existing persisted row contract.
-        rows: rows.map(({ sourceEvidence: _sourceEvidence, ...row }) => row),
+        rows: rows.map(({ sourceEvidence: _sourceEvidence, moduleEvaluations: _moduleEvaluations, ...row }) => row),
         recordedSha,
         runGroupId,
         retiredFiles,

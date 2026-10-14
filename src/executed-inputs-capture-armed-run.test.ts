@@ -92,7 +92,9 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       const map = JSON.parse(readFileSync(run.mapPath, 'utf8')) as {
         workspaceName: string;
         rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[];
-          executedModules?: string[]; sourceEvidence?: { status: string; reasons: string[];
+          executedModules?: string[]; moduleEvaluations?: { basis: string; reasons: string[];
+            entries: Array<{ id: string; sha256: string; byteLength: number; codeRef?: string }> };
+          sourceEvidence?: { status: string; reasons: string[];
             sources: Array<{ path: string; sha256: string; basis?: string }> } }>;
       };
       expect(map.workspaceName).toBe(FIXTURE_WORKSPACE);
@@ -114,6 +116,23 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
         path: dynamicRoute, basis: 'vite-pre-transform',
         sha256: createHash('sha256').update(readFileSync(join(FIXTURE, 'dynamic-route.fixture.ts'))).digest('hex'),
       }));
+      const evaluations = map.rows[0]?.moduleEvaluations;
+      expect(evaluations?.basis).toBe('before-evaluator-call');
+      expect(evaluations?.reasons).not.toContain('evaluator-seam-unavailable');
+      expect(evaluations?.reasons).toContain('external-evaluations-unobserved');
+      const route = evaluations?.entries.filter(row => row.id === join(FIXTURE, 'dynamic-route.fixture.ts'));
+      expect(route?.length).toBeGreaterThan(0);
+      expect(route?.every(row => /^[a-f0-9]{64}$/.test(row.sha256) && row.byteLength > 0)).toBe(true);
+      expect(evaluations?.reasons).not.toContain('code-bytes-not-retained');
+      for (const entry of route ?? []) {
+        expect(entry.codeRef).toBeDefined();
+        const retained = readFileSync(entry.codeRef!);
+        expect(createHash('sha256').update(retained).digest('hex')).toBe(entry.sha256);
+        expect(retained.byteLength).toBe(entry.byteLength);
+      }
+      // The evaluator sees transformed JavaScript; a hash of current TS disk is not its identity.
+      expect(route?.[0]?.sha256).not.toBe(createHash('sha256')
+        .update(readFileSync(join(FIXTURE, 'dynamic-route.fixture.ts'))).digest('hex'));
 
       // The runner-readable result channel reports this flush. The database is unreachable, so
       // the outcome is never `written`; it must still describe the one row.
