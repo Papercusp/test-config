@@ -13,4 +13,6 @@ it('executes a route imported after collection and resetModules with a mocked de
   vi.doMock('./dynamic-dependency.fixture.ts', () => ({ value: 'mocked' }));
   const { route } = await import('./dynamic-route.fixture.ts');
   expect(route()).toBe('mocked');
+  const querystring = await import('node:querystring');
+  expect(querystring.stringify({ observed: 'external' })).toBe('observed=external');
 });

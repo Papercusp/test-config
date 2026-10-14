@@ -93,7 +93,10 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
         workspaceName: string;
         rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[];
           executedModules?: string[]; moduleEvaluations?: { basis: string; reasons: string[];
-            entries: Array<{ id: string; sha256: string; byteLength: number; codeRef?: string }> };
+            entries: Array<{ id: string; sha256: string; byteLength: number; codeRef?: string }>;
+            vmInputs?: Array<{ inputIndex: number; id: string; api: string; filename: string;
+              sha256: string; byteLength: number; codeRef?: string }>;
+            externalCalls?: Array<{ id: string }> };
           sourceEvidence?: { status: string; reasons: string[];
             sources: Array<{ path: string; sha256: string; basis?: string }> } }>;
       };
@@ -119,7 +122,8 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       const evaluations = map.rows[0]?.moduleEvaluations;
       expect(evaluations?.basis).toBe('before-evaluator-call');
       expect(evaluations?.reasons).not.toContain('evaluator-seam-unavailable');
-      expect(evaluations?.reasons).toContain('external-evaluations-unobserved');
+      expect(evaluations?.externalCalls).toContainEqual({ id: 'node:querystring' });
+      expect(evaluations?.reasons).toContain('external-loader-bytes-unobserved');
       const route = evaluations?.entries.filter(row => row.id === join(FIXTURE, 'dynamic-route.fixture.ts'));
       expect(route?.length).toBeGreaterThan(0);
       expect(route?.every(row => /^[a-f0-9]{64}$/.test(row.sha256) && row.byteLength > 0)).toBe(true);
@@ -133,6 +137,20 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       // The evaluator sees transformed JavaScript; a hash of current TS disk is not its identity.
       expect(route?.[0]?.sha256).not.toBe(createHash('sha256')
         .update(readFileSync(join(FIXTURE, 'dynamic-route.fixture.ts'))).digest('hex'));
+      const wrappers = evaluations?.vmInputs?.filter(row => row.id === join(FIXTURE, 'dynamic-route.fixture.ts'));
+      expect(wrappers?.length).toBeGreaterThan(0);
+      for (const entry of wrappers ?? []) {
+        expect(entry.api).toBe('runInThisContext');
+        expect(entry.filename).toBe(entry.id);
+        const retained = readFileSync(entry.codeRef!);
+        expect(createHash('sha256').update(retained).digest('hex')).toBe(entry.sha256);
+        expect(retained.byteLength).toBe(entry.byteLength);
+        const input = evaluations!.entries[entry.inputIndex]!;
+        expect(input.id).toBe(entry.id);
+        expect(entry.sha256).not.toBe(input.sha256);
+        expect(retained.toString()).toContain(readFileSync(input.codeRef!, 'utf8'));
+      }
+      expect(evaluations?.reasons).toContain('pre-setup-evaluations-unobserved');
 
       // The runner-readable result channel reports this flush. The database is unreachable, so
       // the outcome is never `written`; it must still describe the one row.

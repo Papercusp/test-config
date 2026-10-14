@@ -120,7 +120,7 @@ describe('prospective evaluator inputs', () => {
       ]);
       for (const row of observation?.vmInputs ?? []) {
         const actual = compiled[row.inputIndex + 1]![0] as string;
-        expect(readFileSyncForTest(row.codeRef!)).toBe(actual);
+        expect(fs.readFileSync(row.codeRef!, 'utf8')).toBe(actual);
         expect(row.sha256).toBe(createHash('sha256').update(actual).digest('hex'));
         expect(row.byteLength).toBe(Buffer.byteLength(actual));
         expect(row.sha256).not.toBe(observation?.entries[row.inputIndex]?.sha256);
@@ -192,7 +192,6 @@ describe('prospective evaluator inputs', () => {
   });
 });
 
-function readFileSyncForTest(path: string): string { return fs.readFileSync(path, 'utf8'); }
 
 describe('repoPathOf', () => {
   const repo = '/repo';
