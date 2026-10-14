@@ -1458,6 +1458,9 @@ export async function insertTestRunRowsWithSql(
   onCaseOutcome?: (outcome: TestCaseInsertOutcome) => void,
 ): Promise<TestRunReceipt[]> {
   const receipts: TestRunReceipt[] = [];
+  // Keep delayed settlement on the evidence sink that belonged to this run,
+  // even if another in-process runner changes its environment meanwhile.
+  const receiptEnv = { [TEST_RUN_RECEIPT_ENV]: process.env[TEST_RUN_RECEIPT_ENV] };
   const deadline = Date.now() + budget.totalInsertMs;
   let columns: readonly (typeof TEST_RUN_INSERT_COLUMNS)[number][] = TEST_RUN_INSERT_COLUMNS;
   // Case rows ride behind their file rows: collected per inserted batch, written once
@@ -1539,6 +1542,14 @@ export async function insertTestRunRowsWithSql(
       );
       // A timed-out query may still be in flight; queueing case rows behind it would
       // break the one-in-flight-query invariant above, so case rows are dropped here.
+      if (!failure) {
+        // The wait expired, not the INSERT. Preserve its eventual RETURNING ids
+        // without retrying the statement or extending the foreground budget.
+        void query.then(
+          () => appendTestRunReceipts(receiptEnv, insertedReceipts(sourceRows, written)),
+          (error) => appendTestRunReceipts(receiptEnv, unwrittenReceipts(sourceRows, 'failed', receiptReason(error))),
+        );
+      }
       return receipts;
     }
     receipts.push(...insertedReceipts(sourceRows, written));

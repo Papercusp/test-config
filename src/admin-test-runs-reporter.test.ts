@@ -972,6 +972,59 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       ]);
     });
 
+    it('records late RETURNING ids on the original receipt sink without retrying the insert', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'test-run-late-receipts-'));
+      const file = join(dir, 'original.jsonl');
+      const otherFile = join(dir, 'other.jsonl');
+      let resolveInsert!: (value: unknown) => void;
+      const statement = vi.fn(() => new Promise(resolve => { resolveInsert = resolve; }));
+      vi.stubEnv(TEST_RUN_RECEIPT_ENV, file);
+      try {
+        const receipts = await insertTestRunRowsWithSql(fakeSql(statement), [row('a.test.ts'), row('b.test.ts', 'pass')], context, {
+          insertTimeoutMs: 20, totalInsertMs: 1_000,
+        });
+        expect(receipts.map(receipt => receipt.outcome)).toEqual(['timeout', 'timeout']);
+        appendTestRunReceipts(process.env, receipts);
+        vi.stubEnv(TEST_RUN_RECEIPT_ENV, otherFile);
+        resolveInsert([{ id: '902', file_path: 'b.test.ts' }, { id: '901', file_path: 'a.test.ts' }]);
+        await vi.waitFor(() => {
+          expect(readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line)).slice(2)).toEqual([
+            { filePath: 'a.test.ts', status: 'fail', outcome: 'inserted', id: '901' },
+            { filePath: 'b.test.ts', status: 'pass', outcome: 'inserted', id: '902' },
+          ]);
+        });
+        expect(statement).toHaveBeenCalledTimes(1);
+        expect(() => readFileSync(otherFile, 'utf8')).toThrow();
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('records a late rejection after the foreground timeout without an unhandled rejection', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'test-run-late-rejection-'));
+      const file = join(dir, 'receipts.jsonl');
+      let rejectInsert!: (error: Error) => void;
+      const statement = vi.fn(() => new Promise((_resolve, reject) => { rejectInsert = reject; }));
+      vi.stubEnv(TEST_RUN_RECEIPT_ENV, file);
+      try {
+        const receipts = await insertTestRunRowsWithSql(fakeSql(statement), [row('a.test.ts')], context, {
+          insertTimeoutMs: 20, totalInsertMs: 1_000,
+        });
+        expect(receipts[0]?.outcome).toBe('timeout');
+        rejectInsert(new Error('connection closed after timeout'));
+        await vi.waitFor(() => {
+          expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
+            filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: 'connection closed after timeout',
+          });
+        });
+        expect(statement).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it('marks a returned row set that omits a file as failed, never as inserted', async () => {
       const sql = fakeSql(async () => []);
       const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts')], context);
