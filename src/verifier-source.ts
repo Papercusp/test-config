@@ -106,16 +106,19 @@ export function verifierGitCheckoutSync(root: string, sourceCommit: string,
 
 /** Never follow archive symlinks or exclude a recorded source path. */
 export function verifierSourceFiles(root: string, {
-  runtimeArtifacts = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root,
+  runtimeArtifacts = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root, includedPaths,
 }: { runtimeArtifacts?: boolean; recordedPaths?: string[]; gitMetadataPaths?: string[];
   /** Dependency trees can link to workspace source inside the same archive. */
-  symlinkRoot?: string } = {}): VerifierSourceFile[] {
+  symlinkRoot?: string;
+  /** Explicit population from the maintained dependency-generation record writer. */
+  includedPaths?: ReadonlySet<string> } = {}): VerifierSourceFile[] {
   const rows: VerifierSourceFile[] = [];
   function walk(dir: string): void {
     for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const path = join(dir, entry.name);
       const rel = relative(root, path).split(sep).join('/');
-      if (rel === '.verifier-source.json') continue;
+      if (includedPaths && !includedPaths.has(rel)) continue;
+      if (rel === '.verifier-source.json' && !includedPaths) continue;
       // Only independently verified checkout metadata is outside the source population.
       if (gitMetadataPaths.includes(rel) && !recordedPaths.includes(rel)) {
         if (!lstatSync(path).isDirectory()) throw new VerifierSourceError(`verification Git metadata is not independent: ${rel}`);
