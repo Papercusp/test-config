@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { Worker } from 'node:worker_threads';
 
 export interface VerifierSourceFile {
   path: string;
@@ -47,6 +48,31 @@ export function readVerifierSourceReceiptSync(root: string, receiptPath = proces
     throw new VerifierSourceError('verifier source receipt differs from selected source ref');
   verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true });
   return receipt;
+}
+
+/** Keep Vitest's controller available for fork-stop IPC during the full census.
+ * Reuse the exact synchronous verifier; Playwright's unawaited hooks still use
+ * its synchronous entry point. Resolve only after our worker has exited.
+ */
+export function readVerifierSourceReceipt(root: string,
+  receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT): Promise<VerifierSourceReceipt> {
+  return new Promise((resolveReceipt, reject) => {
+    const worker = new Worker(new URL('./verifier-source-worker.mjs', import.meta.url), {
+      workerData: { root, receiptPath },
+    });
+    let receipt: VerifierSourceReceipt | undefined;
+    let failure: Error | undefined;
+    worker.once('message', (result: { receipt?: VerifierSourceReceipt; error?: string }) => {
+      if (result.error) failure = new VerifierSourceError(result.error);
+      else receipt = result.receipt;
+    });
+    worker.once('error', error => { failure = error; });
+    worker.once('exit', code => {
+      if (failure) reject(failure);
+      else if (code === 0 && receipt) resolveReceipt(receipt);
+      else reject(new VerifierSourceError(`verifier source worker exited without a receipt (code ${code})`));
+    });
+  });
 }
 
 /** Real Git semantics are a separate precondition from exact source bytes. */

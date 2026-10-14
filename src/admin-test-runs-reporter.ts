@@ -37,7 +37,7 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { defaultEvidenceRoot } from '@papercusp/verification-harness';
 // This verifier is built-ins only; do not load operator stores in a reporter.
-import { findVerifierSourceRoot, readVerifierSourceReceiptSync } from './verifier-source.ts';
+import { findVerifierSourceRoot, readVerifierSourceReceipt } from './verifier-source.ts';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, isRecordedCaseTitle,
   MAX_RECORDED_FAILED_CASES, MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
@@ -533,7 +533,7 @@ export async function captureWorktreeSnapshot(run: WorktreeGitRunner = runGit): 
   const root = resolveWorktreeSnapshotRoot();
   if (existsSync(join(root, '.verifier-source.json'))) {
     try {
-      return { commit: readVerifierSourceReceiptSync(root).sourceCommit, porcelain: '' };
+      return { commit: (await readVerifierSourceReceipt(root)).sourceCommit, porcelain: '' };
     } catch (error) {
       return { commit: null, porcelain: null,
         provenanceError: `verifier source: ${error instanceof Error ? error.message : String(error)}` };
