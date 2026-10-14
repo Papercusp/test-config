@@ -9,6 +9,26 @@ import {
   type TestRunExecutionDetails,
 } from './execution-details.ts';
 
+describe('recorded operational command scope', () => {
+  it('preserves exact producer, install and window arguments while accepting legacy rows without them', () => {
+    const operational = { schemaVersion: 1, command: ['executeGreenMainAdmissionWindow',
+      'workspace-test', 'install-test', '1791000000000', '1791604800000'] };
+    expect(parseTestRunExecutionDetails(details({ operational })))
+      .toMatchObject({ operational });
+    expect(parseTestRunExecutionDetails(details())).not.toHaveProperty('operational');
+  });
+
+  it('rejects malformed or extended command metadata rather than treating it as scoped proof', () => {
+    for (const operational of [null, { schemaVersion: 2, command: ['native'] },
+      { schemaVersion: 1, command: [] }, { schemaVersion: 1, command: [''] },
+      { schemaVersion: 1, command: [42] }, { schemaVersion: 1, command: Array(51).fill('x') },
+      { schemaVersion: 1, command: ['x'.repeat(1001)] },
+      { schemaVersion: 1, command: ['native'], trusted: true }]) {
+      expect(parseTestRunExecutionDetails(details({ operational }))).toBeUndefined();
+    }
+  });
+});
+
 describe('recorded runtime execution witnesses', () => {
   it('accepts exact original integration receipts and rejects missing hashes, extensions and duplicate runs', () => {
     const receipt = { runId: '20261008T000000Z-100', resultSha256: 'a'.repeat(64),
