@@ -92,6 +92,20 @@ export interface RecordedRuntimeEnvironment {
   observedAt: string;
 }
 
+/** Exact arguments of the executed operational producer, including its original scope. */
+export interface RecordedOperationalExecution {
+  schemaVersion: 1;
+  command: string[];
+}
+
+export function parseRecordedOperationalExecution(value: unknown): RecordedOperationalExecution | undefined {
+  if (!isRecord(value) || Object.keys(value).some(key => !['schemaVersion', 'command'].includes(key))
+    || value.schemaVersion !== 1 || !Array.isArray(value.command)
+    || value.command.length === 0 || value.command.length > 50
+    || value.command.some(arg => typeof arg !== 'string' || arg.length === 0 || arg.length > 1_000)) return undefined;
+  return value as unknown as RecordedOperationalExecution;
+}
+
 export function parseRecordedRuntimeEnvironment(value: unknown): RecordedRuntimeEnvironment | undefined {
   if (!isRecord(value) || Object.keys(value).some(key =>
     !['schemaVersion', 'units', 'fingerprint', 'observedAt'].includes(key))
@@ -173,6 +187,8 @@ export interface TestRunExecutionDetails {
    * working-tree reporter writes, and an unknown key makes the row unproven.
    */
   runStartedAt?: string;
+  /** Absent on historical/status-only rows; absence does not prove producer/install/window scope. */
+  operational?: RecordedOperationalExecution;
   runtimeEnvironmentBefore?: RecordedRuntimeEnvironment;
   runtimeEnvironmentAfter?: RecordedRuntimeEnvironment;
   /** Why a runtime witness is absent, or confirmation that it was captured. */
@@ -283,7 +299,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
-  'isolatedRuntimeReceipts', 'mutation', 'check',
+  'isolatedRuntimeReceipts', 'mutation', 'check', 'operational',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -376,6 +392,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
       && (typeof value.worktreeDirtyReason !== 'string' || value.worktreeDirtyReason.length === 0
         || value.worktreeDirty !== true))
     || (value.runStartedAt !== undefined && !isRecordedInstant(value.runStartedAt))
+    || (value.operational !== undefined && !parseRecordedOperationalExecution(value.operational))
     || (value.isolatedRuntimeReceipts !== undefined && !parseIsolatedRuntimeReceipts(value.isolatedRuntimeReceipts))
     || (value.runtimeEnvironmentBefore !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentBefore))
     || (value.runtimeEnvironmentAfter !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentAfter))
