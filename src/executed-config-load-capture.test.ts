@@ -118,6 +118,18 @@ describe('capture diagnostic evidence retention', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });
 
+  it('retains the saved receipt when an enrichment write is interrupted', () => {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.options.outPath + '.processes', '41-0.json.pending'), '{"pid":41,');
+      const result = writeExecutedCaptureDiagnostic(f.options);
+      expect(result.receipts).toEqual([f.source]);
+      expect(result.failures).toEqual([]);
+      expect(result.forkProcessCoverage).toEqual([expect.objectContaining({ pid: 41, terminationVerified: true })]);
+      expect(result.loaderChainAcceptance).toBe('unknown');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
   it.each([false, true])('persists exact engine observations without promoting diagnostic authority (source drift=%s)', drift => {
     const f = fixture();
     const engineScripts = {
@@ -202,11 +214,13 @@ describe('capture diagnostic evidence retention', () => {
 });
 
 describe('original config load evidence', () => {
-  it.skipIf(process.platform !== 'linux')('retains real Vitest fork termination receipts without changing its SIGTERM exit', () => {
+  it.skipIf(process.platform !== 'linux').each(['native snapshot', 'slow snapshot'] as const)
+    ('retains real Vitest fork termination receipts (%s)', mode => {
     const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
     const dir = mkdtempSync(join(tmpdir(), 'vitest-fork-termination-'));
     const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
     const containment = join(root, 'scripts/lib/managed-test-cgroup-preload.mjs');
+    const committedLoader = join(root, 'scripts/lib/committed-source-loader.mjs');
     const fixture = fileURLToPath(new URL('./__fixtures__/armed-capture/', import.meta.url));
     const bin = join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'vitest.mjs');
     const out = join(dir, 'sources.json');
@@ -215,6 +229,8 @@ describe('original config load evidence', () => {
     const evaluatorInputs = join(dir, 'evaluator-inputs.jsonl');
     const sample = join(fixture, 'sample.armed-fixture.ts');
     const parentObserver = join(dir, 'parent-observer.mjs');
+    const snapshotObserver = join(dir, 'snapshot-observer.mjs');
+    const snapshotEvents = join(dir, 'snapshot-events.jsonl');
     const cgroupPath = readFileSync('/proc/self/cgroup', 'utf8').split('\n')
       .find(line => line.startsWith('0::'))?.slice(3);
     expect(cgroupPath).toBeTruthy();
@@ -229,7 +245,7 @@ describe('original config load evidence', () => {
         cp.fork = (...args) => {
           const child = original(...args);
           child.once('exit', (code, signal) => appendFileSync(${JSON.stringify(exits)},
-            JSON.stringify({ pid: child.pid, entry: args[0], code, signal }) + '\\n'));
+            JSON.stringify({ pid: child.pid, parentPid: process.pid, entry: args[0], code, signal }) + '\\n'));
           return child;
         };
         // Observe the actual evaluator argument independently of inspector
@@ -244,14 +260,32 @@ describe('original config load evidence', () => {
           return result;
         };
         syncBuiltinESMExports();\n`);
+      // Only the actual Vitest fork is delayed, at the inspector snapshot seam.
+      // The parent retains Vitest's real 500 ms SIGTERM -> SIGKILL escalation.
+      // This distinguishes an interrupted snapshot from an unarmed preload;
+      // neither observation attributes the historical TDZ or missing receipt.
+      writeFileSync(snapshotObserver, `import { Session } from 'node:inspector';
+        import { appendFileSync } from 'node:fs';
+        const original = Session.prototype.post;
+        Session.prototype.post = function (method, ...args) {
+          if (method === 'Profiler.getBestEffortCoverage' &&
+              process.argv[1]?.replaceAll('\\\\', '/').endsWith('/vitest/dist/workers/forks.js')) {
+            appendFileSync(${JSON.stringify(snapshotEvents)}, JSON.stringify({ pid: process.pid, phase: 'started' }) + '\\n');
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000);
+            appendFileSync(${JSON.stringify(snapshotEvents)}, JSON.stringify({ pid: process.pid, phase: 'finished' }) + '\\n');
+          }
+          return original.call(this, method, ...args);
+        };\n`);
       const env = { ...process.env };
       for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
           /^(PC_|VITEST|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_|AFFECTED_)/.test(key) || key === 'NODE_OPTIONS') delete env[key];
       execFileSync(process.execPath, ['--import', parentObserver, bin, 'run', '--root', fixture,
         '--config', join(fixture, 'vitest.config.ts'), '--pool=forks', '--maxWorkers=1', '--no-file-parallelism'], {
         cwd: root, encoding: 'utf8', timeout: 90000,
-        env: { ...env, NODE_OPTIONS: `--import=${pathToFileURL(capture).href} --import=${pathToFileURL(containment).href}` +
-          ` --import=${pathToFileURL(parentObserver).href}`,
+        env: { ...env, NODE_OPTIONS: `--import=${pathToFileURL(committedLoader).href}` +
+          ` --import=${pathToFileURL(capture).href} --import=${pathToFileURL(containment).href}` +
+          ` --import=${pathToFileURL(parentObserver).href}` +
+          (mode === 'slow snapshot' ? ` --import=${pathToFileURL(snapshotObserver).href}` : ''),
           PC_EXECUTED_SOURCE_MAP_PRELOAD: '1', PC_EXECUTED_SOURCE_MAP_WORKSPACE: '@papercusp/armed-capture-fixture',
           PC_EXECUTED_SOURCE_MAP_ROOT: root, PC_EXECUTED_SOURCE_MAP_OUT: out, PC_EXECUTED_SOURCE_MAP_NO_PERSIST: '1',
           HARNESS_ADMIN_DATABASE_URL: 'postgresql://127.0.0.1:1/termination-fixture',
@@ -265,8 +299,29 @@ describe('original config load evidence', () => {
       const parentExits = readFileSync(exits, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(forks).toHaveLength(1);
       const pid = forks[0].pid;
-      expect(parentExits).toContainEqual(expect.objectContaining({ pid, code: null, signal: 'SIGTERM' }));
+      expect(parentExits).toContainEqual(expect.objectContaining({ pid, code: null,
+        signal: mode === 'slow snapshot' ? 'SIGKILL' : 'SIGTERM' }));
       const receipt = join(`${out}.processes`, `${pid}-0.json`);
+      if (mode === 'slow snapshot') {
+        expect(readFileSync(snapshotEvents, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
+          .toEqual([{ pid, phase: 'started' }]);
+        expect(existsSync(receipt), `interrupted snapshot lost termination receipt; parent=${JSON.stringify(parentExits)}`).toBe(true);
+        expect(JSON.parse(readFileSync(receipt, 'utf8'))).toMatchObject({ pid, isMainThread: true,
+          phase: 'signal', exitCode: null, signal: 'SIGTERM', status: 'unknown', engineScripts: null,
+          reasons: expect.arrayContaining(['process-source-snapshot-incomplete', 'process-engine-snapshot-incomplete']),
+        });
+        const result = writeExecutedCaptureDiagnostic({ outPath: out, cgroupsPath: cgroups,
+          auditPath: join(dir, 'absent-loader-audit.jsonl'), parentExitsPath: exits,
+          summaryPath: join(dir, 'summary.json'), cgroupPath: cgroupPath!, runGroup: forks[0].runGroup,
+          deadlineEpochMs: forks[0].deadlineEpochMs, verifySource: () => {},
+          child: { code: 0, signal: null, resultLine: '' },
+        });
+        // A SIGTERM observation must never attest the parent's SIGKILL outcome.
+        expect(result.forkProcessCoverage).toEqual([expect.objectContaining({ pid, terminationVerified: false })]);
+        expect(result.valid).toBe(false);
+        expect(result.loaderChainAcceptance).toBe('unknown');
+        return;
+      }
       expect(existsSync(receipt), `missing worker receipt for ${pid}; parent=${JSON.stringify(parentExits)}`).toBe(true);
       expect(JSON.parse(readFileSync(receipt, 'utf8'))).toMatchObject({ pid, isMainThread: true,
         phase: 'signal', exitCode: null, signal: 'SIGTERM', observedSources: expect.any(Array),

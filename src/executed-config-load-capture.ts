@@ -3,7 +3,7 @@
  * reads cannot recover these bytes. This never authorizes reusable test passes. */
 import { createHash } from 'node:crypto';
 import { Session } from 'node:inspector';
-import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import * as nodeModule from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -184,23 +184,38 @@ function install(): void {
     !rel.split('/').includes('node_modules') ? rel : null;
   if (repoRoot && isAbsolute(repoRoot)) observeProcessTermination(termination => {
     try {
+      const directory = `${outPath}.processes`;
+      mkdirSync(directory, { recursive: true });
+      const receiptPath = join(directory, `${process.pid}-${threadId}.json`);
+      const receipt = {
+        schemaVersion: 'node-loaded-process-sources-v1', scope: 'repository-node-process-sources',
+        entrypoint, pid: process.pid, parentPid: process.ppid, isMainThread, threadId, ...termination,
+        // These are observed inputs, never a census of every descendant or a
+        // complete runtime identity. The preload itself predates its own hook.
+        unresolved: ['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured',
+          'node-external-native-runtime-unmeasured', 'node-loader-chain-not-closed'],
+      };
+      // Vitest can SIGKILL the fork while disk reads or inspector work are in
+      // progress. Retain the signal observation first, with explicit unknown
+      // evidence. It does not attest the parent's eventual termination outcome.
+      writeFileSync(receiptPath, JSON.stringify({ ...receipt, basis: 'node-load-hook', status: 'unknown',
+        sources: [], observedSources: [], engineScripts: null,
+        reasons: ['process-source-snapshot-incomplete', 'process-engine-snapshot-incomplete'],
+        loaderChain: { scope: 'declared-node-preloads', status: 'unknown',
+          preloads: state.preloads.map(preload => ({ ...preload, observedSha256: null })),
+          unresolved: ['node-loader-chain-not-closed', 'node-preload-self-unmeasured'] },
+      }));
       const evidence = qualifyLoadedSources([...state.sources.keys()], repoRoot, 'process');
       if (!isMainThread) evidence.reasons.push('process-worker-thread-entrypoint-unmeasured');
       if (!entrypoint || !evidence.sources.some(source => source.path === entrypoint && source.sha256 !== null)) {
         evidence.reasons.push('process-entrypoint-original-load-unavailable');
         if (evidence.status === 'stable') evidence.status = 'unknown';
       }
-      const directory = `${outPath}.processes`;
-      mkdirSync(directory, { recursive: true });
-      writeFileSync(join(directory, `${process.pid}-${threadId}.json`), JSON.stringify({
-        schemaVersion: 'node-loaded-process-sources-v1', scope: 'repository-node-process-sources',
-        entrypoint, pid: process.pid, parentPid: process.ppid, isMainThread, threadId, ...termination, ...evidence,
+      // An interrupted enrichment must not truncate the retained observation.
+      writeFileSync(`${receiptPath}.pending`, JSON.stringify({ ...receipt, ...evidence,
         engineScripts: engine?.snapshot() ?? null,
-        // These are observed inputs, never a census of every descendant or a
-        // complete runtime identity. The preload itself predates its own hook.
-        unresolved: ['node-process-descendant-population-unmeasured', 'node-preload-self-unmeasured',
-          'node-external-native-runtime-unmeasured', 'node-loader-chain-not-closed'],
       }));
+      renameSync(`${receiptPath}.pending`, receiptPath);
     } catch { /* The consumer records absent/malformed receipts as unknown. */ }
   });
   if (typeof nodeModule.registerHooks !== 'function') {
@@ -357,7 +372,8 @@ export function writeExecutedCaptureDiagnostic(options: {
   if (options.child.spawnFailure) failures.push({ label: 'child-spawn', error: options.child.spawnFailure });
   const membership = read('cgroup-artifact', () => jsonl(options.cgroupsPath), []);
   const reporter = read('reporter-artifact', () => object(JSON.parse(readFileSync(options.outPath, 'utf8'))), {});
-  const processFiles = read('process-directory', () => readdirSync(options.outPath + '.processes').sort(), []);
+  const processFiles = read('process-directory', () => readdirSync(options.outPath + '.processes')
+    .filter(file => file.endsWith('.json')).sort(), []);
   const receipts = processFiles.map(file => read('process-artifact:' + file,
     () => object(JSON.parse(readFileSync(join(options.outPath + '.processes', file), 'utf8'))), null))
     .filter((row): row is DiagnosticRow => row !== null);
