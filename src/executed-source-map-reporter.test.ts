@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TestModule } from 'vitest/node';
 import { executedSourceOriginalsPlugin } from './vitest-config';
+// The router stays plain Node; exercise its output routing with the real reporter.
+// @ts-expect-error the executable .mjs router has no declaration file
+import { perGroupVitestEnv } from '../../../scripts/test-files.mjs';
 
 import { inferWorkspaceRoot } from './admin-test-runs-reporter';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
@@ -498,6 +501,42 @@ describe('ExecutedSourceMapReporter', () => {
     expect(flushes[0]!.rows).toEqual([]);
     expect(flushes[0]!.retiredFiles).toEqual(['libs/test-config/src/executed-source-map-reporter.test.ts']);
     expect(flushes[0]).not.toHaveProperty('diagnostics');
+  });
+
+  it('retains original-source evidence from three routed groups including failed diagnostics', async () => {
+    const self = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
+    const source = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.ts');
+    const parentEnv = { ...process.env };
+    const paths: string[] = [];
+    for (const [index, state] of ['passed', 'failed', 'passed'].entries()) {
+      const env = perGroupVitestEnv(parentEnv, index, 3);
+      process.env[PC_EXECUTED_SOURCE_MAP_OUT_ENV] = env.PC_EXECUTED_SOURCE_MAP_OUT;
+      paths.push(env.PC_EXECUTED_SOURCE_MAP_OUT);
+      const nodes = new Map([self, source].map(id => [id, {
+        id, transformResult: { map: { sources: [id], sourcesContent: [readFileSync(id, 'utf8')] } },
+      }]));
+      const mod = Object.assign(fakeModule({ state, moduleId: self, imports: { [source]: {} }, workerImports: true }), {
+        viteEnvironment: { moduleGraph: { idToModuleMap: nodes } },
+      });
+      const { r } = reporter();
+      r.onInit({} as never);
+      r.onTestModuleCollected(mod);
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd();
+      await r.onExit();
+    }
+    expect(paths).toEqual([join(tmp, 'out.json'), join(tmp, 'out.1.json'), join(tmp, 'out.2.json')]);
+    for (const [index, path] of paths.entries()) {
+      const out = JSON.parse(readFileSync(path, 'utf8'));
+      const evidence = index === 1 ? out.diagnostics[0].sourceEvidence : out.rows[0].sourceEvidence;
+      expect(evidence).toMatchObject({ status: 'stable', sources: expect.arrayContaining([
+        expect.objectContaining({ path: 'libs/test-config/src/executed-source-map-reporter.ts',
+          sha256: createHash('sha256').update(readFileSync(source)).digest('hex') }),
+      ]) });
+      expect(out.rows).toHaveLength(index === 1 ? 0 : 1);
+      expect(out.diagnostics[0].state).toBe(index === 1 ? 'failed' : 'passed');
+    }
+    expect(results()).toHaveLength(3); // RESULT is append-only and still shared across groups.
   });
 
   it.each([
