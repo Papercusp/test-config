@@ -106,8 +106,10 @@ export function verifierGitCheckoutSync(root: string, sourceCommit: string,
 
 /** Never follow archive symlinks or exclude a recorded source path. */
 export function verifierSourceFiles(root: string, {
-  runtimeArtifacts = false, recordedPaths = [], gitMetadataPaths = [],
-}: { runtimeArtifacts?: boolean; recordedPaths?: string[]; gitMetadataPaths?: string[] } = {}): VerifierSourceFile[] {
+  runtimeArtifacts = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root,
+}: { runtimeArtifacts?: boolean; recordedPaths?: string[]; gitMetadataPaths?: string[];
+  /** Dependency trees can link to workspace source inside the same archive. */
+  symlinkRoot?: string } = {}): VerifierSourceFile[] {
   const rows: VerifierSourceFile[] = [];
   function walk(dir: string): void {
     for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
@@ -159,8 +161,16 @@ export function verifierSourceFiles(root: string, {
         const bytes = stat.isSymbolicLink() ? readlinkSync(path) : readFileSync(path);
         if (stat.isSymbolicLink()) {
           const target = resolve(dirname(path), String(bytes));
-          if (isAbsolute(String(bytes)) || target !== root && !target.startsWith(`${resolve(root)}${sep}`)) {
+          const boundary = resolve(symlinkRoot);
+          if (isAbsolute(String(bytes)) || target !== boundary && !target.startsWith(`${boundary}${sep}`)) {
             throw new VerifierSourceError(`archive symlink escapes source root: ${rel}`);
+          }
+          // Dependency redirects must resolve inside the archive, too. The
+          // lexical path alone misses links routed through another symlink.
+          if (symlinkRoot !== root) {
+            const actual = realpathSync(path);
+            if (actual !== boundary && !actual.startsWith(`${boundary}${sep}`))
+              throw new VerifierSourceError(`dependency symlink escapes source root: ${rel}`);
           }
         }
         rows.push({ path: rel, kind: stat.isSymbolicLink() ? 'symlink' : 'file',
