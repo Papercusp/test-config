@@ -16,7 +16,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { configDefaults } from 'vitest/config';
+import AdminTestRunsReporter, { type TestRunRow } from './admin-test-runs-reporter.ts';
 import {
   ADMIN_TEST_RUNS_REPORTER_PATH,
   HOST_PREFLIGHT_GLOBAL_SETUP,
@@ -71,11 +73,36 @@ describe('gateParticipationConfig — what a hand-rolled unit config spreads in'
       {},
     );
     expect(fragment).toEqual({
+      provide: { papercuspTestLayer: 'unit' },
       reporters: ['default', ADMIN_TEST_RUNS_REPORTER_PATH],
       setupFiles: ['./src/test-setup.ts'],
       globalSetup: [HOST_PREFLIGHT_GLOBAL_SETUP],
       exclude: [...configDefaults.exclude, 'src/**/*.integration.test.ts'],
     });
+  });
+
+  it('records the unit layer and executed case for a hand-rolled project', async () => {
+    const fragment = gateParticipationConfig({}, {});
+    const root = fileURLToPath(new URL('../', import.meta.url));
+    const rows: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(
+      async () => ({ commit: 'abc', porcelain: '' }),
+      async row => { rows.push(row); },
+    );
+    await reporter.onInit({ config: { root, provide: fragment.provide } } as never);
+    reporter.onTestModuleEnd({
+      moduleId: fileURLToPath(import.meta.url),
+      project: { config: { provide: fragment.provide } },
+      state: () => 'passed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+      children: { allTests: () => [{
+        fullName: 'hand-rolled project > recorded case',
+        result: () => ({ state: 'passed' }),
+      }] },
+    } as never);
+    await reporter.onTestRunEnd();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.executionDetails?.testLayer).toBe('unit');
+    expect(rows[0]!.executionDetails?.passedCaseTitles).toEqual(['hand-rolled project > recorded case']);
   });
 
   // WI-10005724: a hand-rolled config must not lose the host preflight to its own globalSetup,
