@@ -1381,7 +1381,7 @@ export type SerializedTestRunReceiptRow = Omit<ReceiptIdentifiedTestRunRow, 'sta
   finishedAt: string;
 };
 
-type TestRunReceiptBase = {
+export type TestRunReceiptBase = {
   receiptId: string;
   attempt: number;
   filePath: string;
@@ -1422,6 +1422,16 @@ function receiptBase(row: ReceiptIdentifiedTestRunRow): TestRunReceiptBase {
     status: row.status,
     row: serializedReceiptRow(row),
   };
+}
+
+/**
+ * The canonical receipt identity + serialized row for ONE row written by a reporter that runs its
+ * own INSERT (the Playwright reporter). Build it once per row and spread it into every receipt for
+ * that row, so a late `inserted` supersedes its `timeout` under one receiptId — the shape
+ * `missingTestRunReceiptPaths` accepts. A hand-built receipt missing these fields is ignored there.
+ */
+export function testRunReceiptBaseFor(row: TestRunRow): TestRunReceiptBase {
+  return receiptBase(receiptIdentifiedRows([row])[0]!);
 }
 
 function errorCode(error: unknown): string | undefined {
