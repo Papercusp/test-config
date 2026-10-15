@@ -2079,6 +2079,7 @@ export default class AdminTestRunsReporter implements Reporter {
   private pgLease: (() => Promise<void>) | null = null;
 
   async onInit(ctx: Vitest): Promise<void> {
+    const runStartedAt = new Date().toISOString();
     // Select which actually passing identities occupy the existing bounded
     // evidence field, without filtering execution or changing skip counts.
     // Late cases in a large suite otherwise have no full-suite proof path.
@@ -2098,6 +2099,7 @@ export default class AdminTestRunsReporter implements Reporter {
     this.failureDetailsFlushed = false;
     this.executionContext = {
       schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
+      runStartedAt,
       root: resolveRecordRoot(),
       runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
       workspaceId: resolveTestRunWorkspaceId(),
