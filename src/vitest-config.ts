@@ -315,6 +315,7 @@ export interface GateParticipationOptions {
 }
 
 export interface GateParticipationFragment {
+  provide: { papercuspTestLayer: 'unit' };
   reporters: string[];
   setupFiles: string[];
   /** The host preflight. Pass the workspace's own globalSetup through `opts.globalSetup`. */
@@ -339,6 +340,7 @@ export function gateParticipationConfig(
 ): GateParticipationFragment {
   const gate = gateOwnedParts('unit', env);
   return {
+    provide: { papercuspTestLayer: 'unit' },
     reporters: ['default', ...gate.reporters],
     setupFiles: [...gate.leadingSetupFiles, ...(opts.setupFiles ?? [])],
     globalSetup: [...gate.leadingGlobalSetup, ...(opts.globalSetup ?? [])],
