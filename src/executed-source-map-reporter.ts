@@ -28,7 +28,7 @@
  * Fail-soft throughout (D-007, same contract as admin-test-runs-reporter.ts): nothing here can
  * change a test outcome, and every write is bounded by a timeout.
  */
-import type { Reporter, TestModule, Vitest } from 'vitest/node';
+import type { Reporter, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -41,6 +41,7 @@ import {
   closeSharedPgIfUnheld,
   computeWorktreeDirty,
   collectModuleExecution,
+  collectTestCases,
   retainSharedPg,
   inferWorkspaceRoot,
   isMutationProbeRun,
@@ -698,6 +699,21 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private diagnostics: Array<{ testFile: string; state: string; sourceEvidence: ExecutedSourceEvidence;
     moduleEvaluations?: InputsRecord['moduleEvaluations'] }> = [];
   private fileResults: NonNullable<ExecutedSourceMapResult['fileResults']>['files'] = [];
+  // Extend the existing OUT diagnostics with actual reporter outcomes. These
+  // observations include failed/skipped runs and never become reusable passes.
+  private nativeRun: {
+    schemaVersion: 'native-vitest-run-v1';
+    scope: 'vitest-reporter-callbacks';
+    pid: number; ppid: number; startedAtMs: number; finishedAtMs: number | null;
+    terminalHook: 'onTestRunEnd' | 'onExit' | null;
+    reason: TestRunEndReason | null; unhandledErrorCount: number | null;
+    reportedModulePaths: Array<string | null> | null;
+    modulePopulationMatched: boolean;
+    files: Array<{ testFile: string; state: string; observedAtMs: number;
+      firstAttemptVerdict: 'pass' | 'fail' | 'unknown';
+      execution: ReturnType<typeof collectModuleExecution>; cases: ReturnType<typeof collectTestCases> }>;
+    gaps: string[];
+  } | null = null;
 
   private discardInputs(moduleId: string): void {
     if (!this.inputsDir) return;
@@ -740,6 +756,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.collectedSources = new WeakMap();
     this.diagnostics = [];
     this.fileResults = [];
+    this.nativeRun = this.armed.outPath ? {
+      schemaVersion: 'native-vitest-run-v1', scope: 'vitest-reporter-callbacks',
+      pid: process.pid, ppid: process.ppid, startedAtMs: Date.now(), finishedAtMs: null,
+      terminalHook: null, reason: null, unhandledErrorCount: null,
+      reportedModulePaths: null, modulePopulationMatched: false, files: [], gaps: [],
+    } : null;
   }
 
   onTestModuleCollected(testModule: TestModule): void {
@@ -778,7 +800,17 @@ export default class ExecutedSourceMapReporter implements Reporter {
         /* fail-soft: treat as not recordable */
       }
       const resultFile = normalizeExecutedKey(testModule.moduleId, this.repoRoot);
-      if (resultFile) this.fileResults.push({ testFile: resultFile, verdict: firstAttemptModuleVerdict(testModule, state) });
+      if (resultFile) {
+        const verdict = firstAttemptModuleVerdict(testModule, state);
+        this.fileResults.push({ testFile: resultFile, verdict });
+        if (this.nativeRun) {
+          const execution = collectModuleExecution(testModule), cases = collectTestCases(testModule);
+          this.nativeRun.files.push({ testFile: resultFile, state, observedAtMs: Date.now(),
+            firstAttemptVerdict: verdict, execution, cases });
+          if (execution === null || cases === null)
+            this.nativeRun.gaps.push(`module-cases-unmeasured:${resultFile}`);
+        }
+      } else this.nativeRun?.gaps.push('module-path-outside-repository');
       if (this.armed.outPath) {
         const testFile = normalizeExecutedKey(testModule.moduleId, this.repoRoot);
         if (testFile) {
@@ -883,6 +915,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
           this.armed.outPath,
           JSON.stringify({ workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty,
             skipped: this.skipped, rows, diagnostics: this.diagnostics,
+            ...(this.nativeRun ? { nativeRun: this.nativeRun } : {}),
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
             configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot),
             mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot) }, null, 1),
@@ -973,8 +1006,33 @@ export default class ExecutedSourceMapReporter implements Reporter {
     report(settled.outcome, settled.error);
   }
 
-  async onTestRunEnd(): Promise<void> {
+  async onTestRunEnd(
+    testModules?: ReadonlyArray<TestModule>,
+    unhandledErrors: ReadonlyArray<unknown> = [],
+    reason?: TestRunEndReason,
+  ): Promise<void> {
     try {
+      if (this.nativeRun && !this.flushed) {
+        this.nativeRun.finishedAtMs = Date.now();
+        this.nativeRun.terminalHook = 'onTestRunEnd';
+        this.nativeRun.reason = reason ?? null;
+        this.nativeRun.unhandledErrorCount = unhandledErrors.length;
+        try {
+          this.nativeRun.reportedModulePaths = testModules?.map(module =>
+            normalizeExecutedKey(module.moduleId, this.repoRoot)) ?? null;
+        } catch {
+          this.nativeRun.gaps.push('terminal-module-population-unreadable');
+        }
+        const reported = this.nativeRun.reportedModulePaths;
+        // Compare multisets: repeated files from separate projects are distinct
+        // observations, and a missing callback cannot disappear through a Set.
+        this.nativeRun.modulePopulationMatched = reported !== null && reported.every(path => path !== null) &&
+          JSON.stringify([...reported].sort()) ===
+            JSON.stringify(this.nativeRun.files.map(file => file.testFile).sort());
+        if (!this.nativeRun.modulePopulationMatched) this.nativeRun.gaps.push('terminal-module-population-unmatched');
+        if (!reason) this.nativeRun.gaps.push('run-end-reason-unobserved');
+        if (!this.nativeRun.files.length) this.nativeRun.gaps.push('no-module-results');
+      }
       await this.flushPending();
     } catch {
       /* swallow — D-007 */
@@ -985,6 +1043,11 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   async onExit(): Promise<void> {
     try {
+      if (this.nativeRun && !this.flushed) {
+        this.nativeRun.finishedAtMs = Date.now();
+        this.nativeRun.terminalHook = 'onExit';
+        this.nativeRun.gaps.push('run-end-unobserved');
+      }
       await this.flushPending();
     } catch {
       /* swallow — D-007 */

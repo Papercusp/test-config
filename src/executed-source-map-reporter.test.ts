@@ -476,6 +476,132 @@ describe('ExecutedSourceMapReporter', () => {
     expect(flushes[0]).not.toHaveProperty('configSources');
   });
 
+  describe('native runner outcomes in OUT', () => {
+    function nativeModule(states: string[], state = 'passed', retryCount = 0): TestModule {
+      return Object.assign(fakeModule({ state }), {
+        children: { allTests: () => states.map(status => ({
+          fullName: 'same case title', result: () => ({ state: status }),
+          diagnostic: () => ({ duration: 1, retryCount, flaky: retryCount > 0 }),
+        })) },
+      });
+    }
+
+    function nativeOut() {
+      return JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8')).nativeRun;
+    }
+
+    it('retains the actual case population, repeated titles, process and callback clocks', async () => {
+      const { r, flushes } = reporter();
+      const mod = nativeModule(['passed', 'passed']);
+      r.onInit({} as never);
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd([mod], [], 'passed');
+      await r.onExit();
+      const out = nativeOut();
+      expect(out).toMatchObject({ schemaVersion: 'native-vitest-run-v1', scope: 'vitest-reporter-callbacks',
+        pid: process.pid, ppid: process.ppid, terminalHook: 'onTestRunEnd', reason: 'passed',
+        unhandledErrorCount: 0, reportedModulePaths: ['libs/test-config/src/__fake__/thing.test.ts'],
+        modulePopulationMatched: true, gaps: [],
+      });
+      expect(out.files).toHaveLength(1);
+      expect(out.files[0]).toMatchObject({ state: 'passed', firstAttemptVerdict: 'pass',
+        execution: { passed: 2, failed: 0, skipped: 0, collectionFailed: false },
+        cases: [{ caseIndex: 0, caseKey: 'same case title', occurrence: 1, status: 'pass' },
+          { caseIndex: 1, caseKey: 'same case title', occurrence: 2, status: 'pass' }],
+      });
+      expect(out.startedAtMs).toBeLessThanOrEqual(out.files[0].observedAtMs);
+      expect(out.files[0].observedAtMs).toBeLessThanOrEqual(out.finishedAtMs);
+      expect(flushes).toHaveLength(1);
+      expect(flushes[0]).not.toHaveProperty('nativeRun');
+      expect(flushes[0]!.rows[0]).not.toHaveProperty('cases');
+    });
+
+    it.each([
+      ['failed case', ['failed'], 'failed', 0, 'fail', { passed: 0, failed: 1, skipped: 0 }],
+      ['skipped case', ['passed', 'skipped'], 'passed', 0, 'unknown', { passed: 1, failed: 0, skipped: 1 }],
+      ['pending case', ['pending'], 'passed', 0, 'unknown', null],
+      ['collection failure', [], 'failed', 0, 'fail', { passed: 0, failed: 0, skipped: 0, collectionFailed: true }],
+      ['inline retry', ['passed'], 'passed', 1, 'fail', { passed: 1, failed: 0, skipped: 0 }],
+    ] as const)('preserves %s instead of turning a final module state into a clean pass', async (
+      _name, states, state, retryCount, verdict, counts,
+    ) => {
+      const { r } = reporter();
+      const mod = nativeModule([...states], state, retryCount);
+      r.onInit({} as never);
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd([mod], [], state === 'failed' ? 'failed' : 'passed');
+      const file = nativeOut().files[0];
+      expect(file.firstAttemptVerdict).toBe(verdict);
+      if (counts === null) {
+        expect(file.execution).toBeNull();
+        expect(file.cases).toBeNull();
+        expect(nativeOut().gaps).toContain('module-cases-unmeasured:libs/test-config/src/__fake__/thing.test.ts');
+      } else expect(file.execution).toMatchObject(counts);
+    });
+
+    it.each(['failed', 'interrupted'] as const)('retains a %s run even when its file assertions passed', async reason => {
+      const { r } = reporter();
+      const mod = nativeModule(['passed']);
+      r.onInit({} as never);
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd([mod], [new Error('native unhandled error')], reason);
+      expect(nativeOut()).toMatchObject({ reason, unhandledErrorCount: 1,
+        files: [{ state: 'passed', firstAttemptVerdict: 'pass', execution: { passed: 1 } }],
+      });
+    });
+
+    it('keeps an exit-only flush explicitly incomplete', async () => {
+      const { r } = reporter();
+      r.onInit({} as never);
+      r.onTestModuleEnd(nativeModule(['passed']));
+      await r.onExit();
+      expect(nativeOut()).toMatchObject({ terminalHook: 'onExit', reason: null,
+        unhandledErrorCount: null, reportedModulePaths: null, modulePopulationMatched: false,
+        gaps: ['run-end-unobserved'],
+      });
+    });
+
+    it('compares complete module occurrences rather than deduplicating repeated paths', async () => {
+      const { r } = reporter();
+      const mod = nativeModule(['passed']);
+      r.onInit({} as never);
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd([mod, mod], [], 'passed');
+      expect(nativeOut()).toMatchObject({ modulePopulationMatched: false,
+        gaps: ['terminal-module-population-unmatched'],
+      });
+      expect(nativeOut().reportedModulePaths).toHaveLength(2);
+      expect(nativeOut().files).toHaveLength(1);
+    });
+
+    it('preserves existing flushes when the terminal population is unreadable', async () => {
+      const { r, flushes } = reporter();
+      const mod = nativeModule(['passed']);
+      r.onInit({} as never);
+      r.onTestModuleEnd(mod);
+      const unreadable = { get moduleId(): string { throw new Error('unreadable module'); } } as TestModule;
+      await r.onTestRunEnd([unreadable], [], 'passed');
+      expect(flushes).toHaveLength(1);
+      expect(nativeOut()).toMatchObject({ modulePopulationMatched: false,
+        gaps: ['terminal-module-population-unreadable', 'terminal-module-population-unmatched'],
+      });
+    });
+
+    it('retains dirty no-persist run diagnostics without reusable rows', async () => {
+      process.env[PC_EXECUTED_SOURCE_MAP_NO_PERSIST_ENV] = '1';
+      const { r, flushes } = reporter(snapshot({ ...clean, porcelain: ' M changed.ts' }));
+      const mod = nativeModule(['passed']);
+      r.onInit({} as never);
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd([mod], [], 'passed');
+      expect(flushes).toEqual([]);
+      expect(nativeOut()).toMatchObject({ reason: 'passed', modulePopulationMatched: true,
+        files: [{ firstAttemptVerdict: 'pass' }],
+      });
+      expect(JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8')).worktreeDirty).toBe(true);
+    });
+  });
+
   it('retains failed worker source diagnostics in OUT without creating a reusable pass', async () => {
     const self = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.test.ts');
     const source = join(REPO_ROOT, 'libs/test-config/src/executed-source-map-reporter.ts');
