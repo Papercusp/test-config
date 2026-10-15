@@ -524,7 +524,7 @@ describe('test database janitor (WI-6554700010008843)', () => {
         const sql = postgres(url, { max: 1, onnotice: () => {} });
         try { await sql.unsafe(`CREATE TABLE janitor_marker (id int)`); } finally { await sql.end({ timeout: 5 }); }
       });
-      await sleepMs(30); // distinct PG_VERSION mtimes, so "newest" is well defined
+      await sleepMs(30); // distinct database-directory mtimes, so "newest" is well defined
     }
     const admin = await adminClient();
     // Every template was built before the cutoff; only `cloned` is used after it.
