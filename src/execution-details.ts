@@ -66,7 +66,7 @@ export const REGISTERED_VITEST_FILE_PROJECTS = [
     root: 'apps/operator-public',
     name: 'wallet-binding-calibration-integration',
     layer: 'integration',
-    files: ['src/__tests__/wallet-binding-calibration.integration.test.ts'],
+    files: ['src/__tests__/wallet-binding-calibration.test.ts'],
   },
   {
     root: 'apps/operator-public',
