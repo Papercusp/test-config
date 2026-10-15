@@ -428,6 +428,12 @@ describe('original isolated runtime receipt recording', () => {
       const expected = createHash('sha256').update('{}').digest('hex');
       expect(collectIsolatedRuntimeReceipts(module([test])))
         .toEqual([{ runId, resultSha256: expected, sourceSha256: expected, lifecycleSha256: expected }]);
+      const skipped = { result: () => ({ state: 'skipped' }), meta: () => ({}) };
+      expect(collectIsolatedRuntimeReceipts(module([skipped, test, skipped])))
+        .toEqual([{ runId, resultSha256: expected, sourceSha256: expected, lifecycleSha256: expected }]);
+      expect(collectIsolatedRuntimeReceipts(module([skipped]))).toBeUndefined();
+      expect(collectIsolatedRuntimeReceipts(module([test, { result: () => undefined }])))
+        .toBeUndefined();
       expect(collectIsolatedRuntimeReceipts(module([test, test]))).toBeUndefined();
       expect(collectIsolatedRuntimeReceipts(module([{ ...test, meta: () => ({}) }]))).toBeUndefined();
       expect(collectIsolatedRuntimeReceipts(module([{ ...test, result: () => ({ state: 'failed' }) }]))).toBeUndefined();
