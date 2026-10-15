@@ -32,6 +32,7 @@ const FILE = '/repo/papercusp-desktop/test/guard.test.js';
 function ctx(overrides: Partial<NodeTestRowContext> = {}): NodeTestRowContext {
   return {
     repoRoot: ROOT,
+    runStartedAt: '2026-10-06T16:00:00.000Z',
     finishedAt: new Date('2026-10-06T17:00:00.000Z'),
     worktreeDirty: false,
     worktreeDirtyReason: null,
@@ -189,6 +190,7 @@ describe('buildNodeTestRunRows', () => {
     expect(parsed).toMatchObject({
       filePath: 'papercusp-desktop/test/guard.test.js', passed: 7, failed: 0, collectionFailed: false,
       passedCaseTitles: ['guard > passed'],
+      runStartedAt: '2026-10-06T16:00:00.000Z',
     });
   });
 
@@ -350,6 +352,9 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     expect(parseTestRunExecutionDetails(written[0].executionDetails)).toMatchObject({
       passed: 1, failed: 1, failedCaseTitles: ['outer > fails here'],
     });
+    const runStartedAt = parseTestRunExecutionDetails(written[0].executionDetails)?.runStartedAt;
+    expect(typeof runStartedAt).toBe('string');
+    expect(Date.parse(runStartedAt!)).toBeLessThanOrEqual(written[0].startedAt.getTime());
   });
 
   it('records nothing, and says why, when the child never reported', async () => {

@@ -48,6 +48,7 @@ type WorktreeSnapshot = Awaited<ReturnType<typeof captureWorktreeSnapshot>>;
 
 export interface NodeTestRowContext {
   repoRoot: string;
+  runStartedAt: string;
   finishedAt: Date;
   worktreeDirty: boolean;
   worktreeDirtyReason: string | null;
@@ -125,6 +126,7 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
     const durationMs = Math.max(0, Math.round(result.durationMs));
     const executionDetails: TestRunExecutionDetails = {
       schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
+      runStartedAt: runContext.runStartedAt,
       root: runContext.repoRoot,
       filePath,
       runGroupId: runContext.runGroupId,
@@ -217,6 +219,7 @@ export interface BeginNodeTestLedgerOptions {
  */
 export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): Promise<NodeTestLedgerSession> {
   const { repoRoot } = options;
+  const runStartedAt = new Date().toISOString();
   const readSnapshot = options.readSnapshot ?? captureWorktreeSnapshot;
   const writeRows = options.writeRows ?? insertRows;
   // The snapshot and the ledger path filter both resolve against the checkout under test.
@@ -299,6 +302,7 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
 
         const rows = buildNodeTestRunRows(summary, {
           repoRoot,
+          runStartedAt,
           finishedAt: new Date(),
           worktreeDirty,
           worktreeDirtyReason,

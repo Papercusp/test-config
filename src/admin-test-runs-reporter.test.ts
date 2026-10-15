@@ -130,6 +130,9 @@ describe('Vitest run-level ledger verdict', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe('pass');
     expect(rows[0].outputTail).toBeNull();
+    const runStartedAt = rows[0].executionDetails?.runStartedAt;
+    expect(typeof runStartedAt).toBe('string');
+    expect(Date.parse(runStartedAt!)).toBeLessThanOrEqual(rows[0].startedAt.getTime());
   });
 
   it('preserves successful modules when another module only fails assertions', async () => {
