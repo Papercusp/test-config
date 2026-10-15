@@ -1624,8 +1624,20 @@ export async function insertTestRunRowsWithSql(
       (value) => { written = value; },
       (error) => { failure = error ?? new Error('insert_rejected'); throw failure; },
     );
-    const timeoutMs = Math.min(budget.insertTimeoutMs, remainingMs);
-    const completed = await settleWithin(query, timeoutMs);
+    let timeoutMs = Math.min(budget.insertTimeoutMs, remainingMs);
+    let completed = await settleWithin(query, timeoutMs);
+    if (!completed && !failure) {
+      // Expiring a waiter does not finish its submitted statement. Returning now
+      // releases the reporter lease and sql.end() can destroy RETURNING even
+      // though PostgreSQL committed the row. Give this ONE in-flight statement
+      // the rest of the existing total budget; never submit it again. The total
+      // deadline still bounds teardown when the statement never settles.
+      const drainMs = Math.max(0, deadline - Date.now());
+      if (drainMs > 0) {
+        completed = await settleWithin(query, drainMs);
+        timeoutMs = budget.totalInsertMs;
+      }
+    }
     return { completed, failure, timeoutMs, readWritten: () => written, query };
   };
   for (let offset = 0; offset < identifiedRows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {

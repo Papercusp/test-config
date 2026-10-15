@@ -964,16 +964,29 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       ]);
     });
 
-    it('reports a batch that outlives its budget as timeout instead of silently dropping it', async () => {
+    it('bounds a permanently pending insert by the total budget without replaying it', async () => {
+      vi.useFakeTimers();
       const statement = vi.fn(() => new Promise(() => {}));
       const sql = fakeSql(statement);
-      const receipts = await insertTestRunRowsWithSql(sql, [row('a.test.ts')], context, {
+      let finished = false;
+      const write = insertTestRunRowsWithSql(sql, [row('a.test.ts')], context, {
         insertTimeoutMs: 20, totalInsertMs: 1_000,
+      }).then(receipts => {
+        finished = true;
+        return receipts;
       });
-      expect(receipts).toMatchObject([
-        { filePath: 'a.test.ts', status: 'fail', outcome: 'timeout', reason: 'pg_insert_timeout_20ms' },
-      ]);
-      expect(statement).toHaveBeenCalledTimes(1);
+      try {
+        await vi.advanceTimersByTimeAsync(999);
+        expect(finished).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await write).toMatchObject([
+          { filePath: 'a.test.ts', status: 'fail', outcome: 'timeout', reason: 'pg_insert_timeout_1000ms' },
+        ]);
+        expect(statement).toHaveBeenCalledTimes(1);
+      } finally {
+        await vi.runAllTimersAsync();
+        vi.useRealTimers();
+      }
     });
 
     it('reports a rejected insert as failed with the reason', async () => {
