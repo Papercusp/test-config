@@ -37,8 +37,16 @@ export function findVerifierSourceRoot(from: string): string | null {
   }
 }
 
+export interface VerifierSourceProgress {
+  step: 'git-checkout' | 'source-census';
+  event: 'start' | 'end';
+  status?: number;
+  error?: string;
+}
+
 /** Reuse the full source census, never a supplied SHA or the enclosing Git HEAD. */
-export function readVerifierSourceReceiptSync(root: string, receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT): VerifierSourceReceipt {
+export function readVerifierSourceReceiptSync(root: string, receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT,
+  options: { progress?: (record: VerifierSourceProgress) => void } = {}): VerifierSourceReceipt {
   if (!receiptPath) throw new VerifierSourceError('missing independent verifier source receipt');
   const receiptRel = relative(realpathSync(root), realpathSync(receiptPath));
   if (receiptRel !== '..' && !receiptRel.startsWith(`..${sep}`))
@@ -46,7 +54,7 @@ export function readVerifierSourceReceiptSync(root: string, receiptPath = proces
   const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
   if (process.env.VERIFY_TAURI_SOURCE_REF && receipt.sourceCommit !== process.env.VERIFY_TAURI_SOURCE_REF)
     throw new VerifierSourceError('verifier source receipt differs from selected source ref');
-  verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true });
+  verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true, progress: options.progress });
   return receipt;
 }
 
@@ -187,7 +195,18 @@ export function verifierSourceFiles(root: string, {
 
 /** Synchronous for Playwright's unawaited onBegin hook; unknown source fails closed. */
 export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: string, expected: T,
-  options: { runtimeArtifacts?: boolean } = {}): T {
+  options: { runtimeArtifacts?: boolean; progress?: (record: VerifierSourceProgress) => void } = {}): T {
+  const phase = <V>(step: VerifierSourceProgress['step'], action: () => V): V => {
+    options.progress?.({ step, event: 'start' });
+    try {
+      const value = action();
+      options.progress?.({ step, event: 'end', status: 0 });
+      return value;
+    } catch (error) {
+      options.progress?.({ step, event: 'end', status: 3, error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  };
   if (expected?.schemaVersion !== 'verifier-source-v1' || !expected.testedInputs?.length) {
     throw new VerifierSourceError('missing verification source provenance');
   }
@@ -197,23 +216,27 @@ export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: 
     throw new VerifierSourceError('invalid verification source provenance');
   }
   const gitMetadataPaths = expected.gitCheckout ? ['.git', ...(expected.submodules ?? []).map(row => `${row.path}/.git`)] : [];
-  if (expected.gitCheckout && JSON.stringify(verifierGitCheckoutSync(dest, expected.sourceCommit, expected.submodules)) !== JSON.stringify(expected.gitCheckout)) {
-    throw new VerifierSourceError('tampered verification Git checkout');
-  }
-  const actual = verifierSourceFiles(dest, { ...options, gitMetadataPaths, recordedPaths: expected.files.map(file => file.path) });
-  if (JSON.stringify(actual) !== JSON.stringify(expected.files)) {
-    const recorded = new Map(expected.files.map(file => [file.path, file]));
-    const observed = new Map(actual.map(file => [file.path, file]));
-    const differences: string[] = [];
-    for (const file of expected.files) {
-      const current = observed.get(file.path);
-      if (!current) differences.push(`missing ${file.path}`);
-      else if (JSON.stringify(current) !== JSON.stringify(file)) differences.push(`changed ${file.path}`);
+  if (expected.gitCheckout) phase('git-checkout', () => {
+    if (JSON.stringify(verifierGitCheckoutSync(dest, expected.sourceCommit, expected.submodules)) !== JSON.stringify(expected.gitCheckout))
+      throw new VerifierSourceError('tampered verification Git checkout');
+  });
+  phase('source-census', () => {
+    const actual = verifierSourceFiles(dest, { runtimeArtifacts: options.runtimeArtifacts,
+      gitMetadataPaths, recordedPaths: expected.files.map(file => file.path) });
+    if (JSON.stringify(actual) !== JSON.stringify(expected.files)) {
+      const recorded = new Map(expected.files.map(file => [file.path, file]));
+      const observed = new Map(actual.map(file => [file.path, file]));
+      const differences: string[] = [];
+      for (const file of expected.files) {
+        const current = observed.get(file.path);
+        if (!current) differences.push(`missing ${file.path}`);
+        else if (JSON.stringify(current) !== JSON.stringify(file)) differences.push(`changed ${file.path}`);
+      }
+      for (const file of actual) {
+        if (!recorded.has(file.path)) differences.push(`added ${file.path}`);
+      }
+      throw new VerifierSourceError(`tampered verification source archive: ${differences.slice(0, 10).join('; ')}${differences.length > 10 ? '; further differences omitted' : ''}`);
     }
-    for (const file of actual) {
-      if (!recorded.has(file.path)) differences.push(`added ${file.path}`);
-    }
-    throw new VerifierSourceError(`tampered verification source archive: ${differences.slice(0, 10).join('; ')}${differences.length > 10 ? '; further differences omitted' : ''}`);
-  }
+  });
   return expected;
 }
