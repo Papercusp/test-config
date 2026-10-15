@@ -1008,7 +1008,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   async onTestRunEnd(
     testModules?: ReadonlyArray<TestModule>,
-    unhandledErrors: ReadonlyArray<unknown> = [],
+    unhandledErrors?: ReadonlyArray<unknown>,
     reason?: TestRunEndReason,
   ): Promise<void> {
     try {
@@ -1016,7 +1016,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
         this.nativeRun.finishedAtMs = Date.now();
         this.nativeRun.terminalHook = 'onTestRunEnd';
         this.nativeRun.reason = reason ?? null;
-        this.nativeRun.unhandledErrorCount = unhandledErrors.length;
+        this.nativeRun.unhandledErrorCount = unhandledErrors?.length ?? null;
+        if (!unhandledErrors) this.nativeRun.gaps.push('run-errors-unobserved');
         try {
           this.nativeRun.reportedModulePaths = testModules?.map(module =>
             normalizeExecutedKey(module.moduleId, this.repoRoot)) ?? null;

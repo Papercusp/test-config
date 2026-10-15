@@ -550,6 +550,18 @@ describe('ExecutedSourceMapReporter', () => {
       });
     });
 
+    it('keeps omitted run errors and reason unknown instead of inventing a clean end', async () => {
+      const { r } = reporter();
+      const mod = nativeModule(['passed']);
+      r.onInit({} as never);
+      r.onTestModuleEnd(mod);
+      await r.onTestRunEnd([mod]);
+      expect(nativeOut()).toMatchObject({ terminalHook: 'onTestRunEnd', reason: null,
+        unhandledErrorCount: null, modulePopulationMatched: true,
+        gaps: ['run-errors-unobserved', 'run-end-reason-unobserved'],
+      });
+    });
+
     it('keeps an exit-only flush explicitly incomplete', async () => {
       const { r } = reporter();
       r.onInit({} as never);
