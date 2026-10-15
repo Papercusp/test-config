@@ -331,9 +331,9 @@ export interface TestDbJanitorOptions {
   limit?: number;
 }
 
-/** Creation time of a database: the mtime of the PG_VERSION file CREATE DATABASE writes. */
+/** Database age signal: the per-database directory under PGDATA/base. */
 const DATABASE_CREATED_AT_SQL =
-  `(pg_stat_file('base/' || d.oid || '/PG_VERSION', true)).modification`;
+  `(pg_stat_file('base/' || d.oid, true)).modification`;
 
 /**
  * Drop ready templates nobody has cloned recently (WI-6554700010008843). Each drop
