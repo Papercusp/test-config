@@ -13,7 +13,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { pinModuleState } from '@papercusp/module-singleton';
 
-import { closeSharedPg, closeSharedPgIfUnheld, retainSharedPg, tryGetPg, type PgHandle } from './admin-test-runs-reporter.ts';
+import { closeSharedPg, closeSharedPgIfUnheld, insertTestRunRowsWithSql, retainSharedPg, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
 
 const shared = pinModuleState('@papercusp/test-config.shared-pg', () => ({
   promise: undefined as Promise<PgHandle> | undefined,
@@ -93,5 +93,52 @@ describe('shared PG lease (WI-10003715)', () => {
     expect(end).not.toHaveBeenCalled();
     await held();
     expect(end).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves a late INSERT acknowledgement before releasing the reporter lease within its total budget', async () => {
+    vi.useFakeTimers();
+    let resolveInsert!: (value: unknown) => void;
+    let rejectInsert!: (error: Error) => void;
+    const statement = vi.fn(() => new Promise((resolve, reject) => {
+      resolveInsert = resolve;
+      rejectInsert = reject;
+    }));
+    const end = vi.fn(async () => {
+      rejectInsert(new Error('write CONNECTION_DESTROYED localhost:5432'));
+    });
+    const sql = Object.assign(
+      (first: unknown) => Array.isArray(first) && !('raw' in first) ? {} : statement(),
+      { end },
+    ) as unknown as PgSql;
+    shared.promise = Promise.resolve({ sql });
+    const lease = retainSharedPg();
+    const at = new Date('2026-10-15T20:00:00Z');
+    const row: TestRunRow = {
+      filePath: 'late.test.ts', status: 'fail', durationMs: 1,
+      startedAt: at, finishedAt: at, outputTail: null,
+      isScratchConfig: false, worktreeDirty: false, commitSha: 'abc123', executionDetails: null,
+    };
+    const write = insertTestRunRowsWithSql(sql, [row], {
+      branch: 'staging', inferredCommit: null, declaredSource: 'mutation-probe', runGroupId: null,
+      harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null,
+    }, { insertTimeoutMs: 20, totalInsertMs: 100 }).then(async receipts => {
+      // The same lifetime boundary as AdminTestRunsReporter's onTestRunEnd finally.
+      await lease();
+      return receipts;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(21);
+      expect(end).not.toHaveBeenCalled();
+      resolveInsert([{ id: '901', file_path: row.filePath }]);
+      const receipts = await write;
+      expect(receipts).toMatchObject([{ outcome: 'inserted', id: '901', filePath: row.filePath }]);
+      expect(statement).toHaveBeenCalledTimes(1);
+      expect(end).toHaveBeenCalledTimes(1);
+    } finally {
+      resolveInsert([]);
+      await vi.runAllTimersAsync();
+      await write;
+      vi.useRealTimers();
+    }
   });
 });
