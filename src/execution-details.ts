@@ -64,6 +64,12 @@ export function isRecordedTestLayer(value: unknown): value is RecordedTestLayer 
 export const REGISTERED_VITEST_FILE_PROJECTS = [
   {
     root: 'apps/operator-public',
+    name: 'wallet-binding-calibration-integration',
+    layer: 'integration',
+    files: ['src/__tests__/wallet-binding-calibration.integration.test.ts'],
+  },
+  {
+    root: 'apps/operator-public',
     name: 'treasury-integration',
     layer: 'integration',
     files: ['src/__tests__/treasury.test.ts', 'src/__tests__/transparency-routes.test.ts'],
