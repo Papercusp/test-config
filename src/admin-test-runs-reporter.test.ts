@@ -84,7 +84,9 @@ describe('Vitest run-level ledger verdict', () => {
     const modules = outcomes.map(outcome => ({
       moduleId: join(TEST_CONFIG_ROOT, `src/${outcome.name}.test.ts`),
       state: () => outcome.failed ? 'failed' : outcome.passed ? 'passed' : 'skipped',
-      diagnostic: () => ({ duration: 1 }),
+      // This fixture executes no test body; subtracting a fictitious millisecond
+      // could backdate its module before onInit when both happen in one tick.
+      diagnostic: () => ({ duration: 0 }),
       errors: () => [],
       children: { allTests: () => ['passed', 'failed', 'skipped'].flatMap(state =>
         Array.from({ length: outcome[state as 'passed' | 'failed' | 'skipped'] }, (_, index) => ({
