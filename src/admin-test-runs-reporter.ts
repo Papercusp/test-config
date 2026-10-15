@@ -75,7 +75,11 @@ export function collectIsolatedRuntimeReceipts(testModule: TestModule): Isolated
     const receipts: IsolatedRuntimeReceipt[] = [];
     const base = realpathSync(defaultEvidenceRoot('isolated-integration'));
     for (const test of testModule.children.allTests()) {
-      if (test.result()?.state !== 'passed') return undefined;
+      const state = test.result()?.state;
+      // Name-filtered siblings did not allocate a runtime. Only executed cases
+      // contribute receipts; failed or unsettled cases still refuse custody.
+      if (state === 'skipped') continue;
+      if (state !== 'passed') return undefined;
       const runId = test.meta()?.papercuspIsolatedRuntimeRunId;
       if (typeof runId !== 'string' || !/^\d{8}T\d{6}Z-\d+(?:\.\d+)?$/.test(runId)) return undefined;
       const hashes = ['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json'].map(file => {
