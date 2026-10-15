@@ -3,7 +3,9 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { readVerifierSourceReceiptSync } from './verifier-source.ts';
 
 try {
-  parentPort.postMessage({ receipt: readVerifierSourceReceiptSync(workerData.root, workerData.receiptPath) });
+  parentPort.postMessage({
+    receipt: readVerifierSourceReceiptSync(workerData.root, workerData.receiptPath, { mutation: workerData.mutation }),
+  });
 } catch (error) {
   parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) });
 }

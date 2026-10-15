@@ -44,9 +44,14 @@ export interface VerifierSourceProgress {
   error?: string;
 }
 
+export interface VerifierSourceMutation {
+  /** Absolute path of the one probe subject allowed to differ from the receipt. */
+  subjectPath: string;
+}
+
 /** Reuse the full source census, never a supplied SHA or the enclosing Git HEAD. */
 export function readVerifierSourceReceiptSync(root: string, receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT,
-  options: { progress?: (record: VerifierSourceProgress) => void } = {}): VerifierSourceReceipt {
+  options: { progress?: (record: VerifierSourceProgress) => void; mutation?: VerifierSourceMutation } = {}): VerifierSourceReceipt {
   if (!receiptPath) throw new VerifierSourceError('missing independent verifier source receipt');
   const receiptRel = relative(realpathSync(root), realpathSync(receiptPath));
   if (receiptRel !== '..' && !receiptRel.startsWith(`..${sep}`))
@@ -54,7 +59,7 @@ export function readVerifierSourceReceiptSync(root: string, receiptPath = proces
   const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
   if (process.env.VERIFY_TAURI_SOURCE_REF && receipt.sourceCommit !== process.env.VERIFY_TAURI_SOURCE_REF)
     throw new VerifierSourceError('verifier source receipt differs from selected source ref');
-  verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true, progress: options.progress });
+  verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true, progress: options.progress, mutation: options.mutation });
   return receipt;
 }
 
@@ -63,10 +68,11 @@ export function readVerifierSourceReceiptSync(root: string, receiptPath = proces
  * its synchronous entry point. Resolve only after our worker has exited.
  */
 export function readVerifierSourceReceipt(root: string,
-  receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT): Promise<VerifierSourceReceipt> {
+  receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT,
+  options: { mutation?: VerifierSourceMutation } = {}): Promise<VerifierSourceReceipt> {
   return new Promise((resolveReceipt, reject) => {
     const worker = new Worker(new URL('./verifier-source-worker.mjs', import.meta.url), {
-      workerData: { root, receiptPath },
+      workerData: { root, receiptPath, mutation: options.mutation },
     });
     let receipt: VerifierSourceReceipt | undefined;
     let failure: Error | undefined;
@@ -195,7 +201,8 @@ export function verifierSourceFiles(root: string, {
 
 /** Synchronous for Playwright's unawaited onBegin hook; unknown source fails closed. */
 export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: string, expected: T,
-  options: { runtimeArtifacts?: boolean; progress?: (record: VerifierSourceProgress) => void } = {}): T {
+  options: { runtimeArtifacts?: boolean; progress?: (record: VerifierSourceProgress) => void;
+    mutation?: VerifierSourceMutation } = {}): T {
   const phase = <V>(step: VerifierSourceProgress['step'], action: () => V): V => {
     options.progress?.({ step, event: 'start' });
     try {
@@ -234,6 +241,24 @@ export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: 
       }
       for (const file of actual) {
         if (!recorded.has(file.path)) differences.push(`added ${file.path}`);
+      }
+      if (options.mutation) {
+        // A probe is a content edit of one existing regular file. Mode, kind,
+        // deletion, and every other archive difference remain provenance failures.
+        if (!isAbsolute(options.mutation.subjectPath))
+          throw new VerifierSourceError('mutation subject must be absolute');
+        const mutationRel = relative(resolve(dest), resolve(options.mutation.subjectPath)).split(sep).join('/');
+        if (!mutationRel || mutationRel.startsWith('../') || isAbsolute(mutationRel))
+          throw new VerifierSourceError('mutation subject escapes verifier source archive');
+        const allowed = `changed ${mutationRel}`;
+        const before = recorded.get(mutationRel);
+        const after = observed.get(mutationRel);
+        if (!before || !after || before.kind !== 'file' || after.kind !== 'file'
+          || before.executable !== after.executable)
+          throw new VerifierSourceError(`mutation subject is not a recorded source file: ${mutationRel}`);
+        const remaining = differences.filter(difference => difference !== allowed);
+        if (remaining.length === 0) return;
+        throw new VerifierSourceError(`tampered verification source archive: ${remaining.slice(0, 10).join('; ')}${remaining.length > 10 ? '; further differences omitted' : ''}`);
       }
       throw new VerifierSourceError(`tampered verification source archive: ${differences.slice(0, 10).join('; ')}${differences.length > 10 ? '; further differences omitted' : ''}`);
     }

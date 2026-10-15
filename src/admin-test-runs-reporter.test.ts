@@ -12,7 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -64,7 +64,7 @@ import AdminTestRunsReporter, {
 } from './admin-test-runs-reporter';
 import { parseTestRunExecutionDetails } from './execution-details.ts';
 import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
-import { verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
+import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
@@ -366,6 +366,71 @@ describe('receipt-backed native archive reporter', () => {
       if (mutate) expect(persisted[0].executionDetails?.worktreeDirtyReason).toContain('changed packages/operator-core/journey.e2e.test.ts');
     } finally { setRunRoot(null); vi.unstubAllEnvs(); rmSync(parent, { recursive: true, force: true }); }
   });
+
+  it('allows exactly the recorded mutation subject in a verifier archive', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'native-archive-mutation-subject-'));
+    const root = join(parent, 'source');
+    const file = join(root, 'journey.e2e.test.ts');
+    mkdirSync(root);
+    writeFileSync(file, 'export const journey = true;\n');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'e'.repeat(40),
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })), files };
+    const receiptPath = join(parent, 'receipt.json');
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', receiptPath);
+    vi.stubEnv('VERIFY_TAURI_SOURCE_REF', receipt.sourceCommit);
+    vi.stubEnv('OPERATOR_SOURCE_ROOT', root);
+    vi.stubEnv('PAPERCUSP_MUTATION_PROBE', '1');
+    vi.stubEnv('PAPERCUSP_MUTATION_PROBE_SUBJECT', file);
+    setRunRoot(root);
+    try {
+      writeFileSync(file, 'export const journey = false;\n');
+      // The ordinary source verifier remains immutable even in a probe process.
+      expect(() => readVerifierSourceReceiptSync(root)).toThrow('changed journey.e2e.test.ts');
+      expect(await captureWorktreeSnapshot()).toEqual({ commit: receipt.sourceCommit, porcelain: '' });
+      writeFileSync(join(root, 'unrelated.ts'), 'export const unrelated = true;\n');
+      expect(await captureWorktreeSnapshot()).toMatchObject({
+        commit: null,
+        porcelain: null,
+        provenanceError: expect.stringContaining('added unrelated.ts'),
+      });
+    } finally { setRunRoot(null); vi.unstubAllEnvs(); rmSync(parent, { recursive: true, force: true }); }
+  });
+
+  it.each(['not-a-probe', 'relative-subject', 'outside-subject', 'wrong-subject',
+    'deleted-subject', 'mode-change', 'symlink-subject'] as const)(
+    'refuses a verifier archive mutation with %s', async kind => {
+      const parent = mkdtempSync(join(tmpdir(), 'native-archive-mutation-negative-'));
+      const root = join(parent, 'source');
+      const file = join(root, 'subject.ts');
+      mkdirSync(root);
+      writeFileSync(file, 'export const source = true;\n');
+      writeFileSync(join(root, 'other.ts'), 'export const other = true;\n');
+      const files = verifierSourceFiles(root);
+      const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'd'.repeat(40),
+        testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })), files };
+      const receiptPath = join(parent, 'receipt.json');
+      writeFileSync(receiptPath, JSON.stringify(receipt));
+      writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+      vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', receiptPath);
+      vi.stubEnv('VERIFY_TAURI_SOURCE_REF', receipt.sourceCommit);
+      vi.stubEnv('PAPERCUSP_MUTATION_PROBE', kind === 'not-a-probe' ? '' : '1');
+      vi.stubEnv('PAPERCUSP_MUTATION_PROBE_SUBJECT',
+        kind === 'relative-subject' ? 'subject.ts' : kind === 'outside-subject' ? join(parent, 'outside.ts')
+          : kind === 'wrong-subject' ? join(root, 'other.ts') : file);
+      setRunRoot(root);
+      try {
+        writeFileSync(file, 'export const source = false;\n');
+        if (kind === 'deleted-subject') rmSync(file);
+        if (kind === 'mode-change') chmodSync(file, 0o755);
+        if (kind === 'symlink-subject') { rmSync(file); symlinkSync('other.ts', file); }
+        expect(await captureWorktreeSnapshot()).toMatchObject({
+          commit: null, porcelain: null, provenanceError: expect.stringContaining('verifier source:'),
+        });
+      } finally { setRunRoot(null); vi.unstubAllEnvs(); rmSync(parent, { recursive: true, force: true }); }
+    });
 
   it('keeps an explicitly unknown source null instead of substituting the parent or caller commit', async () => {
     const captured: Record<string, unknown>[] = [];
