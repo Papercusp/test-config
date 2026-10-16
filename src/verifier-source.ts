@@ -143,8 +143,14 @@ export function verifierSourceFiles(root: string, {
       // Vitest writes its result cache beneath the shared config's .vitest-tmp.
       // Permit only the exact cache file, never the whole directory or recorded source.
       const vitestResultCache = /(?:^|\/)\.vitest-tmp\/vitest\/[0-9a-f]{40}\/results\.json$/.test(rel);
-      if (runtimeArtifacts && (vitestResultCache || [
+      // setup-vad-runtime.sh mirrors ORT's versioned wasm/module names into
+      // the public root too. Keep the match at that exact root and extension.
+      const vadRuntimeAsset = /^apps\/operator\/public\/ort-wasm-[^/]+\.(?:wasm|mjs)$/.test(rel);
+      if (runtimeArtifacts && (vitestResultCache || vadRuntimeAsset || [
         'apps/operator-vite/src/routeTree.gen.ts', '.papercusp-pinned-deps',
+        'apps/operator/public/silero_vad_v5.onnx',
+        'apps/operator/public/silero_vad_legacy.onnx',
+        'apps/operator/public/vad.worklet.bundle.min.js',
         // Native build wrappers create this exact regular flock file.
         'papercusp-desktop/src-tauri/sidecar.lock',
         // build.rs creates these exact placeholders on a clean native build.
@@ -165,6 +171,14 @@ export function verifierSourceFiles(root: string, {
         'apps/operator/playwright-report', 'papercusp-desktop/src-tauri/target',
         'papercusp-desktop/src-tauri/gen/schemas',
         'libs/generic/sse/dist', 'packages/omp-plugin/dist',
+        // The maintained operator-vite prebuild creates these mirrors from
+        // pinned dependencies (and the SHA-pinned Porcupine model) before the
+        // host bundler rechecks this census. Public source outside these exact
+        // roots stays in the census; recorded files below them stay source too.
+        'apps/operator/public/wake-runtime', 'apps/operator/public/vad-runtime',
+        'apps/operator/public/vditor', 'apps/operator/public/vditor-local',
+        'apps/operator/public/monaco', 'apps/operator/public/excalidraw',
+        'apps/operator/public/porcupine', 'apps/operator/public/elevenlabs-runtime',
       ].includes(rel);
       if (runtimeArtifacts && runtimeDirectory
         && !recordedPaths.some(p => p === rel || p.startsWith(`${rel}/`))) {
