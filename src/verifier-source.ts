@@ -39,9 +39,14 @@ export function findVerifierSourceRoot(from: string): string | null {
 
 export interface VerifierSourceProgress {
   step: 'git-checkout' | 'source-census';
-  event: 'start' | 'end';
+  event: 'start' | 'progress' | 'end';
   status?: number;
   error?: string;
+  completedFiles?: number;
+  totalFiles?: number;
+  bytesRead?: number;
+  /** Next file to inspect; counters cover only the files already hashed. */
+  nextPath?: string;
 }
 
 export interface VerifierSourceMutation {
@@ -120,13 +125,24 @@ export function verifierGitCheckoutSync(root: string, sourceCommit: string,
 
 /** Never follow archive symlinks or exclude a recorded source path. */
 export function verifierSourceFiles(root: string, {
-  runtimeArtifacts = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root, includedPaths,
+  runtimeArtifacts = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root, includedPaths, progress,
 }: { runtimeArtifacts?: boolean; recordedPaths?: string[]; gitMetadataPaths?: string[];
   /** Dependency trees can link to workspace source inside the same archive. */
   symlinkRoot?: string;
   /** Explicit population from the maintained dependency-generation record writer. */
-  includedPaths?: ReadonlySet<string> } = {}): VerifierSourceFile[] {
+  includedPaths?: ReadonlySet<string>;
+  progress?: (record: VerifierSourceProgress) => void } = {}): VerifierSourceFile[] {
   const rows: VerifierSourceFile[] = [];
+  let bytesRead = 0;
+  let lastReportedFiles = -256;
+  let nextReportAt = 0;
+  const report = (nextPath?: string): void => {
+    progress?.({ step: 'source-census', event: 'progress', completedFiles: rows.length,
+      ...(recordedPaths.length ? { totalFiles: recordedPaths.length } : {}), bytesRead,
+      ...(nextPath ? { nextPath } : {}) });
+    lastReportedFiles = rows.length;
+    nextReportAt = Date.now() + 5_000;
+  };
   function walk(dir: string): void {
     for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const path = join(dir, entry.name);
@@ -189,6 +205,10 @@ export function verifierSourceFiles(root: string, {
       else {
         const stat = lstatSync(path);
         if (!stat.isFile() && !stat.isSymbolicLink()) throw new VerifierSourceError(`unsupported archive entry: ${rel}`);
+        // Synchronous hashing cannot service a timer. Bound journal volume by
+        // file count/time, and name a large read before it can block or be killed.
+        if (progress && (rows.length - lastReportedFiles >= 256 || Date.now() >= nextReportAt
+          || stat.size >= 16 * 1024 * 1024)) report(rel);
         const bytes = stat.isSymbolicLink() ? readlinkSync(path) : readFileSync(path);
         if (stat.isSymbolicLink()) {
           const target = resolve(dirname(path), String(bytes));
@@ -206,10 +226,12 @@ export function verifierSourceFiles(root: string, {
         }
         rows.push({ path: rel, kind: stat.isSymbolicLink() ? 'symlink' : 'file',
           executable: Boolean(stat.mode & 0o111), sha256: createHash('sha256').update(bytes).digest('hex') });
+        bytesRead += Buffer.byteLength(bytes);
       }
     }
   }
   walk(root);
+  if (progress) report();
   return rows;
 }
 
@@ -243,7 +265,7 @@ export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: 
   });
   phase('source-census', () => {
     const actual = verifierSourceFiles(dest, { runtimeArtifacts: options.runtimeArtifacts,
-      gitMetadataPaths, recordedPaths: expected.files.map(file => file.path) });
+      gitMetadataPaths, recordedPaths: expected.files.map(file => file.path), progress: options.progress });
     if (JSON.stringify(actual) !== JSON.stringify(expected.files)) {
       const recorded = new Map(expected.files.map(file => [file.path, file]));
       const observed = new Map(actual.map(file => [file.path, file]));
