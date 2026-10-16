@@ -448,6 +448,46 @@ export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
     this.ownedStartupId = id;
   }
 
+  /**
+   * Retire a reused candidate that the caller has just proven unreachable.
+   *
+   * The ordinary start sweep only removes stopped generations because a
+   * running old generation may still be serving another test process. This
+   * path is different: `withContainerRecoveryReResolution` calls it only
+   * after the bounded readiness retry and a fresh reachability probe both say
+   * the candidate is unusable. Recheck the reuse labels before stopping so a
+   * concurrent generation change cannot make this call remove a peer's
+   * container. `removeVolumes:true` is required because reused Postgres
+   * containers own anonymous data volumes that Docker otherwise leaves behind.
+   */
+  async retireUnreachable(container: StartedPostgreSqlContainer): Promise<void> {
+    const reuse = this.reuseGeneration;
+    if (!reuse) return;
+    try {
+      const client = await this.runtimeClient();
+      const handle = client.container.getById(container.getId());
+      const current = await client.container.inspect(handle);
+      const labels = current.Config?.Labels ?? {};
+      const rawGeneration = labels[reuse.label];
+      const generation = Number(rawGeneration);
+      if (
+        labels["org.testcontainers"] !== "true" ||
+        !labels["org.testcontainers.container-hash"] ||
+        !Number.isSafeInteger(generation) ||
+        generation < 0 ||
+        String(generation) !== rawGeneration ||
+        generation >= reuse.generation
+      ) return;
+      if (current.State?.Running || current.State?.Restarting) {
+        await client.container.stop(handle, { timeout: 0 });
+      }
+      await client.container.remove(handle, { removeVolumes: true });
+    } catch (error) {
+      // Another recovery attempt may have removed the same candidate first.
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+  }
+
   override async start(): Promise<StartedPostgreSqlContainer> {
     this.ownedStartupId = undefined;
     if (this.reuse && this.reuseGeneration && process.env.TESTCONTAINERS_REUSE_ENABLE !== "false") {
@@ -613,12 +653,13 @@ export async function getTestPg(): Promise<string> {
     // the packaged desktop uncaught. pgvector/pgvector:pg18 exists on Docker Hub
     // (verified via `docker manifest inspect` + a version pull: reports
     // "PostgreSQL 18.4 (Debian 18.4-1.pgdg12+1)" — same major as the shipped 18.3).
+    let candidateBuilder: CappedLogPostgreSqlContainer | undefined;
     containerPromise = withTestcontainerStartLock(
       "shared-docker-testcontainers-start",
       () =>
         withContainerRecoveryReResolution(
-          async () =>
-            new CappedLogPostgreSqlContainer(TEST_PG_IMAGE)
+          async () => {
+            candidateBuilder = new CappedLogPostgreSqlContainer(TEST_PG_IMAGE)
               .withDatabase("papercusp_test")
               .withEnvironment({ POSTGRES_INITDB_ARGS: TEST_PG_INITDB_ARGS })
               .withCappedJsonLog()
@@ -664,8 +705,9 @@ export async function getTestPg(): Promise<string> {
               // host loop still refuses until Postgres is writable.
               .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
               .withWaitStrategy(Wait.forListeningPorts())
-              .withReuse()
-              .start(),
+              .withReuse();
+            return candidateBuilder.start();
+          },
           async (container) => {
             // Heal the cluster-global framework roles once per container (see above).
             //
@@ -759,9 +801,11 @@ export async function getTestPg(): Promise<string> {
               );
             }
           },
-          async () => {
-            // A reused container may still serve other test processes. Change
-            // the reuse hash instead of stopping their database underneath them.
+          async (container) => {
+            // This callback runs only after shouldRetire proves the candidate
+            // unreachable. Stop/remove that retired generation, including its
+            // anonymous data volume, before publishing the next generation.
+            await candidateBuilder?.retireUnreachable(container);
             await rotateTestPgReuseGeneration();
           },
           {

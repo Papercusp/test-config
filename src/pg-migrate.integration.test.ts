@@ -517,14 +517,19 @@ const sleepMs = (ms: number) => new Promise<void>((resolve) => setTimeout(resolv
 describe('test database janitor (WI-6554700010008843)', () => {
   it('collects an idle superseded template, keeps the newest and a recently cloned one, and never races its build lock', async () => {
     const family = `gcfam${randomBytes(3).toString('hex').replace(/[0-9]/g, 'q')}`;
-    const keys = [0, 1, 2].map(() => `${family}_${randomBytes(8).toString('hex')}`);
+    // Reverse lexical order relative to creation: names must not accidentally
+    // stand in for the true newest database when directory mtimes tie.
+    const keys = [
+      `${family}_ffffffffffffffff`,
+      `${family}_8888888888888888`,
+      `${family}_0000000000000000`,
+    ];
     const [oldest, cloned, newest] = keys.map((k) => `tmpl_${k}`) as [string, string, string];
     for (const key of keys) {
       await getOrBuildTemplate(key, async (url) => {
         const sql = postgres(url, { max: 1, onnotice: () => {} });
         try { await sql.unsafe(`CREATE TABLE janitor_marker (id int)`); } finally { await sql.end({ timeout: 5 }); }
       });
-      await sleepMs(30); // distinct database-directory mtimes, so "newest" is well defined
     }
     const admin = await adminClient();
     // Every template was built before the cutoff; only `cloned` is used after it.
@@ -539,7 +544,14 @@ describe('test database janitor (WI-6554700010008843)', () => {
           AND cfg LIKE 'papercusp.template_last_used=%'`,
     ) as Array<{ cfg: string }>;
     expect(Number(stamp[0]?.cfg.split('=')[1])).toBeGreaterThan(cutoff);
-    const scoped = scopedTo(admin, [oldest, cloned, newest]);
+    // Model a filesystem whose directory mtimes have only coarse precision.
+    // The janitor must still preserve the actually newest template by database
+    // creation order, not by its random name.
+    const scoped = scopedTo(admin, [oldest, cloned, newest], (q) => {
+      const mtimeExpression = "(pg_stat_file('base/' || d.oid, true)).modification";
+      expect(q).toContain(mtimeExpression);
+      return q.replace(mtimeExpression, "TIMESTAMPTZ '2000-01-01 00:00:00+00'");
+    });
     const opts = { nowMs: cutoff, templateIdleMs: 0, templateKeepPerFamily: 1, limit: 10 };
 
     // A held build lock means a builder owns the key: the janitor must skip it.

@@ -357,6 +357,7 @@ export async function sweepIdleTemplates(
     rows = (await admin.unsafe(
       `WITH ready AS MATERIALIZED (
          SELECT d.datname,
+                d.oid AS created_oid,
                 regexp_replace(d.datname, '_[0-9a-f]{8,}$', '') AS family,
                 ${DATABASE_CREATED_AT_SQL} AS created_at,
                 (SELECT substring(cfg FROM '=([0-9]{13})$')
@@ -375,7 +376,10 @@ export async function sweepIdleTemplates(
          SELECT r.*,
                 row_number() OVER (
                   PARTITION BY r.family
-                  ORDER BY r.created_at DESC NULLS FIRST, r.datname DESC
+                  -- Filesystem directory mtimes can collide at their timestamp
+                  -- resolution. Database OIDs are assigned at creation, so use
+                  -- them to break ties instead of an arbitrary/random name.
+                  ORDER BY r.created_at DESC NULLS FIRST, r.created_oid DESC
                 ) AS newest_rank,
                 COALESCE(r.last_used_ms, (extract(epoch from r.created_at) * 1000)::bigint) AS idle_since_ms
            FROM ready r

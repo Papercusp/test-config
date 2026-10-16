@@ -426,6 +426,34 @@ describe("reusable PG container lifecycle (WI-10008196)", () => {
     expect(f.stop).not.toHaveBeenCalled();
   });
 
+  it("retires an unreachable running generation and removes its anonymous volumes", async () => {
+    const f = fixture();
+    const started = { getId: () => "unreachable" } as StartedPostgreSqlContainer;
+    f.inspect.mockResolvedValue({ State: { Running: true, Restarting: false }, Config: { Labels: labels("0") } });
+    await f.probe.withReuseGeneration(label, 2).withReuse().retireUnreachable(started);
+    expect(f.stop).toHaveBeenCalledWith({ id: "unreachable" }, { timeout: 0 });
+    expect(f.remove).toHaveBeenCalledWith({ id: "unreachable" }, { removeVolumes: true });
+  });
+
+  it.each(["current-generation", "foreign", "not-reused", "invalid-generation"])(
+    "does not retire a candidate whose reuse identity changed: %s",
+    async (reason) => {
+      const f = fixture();
+      const started = { getId: () => reason } as StartedPostgreSqlContainer;
+      const candidateLabels = reason === "current-generation"
+        ? labels("2")
+        : reason === "foreign"
+          ? { ...labels("0"), ["org.testcontainers"]: "false" }
+          : reason === "not-reused"
+            ? { ...labels("0"), ["org.testcontainers.container-hash"]: "" }
+            : { ...labels("01") };
+      f.inspect.mockResolvedValue({ State: { Running: true, Restarting: false }, Config: { Labels: candidateLabels } });
+      await f.probe.withReuseGeneration(label, 2).withReuse().retireUnreachable(started);
+      expect(f.stop).not.toHaveBeenCalled();
+      expect(f.remove).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["changed-generation", "foreign", "not-reused", "restarting"])("preserves a candidate whose inspected ownership/state changed: %s", async (reason) => {
     const f = fixture();
     f.list.mockResolvedValue([{ Id: reason, Labels: labels("0") }]);
@@ -459,6 +487,7 @@ describe("reusable PG container lifecycle (WI-10008196)", () => {
 
   it("wires both shared and baseline cluster families through the same lifecycle builder", () => {
     expect(SOURCE).toMatch(/withReuseGeneration\(TEST_PG_REUSE_GENERATION_LABEL, await readTestPgReuseGeneration\(\)\)/);
+    expect(SOURCE).toMatch(/candidateBuilder\?\.retireUnreachable\(container\)/);
     expect(BASELINE_SCHEMA_SOURCE).toMatch(/new CappedLogPostgreSqlContainer\(/);
     expect(BASELINE_SCHEMA_SOURCE).toMatch(/withReuseGeneration\(BASELINE_SCHEMA_REUSE_GENERATION_LABEL, generation\)/);
   });
