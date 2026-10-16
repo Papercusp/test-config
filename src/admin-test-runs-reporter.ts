@@ -1293,6 +1293,12 @@ export function tryGetPg(): Promise<PgHandle> {
       const url = resolveTestRunsPgUrl();
       const sql = pg(url, {
         max: 2,
+        // Ledger writes use scalar and JSON columns, not custom PostgreSQL
+        // array types. postgres.js starts an unobserved async catalog lookup
+        // otherwise; interrupting it at our bounded shutdown leaks a rejection
+        // outside the reporter's fail-soft boundary (EI-26154571958613818).
+        // Keep submitted INSERT failures on their observed query promises.
+        fetch_types: false,
         connect_timeout: reporterWriteBudget(process.env).connectTimeoutSec,
         onnotice: () => {},
       });
