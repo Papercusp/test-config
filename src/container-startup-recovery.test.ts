@@ -52,6 +52,9 @@ describe.each(helpers)('$name startup failure recovery (WI-6554700010015985)', (
     // Concurrent callers share one attempt and observe its actual failure.
     const failed = await Promise.allSettled([get(), get()]);
     expect(failed.map(result => result.status)).toEqual(['rejected', 'rejected']);
+    for (const result of failed) {
+      if (result.status === 'rejected') expect(result.reason).toBe(failure);
+    }
     expect(start).toHaveBeenCalledOnce();
 
     // This distinguishes a poisoned process-local cache from Docker staying

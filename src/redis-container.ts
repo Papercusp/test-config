@@ -18,7 +18,12 @@ export async function getTestRedis(): Promise<string> {
         .withExposedPorts(6379)
         .withReuse()
         .start(),
-    );
+    ).catch((error) => {
+      // Keep concurrent callers on one attempt, but do not cache a failed
+      // Docker start forever after the daemon has recovered.
+      redisPromise = null;
+      throw error;
+    });
   }
   const container = await redisPromise;
   return `redis://${container.getHost()}:${container.getMappedPort(6379)}`;

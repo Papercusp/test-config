@@ -56,7 +56,12 @@ export async function getTestTypesense(): Promise<TestTypesense> {
         .withWaitStrategy(Wait.forHttp('/health', 8108).forStatusCode(200))
         .withReuse()
         .start(),
-    );
+    ).catch((error) => {
+      // A startup transport failure must not poison every later health/auth
+      // caller in this process. Only pending/successful starts are shared.
+      typesensePromise = null;
+      throw error;
+    });
   }
   const container = await typesensePromise;
   const host = container.getHost();
