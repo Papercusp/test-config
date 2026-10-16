@@ -513,6 +513,63 @@ describe('original isolated runtime receipt recording', () => {
   });
 });
 
+describe('retained isolated runtime receipt custody', () => {
+  it('records every original receipt after completed run directories are pruned', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'isolated-reporter-retained-'));
+    vi.stubEnv('VH_EVIDENCE_ROOT_BASE', dir);
+    const files = ['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json'];
+    const runIds = ['20261008T000000Z-100', '20261008T000001Z-100'];
+    try {
+      for (const runId of runIds) {
+        for (const file of files) {
+          for (const location of [runId, join('retained', runId)]) {
+            const target = join(dir, 'isolated-integration', location, file);
+            mkdirSync(join(target, '..'), { recursive: true });
+            writeFileSync(target, JSON.stringify({ runId, file }));
+          }
+        }
+      }
+      // A long multi-case file outlives its early runs' active directories.
+      rmSync(join(dir, 'isolated-integration', runIds[0]), { recursive: true });
+      // Retained originals remain authoritative while a live directory exists.
+      writeFileSync(join(dir, 'isolated-integration', runIds[1], files[0]), 'changed live result');
+      const module = { children: { allTests: () => runIds.map(runId => ({
+        result: () => ({ state: 'passed' }), meta: () => ({ papercuspIsolatedRuntimeRunId: runId }),
+      })) } } as never;
+      expect(collectIsolatedRuntimeReceipts(module)).toEqual(runIds.map(runId => {
+        const hashes = files.map(file => createHash('sha256').update(JSON.stringify({ runId, file })).digest('hex'));
+        return { runId, resultSha256: hashes[0], sourceSha256: hashes[1], lifecycleSha256: hashes[2] };
+      }));
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses partial retained originals and receipts escaping the evidence root', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'isolated-reporter-retained-invalid-'));
+    const outside = mkdtempSync(join(tmpdir(), 'isolated-reporter-outside-'));
+    vi.stubEnv('VH_EVIDENCE_ROOT_BASE', dir);
+    const runId = '20261008T000000Z-100';
+    const base = join(dir, 'isolated-integration', 'retained', runId);
+    const files = ['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json'];
+    const module = { children: { allTests: () => [{ result: () => ({ state: 'passed' }),
+      meta: () => ({ papercuspIsolatedRuntimeRunId: runId }) }] } } as never;
+    try {
+      for (const file of files) {
+        mkdirSync(join(base, file, '..'), { recursive: true });
+        writeFileSync(join(base, file), '{}');
+      }
+      rmSync(join(base, files[2]));
+      expect(collectIsolatedRuntimeReceipts(module)).toBeUndefined();
+      writeFileSync(join(outside, 'lifecycle.json'), '{}');
+      symlinkSync(join(outside, 'lifecycle.json'), join(base, files[2]));
+      expect(collectIsolatedRuntimeReceipts(module)).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('runtime environment recorded around execution', () => {
   async function record(fingerprints: Array<string | null>, fault?: { call: number; kind: 'error' | 'timeout' }) {
     const rows: TestRunRow[] = [];
