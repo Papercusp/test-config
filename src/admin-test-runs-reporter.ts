@@ -82,8 +82,12 @@ export function collectIsolatedRuntimeReceipts(testModule: TestModule): Isolated
       if (state !== 'passed') return undefined;
       const runId = test.meta()?.papercuspIsolatedRuntimeRunId;
       if (typeof runId !== 'string' || !/^\d{8}T\d{6}Z-\d+(?:\.\d+)?$/.test(runId)) return undefined;
+      // runHarness retains immutable originals before pruning completed run
+      // directories. Early cases may already be pruned when a long file ends.
+      const retained = join(base, 'retained', runId);
+      const runRoot = existsSync(retained) ? retained : join(base, runId);
       const hashes = ['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json'].map(file => {
-        const path = realpathSync(join(base, runId, file));
+        const path = realpathSync(join(runRoot, file));
         if (relative(base, path).startsWith('..') || statSync(path).size > 1_048_576) throw new Error('invalid runtime artifact');
         return createHash('sha256').update(readFileSync(path)).digest('hex');
       });
