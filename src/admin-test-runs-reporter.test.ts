@@ -2470,6 +2470,69 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
 });
 
 describe('runGit failure diagnostics (EI-25879692352233544)', () => {
+  it.skipIf(process.platform === 'win32').each(['stdout', 'stderr'] as const)(
+    'bounds %s while terminating the command without throwing (EI-26096532443968552)', async stream => {
+      const failures: string[] = [];
+      const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+      const program = `process.${stream}.write('x'.repeat(1024 * 1024 + 1));`;
+      expect(await runGit(`${quote(process.execPath)} -e ${quote(program)}`, process.cwd(), 5_000,
+        detail => failures.push(detail))).toBeNull();
+      expect(failures).toHaveLength(1);
+      const failure = JSON.parse(failures[0]);
+      expect(failure).toMatchObject({ killed: true, message: `${stream} maxBuffer length exceeded` });
+      expect(failure.stderr.length).toBeLessThanOrEqual(512);
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')('stops Git descendants that ignore SIGTERM when the read times out (EI-26096532443968552)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'git-descendant-timeout-'));
+    const pidPath = join(root, 'descendant.pid');
+    const script = join(root, 'blocked.cjs');
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    let descendant: number | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const running = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        // An orphan may await reaping by PID 1 after it has already stopped.
+        if (process.platform === 'linux') {
+          const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+          return !stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z ');
+        }
+        return true;
+      } catch { return false; }
+    };
+    writeFileSync(script, [
+      'process.on("SIGTERM", () => {});',
+      'require("node:fs").writeFileSync(process.argv[2], String(process.pid));',
+      'setInterval(() => {}, 1000);',
+    ].join('\n'));
+    const alias = `!${quote(process.execPath)} ${quote(script)} ${quote(pidPath)}`;
+    try {
+      const failures: string[] = [];
+      const pending = runGit(`git -c ${quote(`alias.reporter-block=${alias}`)} reporter-block`, root, 5_000,
+        detail => failures.push(detail));
+      const result = await Promise.race([pending, new Promise<string>(resolve => {
+        deadline = setTimeout(() => resolve('reporter timeout did not settle'), 8_000);
+      })]);
+      descendant = Number(readFileSync(pidPath, 'utf8'));
+      expect(descendant).toBeGreaterThan(0);
+      expect(result).toBeNull();
+      expect(failures).toHaveLength(1);
+      expect(JSON.parse(failures[0])).toMatchObject({ timeoutMs: 5_000, killed: true });
+      await vi.waitFor(() => expect(running(descendant!)).toBe(false), { timeout: 1_000, interval: 20 });
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      if (descendant === undefined) {
+        try { descendant = Number(readFileSync(pidPath, 'utf8')); } catch { /* Spawn may have failed. */ }
+      }
+      if (descendant && running(descendant)) {
+        try { process.kill(descendant, 'SIGKILL'); } catch { /* Already exited. */ }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it('retains a real Git exit code and bounded stderr without changing null semantics', async () => {
     const root = mkdtempSync(join(tmpdir(), 'git-diagnostic-'));
     try {

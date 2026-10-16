@@ -30,7 +30,7 @@
 
 import type { Reporter, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
-import { exec } from 'node:child_process';
+import { exec, spawn } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -451,6 +451,9 @@ let _gitCache: { value: GitContext; expiresAt: number } | null = null;
 export function runGit(
   cmd: string, cwd: string, timeoutMs: number, onFailure?: (diagnostic: string) => void,
 ): Promise<string | null> {
+  // Windows retains exec's native shell/timeout behavior. POSIX must own a
+  // process group: killing exec's shell alone leaves Git and its helpers alive.
+  if (process.platform !== 'win32') return runGitProcessGroup(cmd, cwd, timeoutMs, onFailure);
   return new Promise((resolveP) => {
     const startedAt = Date.now();
     let settled = false;
@@ -478,6 +481,71 @@ export function runGit(
     } catch (error) {
       finish(error, '', '');
     }
+  });
+}
+
+/** Built-ins only, like the reporter; the script runner's group-kill helper cannot be loaded here. */
+function runGitProcessGroup(
+  cmd: string, cwd: string, timeoutMs: number, onFailure?: (diagnostic: string) => void,
+): Promise<string | null> {
+  return new Promise((resolveP) => {
+    const startedAt = Date.now();
+    let settled = false;
+    let killed = false;
+    let stdout = '';
+    let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let child: ReturnType<typeof spawn> | undefined;
+    let terminationReason: string | undefined;
+    const finish = (error?: unknown, code: string | number | null = null, signal: string | null = null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error || killed || code !== 0) {
+        const failure = error as { code?: string | number; message?: string } | undefined;
+        try {
+          onFailure?.(JSON.stringify({ command: cmd, timeoutMs, elapsedMs: Date.now() - startedAt,
+            code: failure?.code ?? code, signal, killed,
+            message: (terminationReason ?? failure?.message ?? '').slice(0, 512),
+            stderr: stderr.trim().slice(-512) }));
+        } catch { /* Diagnostics must obey the reporter's fail-soft contract too. */ }
+        resolveP(null);
+      } else resolveP(stdout.trim());
+    };
+    const stop = (reason: string) => {
+      if (settled || killed) return;
+      killed = true;
+      terminationReason = reason;
+      // SIGKILL makes the read budget a bound even for a Git helper that ignores
+      // SIGTERM. The group may survive its shell, so signal it before the child.
+      try { if (child?.pid) process.kill(-child.pid, 'SIGKILL'); }
+      catch { try { child?.kill('SIGKILL'); } catch { /* Already gone. */ } }
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+      // A blocked event loop can run this timer before reading an already-exited
+      // child's output. Such an attempt is still unreadable, never false-clean.
+      finish(undefined, child?.exitCode ?? null, child?.signalCode ?? 'SIGKILL');
+    };
+    try {
+      child = spawn(cmd, { cwd, shell: true, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      child.stdout?.setEncoding('utf8');
+      child.stderr?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk: string) => {
+        stdoutBytes += Buffer.byteLength(chunk);
+        if (stdoutBytes > 1024 * 1024) stop('stdout maxBuffer length exceeded');
+        else stdout += chunk;
+      });
+      child.stderr?.on('data', (chunk: string) => {
+        stderrBytes += Buffer.byteLength(chunk);
+        if (stderrBytes > 1024 * 1024) stop('stderr maxBuffer length exceeded');
+        else stderr += chunk;
+      });
+      child.once('error', error => finish(error));
+      child.once('close', (code, signal) => finish(undefined, code, signal));
+      if (timeoutMs > 0) timer = setTimeout(() => stop('command timed out'), timeoutMs);
+    } catch (error) { finish(error); }
   });
 }
 async function resolveGitContext(): Promise<GitContext> {
