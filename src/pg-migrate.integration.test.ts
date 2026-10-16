@@ -547,12 +547,18 @@ describe('test database janitor (WI-6554700010008843)', () => {
     // Model a filesystem whose directory mtimes have only coarse precision.
     // The janitor must still preserve the actually newest template by database
     // creation order, not by its random name.
+    let janitorQuery = '';
     const scoped = scopedTo(admin, [oldest, cloned, newest], (q) => {
       const mtimeExpression = "(pg_stat_file('base/' || d.oid, true)).modification";
       expect(q).toContain(mtimeExpression);
-      return q.replace(mtimeExpression, "TIMESTAMPTZ '2000-01-01 00:00:00+00'");
+      janitorQuery = q.replace(mtimeExpression, "TIMESTAMPTZ '2000-01-01 00:00:00+00'");
+      return janitorQuery;
     });
     const opts = { nowMs: cutoff, templateIdleMs: 0, templateKeepPerFamily: 1, limit: 10 };
+    const idsByCreation = await admin.unsafe(
+      `SELECT datname, oid FROM pg_database WHERE datname IN ('${oldest}', '${cloned}', '${newest}') ORDER BY oid DESC`,
+    ) as Array<{ datname: string; oid: string | number }>;
+    expect(idsByCreation[0]?.datname).toBe(newest);
 
     // A held build lock means a builder owns the key: the janitor must skip it.
     const builder = await adminClient();
@@ -565,7 +571,18 @@ describe('test database janitor (WI-6554700010008843)', () => {
     }
 
     expect(await sweepIdleTemplates(scoped, Date.now() + 30_000, opts)).toBe(true);
-    expect(await databaseExists(admin, oldest)).toBe(false);
+    const candidateQuery = janitorQuery.replace(
+      'SELECT k.datname\n',
+      'SELECT k.datname, k.created_oid, k.newest_rank, k.last_used_ms, k.idle_since_ms\n',
+    );
+    const candidates = await admin.unsafe(candidateQuery) as Array<Record<string, unknown>>;
+    const remaining = await admin.unsafe(
+      `SELECT datname, oid FROM pg_database WHERE datname IN ('${oldest}', '${cloned}', '${newest}') ORDER BY oid DESC`,
+    ) as Array<{ datname: string; oid: string | number }>;
+    expect(
+      await databaseExists(admin, oldest),
+      `database OIDs before janitor=${JSON.stringify(idsByCreation)}; candidates after=${JSON.stringify(candidates)}; remaining after=${JSON.stringify(remaining)}`,
+    ).toBe(false);
     expect(await databaseExists(admin, cloned)).toBe(true);
     expect(await databaseExists(admin, newest)).toBe(true);
     // The janitor released the build lock it took for the drop.
