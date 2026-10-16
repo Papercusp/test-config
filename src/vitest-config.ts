@@ -18,7 +18,7 @@ import { resolveLaneInclude, type TestLane } from './lane-split.ts';
 // is kept because it still governs every mkdtemp() a test performs at runtime.
 import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
 // gate-file-level-test-reuse-2026-09-27 P-008: per-file pass reuse (PC_TEST_REUSE_SKIP_LIST).
-import { resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
+import { resolvePartialResumeSkipExclude, resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
 import type { RecordedRuntimeEnvironment } from './execution-details.ts';
 import {
   EXECUTED_INPUTS_CAPTURE_SETUP,
@@ -283,6 +283,8 @@ interface GateOwnedParts {
   leadingGlobalSetup: string[];
   /** Exclude globs for files whose pass proof is still valid at the judged sha. */
   reuseSkipExclude: string[];
+  /** Excludes only the source-bound completed files of an explicitly resumed integration run. */
+  partialResumeExclude: string[];
   experimental: { importDurations: { limit: number; print: false } } | undefined;
 }
 
@@ -301,6 +303,9 @@ function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedPart
     // affected-tests arms the skip channel for unit vitest tasks alone, and the reader re-checks
     // run context + runner identity (a declined list means every file runs).
     reuseSkipExclude: layer === 'unit' ? resolveReuseSkipExclude(env) : [],
+    // This channel is deliberately separate from pass reuse and is only available to integration
+    // tasks with the explicit parent-watchdog resume rail armed.
+    partialResumeExclude: layer === 'integration' ? resolvePartialResumeSkipExclude(env) : [],
     experimental: executedSourceMap.experimental,
   };
 }
@@ -794,6 +799,7 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         // P-008: files whose clean-run pass proof is still valid at the judged sha (unit layer
         // only — see gateOwnedParts).
         ...gate.reuseSkipExclude,
+        ...gate.partialResumeExclude,
       ],
       // Use process-forked workers (vitest's own default), NOT worker_threads,
       // for the unit + integration layers. The `threads` pool core-dumps

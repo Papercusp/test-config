@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  PARTIAL_SKIP_LIST_SCHEMA,
+  PC_TEST_PARTIAL_SKIP_LIST_ENV,
   PC_TEST_REUSE_SKIP_LIST_ENV,
   REUSE_SKIP_LIST_SCHEMA,
   escapeGlobLiteral,
@@ -12,6 +14,7 @@ import {
   normalizeReuseSkipFiles,
   resolveReuseSkipExclude,
   resolveReuseSkipFiles,
+  resolvePartialResumeSkipExclude,
 } from './test-pass-reuse-skip';
 
 // gate-file-level-test-reuse-2026-09-27 P-008: the vitest side of per-file pass reuse. Every
@@ -110,5 +113,22 @@ describe('resolveReuseSkipExclude', () => {
     };
     expect(executedSourceRunContext(selective)).toBe(executedSourceRunContext(full));
     expect(executedSourceRunContext({ ...full, PAPERCUSP_TEST_RUN_GROUP: 'gate-run-2' })).toBe('green-checkpoint');
+  });
+});
+
+describe('resolvePartialResumeSkipExclude', () => {
+  it('is inert unless the explicit partial-resume rail is armed', () => {
+    const path = listFile({ schema: PARTIAL_SKIP_LIST_SCHEMA, taskKey: 'integration', sourceCommit: 'a', sourceDigest: 'b', files: ['lib/a.test.ts'] });
+    expect(resolvePartialResumeSkipExclude({ [PC_TEST_PARTIAL_SKIP_LIST_ENV]: path })).toEqual([]);
+  });
+
+  it('escapes only the source-bound partial skip list and fails open on malformed input', () => {
+    const path = listFile({ schema: PARTIAL_SKIP_LIST_SCHEMA, taskKey: 'integration', sourceCommit: 'a', sourceDigest: 'b', files: ['lib/(a).integration.test.ts'] });
+    const logs: string[] = [];
+    expect(resolvePartialResumeSkipExclude({ AFFECTED_PARTIAL_RESUME: '1', [PC_TEST_PARTIAL_SKIP_LIST_ENV]: path }, (line) => logs.push(line)))
+      .toEqual(['lib/\\(a\\).integration.test.ts']);
+    expect(logs[0]).toContain('partial run remains non-green');
+    expect(resolvePartialResumeSkipExclude({ AFFECTED_PARTIAL_RESUME: '1', [PC_TEST_PARTIAL_SKIP_LIST_ENV]: listFile('bad') }))
+      .toEqual([]);
   });
 });

@@ -17,6 +17,11 @@ import { readFileSync } from 'node:fs';
 export const PC_TEST_REUSE_SKIP_LIST_ENV = 'PC_TEST_REUSE_SKIP_LIST';
 export const REUSE_SKIP_LIST_SCHEMA = 1;
 
+// Separate from pass reuse: this channel only resumes an explicitly armed integration task
+// after a parent watchdog interruption. Its rows are not pass proofs and never enter the cache.
+export const PC_TEST_PARTIAL_SKIP_LIST_ENV = 'PC_TEST_PARTIAL_SKIP_LIST';
+export const PARTIAL_SKIP_LIST_SCHEMA = 1;
+
 /** The runner class a pass proof belongs to; reuse only consumes its own context (D-004 rule 1). */
 export function executedSourceRunContext(env: NodeJS.ProcessEnv = process.env): string {
   return env.GREEN_CHECKPOINT === '1' ? 'green-checkpoint' : 'clean-local';
@@ -110,6 +115,32 @@ export function resolveReuseSkipExclude(
   log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
 ): string[] {
   return resolveReuseSkipFiles(env, log).map(escapeGlobLiteral);
+}
+
+/** Read the source-bound partial-resume channel; malformed input runs every file. */
+export function resolvePartialResumeSkipExclude(
+  env: NodeJS.ProcessEnv = process.env,
+  log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
+): string[] {
+  if (env.AFFECTED_PARTIAL_RESUME !== '1') return [];
+  const path = env[PC_TEST_PARTIAL_SKIP_LIST_ENV]?.trim();
+  if (!path) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
+      schema?: unknown; taskKey?: unknown; sourceCommit?: unknown; sourceDigest?: unknown; files?: unknown;
+    };
+    if (parsed.schema !== PARTIAL_SKIP_LIST_SCHEMA || typeof parsed.taskKey !== 'string' ||
+        typeof parsed.sourceCommit !== 'string' || typeof parsed.sourceDigest !== 'string' ||
+        !Array.isArray(parsed.files) || !parsed.files.every((file) => typeof file === 'string' && file.length > 0)) {
+      throw new Error(`not a schema-${PARTIAL_SKIP_LIST_SCHEMA} partial skip list`);
+    }
+    const files = normalizeReuseSkipFiles(parsed.files);
+    log(`[partial-test-resume] skipping ${files.length} completed file(s) for ${parsed.taskKey} — partial run remains non-green`);
+    return files.map(escapeGlobLiteral);
+  } catch (error) {
+    log(`[partial-test-resume] UNREADABLE ${path} (${error instanceof Error ? error.message : String(error)}) — running every file`);
+    return [];
+  }
 }
 
 /**
