@@ -30,6 +30,8 @@ import {
 } from './vitest-config.ts';
 import {
   PC_TEST_REUSE_SKIP_LIST_ENV,
+  PC_TEST_PARTIAL_SKIP_LIST_ENV,
+  PARTIAL_SKIP_LIST_SCHEMA,
   REUSE_SKIP_LIST_SCHEMA,
   executedSourceRunnerIdentity,
 } from './test-pass-reuse-skip.ts';
@@ -63,6 +65,12 @@ function writeSkipList(files: string[], runnerIdentity = executedSourceRunnerIde
       judgedSha: 'a'.repeat(40),
     }),
   );
+  return path;
+}
+
+function writePartialSkipList(files: string[]): string {
+  const path = join(scratch, 'partial-skip.json');
+  writeFileSync(path, JSON.stringify({ schema: PARTIAL_SKIP_LIST_SCHEMA, taskKey: 'integration', sourceCommit: 'a', sourceDigest: 'b', files }));
   return path;
 }
 
@@ -155,6 +163,16 @@ describe('gateParticipationConfig — what a hand-rolled unit config spreads in'
   it('a skip list for another runner identity is declined, so every file runs', () => {
     const env = { [PC_TEST_REUSE_SKIP_LIST_ENV]: writeSkipList(['src/a.test.ts'], 'v0.0.0 plan9 mips') };
     expect(gateParticipationConfig({}, env).exclude).toEqual([...configDefaults.exclude]);
+  });
+
+  it('applies the partial skip channel only to integration configs', () => {
+    const env = { AFFECTED_PARTIAL_RESUME: '1', [PC_TEST_PARTIAL_SKIP_LIST_ENV]: writePartialSkipList(['src/a.integration.test.ts']) };
+    expect(gateParticipationConfig({}, env).exclude).toEqual([...configDefaults.exclude]);
+    vi.stubEnv('AFFECTED_PARTIAL_RESUME', env.AFFECTED_PARTIAL_RESUME);
+    vi.stubEnv(PC_TEST_PARTIAL_SKIP_LIST_ENV, env[PC_TEST_PARTIAL_SKIP_LIST_ENV]);
+    const integration = defineVitestConfig({ layer: 'integration', exclude: ['caller/**'] }).test!;
+    expect(integration.exclude).toContain('src/a.integration.test.ts');
+    expect(integration.exclude).toContain('caller/**');
   });
 });
 
