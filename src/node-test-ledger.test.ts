@@ -8,11 +8,12 @@
  * dropping ledger rows again.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runGit } from './admin-test-runs-reporter.ts';
 import type { TestRunRow, WorktreeGitSnapshot } from './admin-test-runs-reporter.ts';
 import { MAX_RECORDED_PASSED_CASES, parseTestRunExecutionDetails } from './execution-details.ts';
@@ -25,6 +26,7 @@ import {
   parseNodeTestLedgerSummary,
 } from './node-test-ledger.ts';
 import type { NodeTestRowContext } from './node-test-ledger.ts';
+import type { MutationInvocationDescriptor } from './mutation-descriptor.ts';
 
 const ROOT = '/repo';
 const FILE = '/repo/papercusp-desktop/test/guard.test.js';
@@ -41,6 +43,7 @@ function ctx(overrides: Partial<NodeTestRowContext> = {}): NodeTestRowContext {
     workspaceId: 'papercusp-workspace',
     harnessSlug: 'papercusp',
     mutationPhase: null,
+    mutationInvocation: null,
     testNamePattern: null,
     ...overrides,
   };
@@ -268,6 +271,7 @@ describe('buildNodeTestRunRows', () => {
 describe('beginNodeTestLedger — a real node --test child', () => {
   let dir: string | null = null;
   afterEach(() => {
+    vi.unstubAllEnvs();
     if (dir) rmSync(dir, { recursive: true, force: true });
     dir = null;
   });
@@ -315,6 +319,61 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     const events = JSON.parse(readFileSync(tracePath, 'utf8'));
     return { session, child, written, summary, events };
   }
+
+  const invocation: MutationInvocationDescriptor = {
+    schemaVersion: 1,
+    probeInvocationId: 'node-ledger-0123456789abcdef',
+    mode: 'copy-out',
+    subjectPath: 'scripts/example-subject.sh',
+    mutateExpression: 's/exit 0/exit 1/',
+    againstCommit: null,
+    subjectBeforeSha256: 'a'.repeat(64),
+    subjectAfterSha256: 'b'.repeat(64),
+    mutantDiff: '-exit 0\n+exit 1\n',
+    mutantDiffTruncated: false,
+    testCommandSha256: 'c'.repeat(64),
+  };
+
+  it.each(['baseline', 'copy-baseline', 'mutant'])
+    ('persists the exported mutation descriptor for a native %s leg', async phase => {
+      vi.stubEnv('PAPERCUSP_MUTATION_PROBE', '1');
+      vi.stubEnv('PAPERCUSP_MUTATION_PHASE', phase);
+      vi.stubEnv('PAPERCUSP_MUTATION_DESCRIPTOR', JSON.stringify(invocation));
+      const body = "import { test } from 'node:test'; test('mutation guard', () => {"
+        + (phase === 'mutant' ? "throw new Error('caught mutation');" : '') + '});';
+      const { session, child, written } = await runChild(body);
+      expect(child.status).toBe(phase === 'mutant' ? 1 : 0);
+      // Later environment changes must not relabel the invocation which ran the child.
+      vi.stubEnv('PAPERCUSP_MUTATION_DESCRIPTOR', JSON.stringify({
+        ...invocation, probeInvocationId: 'different-invocation-01234567',
+      }));
+      expect(await session.record()).toMatchObject({ recorded: 1, reason: null });
+      expect(written).toHaveLength(1);
+      expect(written[0].status).toBe(phase === 'mutant' ? 'fail' : 'pass');
+      const details = parseTestRunExecutionDetails(written[0].executionDetails);
+      expect(details?.mutationPhase).toBe(phase);
+      expect(details?.mutation).toEqual({
+        ...invocation,
+        leg: phase,
+        testFileSha256: createHash('sha256').update(readFileSync(join(dir!, 'fx.test.mjs'))).digest('hex'),
+      });
+    });
+
+  it.each([
+    { name: 'absent', probe: '1', descriptor: undefined },
+    { name: 'malformed', probe: '1', descriptor: '{invalid json' },
+    { name: 'outside a probe', probe: undefined, descriptor: JSON.stringify(invocation) },
+  ])('keeps a native row parseable when the descriptor is $name', async ({ probe, descriptor }) => {
+    vi.stubEnv('PAPERCUSP_MUTATION_PROBE', probe);
+    vi.stubEnv('PAPERCUSP_MUTATION_PHASE', 'mutant');
+    vi.stubEnv('PAPERCUSP_MUTATION_DESCRIPTOR', descriptor);
+    const { session, child, written } = await runChild(
+      "import { test } from 'node:test'; test('ordinary guard', () => {});");
+    expect(child.status).toBe(0);
+    expect(await session.record()).toMatchObject({ recorded: 1, reason: null });
+    expect(written[0].executionDetails).not.toHaveProperty('mutation');
+    expect(parseTestRunExecutionDetails(written[0].executionDetails)).toBeDefined();
+  });
 
   it.each([
     { body: "import { test } from 'node:test'; test('one', () => {});", exit: 0, passed: 1, failed: 0 },

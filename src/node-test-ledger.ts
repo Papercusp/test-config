@@ -15,7 +15,7 @@
  */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   captureWorktreeSnapshot,
@@ -25,6 +25,7 @@ import {
   resolveMutationProbePhase,
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
+  sha256OfTestFile,
   setRunRoot,
   shouldRecordTestRunPath,
 } from './admin-test-runs-reporter.ts';
@@ -36,6 +37,11 @@ import {
   isRecordedCaseTitle,
 } from './execution-details.ts';
 import type { TestRunExecutionDetails } from './execution-details.ts';
+import {
+  mutationDescriptorForRow,
+  readMutationInvocationDescriptor,
+} from './mutation-descriptor.ts';
+import type { MutationInvocationDescriptor } from './mutation-descriptor.ts';
 import { NODE_TEST_LEDGER_SUMMARY_SCHEMA_VERSION } from './node-test-ledger-collector.ts';
 import type { NodeTestFileResult, NodeTestLedgerSummary } from './node-test-ledger-collector.ts';
 
@@ -57,6 +63,7 @@ export interface NodeTestRowContext {
   workspaceId: string | null;
   harnessSlug: string | null;
   mutationPhase: string | null;
+  mutationInvocation: MutationInvocationDescriptor | null;
   testNamePattern: string | null;
 }
 
@@ -148,6 +155,14 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
       worktreeDirty: runContext.worktreeDirty,
       ...(runContext.worktreeDirty && runContext.worktreeDirtyReason ? { worktreeDirtyReason: runContext.worktreeDirtyReason } : {}),
     };
+    const mutation = runContext.mutationInvocation
+      ? mutationDescriptorForRow(
+          runContext.mutationInvocation,
+          runContext.mutationPhase,
+          sha256OfTestFile(resolve(runContext.repoRoot, result.file)),
+        )
+      : undefined;
+    if (mutation) executionDetails.mutation = mutation;
     rows.push({
       filePath,
       status,
@@ -223,6 +238,9 @@ export interface BeginNodeTestLedgerOptions {
 export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): Promise<NodeTestLedgerSession> {
   const { repoRoot } = options;
   const runStartedAt = new Date().toISOString();
+  // Capture the invocation-level export before the child starts. Each row then receives
+  // the same descriptor with its own phase and test-file hash, matching the Vitest writer.
+  const mutationInvocation = readMutationInvocationDescriptor();
   const readSnapshot = options.readSnapshot ?? captureWorktreeSnapshot;
   const writeRows = options.writeRows ?? insertRows;
   // The snapshot and the ledger path filter both resolve against the checkout under test.
@@ -314,6 +332,7 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
           workspaceId: resolveTestRunWorkspaceId(),
           harnessSlug: resolveTestRunHarnessSlug(),
           mutationPhase: resolveMutationProbePhase(),
+          mutationInvocation,
           testNamePattern: opts.testNamePattern ?? null,
         });
         if (rows.length === 0) return { recorded: 0, reason: 'no recordable file executed a case', assertionFailures, counts };
