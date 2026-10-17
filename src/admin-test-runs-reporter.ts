@@ -48,6 +48,7 @@ import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './conf
 import {
   mutationDescriptorForRow, readMutationInvocationDescriptor, type MutationInvocationDescriptor,
 } from './mutation-descriptor.ts';
+import { isRestoredCheckoutPath } from './test-run-paths.ts';
 
 /** sha256 of the test file a row ran (its execution_details.mutation.testFileSha256), or null. */
 export function sha256OfTestFile(absolutePath: string): string | null {
@@ -1176,12 +1177,6 @@ export function toWorkspaceRel(absPath: string): string {
   return relative(root, absPath).split(/[/\\]/).join(posix.sep);
 }
 
-const NON_SIGNAL_PREFIXES = [
-  'papercupai-workspace/papercup-checkpoint/',
-  'papercupai-workspace/papercusp-checkpoint/',
-  'papercupai-workspace/papercup-staging/',
-] as const;
-
 export function shouldRecordTestRunPath(filePath: string): boolean {
   // A `toWorkspaceRel`'d path that still starts with `../` resolved OUTSIDE the
   // workspace root entirely (e.g. `/tmp/fake.test.ts` → `../../../../tmp/fake.test.ts`)
@@ -1223,7 +1218,7 @@ export function shouldRecordTestRunPath(filePath: string): boolean {
   // lets relocated bundles leak into the test-run ledger. A src-tauri/target
   // tree is unambiguously Cargo output; keep the source templates/ tree live.
   if (/(?:^|\/)src-tauri\/target\//.test(filePath)) return false;
-  if (NON_SIGNAL_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return false;
+  if (isRestoredCheckoutPath(filePath)) return false;
   return true;
 }
 

@@ -1471,6 +1471,11 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(shouldRecordTestRunPath('papercupai-workspace/papercup-checkpoint/apps/operator/x.test.ts')).toBe(false);
     expect(shouldRecordTestRunPath('papercupai-workspace/papercusp-checkpoint/apps/operator/x.test.ts')).toBe(false);
     expect(shouldRecordTestRunPath('papercupai-workspace/papercup-staging/apps/operator/x.test.ts')).toBe(false);
+    // The parent workspace dirname is installation-specific; classify the
+    // preserved checkout by its own basename instead of this box's root.
+    expect(shouldRecordTestRunPath('custom-install/papercup-checkpoint/apps/operator/x.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('custom-install/papercusp-checkpoint/apps/operator/x.test.ts')).toBe(false);
+    expect(shouldRecordTestRunPath('custom-install/papercup-staging/apps/operator/x.test.ts')).toBe(false);
     // `*.flakeproof.test.{ts,tsx}` — reserved flake-soak self-test scratch fixtures,
     // intended REDs, never committed (EI-10761 — a red-test EI on a non-existent file).
     expect(shouldRecordTestRunPath('apps/operator-vite/src/components/left-sidebar/MugTab.flakeproof.test.tsx')).toBe(false);

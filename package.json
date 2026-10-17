@@ -71,6 +71,11 @@
       "import": "./src/admin-test-runs-reporter.ts",
       "default": "./src/admin-test-runs-reporter.ts"
     },
+    "./test-run-paths": {
+      "types": "./src/test-run-paths.ts",
+      "import": "./src/test-run-paths.ts",
+      "default": "./src/test-run-paths.ts"
+    },
     "./verifier-source": "./src/verifier-source.ts",
     "./execution-details": {
       "types": "./src/execution-details.ts",
