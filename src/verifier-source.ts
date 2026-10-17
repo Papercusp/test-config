@@ -125,8 +125,10 @@ export function verifierGitCheckoutSync(root: string, sourceCommit: string,
 
 /** Never follow archive symlinks or exclude a recorded source path. */
 export function verifierSourceFiles(root: string, {
-  runtimeArtifacts = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root, includedPaths, progress,
-}: { runtimeArtifacts?: boolean; recordedPaths?: string[]; gitMetadataPaths?: string[];
+  runtimeArtifacts = false, dependencyStaging = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root, includedPaths, progress,
+}: { runtimeArtifacts?: boolean;
+  /** Pre-copy preparation only; subsequent verification must reject leftover staging. */
+  dependencyStaging?: boolean; recordedPaths?: string[]; gitMetadataPaths?: string[];
   /** Dependency trees can link to workspace source inside the same archive. */
   symlinkRoot?: string;
   /** Explicit population from the maintained dependency-generation record writer. */
@@ -144,10 +146,29 @@ export function verifierSourceFiles(root: string, {
     nextReportAt = Date.now() + 5_000;
   };
   function walk(dir: string): void {
-    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    // Only dependency preparation may admit the copier's retained staging.
+    // Recorded source stays attested; redirects and ambiguity remain fatal.
+    const staging = dependencyStaging || recordedPaths.length ? entries.filter(entry => {
+      if (!entry.name.startsWith('node_modules.pinned-deps-tmp')) return false;
+      const rel = relative(root, join(dir, entry.name)).split(sep).join('/');
+      return !recordedPaths.some(path => path === rel || path.startsWith(`${rel}/`));
+    }) : [];
+    // Directories have no source-file row, so even empty staging must be
+    // checked explicitly rather than disappearing from the census.
+    if (staging.length && !dependencyStaging)
+      throw new VerifierSourceError(`unexpected dependency staging: ${relative(root, join(dir, staging[0]!.name))}`);
+    if (staging.length > 1) throw new VerifierSourceError(`ambiguous dependency staging: ${relative(root, dir) || '.'}`);
+    for (const entry of staging) {
+      if (!/^node_modules\.pinned-deps-tmp(?:\.[1-9][0-9]*)?$/.test(entry.name))
+        throw new VerifierSourceError(`invalid dependency staging name: ${relative(root, join(dir, entry.name))}`);
+      if (!entry.isDirectory()) throw new VerifierSourceError(`dependency staging is not an independent directory: ${relative(root, join(dir, entry.name))}`);
+    }
+    for (const entry of entries) {
       const path = join(dir, entry.name);
       const rel = relative(root, path).split(sep).join('/');
       if (includedPaths && !includedPaths.has(rel)) continue;
+      if (staging.includes(entry)) continue;
       if (rel === '.verifier-source.json' && !includedPaths) continue;
       // Only independently verified checkout metadata is outside the source population.
       if (gitMetadataPaths.includes(rel) && !recordedPaths.includes(rel)) {
@@ -237,7 +258,7 @@ export function verifierSourceFiles(root: string, {
 
 /** Synchronous for Playwright's unawaited onBegin hook; unknown source fails closed. */
 export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: string, expected: T,
-  options: { runtimeArtifacts?: boolean; progress?: (record: VerifierSourceProgress) => void;
+  options: { runtimeArtifacts?: boolean; dependencyStaging?: boolean; progress?: (record: VerifierSourceProgress) => void;
     mutation?: VerifierSourceMutation } = {}): T {
   const phase = <V>(step: VerifierSourceProgress['step'], action: () => V): V => {
     options.progress?.({ step, event: 'start' });
@@ -264,7 +285,7 @@ export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: 
       throw new VerifierSourceError('tampered verification Git checkout');
   });
   phase('source-census', () => {
-    const actual = verifierSourceFiles(dest, { runtimeArtifacts: options.runtimeArtifacts,
+    const actual = verifierSourceFiles(dest, { runtimeArtifacts: options.runtimeArtifacts, dependencyStaging: options.dependencyStaging,
       gitMetadataPaths, recordedPaths: expected.files.map(file => file.path), progress: options.progress });
     if (JSON.stringify(actual) !== JSON.stringify(expected.files)) {
       const recorded = new Map(expected.files.map(file => [file.path, file]));
