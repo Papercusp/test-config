@@ -189,6 +189,7 @@ describe('buildNodeTestRunRows', () => {
     const parsed = parseTestRunExecutionDetails(row.executionDetails);
     expect(parsed).toMatchObject({
       filePath: 'papercusp-desktop/test/guard.test.js', passed: 7, failed: 0, collectionFailed: false,
+      testLayer: 'unit',
       passedCaseTitles: ['guard > passed'],
       runStartedAt: '2026-10-06T16:00:00.000Z',
     });
@@ -222,6 +223,7 @@ describe('buildNodeTestRunRows', () => {
     const parsed = parseTestRunExecutionDetails(row.executionDetails);
     expect(parsed?.failedCaseTitles).toEqual(failedCases.map((c) => c.title));
     expect(parsed?.mutationPhase).toBe('mutant');
+    expect(parsed?.testLayer).toBe('unit');
   });
 
   it('marks a file that crashed before any case as collectionFailed with no titles', () => {

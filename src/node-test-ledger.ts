@@ -126,6 +126,9 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
     const durationMs = Math.max(0, Math.round(result.durationMs));
     const executionDetails: TestRunExecutionDetails = {
       schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
+      // The router's native Node route executes unit tests without a Vitest project.
+      // Record that runtime layer explicitly; never infer integration/llm from a filename.
+      testLayer: 'unit',
       runStartedAt: runContext.runStartedAt,
       root: runContext.repoRoot,
       filePath,
