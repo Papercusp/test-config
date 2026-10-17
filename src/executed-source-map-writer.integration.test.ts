@@ -122,6 +122,45 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
     ]);
   });
 
+  it('persists, replaces and retires proofs with production type discovery disabled (EI-26208403092404320)', async () => {
+    // tryGetPg uses fetch_types:false. A default postgres client discovers array
+    // OIDs, hiding the scalar serialization used by the real reporter client.
+    const reporterSql = postgres(db.url, { max: 1, fetch_types: false, onnotice: () => {} });
+    const reporterHandle = { sql: reporterSql } as unknown as PgHandle;
+    const workspaceName = '@probe/no-type-discovery';
+    const testFile = 'src/quoted,"proof.test.ts';
+    const modules = ['src/quoted,"module.ts', 'src/back\\slash.ts', testFile];
+    const write = (rows: ExecutedSourceRow[], recordedSha: string, retiredFiles?: string[]) =>
+      writeExecutedSourceRows({ rows, recordedSha, runGroupId: 'no-types', workspaceName,
+        runContext: 'clean-local', retiredFiles }, reporterHandle);
+    try {
+      await write([
+        row(testFile, { workspaceName, executedModules: modules, inputsCaptured: true,
+          readPaths: ['fixtures/quoted,"input.json'], opaqueReasons: [] }),
+        row('src/retired.test.ts', { workspaceName, inputsCaptured: false }),
+      ], SHA_A);
+      const initial = await sql`
+        SELECT test_file, inputs_captured FROM harness_shared.test_executed_sources
+         WHERE workspace_name = ${workspaceName} ORDER BY test_file`;
+      expect(initial).toEqual([
+        { test_file: testFile, inputs_captured: true },
+        { test_file: 'src/retired.test.ts', inputs_captured: false },
+      ]);
+      await write([row(testFile, { workspaceName, executedModules: modules, inputsCaptured: true,
+        readPaths: ['fixtures/quoted,"input.json'], opaqueReasons: ['reason,with"quotes'] })],
+      SHA_B, ['src/retired.test.ts']);
+      const remaining = await sql`
+        SELECT test_file, recorded_sha, executed_modules, module_count, read_paths,
+               inputs_captured, opaque_reasons
+          FROM harness_shared.test_executed_sources WHERE workspace_name = ${workspaceName}`;
+      expect(remaining).toEqual([{ test_file: testFile, recorded_sha: SHA_B,
+        executed_modules: modules, module_count: 3, read_paths: ['fixtures/quoted,"input.json'],
+        inputs_captured: true, opaque_reasons: ['reason,with"quotes'] }]);
+    } finally {
+      await reporterSql.end();
+    }
+  });
+
   it('a newer sha supersedes the same-context proof, and a retired file loses every proof', async () => {
     await writeExecutedSourceRows(
       {

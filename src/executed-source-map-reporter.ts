@@ -547,14 +547,14 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
   const { sql } = handle;
   for (let i = 0; i < flush.rows.length; i += EXECUTED_SOURCE_MAP_CHUNK) {
     const chunk = flush.rows.slice(i, i + EXECUTED_SOURCE_MAP_CHUNK);
-    const files = chunk.map((r) => r.testFile);
-    const modules = chunk.map((r) => JSON.stringify(r.executedModules));
-    const reads = chunk.map((r) => JSON.stringify(r.readPaths ?? []));
-    const opaque = chunk.map((r) => JSON.stringify(r.opaqueReasons ?? []));
-    // Sent as text[] and cast per element: postgres.js serializes a JS boolean[] parameter as a
-    // scalar `boolean`, so `${captured}::boolean[]` fails every write with "cannot cast type
-    // boolean to boolean[]" (WI-10003597 — it silently recorded zero pass proofs at the gate).
-    const captured = chunk.map((r) => (r.inputsCaptured === true ? 'true' : 'false'));
+    // The shared reporter deliberately disables postgres.js type discovery. Raw
+    // JS arrays then serialize as scalars, even with a ::text[] SQL cast. Pass
+    // scalar JSON instead so both client modes preserve arrays and booleans.
+    const files = JSON.stringify(chunk.map((r) => r.testFile));
+    const rows = JSON.stringify(chunk.map((r) => ({
+      f: r.testFile, m: r.executedModules, r: r.readPaths ?? [],
+      c: r.inputsCaptured === true, o: r.opaqueReasons ?? [],
+    })));
     const workspaceName = chunk[0]!.workspaceName;
     // WI-10004880: replace only THIS context's row at this sha, then insert with a target-less
     // ON CONFLICT DO NOTHING. The old `ON CONFLICT (workspace_name, test_file, recorded_sha) DO
@@ -566,7 +566,7 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
     await sql`
       DELETE FROM harness_shared.test_executed_sources
        WHERE workspace_name = ${workspaceName}
-         AND test_file = ANY(${files}::text[])
+         AND test_file = ANY(ARRAY(SELECT jsonb_array_elements_text(${files}::text::jsonb)))
          AND recorded_sha = ${flush.recordedSha}
          AND run_context IS NOT DISTINCT FROM ${flush.runContext ?? null}::text
     `;
@@ -583,8 +583,7 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
              ARRAY(SELECT jsonb_array_elements_text(u.o::jsonb)),
              ${flush.runContext ?? null},
              ${flush.runnerIdentity ?? null}
-        FROM unnest(${files}::text[], ${modules}::text[], ${reads}::text[], ${captured}::text[], ${opaque}::text[])
-          AS u(f, m, r, c, o)
+        FROM jsonb_to_recordset(${rows}::text::jsonb) AS u(f text, m jsonb, r jsonb, c boolean, o jsonb)
       ON CONFLICT DO NOTHING
     `;
     // Scoped to this run context (plus legacy pre-1236 NULL rows): a clean-local recording must
@@ -593,7 +592,7 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
     await sql`
       DELETE FROM harness_shared.test_executed_sources
        WHERE workspace_name = ${workspaceName}
-         AND test_file = ANY(${files}::text[])
+         AND test_file = ANY(ARRAY(SELECT jsonb_array_elements_text(${files}::text::jsonb)))
          AND recorded_sha <> ${flush.recordedSha}
          AND (run_context IS NULL OR run_context IS NOT DISTINCT FROM ${flush.runContext ?? null}::text)
     `;
@@ -603,7 +602,7 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
     await sql`
       DELETE FROM harness_shared.test_executed_sources
        WHERE workspace_name = ${flush.workspaceName}
-         AND test_file = ANY(${flush.retiredFiles}::text[])
+         AND test_file = ANY(ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(flush.retiredFiles)}::text::jsonb)))
     `;
   }
 }
