@@ -11,7 +11,9 @@ import { parseMutationDescriptor, type MutationDescriptor } from './mutation-des
 
 export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
 
-export const MAX_RECORDED_FAILED_CASES = 64;
+// Failed case titles are NOT capped (green-main-ratchet-convergence-2026-10-17 D-005, P-017):
+// the gate keys its blocking verdict and downgrade coverage by file + case, so every failed
+// case of a failing row must be named. The natural bound is the row's own `failed` count.
 export const MAX_RECORDED_PASSED_CASES = 1_280;
 export const MAX_RECORDED_CASE_TITLE_CHARS = 2_048;
 
@@ -372,7 +374,6 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
     || (value.failedCaseTitles !== undefined && (
       !Array.isArray(value.failedCaseTitles)
-      || value.failedCaseTitles.length > MAX_RECORDED_FAILED_CASES
       || value.failedCaseTitles.length > (value.failed as number)
       || value.failedCaseTitles.some(title => !isRecordedCaseTitle(title))
       || new Set(value.failedCaseTitles).size !== value.failedCaseTitles.length

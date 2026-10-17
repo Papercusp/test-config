@@ -40,7 +40,7 @@ import { defaultEvidenceRoot } from '@papercusp/verification-harness';
 import { findVerifierSourceRoot, readVerifierSourceReceipt, type VerifierSourceMutation } from './verifier-source.ts';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, isRecordedCaseTitle,
-  MAX_RECORDED_FAILED_CASES, MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
+  MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
   parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment, type RuntimeEnvironmentCaptureStatus,
   parseIsolatedRuntimeReceipts, type IsolatedRuntimeReceipt,
 } from './execution-details.ts';
@@ -905,9 +905,7 @@ export function collectModuleExecution(testModule: TestModule, preferredPassedCa
           break;
         case 'failed':
           failed++;
-          if (isRecordedCaseTitle(test.fullName) && failedCaseTitles.size < MAX_RECORDED_FAILED_CASES) {
-            failedCaseTitles.add(test.fullName);
-          }
+          if (isRecordedCaseTitle(test.fullName)) failedCaseTitles.add(test.fullName);
           break;
         case 'skipped': skipped++; break;
         default: return null; // pending/unreadable is not a completed measurement

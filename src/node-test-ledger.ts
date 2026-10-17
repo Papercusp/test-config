@@ -31,7 +31,6 @@ import {
 } from './admin-test-runs-reporter.ts';
 import type { TestRunRow } from './admin-test-runs-reporter.ts';
 import {
-  MAX_RECORDED_FAILED_CASES,
   MAX_RECORDED_PASSED_CASES,
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
   isRecordedCaseTitle,
@@ -117,7 +116,7 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
       ? []
       : [...new Set(result.failedCases.map((c) => c.title))]
           .filter((title) => isRecordedCaseTitle(title))
-          .slice(0, Math.min(MAX_RECORDED_FAILED_CASES, result.failed));
+          .slice(0, result.failed);
     const allPassedTitles = Array.isArray(result.passedCaseTitles)
       ? [...new Set(result.passedCaseTitles.filter((title) => isRecordedCaseTitle(title)))]
       : [];

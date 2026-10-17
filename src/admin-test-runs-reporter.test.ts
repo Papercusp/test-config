@@ -701,6 +701,14 @@ describe('durable module execution measurement', () => {
     expect(collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never)
       ?.passedCaseTitles).not.toContain('suite > proof-' + lateIndex);
   });
+  it('names every failed case of a failing module: failed identities are not capped (P-017, D-005)', () => {
+    const cases = Array.from({ length: 200 }, (_, i) => ({
+      fullName: 'suite > failing-' + i, result: () => ({ state: 'failed' }),
+    }));
+    const measured = collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never);
+    expect(measured).toMatchObject({ passed: 0, failed: 200, skipped: 0, collectionFailed: false });
+    expect(measured?.failedCaseTitles).toEqual(cases.map(c => c.fullName));
+  });
   it('persists a preferred late identity while running the whole module', async () => {
     vi.stubEnv('PAPERCUSP_TEST_RUN_CASE_TITLE_PATTERN', 'late-proof$');
     const rows: TestRunRow[] = [];

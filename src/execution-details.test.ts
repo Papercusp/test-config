@@ -161,10 +161,16 @@ describe('parseTestRunExecutionDetails — measured case identities', () => {
     { failed: 1, failedCaseTitles: ['multiline\nDOM'] },
     { failed: 1, failedCaseTitles: ['\u001b[36mDOM'] },
     { failed: 1, failedCaseTitles: ['x'.repeat(2_049)] },
-    { failed: 65, failedCaseTitles: Array.from({ length: 65 }, (_, i) => `case ${i}`) },
+    { failed: 64, failedCaseTitles: Array.from({ length: 65 }, (_, i) => `case ${i}`) },
     { failed: 1, failedCaseTitles: null },
   ])('rejects malformed or contradictory identities: %j', overrides => {
     expect(parseTestRunExecutionDetails({ ...details(), ...overrides })).toBeUndefined();
+  });
+
+  it('accepts every failed case title of a failing row: failed identities are not capped (P-017, D-005)', () => {
+    const titles = Array.from({ length: 300 }, (_, i) => `suite > failing case ${i}`);
+    const parsed = parseTestRunExecutionDetails({ ...details(), failed: 300, failedCaseTitles: titles });
+    expect(parsed?.failedCaseTitles).toEqual(titles);
   });
 
   it('accepts exact measured passing identities without changing legacy rows', () => {
