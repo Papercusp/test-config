@@ -919,8 +919,12 @@ export function collectModuleExecution(testModule: TestModule, preferredPassedCa
     const recordedPassedCaseTitles = [...new Set([...preferredPassedCaseTitles, ...passedCaseTitles])]
       .filter(title => titleOutcomes.get(title) === 'passed')
       .slice(0, MAX_RECORDED_PASSED_CASES);
-    const allRecordedPassedCaseTitleCount = [...titleOutcomes.values()].filter(outcome => outcome === 'passed').length;
-    const passedCaseTitlesTruncated = allRecordedPassedCaseTitleCount > recordedPassedCaseTitles.length;
+    // `passed` counts every measured case, while the identity list is a unique,
+    // bounded proof set. Any mismatch means at least one measured passing case
+    // cannot be identified from the persisted titles (for example an unreadable
+    // fullName or a duplicate/ambiguous parameterized title), so keep the
+    // incompleteness marker even when the cap was not reached.
+    const passedCaseTitlesTruncated = passed > recordedPassedCaseTitles.length;
     // A suite hook can fail after its assertions passed. Keep its measured
     // counts and red verdict, but omit assertion proof the shared parser
     // deliberately refuses for a failed collection/suite lifecycle.

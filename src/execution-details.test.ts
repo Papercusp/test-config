@@ -192,6 +192,15 @@ describe('parseTestRunExecutionDetails — measured case identities', () => {
       passed: 65, passedCaseTitlesTruncated: true,
     }))!)).toBe(true);
   });
+  it('infers incomplete identity proof from any measured-count mismatch', () => {
+    const legacy = parseTestRunExecutionDetails(details({
+      passed: 29,
+      passedCaseTitles: Array.from({ length: 28 }, (_, index) => `suite > case ${index}`),
+    }));
+    expect(legacy).toBeDefined();
+    expect(legacy?.passedCaseTitlesTruncated).toBeUndefined();
+    expect(passedCaseTitlesIncomplete(legacy!)).toBe(true);
+  });
 
   it.each([
     { passed: 0, passedCaseTitles: ['not a passed test'] },

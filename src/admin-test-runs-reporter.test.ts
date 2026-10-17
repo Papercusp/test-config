@@ -18,7 +18,7 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { MAX_RECORDED_PASSED_CASES } from './execution-details.ts';
+import { MAX_RECORDED_CASE_TITLE_CHARS, MAX_RECORDED_PASSED_CASES } from './execution-details.ts';
 import AdminTestRunsReporter, {
   buildOutputTail,
   captureWorktreeSnapshot,
@@ -634,7 +634,7 @@ describe('durable module execution measurement', () => {
 
   it('counts all cases, including mixed skips and failures', () => {
     expect(collectModuleExecution(module(['passed', 'passed', 'skipped', 'failed'], 'failed')))
-      .toEqual({ passed: 2, failed: 1, skipped: 1, collectionFailed: false });
+      .toEqual({ passed: 2, failed: 1, skipped: 1, collectionFailed: false, passedCaseTitlesTruncated: true });
   });
   it.each(['passed-first', 'failed-first'])('omits mixed-outcome duplicate names from proof while preserving counts (%s)', order => {
     const mixed = ['passed', 'failed'];
@@ -646,7 +646,8 @@ describe('durable module execution measurement', () => {
     ];
     const measured = collectModuleExecution({ state: () => 'failed', children: { allTests: () => cases } } as never, /duplicate/g);
     expect(measured).toEqual({ passed: 2, failed: 2, skipped: 0, collectionFailed: false,
-      passedCaseTitles: ['suite > positive'], failedCaseTitles: ['suite > negative'] });
+      passedCaseTitles: ['suite > positive'], passedCaseTitlesTruncated: true,
+      failedCaseTitles: ['suite > negative'] });
   });
   it('does not certify a duplicate failure when its passing case falls outside the recording cap', () => {
     const cases = [
@@ -661,6 +662,21 @@ describe('durable module execution measurement', () => {
     expect(measured?.passedCaseTitles).toHaveLength(MAX_RECORDED_PASSED_CASES);
     expect(measured?.passedCaseTitlesTruncated).toBe(true);
     expect(measured?.failedCaseTitles).toBeUndefined();
+  });
+  it('marks the identity proof incomplete when a passing case has an unreadable title', () => {
+    const cases = [
+      { fullName: 'suite > readable', result: () => ({ state: 'passed' }) },
+      { fullName: 'x'.repeat(MAX_RECORDED_CASE_TITLE_CHARS + 1), result: () => ({ state: 'passed' }) },
+    ];
+    const measured = collectModuleExecution({ state: () => 'passed', children: { allTests: () => cases } } as never);
+    expect(measured).toMatchObject({
+      passed: 2,
+      failed: 0,
+      skipped: 0,
+      collectionFailed: false,
+      passedCaseTitles: ['suite > readable'],
+      passedCaseTitlesTruncated: true,
+    });
   });
   it('records requested late passing identities within the cap without crediting skipped or failed cases', () => {
     const lateIndex = MAX_RECORDED_PASSED_CASES + 10;

@@ -13,21 +13,18 @@ export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
 
 export const MAX_RECORDED_FAILED_CASES = 64;
 export const MAX_RECORDED_PASSED_CASES = 1_280;
-const LEGACY_RECORDED_PASSED_CASES = 64;
 export const MAX_RECORDED_CASE_TITLE_CHARS = 2_048;
 
 /**
- * True when the persisted passed-title set is known to be incomplete. Older rows
- * have no marker; a list at either the current or legacy cap with a larger passed
- * count is treated as incomplete so omitted identities are never called absent.
+ * True when the persisted passed-title set is known to be incomplete. The count
+ * measures cases, while titles are unique exact identities, so any count mismatch
+ * means omitted or ambiguous identities even when an older row has no marker.
  */
 export function passedCaseTitlesIncomplete(
   execution: Pick<TestRunExecutionDetails, 'passed' | 'passedCaseTitles' | 'passedCaseTitlesTruncated'>,
 ): boolean {
   const titles = execution.passedCaseTitles ?? [];
-  return execution.passedCaseTitlesTruncated === true
-    || ((titles.length === MAX_RECORDED_PASSED_CASES || titles.length === LEGACY_RECORDED_PASSED_CASES)
-      && execution.passed > titles.length);
+  return execution.passedCaseTitlesTruncated === true || execution.passed > titles.length;
 }
 
 /** Exact identities, never clipped prefixes or assertion-message/DOM lines. */
