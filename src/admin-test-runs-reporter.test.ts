@@ -1583,15 +1583,16 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(buildOutputTail(fakeModule, 'fail')).toContain('expected: { service_select: true }');
   });
 
-  it('writes and merges optional structured failure details across reporter groups', async () => {
+  it('persists completed-module diagnostics before finalization and merges reporter groups', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'papercusp-reporter-details-'));
     const detailsPath = join(dir, 'failure-details.json');
     const previous = process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
     process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = detailsPath;
+    const writeRow = vi.fn(async () => undefined);
     const makeReporter = () =>
       new AdminTestRunsReporter(
         async () => ({ commit: 'abc', porcelain: '' }),
-        async () => undefined,
+        writeRow,
       );
     const makeModule = (file: string, test: string, actual: string, expected: string) => ({
       moduleId: join(TEST_CONFIG_ROOT, file),
@@ -1604,13 +1605,20 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     });
     try {
       const first = makeReporter();
-      first.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      await first.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
       first.onTestModuleEnd(makeModule('src/first.test.ts', 'first', 'actual-a', 'expected-a') as never);
+      // A hard-killed run reaches neither final hook. Its completed failures
+      // must already be readable, while ledger verdicts still await provenance.
+      expect(JSON.parse(readFileSync(detailsPath, 'utf8')).failures).toEqual([
+        expect.objectContaining({ test: 'first', actual: 'actual-a', expected: 'expected-a' }),
+      ]);
+      expect(writeRow).not.toHaveBeenCalled();
       await first.onTestRunEnd();
 
       const second = makeReporter();
-      second.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      await second.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
       second.onTestModuleEnd(makeModule('src/second.test.ts', 'second', 'actual-b', 'expected-b') as never);
+      expect(JSON.parse(readFileSync(detailsPath, 'utf8')).failures).toHaveLength(2);
       await second.onTestRunEnd();
 
       const payload = JSON.parse(readFileSync(detailsPath, 'utf8')) as {

@@ -2267,7 +2267,12 @@ export default class AdminTestRunsReporter implements Reporter {
       const startedAt = new Date(finishedAt.getTime() - durationMs);
 
       const outputTail = buildOutputTail(testModule, status);
-      this.failureDetails.push(...collectTestFailureDetails(testModule, filePath));
+      const details = collectTestFailureDetails(testModule, filePath);
+      this.failureDetails.push(...details);
+      // A watchdog SIGKILL reaches neither final hook. Persist diagnostic
+      // evidence now; ledger verdicts still await the end-of-run snapshot.
+      // Retain details for the final merge/retry if this fail-soft write fails.
+      writeFailureDetails(details);
 
       const counts = collectModuleExecution(testModule, this.preferredPassedCasePattern);
       const verifierSourceReason = unversionedVerifierSourceReason(testModule.moduleId);
