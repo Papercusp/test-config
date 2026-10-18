@@ -34,8 +34,11 @@ export {
   provisionRestartTestDb,
   getOrBuildTemplate,
   dropDatabaseWithLock,
+  dropDatabaseOnDedicatedConnection,
   markManagedTestDatabase,
 } from './pg-migrate.ts';
-export type { MigratedTestDb, CreateFreshTestDbOptions, TestDbDropResult } from './pg-migrate.ts';
+export type { MigratedTestDb, FreshTestDb, CreateFreshTestDbOptions, TestDbDropResult } from './pg-migrate.ts';
+export { cleanupOwnedTestDatabases, recordOwnedTestDbCleanupStage } from './owned-test-db-cleanup.ts';
+export type { OwnedTestDbCleanupResult } from './owned-test-db-cleanup.ts';
 export { probePgReachable, assertPgReachable } from './pg-reachability.ts';
 export type { PgReachabilityResult } from './pg-reachability.ts';

@@ -29,6 +29,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import postgres from 'postgres';
 import { getTestPg } from './pg-container.ts';
+import { registerOwnedTestDatabase } from './owned-test-db-cleanup.ts';
 
 export interface MigratedTestDb {
   /** Connection URL for the freshly-provisioned database. Open your own client against it. */
@@ -37,6 +38,11 @@ export interface MigratedTestDb {
   name: string;
   /** Drop the database (terminates other backends first). Call in `afterAll`. */
   drop: () => Promise<void>;
+}
+
+export interface FreshTestDb extends MigratedTestDb {
+  /** Preserve the dedicated-connection result for evidence-bearing fixtures. */
+  dropWithResult: (options?: DropDatabaseWithLockOptions) => Promise<TestDbDropResult>;
 }
 
 function swapDbName(adminUri: string, name: string): string {
@@ -94,6 +100,9 @@ export async function withConnectRetry<T>(
 async function createFreshDb(prefix = 'it'): Promise<{ url: string; name: string; adminUri: string }> {
   const adminUri = await getTestPg();
   const name = `${prefix}_${randomBytes(6).toString('hex')}`;
+  // Pre-register the generated name so a forced exit during CREATE/provision
+  // still leaves the supervisor an exact, owned, idempotent cleanup target.
+  registerOwnedTestDatabase(name, adminUri);
   await withConnectRetry(async () => {
     const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
     try {
@@ -1065,6 +1074,7 @@ export async function getOrBuildTemplate(
 async function createDbFromTemplate(prefix: string, template: string): Promise<{ url: string; name: string; adminUri: string }> {
   const adminUri = await getTestPg();
   const name = `${prefix}_${randomBytes(6).toString('hex')}`;
+  registerOwnedTestDatabase(name, adminUri);
   // EI-10571: this is the HOT path every `createOrgTestDb`-style fixture takes
   // on every integration test file's beforeAll — see withConnectRetry's docstring.
   await withConnectRetry(async () => {
@@ -1101,7 +1111,7 @@ function isMissingTemplate(e: unknown): boolean {
  *
  * Call once per test file in `beforeAll`; `drop()` in `afterAll`. Requires Docker.
  */
-export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Promise<MigratedTestDb> {
+export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Promise<FreshTestDb> {
   // Template-clone path: build the schema ONCE into a cached template, then clone.
   if (opts.template) {
     const { key, provision, lockTimeoutMs } = opts.template;
@@ -1117,7 +1127,7 @@ export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Pr
       if (templateBuilds.has(key)) templateBuilds.delete(key);
       created = await createDbFromTemplate(prefix, await getOrBuildTemplate(key, provision, { lockTimeoutMs }));
     }
-    return { url: created.url, name: created.name, drop: makeDrop(created.adminUri, created.name) };
+    return recordedFreshTestDb(created.url, created.name, created.adminUri);
   }
   const { url, name, adminUri } = await createFreshDb(opts.prefix);
   if (opts.provision) {
@@ -1128,7 +1138,28 @@ export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Pr
       throw new Error(`createFreshTestDb: provision failed for ${name}: ${(err as Error).message}`);
     }
   }
-  return { url, name, drop: makeDrop(adminUri, name) };
+  return recordedFreshTestDb(url, name, adminUri);
+}
+
+async function recordedFreshTestDb(url: string, name: string, adminUri: string): Promise<FreshTestDb> {
+  let record: ReturnType<typeof registerOwnedTestDatabase>;
+  try {
+    record = registerOwnedTestDatabase(name, adminUri);
+  } catch (cause) {
+    const outcome = await dropDatabaseOnDedicatedConnection(adminUri, name);
+    throw new Error(`test database ownership receipt failed; cleanup=${outcome}`, { cause });
+  }
+  const dropWithResult = async (options?: DropDatabaseWithLockOptions): Promise<TestDbDropResult> => {
+    try {
+      const outcome = await dropDatabaseOnDedicatedConnection(adminUri, name, options);
+      record(outcome);
+      return outcome;
+    } catch (cause) {
+      record('error');
+      throw cause;
+    }
+  };
+  return { url, name, dropWithResult, drop: async () => { await dropWithResult(); } };
 }
 
 /**
