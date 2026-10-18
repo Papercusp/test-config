@@ -71,6 +71,34 @@ import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceF
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
+describe('Vitest before-source boundary', () => {
+  it('keeps module discovery behind the completed before-run snapshot', async () => {
+    let finishSnapshot!: (snapshot: { commit: string; porcelain: string }) => void;
+    const snapshot = new Promise<{ commit: string; porcelain: string }>(resolve => {
+      finishSnapshot = resolve;
+    });
+    const reporter = new AdminTestRunsReporter(() => snapshot, async () => undefined);
+    let modulesMayStart = false;
+    const initialized = reporter.onInit({ config: { root: TEST_CONFIG_ROOT,
+      configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } as never)
+      .then(() => { modulesMayStart = true; });
+    try {
+      // Give onInit every opportunity to finish while the source read remains
+      // pending. Module imports may run synchronous Git/build work, so merely
+      // starting the async read cannot establish a before-test boundary.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(modulesMayStart).toBe(false);
+      finishSnapshot({ commit: 'abc', porcelain: '' });
+      await initialized;
+      expect(modulesMayStart).toBe(true);
+    } finally {
+      finishSnapshot({ commit: 'abc', porcelain: '' });
+      await initialized;
+      await reporter.onTestRunEnd();
+    }
+  });
+});
+
 describe('Vitest run-level ledger verdict', () => {
   async function recordRun(
     outcomes: Array<{ name: string; passed: number; failed: number; skipped: number }>,

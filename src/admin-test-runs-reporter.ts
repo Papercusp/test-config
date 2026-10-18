@@ -2250,6 +2250,11 @@ export default class AdminTestRunsReporter implements Reporter {
     this.executionContext.runtimeEnvironmentBeforeCaptureStatus = runtimeEnvironmentBefore.status;
     if (runtimeEnvironmentBefore.status === 'captured')
       this.executionContext.runtimeEnvironmentBefore = runtimeEnvironmentBefore.witness;
+    // Vitest awaits onInit before importing test modules. Finish the bounded
+    // source read here: synchronous import/build work must not overlap its
+    // subprocess callbacks or move the "before" snapshot into test execution.
+    // The reader already turns failures into dirty provenance without throwing.
+    await this.worktreeBefore;
   }
 
   /** Per-module hook — queue the row until the end snapshot is available. */
