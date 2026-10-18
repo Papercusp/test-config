@@ -54,6 +54,8 @@ export interface DefineVitestConfigOptions {
   layer: TestLayer;
   /** Registered live-host reader; absent on ordinary suites. Reporter brackets execution with it. */
   readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>;
+  /** Producer-declared deadline for the reporter's runtime witness reads. */
+  runtimeEnvironmentCaptureTimeoutMs?: number;
   setupFiles?: string[];
   globalSetup?: string[];
   include?: string[];
@@ -698,7 +700,11 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   const inputsCaptureSetup = gate.leadingSetupFiles;
   const gateReporters = gate.reporters.map(reporter =>
     reporter === ADMIN_TEST_RUNS_REPORTER && opts.readRuntimeEnvironment
-      ? [reporter, { readRuntimeEnvironment: opts.readRuntimeEnvironment }] as [string, Record<string, unknown>]
+      ? [reporter, {
+          readRuntimeEnvironment: opts.readRuntimeEnvironment,
+          ...(opts.runtimeEnvironmentCaptureTimeoutMs === undefined
+            ? {} : { runtimeEnvironmentCaptureTimeoutMs: opts.runtimeEnvironmentCaptureTimeoutMs }),
+        }] as [string, Record<string, unknown>]
       : reporter);
   const finalSetup = allowConsoleNoise
     ? [...inputsCaptureSetup, ...layerSetup, ...leakSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]

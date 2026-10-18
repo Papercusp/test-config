@@ -77,11 +77,14 @@ describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
     withArgv();
     vi.stubEnv('PAPERCUSP_DISABLE_TEST_RUNS_REPORTER', '0');
     const readRuntimeEnvironment = vi.fn(async () => null);
+    const runtimeEnvironmentCaptureTimeoutMs = 12_000;
     try {
-      const reporters = defineVitestConfig({ layer: 'e2e', readRuntimeEnvironment }).test!.reporters as unknown[];
+      const reporters = defineVitestConfig({ layer: 'e2e', readRuntimeEnvironment,
+        runtimeEnvironmentCaptureTimeoutMs }).test!.reporters as unknown[];
       expect(reporters.some(reporter => Array.isArray(reporter)
         && String(reporter[0]).endsWith('/admin-test-runs-reporter.ts')
-        && reporter[1].readRuntimeEnvironment === readRuntimeEnvironment)).toBe(true);
+        && reporter[1].readRuntimeEnvironment === readRuntimeEnvironment
+        && reporter[1].runtimeEnvironmentCaptureTimeoutMs === runtimeEnvironmentCaptureTimeoutMs)).toBe(true);
       expect(readRuntimeEnvironment).not.toHaveBeenCalled();
     } finally { vi.unstubAllEnvs(); }
   });

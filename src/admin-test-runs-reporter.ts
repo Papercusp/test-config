@@ -2105,6 +2105,24 @@ type RuntimeEnvironmentCapture =
   | { status: 'captured'; witness: RecordedRuntimeEnvironment }
   | { status: Exclude<RuntimeEnvironmentCaptureStatus, 'captured'> };
 
+/**
+ * The reporter's default runtime witness deadline. Remote readers may need a
+ * longer producer-owned budget when they perform bounded control-plane reads.
+ */
+export const DEFAULT_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS = 1_000;
+/** Hard ceiling for a producer-declared runtime witness budget. */
+export const MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS = 30_000;
+
+/**
+ * Normalize a producer-declared witness deadline while keeping the fail-soft
+ * default for malformed or non-positive values.
+ */
+export function normalizeRuntimeEnvironmentCaptureTimeout(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)
+    return DEFAULT_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS;
+  return Math.min(MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS, Math.max(1, Math.floor(value)));
+}
+
 export default class AdminTestRunsReporter implements Reporter {
   private pending: PendingTestRunRow[] = [];
   /** Captured in onInit, before Vitest starts executing test modules. */
@@ -2127,6 +2145,7 @@ export default class AdminTestRunsReporter implements Reporter {
     writeRow?: TestRunRowWriter,
     writeRows?: TestRunRowsWriter,
     readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>,
+    runtimeEnvironmentCaptureTimeoutMs?: number,
   ) {
     // Vitest constructs reporters with its options object. Keep that runtime
     // contract intact while allowing the unit suite to inject deterministic
@@ -2158,11 +2177,17 @@ export default class AdminTestRunsReporter implements Reporter {
     this.readRuntimeEnvironment = readRuntimeEnvironment ??
       (typeof configuredReader === 'function'
         ? configuredReader as () => Promise<RecordedRuntimeEnvironment | null> : undefined);
+    const configuredTimeout = typeof readWorktreeSnapshotOrOptions === 'object'
+      ? readWorktreeSnapshotOrOptions?.runtimeEnvironmentCaptureTimeoutMs : undefined;
+    this.runtimeEnvironmentCaptureTimeoutMs = normalizeRuntimeEnvironmentCaptureTimeout(
+      runtimeEnvironmentCaptureTimeoutMs ?? configuredTimeout,
+    );
   }
 
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: TestRunRowsWriter;
   private readonly readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>;
+  private readonly runtimeEnvironmentCaptureTimeoutMs: number;
 
   private async captureRuntimeEnvironment(): Promise<RuntimeEnvironmentCapture> {
     if (!this.readRuntimeEnvironment) return { status: 'not-configured' };
@@ -2171,7 +2196,9 @@ export default class AdminTestRunsReporter implements Reporter {
     try {
       const result = await Promise.race([
         Promise.resolve().then(() => this.readRuntimeEnvironment!()),
-        new Promise<typeof timedOut>(resolve => { timer = setTimeout(() => resolve(timedOut), 1_000); }),
+        new Promise<typeof timedOut>(resolve => {
+          timer = setTimeout(() => resolve(timedOut), this.runtimeEnvironmentCaptureTimeoutMs);
+        }),
       ]);
       if (result === timedOut) return { status: 'timed-out' };
       if (result === null) return { status: 'unavailable' };

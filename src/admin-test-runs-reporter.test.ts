@@ -57,6 +57,9 @@ import AdminTestRunsReporter, {
   TEST_RUN_RECEIPT_ENV,
   appendTestRunReceipts,
   reporterWriteBudget,
+  normalizeRuntimeEnvironmentCaptureTimeout,
+  DEFAULT_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS,
+  MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS,
   type PgSql,
   type TestRunReceipt,
   type TestRunRow,
@@ -571,7 +574,11 @@ describe('retained isolated runtime receipt custody', () => {
 });
 
 describe('runtime environment recorded around execution', () => {
-  async function record(fingerprints: Array<string | null>, fault?: { call: number; kind: 'error' | 'timeout' }) {
+  async function record(
+    fingerprints: Array<string | null>,
+    fault?: { call: number; kind: 'error' | 'timeout' },
+    runtimeEnvironmentCaptureTimeoutMs?: number,
+  ) {
     const rows: TestRunRow[] = [];
     let calls = 0;
     const reader = vi.fn(async () => {
@@ -584,7 +591,7 @@ describe('runtime environment recorded around execution', () => {
         observedAt: '2000-01-01T00:00:00Z' } : null;
     });
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
-      async row => { rows.push(row); }, undefined, reader);
+      async row => { rows.push(row); }, undefined, reader, runtimeEnvironmentCaptureTimeoutMs);
     await reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
     reporter.onTestModuleEnd({ state: () => 'passed',
       children: { allTests: () => [{ fullName: 'suite > observed', result: () => ({ state: 'passed' }) }] },
@@ -623,6 +630,22 @@ describe('runtime environment recorded around execution', () => {
     expect(details.runtimeEnvironmentAfterCaptureStatus).toBe('timed-out');
     expect(details.runtimeEnvironmentBefore?.fingerprint).toBe('a'.repeat(64));
     expect(details).not.toHaveProperty('runtimeEnvironmentAfter');
+  });
+  it('honors a producer-declared budget for a bounded remote reader', async () => {
+    const { details, reader } = await record(
+      ['a'.repeat(64), 'b'.repeat(64)], { call: 1, kind: 'timeout' }, 1_200,
+    );
+    expect(reader).toHaveBeenCalledTimes(2);
+    expect(details.runtimeEnvironmentBeforeCaptureStatus).toBe('captured');
+    expect(details.runtimeEnvironmentBefore?.fingerprint).toBe('a'.repeat(64));
+    expect(details.runtimeEnvironmentAfterCaptureStatus).toBe('captured');
+    expect(details.runtimeEnvironmentAfter?.fingerprint).toBe('b'.repeat(64));
+  });
+  it('keeps malformed capture budgets at the default and caps oversized producer budgets', () => {
+    expect(normalizeRuntimeEnvironmentCaptureTimeout(undefined)).toBe(DEFAULT_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS);
+    expect(normalizeRuntimeEnvironmentCaptureTimeout(Number.NaN)).toBe(DEFAULT_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS);
+    expect(normalizeRuntimeEnvironmentCaptureTimeout(MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS + 1))
+      .toBe(MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS);
   });
 });
 
