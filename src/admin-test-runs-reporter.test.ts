@@ -1257,6 +1257,32 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       ])).toEqual(['apps/operator/b.test.ts', 'apps/operator/c.test.ts']);
     });
 
+    it('reconciles inserted receipt paths against their recorded root without suffix matching', () => {
+      const filePath = 'src/shared.test.ts';
+      const receipt = {
+        receiptId: 'nested-root', attempt: 0, filePath, status: 'pass', outcome: 'inserted', id: '901',
+        row: { filePath, startedAt: at.toISOString(), finishedAt: at.toISOString(),
+          executionDetails: { root: '/repo/libs/first' } },
+      };
+      const expected = ['libs/first/src/shared.test.ts', 'libs/second/src/shared.test.ts'];
+      expect(missingTestRunReceiptPaths(JSON.stringify(receipt), expected, '/repo'))
+        .toEqual(['libs/second/src/shared.test.ts']);
+      // The same receipt remains usable by a standalone submodule caller.
+      expect(missingTestRunReceiptPaths(JSON.stringify(receipt), [filePath])).toEqual([]);
+      for (const badRoot of [undefined, 'libs/first', '/other/libs/first']) {
+        const invalid = { ...receipt, row: { ...receipt.row, executionDetails: { root: badRoot } } };
+        expect(missingTestRunReceiptPaths(JSON.stringify(invalid), expected, '/repo')).toEqual(expected);
+      }
+      const timeout = { ...receipt, outcome: 'timeout', reason: 'pending', replayable: false };
+      expect(missingTestRunReceiptPaths(JSON.stringify(timeout), expected, '/repo')).toEqual(expected);
+      const escaped = { ...receipt, filePath: '../../outside.test.ts',
+        row: { ...receipt.row, filePath: '../../outside.test.ts' } };
+      expect(missingTestRunReceiptPaths(JSON.stringify(escaped), ['outside.test.ts'], '/repo'))
+        .toEqual(['outside.test.ts']);
+      const inconsistent = { ...receipt, row: { ...receipt.row, filePath: 'src/other.test.ts' } };
+      expect(missingTestRunReceiptPaths(JSON.stringify(inconsistent), expected, '/repo')).toEqual(expected);
+    });
+
     it('records late RETURNING ids on the original receipt sink without retrying the insert', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'test-run-late-receipts-'));
       const file = join(dir, 'original.jsonl');

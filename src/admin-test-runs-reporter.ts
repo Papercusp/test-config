@@ -1544,8 +1544,14 @@ function isTestRunReceipt(value: unknown): value is TestRunReceipt {
     typeof receipt.reason === 'string' && typeof receipt.replayable === 'boolean';
 }
 
-/** Return paths without a canonical inserted receipt; inserted acknowledgements dominate timeouts. */
-export function missingTestRunReceiptPaths(receiptLog: string, expectedPaths: readonly string[]): string[] {
+/**
+ * Return paths without a canonical inserted receipt; inserted acknowledgements dominate timeouts.
+ * When expectedRoot is supplied, compare file identities in that checkout using each row's recorded
+ * root. Object-sourced submodules may be independent repos and therefore record shorter paths.
+ */
+export function missingTestRunReceiptPaths(
+  receiptLog: string, expectedPaths: readonly string[], expectedRoot?: string,
+): string[] {
   const latest = new Map<string, TestRunReceipt>();
   for (const line of receiptLog.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -1558,7 +1564,19 @@ export function missingTestRunReceiptPaths(receiptLog: string, expectedPaths: re
   }
   const inserted = new Set([...latest.values()]
     .filter((receipt): receipt is Extract<TestRunReceipt, { outcome: 'inserted' }> => receipt.outcome === 'inserted')
-    .map(receipt => receipt.filePath.replaceAll('\\', '/')));
+    .flatMap(receipt => {
+      const path = receipt.filePath.replaceAll('\\', '/');
+      if (expectedRoot === undefined) return [path];
+      const recordRoot = receipt.row.executionDetails?.root;
+      if (typeof recordRoot !== 'string' || !isAbsolute(recordRoot) || isAbsolute(path)
+        || receipt.row.filePath.replaceAll('\\', '/') !== path) return [];
+      const outside = (path: string) => path === '..' || path.startsWith(`..${posix.sep}`) || isAbsolute(path);
+      const root = resolve(expectedRoot);
+      if (outside(relative(root, recordRoot).replaceAll('\\', '/'))) return [];
+      const absolute = resolve(recordRoot, path);
+      if (outside(relative(recordRoot, absolute).replaceAll('\\', '/'))) return [];
+      return [relative(root, absolute).replaceAll('\\', '/')];
+    }));
   return [...new Set(expectedPaths.map(path => path.replaceAll('\\', '/')))].filter(path => !inserted.has(path));
 }
 
