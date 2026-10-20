@@ -1272,7 +1272,17 @@ const sharedPg = pinModuleState('@papercusp/test-config.shared-pg', () => ({
 export function resolveTestRunsPgUrl(env: NodeJS.ProcessEnv = process.env): string {
   return env.PAPERCUSP_TEST_RUNS_DB_URL?.trim()
     || env.HARNESS_ADMIN_DATABASE_URL?.trim()
-    || 'postgresql://harness_admin:harness_admin_pwd@localhost:5432/papercusp';
+    // `scripts/with-test-pg.mjs` deliberately clears HARNESS_* pins before
+    // launching the test child so resolution-chain tests can exercise their
+    // own environment. It leaves PAPERCUSP_PG_PORT as the private-cluster
+    // isolation signal; follow that signal here too or the fail-soft reporter
+    // opens a pool on the host's native :5432 during teardown.
+    || `postgresql://harness_admin:harness_admin_pwd@localhost:${validReporterPgPort(env.PAPERCUSP_PG_PORT)}/papercusp`;
+}
+
+function validReporterPgPort(raw: string | undefined): number {
+  const port = Number(raw);
+  return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : 5432;
 }
 
 export function tryGetPg(): Promise<PgHandle> {

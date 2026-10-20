@@ -200,6 +200,16 @@ describe('reporter ledger endpoint selection', () => {
     expect(resolveTestRunsPgUrl({ PAPERCUSP_TEST_RUNS_DB_URL: ' postgresql://ledger.example/evidence ',
       HARNESS_ADMIN_DATABASE_URL: 'postgresql://private.example/disposable' })).toBe('postgresql://ledger.example/evidence');
   });
+
+  it('follows the private test-PG port when product DSN pins are intentionally scrubbed', () => {
+    expect(resolveTestRunsPgUrl({ PAPERCUSP_PG_PORT: '33299' }))
+      .toBe('postgresql://harness_admin:harness_admin_pwd@localhost:33299/papercusp');
+  });
+
+  it.each(['', '0', '-1', '65536', 'not-a-port'])('falls back to native PG for an invalid private port (%j)', port => {
+    expect(resolveTestRunsPgUrl({ PAPERCUSP_PG_PORT: port }))
+      .toBe('postgresql://harness_admin:harness_admin_pwd@localhost:5432/papercusp');
+  });
 });
 
 describe('receipt-backed native archive reporter', () => {
