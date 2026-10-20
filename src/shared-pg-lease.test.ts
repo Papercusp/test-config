@@ -141,4 +141,47 @@ describe('shared PG lease (WI-10003715)', () => {
       vi.useRealTimers();
     }
   });
+
+  it('defers sql.end until a timed-out INSERT settles after the total budget', async () => {
+    vi.useFakeTimers();
+    let resolveInsert!: (value: unknown) => void;
+    const statement = vi.fn(() => new Promise(resolve => {
+      resolveInsert = resolve;
+    }));
+    const end = vi.fn(async () => undefined);
+    const sql = Object.assign(
+      (first: unknown) => Array.isArray(first) && !('raw' in first) ? {} : statement(),
+      { end },
+    ) as unknown as PgSql;
+    shared.promise = Promise.resolve({ sql });
+    const lease = retainSharedPg();
+    const at = new Date('2026-10-15T20:00:00Z');
+    const row: TestRunRow = {
+      filePath: 'late-after-budget.test.ts', status: 'fail', durationMs: 1,
+      startedAt: at, finishedAt: at, outputTail: null,
+      isScratchConfig: false, worktreeDirty: false, commitSha: 'abc123', executionDetails: null,
+    };
+    const write = insertTestRunRowsWithSql(sql, [row], {
+      branch: 'staging', inferredCommit: null, declaredSource: 'mutation-probe', runGroupId: null,
+      harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null,
+    }, { insertTimeoutMs: 20, totalInsertMs: 100 }).then(async receipts => {
+      await lease();
+      return receipts;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(101);
+      await expect(write).resolves.toMatchObject([
+        { outcome: 'timeout', reason: 'pg_insert_timeout_100ms' },
+      ]);
+      expect(end).not.toHaveBeenCalled();
+
+      resolveInsert([{ id: '902', file_path: row.filePath }]);
+      await vi.waitFor(() => expect(end).toHaveBeenCalledTimes(1));
+    } finally {
+      resolveInsert([]);
+      await vi.runAllTimersAsync();
+      await write;
+      vi.useRealTimers();
+    }
+  });
 });

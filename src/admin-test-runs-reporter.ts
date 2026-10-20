@@ -1267,6 +1267,11 @@ export type PgHandle = { sql: PgSql } | null;
 const sharedPg = pinModuleState('@papercusp/test-config.shared-pg', () => ({
   promise: undefined as Promise<PgHandle> | undefined,
   holders: 0,
+  /** Queries submitted while a reporter lease is held must settle before sql.end(). */
+  inFlight: 0,
+  /** A lease release requests shutdown; the last query completion performs it. */
+  closeRequested: false,
+  closePromise: undefined as Promise<void> | undefined,
 }));
 
 export function resolveTestRunsPgUrl(env: NodeJS.ProcessEnv = process.env): string {
@@ -1338,6 +1343,26 @@ export function retainSharedPg(): () => Promise<void> {
   };
 }
 
+/**
+ * Keep a shared client's lifetime open across a bounded foreground timeout.
+ *
+ * postgres.js does not cancel a submitted query when the JavaScript waiter times
+ * out. The reporter deliberately keeps that promise attached so a late RETURNING
+ * acknowledgement can be reconciled. If the final reporter lease is released in
+ * that window, closing the client would turn the still-valid late query into
+ * CONNECTION_DESTROYED. Count only operations started under a lease (the direct
+ * SQL seams used by unit tests are not shared-client operations), and let the last
+ * operation completion drain a deferred close request.
+ */
+function trackSharedPgOperation<T>(operation: Promise<T>): Promise<T> {
+  if (sharedPg.holders === 0) return operation;
+  sharedPg.inFlight += 1;
+  return operation.finally(async () => {
+    sharedPg.inFlight = Math.max(0, sharedPg.inFlight - 1);
+    if (sharedPg.inFlight === 0 && sharedPg.closeRequested) await closeSharedPg();
+  });
+}
+
 /** The release path for a reporter that never retained (e.g. unarmed): end the client only if
  *  no sibling still holds it, so a bystander can never cut a live flush short. WI-10003715. */
 export async function closeSharedPgIfUnheld(): Promise<void> {
@@ -1347,14 +1372,32 @@ export async function closeSharedPgIfUnheld(): Promise<void> {
 /** Unconditional end of the shared client. Reporters must NOT call this directly — use the lease
  *  (retainSharedPg) or closeSharedPgIfUnheld; this stays exported for tests and teardown. */
 export async function closeSharedPg(): Promise<void> {
+  if (sharedPg.closePromise) {
+    await sharedPg.closePromise;
+    return;
+  }
+  sharedPg.closeRequested = true;
+  if (sharedPg.inFlight > 0) return;
   const p = sharedPg.promise;
+  if (!p) {
+    sharedPg.closeRequested = false;
+    return;
+  }
   sharedPg.promise = undefined;
-  if (!p) return;
+  sharedPg.closeRequested = false;
+  const closing = (async () => {
+    try {
+      const handle = await p;
+      if (handle?.sql) await handle.sql.end({ timeout: 2 });
+    } catch {
+      /* swallow — D-007 */
+    }
+  })();
+  sharedPg.closePromise = closing;
   try {
-    const handle = await p;
-    if (handle?.sql) await handle.sql.end({ timeout: 2 });
-  } catch {
-    /* swallow — D-007 */
+    await closing;
+  } finally {
+    if (sharedPg.closePromise === closing) sharedPg.closePromise = undefined;
   }
 }
 
@@ -1741,14 +1784,14 @@ export async function insertTestRunRowsWithSql(
     }
     let written: unknown;
     let failure: unknown = null;
-    const query = Promise.resolve(sql`
+    const query = trackSharedPgOperation(Promise.resolve(sql`
       INSERT INTO harness_shared.test_runs
         ${sql(batch, ...columns)}
       RETURNING id, file_path
     `).then(
       (value) => { written = value; },
       (error) => { failure = error ?? new Error('insert_rejected'); throw failure; },
-    );
+    ));
     let timeoutMs = Math.min(budget.insertTimeoutMs, remainingMs);
     let completed = await settleWithin(query, timeoutMs);
     if (!completed && !failure) {
@@ -1916,13 +1959,13 @@ export async function insertTestCaseRowsWithSql(
     if (remainingMs <= 0) return { written, unwritten: rows.length - offset, reason: 'flush_deadline' };
     const batch = rows.slice(offset, offset + TEST_CASE_INSERT_BATCH_SIZE);
     let failure: unknown = null;
-    const query = Promise.resolve(sql`
+    const query = trackSharedPgOperation(Promise.resolve(sql`
       INSERT INTO harness_shared.test_case_runs
         ${sql(batch, ...TEST_CASE_INSERT_COLUMNS)}
     `).then(
       () => undefined,
       (error) => { failure = error ?? new Error('insert_rejected'); throw failure; },
-    );
+    ));
     const timeoutMs = Math.min(limits.insertTimeoutMs, remainingMs);
     if (!(await settleWithin(query, timeoutMs))) {
       const reason = failure
