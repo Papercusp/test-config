@@ -53,7 +53,19 @@ if (process.env.PAPERCUSP_LIVE_PG_GUARD_INITIALIZED !== '1') {
   process.env.PAPERCUSP_LIVE_PG_GUARD_INITIALIZED = '1';
 }
 
-process.env.PAPERCUSP_FORBID_LIVE_PG = '1';
+/**
+ * The ONE sanctioned exception (WI-6554700010019145): the persistent
+ * coverage-attribution venue (design-to-code-coverage-seam P-027) writes
+ * coverage_evidence to the canonical admin PG on purpose — that persistence is
+ * the whole point of the venue. Its package script sets exactly this value; any
+ * other value still arms the rail. setup-no-live-pg.test.ts pins that a single
+ * script, running only the venue file, may carry it, so it cannot spread.
+ */
+export const LIVE_PG_VENUE_ENV = 'PAPERCUSP_LIVE_PG_VENUE';
+export const COVERAGE_ATTRIBUTION_VENUE = 'coverage-attribution';
+
+process.env.PAPERCUSP_FORBID_LIVE_PG =
+  process.env[LIVE_PG_VENUE_ENV] === COVERAGE_ATTRIBUTION_VENUE ? '0' : '1';
 
 // This side-effect setup is also imported by its regression suite.
 export {};
