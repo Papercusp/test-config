@@ -37,6 +37,7 @@ function tableMigrations(): string[] {
 
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
+const GIT_DIR = '/probe/install-a/.git';
 
 function row(testFile: string, over: Partial<ExecutedSourceRow> = {}): ExecutedSourceRow {
   return { workspaceName: '@probe/ws', testFile, executedModules: ['src/a.ts', testFile], ...over };
@@ -77,6 +78,7 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
       {
         rows: [row('src/gate.test.ts', { inputsCaptured: true, readPaths: ['fixtures/x.json'], opaqueReasons: [] })],
         recordedSha: SHA_A,
+        recordedGitDir: GIT_DIR,
         runGroupId: 'rg-1',
         workspaceName: '@probe/ws',
         runContext: 'green-checkpoint',
@@ -85,10 +87,12 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
       handle,
     );
     const [got] = await sql`
-      SELECT recorded_sha, inputs_captured, read_paths, opaque_reasons, run_context, runner_identity, module_count
+      SELECT recorded_sha, inputs_captured, read_paths, opaque_reasons, run_context, runner_identity, module_count,
+             recorded_git_dir
         FROM harness_shared.test_executed_sources WHERE test_file = 'src/gate.test.ts'`;
     expect(got).toMatchObject({
       recorded_sha: SHA_A,
+      recorded_git_dir: GIT_DIR,
       inputs_captured: true,
       read_paths: ['fixtures/x.json'],
       opaque_reasons: [],
@@ -107,6 +111,7 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
           row('src/m3.test.ts'),
         ],
         recordedSha: SHA_A,
+        recordedGitDir: GIT_DIR,
         runGroupId: null,
         runContext: null,
       },
@@ -131,7 +136,7 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
     const testFile = 'src/quoted,"proof.test.ts';
     const modules = ['src/quoted,"module.ts', 'src/back\\slash.ts', testFile];
     const write = (rows: ExecutedSourceRow[], recordedSha: string, retiredFiles?: string[]) =>
-      writeExecutedSourceRows({ rows, recordedSha, runGroupId: 'no-types', workspaceName,
+      writeExecutedSourceRows({ rows, recordedSha, recordedGitDir: GIT_DIR, runGroupId: 'no-types', workspaceName,
         runContext: 'clean-local', retiredFiles }, reporterHandle);
     try {
       await write([
@@ -166,6 +171,7 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
       {
         rows: [row('src/gate.test.ts', { inputsCaptured: true })],
         recordedSha: SHA_B,
+        recordedGitDir: GIT_DIR,
         runGroupId: null,
         workspaceName: '@probe/ws',
         runContext: 'green-checkpoint',
@@ -192,6 +198,7 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
         {
           rows: [row('src/ctx.test.ts', { inputsCaptured: true, readPaths })],
           recordedSha: SHA_C,
+          recordedGitDir: GIT_DIR,
           runGroupId: null,
           workspaceName: '@probe/ws',
           runContext,
@@ -209,5 +216,46 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
 
     await write('green-checkpoint', ['fixtures/second.json']);
     expect(await gateRows()).toEqual([{ read_paths: ['fixtures/second.json'] }]);
+  });
+
+  /**
+   * WI-6554700010019324 — two installs that clone one repository share workspace names and run
+   * contexts. Before 1552, install B's retention DELETE (same file and context, another sha)
+   * removed install A's proof, and B's rule-5 retirement removed A's proofs too.
+   */
+  it("one install's newer sha, same sha and failure never delete another install's proofs", async () => {
+    const GIT_DIR_B = '/probe/install-b/.git';
+    const ws = '@probe/cross-install';
+    const write = (gitDir: string, recordedSha: string, files: string[], retiredFiles?: string[]) =>
+      writeExecutedSourceRows(
+        { rows: files.map((f) => row(f, { workspaceName: ws, inputsCaptured: true })), recordedSha,
+          recordedGitDir: gitDir, runGroupId: null, workspaceName: ws, runContext: 'green-checkpoint', retiredFiles },
+        handle,
+      );
+    const proofs = () => sql<{ test_file: string; recorded_sha: string; recorded_git_dir: string | null }[]>`
+      SELECT test_file, recorded_sha, recorded_git_dir FROM harness_shared.test_executed_sources
+       WHERE workspace_name = ${ws} ORDER BY test_file, recorded_git_dir NULLS FIRST, recorded_sha`;
+
+    // A pre-1552 row: the reporter never deletes what it cannot attribute, except on a failure.
+    await sql`
+      INSERT INTO harness_shared.test_executed_sources
+        (workspace_name, test_file, recorded_sha, executed_modules, module_count, run_context)
+      VALUES (${ws}, 'src/x.test.ts', ${'d'.repeat(40)}, ARRAY['src/x.test.ts'], 1, 'green-checkpoint')`;
+    await write(GIT_DIR, SHA_A, ['src/x.test.ts', 'src/y.test.ts']);
+    await write(GIT_DIR_B, SHA_B, ['src/x.test.ts', 'src/y.test.ts']);
+    await write(GIT_DIR_B, SHA_A, ['src/x.test.ts']);
+    expect(await proofs()).toEqual([
+      { test_file: 'src/x.test.ts', recorded_sha: 'd'.repeat(40), recorded_git_dir: null },
+      { test_file: 'src/x.test.ts', recorded_sha: SHA_A, recorded_git_dir: GIT_DIR },
+      { test_file: 'src/x.test.ts', recorded_sha: SHA_A, recorded_git_dir: GIT_DIR_B },
+      { test_file: 'src/y.test.ts', recorded_sha: SHA_A, recorded_git_dir: GIT_DIR },
+      { test_file: 'src/y.test.ts', recorded_sha: SHA_B, recorded_git_dir: GIT_DIR_B },
+    ]);
+
+    // B fails src/x: B's proofs and the unattributable pre-1552 row go, A's stays.
+    await write(GIT_DIR_B, SHA_B, [], ['src/x.test.ts']);
+    expect((await proofs()).filter((p) => p.test_file === 'src/x.test.ts')).toEqual([
+      { test_file: 'src/x.test.ts', recorded_sha: SHA_A, recorded_git_dir: GIT_DIR },
+    ]);
   });
 });

@@ -23,6 +23,7 @@ import ExecutedSourceMapReporter, {
   normalizeExecutedKey,
   qualifyConfigSources,
   resolveConfigDependencies,
+  resolveRecordedGitDir,
   shouldRecordModule,
   type ExecutedSourceFlush,
   type ExecutedSourceMapResult,
@@ -235,6 +236,7 @@ describe('ExecutedSourceMapReporter', () => {
   const savedEnv: Record<string, string | undefined> = {};
 
   const clean = { commit: 'c0ffee0000000000000000000000000000000000', porcelain: '' };
+  const GIT_DIR = '/fake/install/.git';
   const snapshot = (s: { commit: string | null; porcelain: string | null }) => async () => s;
 
   function fakeModule(o: { state?: string; isolate?: boolean | undefined; imports?: Record<string, { external?: boolean }> | 'throw'; moduleId?: string; workerImports?: boolean }): TestModule {
@@ -258,11 +260,11 @@ describe('ExecutedSourceMapReporter', () => {
     } as unknown as TestModule;
   }
 
-  function reporter(snap = snapshot(clean)) {
+  function reporter(snap = snapshot(clean), gitDir: string | null = GIT_DIR) {
     const flushes: ExecutedSourceFlush[] = [];
     const r = new ExecutedSourceMapReporter(snap, async (flush) => {
       flushes.push(flush);
-    });
+    }, () => gitDir);
     return { r, flushes };
   }
 
@@ -316,6 +318,7 @@ describe('ExecutedSourceMapReporter', () => {
     expect(flushes).toHaveLength(1);
     expect(flushes[0]).toEqual({
       recordedSha: clean.commit,
+      recordedGitDir: GIT_DIR,
       runGroupId: 'grp-1',
       workspaceName: '@papercusp/test-config',
       retiredFiles: [],
@@ -353,6 +356,7 @@ describe('ExecutedSourceMapReporter', () => {
     expect(flushes).toEqual([
       {
         recordedSha: clean.commit,
+        recordedGitDir: GIT_DIR,
         runGroupId: 'grp-1',
         workspaceName: '@papercusp/test-config',
         retiredFiles: ['libs/test-config/src/__fake__/thing.test.ts'],
@@ -382,6 +386,22 @@ describe('ExecutedSourceMapReporter', () => {
     moved.r.onTestModuleEnd(fakeModule({}));
     await moved.r.onTestRunEnd();
     expect(moved.flushes).toEqual([]);
+  });
+
+  it('does not persist when the git common dir is unresolvable, since its DELETEs could not be scoped (WI-6554700010019324)', async () => {
+    const { r, flushes } = reporter(snapshot(clean), null);
+    r.onInit({} as never);
+    r.onTestModuleEnd(fakeModule({}));
+    await r.onTestRunEnd();
+    expect(flushes).toEqual([]);
+    expect(results()).toEqual([expect.objectContaining({ outcome: 'not-persisted', rows: 1 })]);
+  });
+
+  it('resolveRecordedGitDir names the object store, the same from the repo root and from a plain subdirectory', () => {
+    const dir = resolveRecordedGitDir(REPO_ROOT);
+    expect(dir).toMatch(/\/\.git$/);
+    expect(resolveRecordedGitDir(join(REPO_ROOT, 'scripts'))).toBe(dir);
+    expect(resolveRecordedGitDir(join(tmp, 'not-a-repo'))).toBeNull();
   });
 
   it('keeps collected source evidence in OUT across HEAD movement without stamping reusable proof', async () => {

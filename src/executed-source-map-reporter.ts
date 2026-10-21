@@ -31,7 +31,7 @@
 import type { Reporter, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -74,6 +74,9 @@ export interface ExecutedSourceRow {
 export interface ExecutedSourceFlush {
   rows: ExecutedSourceRow[];
   recordedSha: string;
+  /** WI-6554700010019324: the object store recordedSha lives in (resolveRecordedGitDir). Every
+   *  DELETE this flush runs is scoped to it, so a sibling install's proofs are never touched. */
+  recordedGitDir: string;
   runGroupId: string | null;
   /** D-004 rule 5: files that FAILED or ERRORED on this clean run; their pass proofs are retired. */
   retiredFiles?: string[];
@@ -167,6 +170,27 @@ export function trackedPredicate(trackedFiles: Iterable<string>): (rel: string) 
     }
   }
   return (rel) => rel === '' || set.has(rel.replace(/\/+$/, ''));
+}
+
+/**
+ * WI-6554700010019324: the object store a proof's recorded_sha lives in, as the realpath of the
+ * checkout's git common dir. A linked worktree (the gate's checkpoint tree, the release checkout)
+ * shares its main repository's, so every checkout of one install agrees; a separate clone of the
+ * same repository (a pr-drill install) differs, which is what keeps one install's retention from
+ * deleting another's proofs. Null when git cannot answer. PINNED equal to resolveRecordedGitDir in
+ * scripts/lib/executed-source-map.mjs (the reader side).
+ */
+export function resolveRecordedGitDir(repoRoot: string): string | null {
+  try {
+    const out = execFileSync('git', ['-C', repoRoot, 'rev-parse', '--path-format=absolute', '--git-common-dir'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 10_000,
+    }).trim();
+    return out ? realpathSync(out) : null;
+  } catch {
+    return null;
+  }
 }
 
 function listTrackedFiles(repoRoot: string): string[] | null {
@@ -539,7 +563,7 @@ function moduleIsIsolated(testModule: TestModule): boolean {
  * Default writer, per chunk: replace this run context's row for (workspace, file, sha) with
  * the newest observation (delete + target-less insert, WI-10004880), then retire this
  * context's rows at OTHER shas for the same files, so the table holds one row per test file
- * per workspace per run context rather than one per gate run.
+ * per workspace per run context per install (recorded_git_dir) rather than one per gate run.
  */
 export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: PgHandle): Promise<void> {
   const handle = pg ?? (await tryGetPg());
@@ -563,17 +587,21 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
     // form is deliberately schema-agnostic: under today's 3-column key a cross-context collision
     // keeps the existing row, and once the key gains run_context both contexts' rows coexist,
     // with no writer change and no deploy-ordering window in which writes fail.
+    // WI-6554700010019324: every DELETE here is scoped to recorded_git_dir. Two installs that
+    // clone one repository share workspace names and run contexts, so the unscoped form let each
+    // install's recording delete the other's proofs (migration 1552).
     await sql`
       DELETE FROM harness_shared.test_executed_sources
        WHERE workspace_name = ${workspaceName}
          AND test_file = ANY(ARRAY(SELECT jsonb_array_elements_text(${files}::text::jsonb)))
          AND recorded_sha = ${flush.recordedSha}
          AND run_context IS NOT DISTINCT FROM ${flush.runContext ?? null}::text
+         AND recorded_git_dir = ${flush.recordedGitDir}
     `;
     await sql`
       INSERT INTO harness_shared.test_executed_sources
         (workspace_name, test_file, recorded_sha, executed_modules, module_count, run_group_id,
-         read_paths, inputs_captured, opaque_reasons, run_context, runner_identity)
+         read_paths, inputs_captured, opaque_reasons, run_context, runner_identity, recorded_git_dir)
       SELECT ${workspaceName}, u.f, ${flush.recordedSha},
              ARRAY(SELECT jsonb_array_elements_text(u.m::jsonb)),
              jsonb_array_length(u.m::jsonb),
@@ -582,27 +610,34 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
              u.c::boolean,
              ARRAY(SELECT jsonb_array_elements_text(u.o::jsonb)),
              ${flush.runContext ?? null},
-             ${flush.runnerIdentity ?? null}
+             ${flush.runnerIdentity ?? null},
+             ${flush.recordedGitDir}
         FROM jsonb_to_recordset(${rows}::text::jsonb) AS u(f text, m jsonb, r jsonb, c boolean, o jsonb)
       ON CONFLICT DO NOTHING
     `;
     // Scoped to this run context (plus legacy pre-1236 NULL rows): a clean-local recording must
     // not erase the green-checkpoint's pass proof for the same file, since reuse only ever
     // consumes a proof from its own context (gate-file-level-test-reuse-2026-09-27 D-004 rule 1).
+    // Pre-1552 rows (recorded_git_dir NULL) are left alone: nothing says whose they are, and a
+    // reader prefers this install's own row over them.
     await sql`
       DELETE FROM harness_shared.test_executed_sources
        WHERE workspace_name = ${workspaceName}
          AND test_file = ANY(ARRAY(SELECT jsonb_array_elements_text(${files}::text::jsonb)))
          AND recorded_sha <> ${flush.recordedSha}
          AND (run_context IS NULL OR run_context IS NOT DISTINCT FROM ${flush.runContext ?? null}::text)
+         AND recorded_git_dir = ${flush.recordedGitDir}
     `;
   }
-  // D-004 rule 5: a failure on this clean run retires EVERY pass proof for that file.
+  // D-004 rule 5: a failure on this clean run retires EVERY pass proof this install holds for that
+  // file, including pre-1552 rows a reader could still fall back to. Another install's proofs are
+  // judged by that install's own runs.
   if (flush.retiredFiles && flush.retiredFiles.length > 0 && flush.workspaceName) {
     await sql`
       DELETE FROM harness_shared.test_executed_sources
        WHERE workspace_name = ${flush.workspaceName}
          AND test_file = ANY(ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(flush.retiredFiles)}::text::jsonb)))
+         AND (recorded_git_dir = ${flush.recordedGitDir} OR recorded_git_dir IS NULL)
     `;
   }
 }
@@ -686,6 +721,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private readonly repoRoot = inferWorkspaceRoot();
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: ExecutedSourceRowWriter;
+  private readonly resolveGitDir: (repoRoot: string) => string | null;
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
   private pending: ExecutedSourceRow[] = [];
   private retired: string[] = [];
@@ -726,11 +762,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
     writeRows?: ExecutedSourceRowWriter,
+    resolveGitDir?: (repoRoot: string) => string | null,
   ) {
     // Vitest constructs reporters with its options object; the unit suite injects seams.
     this.readWorktreeSnapshot =
       typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
     this.writeRows = writeRows ?? ((flush) => writeExecutedSourceRows(flush));
+    this.resolveGitDir = resolveGitDir ?? resolveRecordedGitDir;
   }
 
   /** WI-10003715: lease on the shared PG client, so the sibling test-runs reporter's concurrent
@@ -961,6 +999,14 @@ export default class ExecutedSourceMapReporter implements Reporter {
       report('not-persisted');
       return;
     }
+    // WI-6554700010019324: an unscoped write could not be told apart from a sibling install's, and
+    // its DELETEs could not be scoped, so a row with no object store is never written.
+    const recordedGitDir = this.resolveGitDir(this.repoRoot);
+    if (!recordedGitDir) {
+      log(`NOT persisted — git common dir unresolvable, so the rows cannot be scoped to this install ${summary}`);
+      report('not-persisted');
+      return;
+    }
     // P-009: relativise each captured read and split tracked inputs from opaque untracked reads.
     if (rows.some((r) => r.inputsCaptured)) {
       const tracked = listTrackedFiles(this.repoRoot);
@@ -984,6 +1030,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
         // Source diagnostics belong only to OUT. Preserve the existing persisted row contract.
         rows: rows.map(({ sourceEvidence: _sourceEvidence, moduleEvaluations: _moduleEvaluations, ...row }) => row),
         recordedSha,
+        recordedGitDir,
         runGroupId,
         retiredFiles,
         workspaceName: armed.workspaceName,
