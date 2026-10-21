@@ -621,11 +621,13 @@ describe('test database janitor (WI-6554700010008843)', () => {
     const connected = name('conn');
     const commented = name('cmt');
     const young = name('young');
+    // test-db-marker: deliberately-unmarked — subjects of the unmarked-database sweeper under test
     for (const n of [aged, connected, commented]) await admin.unsafe(`CREATE DATABASE "${n}"`);
     await admin.unsafe(`COMMENT ON DATABASE "${commented}" IS 'not a papercusp test database'`);
     await sleepMs(1_500);
     const cutoff = Date.now();
     await sleepMs(1_500);
+    // test-db-marker: deliberately-unmarked — the young subject the sweeper must keep
     await admin.unsafe(`CREATE DATABASE "${young}"`);
     const uri = new URL(await getTestPg());
     uri.pathname = `/${connected}`;
