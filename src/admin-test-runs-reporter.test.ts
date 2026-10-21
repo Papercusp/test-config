@@ -18,6 +18,7 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { defaultEvidenceRoot } from '@papercusp/verification-harness';
 import { MAX_RECORDED_CASE_TITLE_CHARS, MAX_RECORDED_PASSED_CASES } from './execution-details.ts';
 import AdminTestRunsReporter, {
   buildOutputTail,
@@ -70,6 +71,9 @@ import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+/** The resolver the reporter's onInit loads in a hive that ships verification-harness. */
+const collectReceipts = (testModule: Parameters<typeof collectIsolatedRuntimeReceipts>[0]) =>
+  collectIsolatedRuntimeReceipts(testModule, defaultEvidenceRoot);
 
 describe('Vitest before-source boundary', () => {
   it('keeps module discovery behind the completed before-run snapshot', async () => {
@@ -537,19 +541,19 @@ describe('original isolated runtime receipt recording', () => {
     try {
       for (const file of files) { mkdirSync(join(base, file, '..'), { recursive: true }); writeFileSync(join(base, file), '{}'); }
       const expected = createHash('sha256').update('{}').digest('hex');
-      expect(collectIsolatedRuntimeReceipts(module([test])))
+      expect(collectReceipts(module([test])))
         .toEqual([{ runId, resultSha256: expected, sourceSha256: expected, lifecycleSha256: expected }]);
       const skipped = { result: () => ({ state: 'skipped' }), meta: () => ({}) };
-      expect(collectIsolatedRuntimeReceipts(module([skipped, test, skipped])))
+      expect(collectReceipts(module([skipped, test, skipped])))
         .toEqual([{ runId, resultSha256: expected, sourceSha256: expected, lifecycleSha256: expected }]);
-      expect(collectIsolatedRuntimeReceipts(module([skipped]))).toBeUndefined();
-      expect(collectIsolatedRuntimeReceipts(module([test, { result: () => undefined }])))
+      expect(collectReceipts(module([skipped]))).toBeUndefined();
+      expect(collectReceipts(module([test, { result: () => undefined }])))
         .toBeUndefined();
-      expect(collectIsolatedRuntimeReceipts(module([test, test]))).toBeUndefined();
-      expect(collectIsolatedRuntimeReceipts(module([{ ...test, meta: () => ({}) }]))).toBeUndefined();
-      expect(collectIsolatedRuntimeReceipts(module([{ ...test, result: () => ({ state: 'failed' }) }]))).toBeUndefined();
+      expect(collectReceipts(module([test, test]))).toBeUndefined();
+      expect(collectReceipts(module([{ ...test, meta: () => ({}) }]))).toBeUndefined();
+      expect(collectReceipts(module([{ ...test, result: () => ({ state: 'failed' }) }]))).toBeUndefined();
       rmSync(join(base, files[2]));
-      expect(collectIsolatedRuntimeReceipts(module([test]))).toBeUndefined();
+      expect(collectReceipts(module([test]))).toBeUndefined();
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
@@ -577,7 +581,7 @@ describe('retained isolated runtime receipt custody', () => {
       const module = { children: { allTests: () => runIds.map(runId => ({
         result: () => ({ state: 'passed' }), meta: () => ({ papercuspIsolatedRuntimeRunId: runId }),
       })) } } as never;
-      expect(collectIsolatedRuntimeReceipts(module)).toEqual(runIds.map(runId => {
+      expect(collectReceipts(module)).toEqual(runIds.map(runId => {
         const hashes = files.map(file => createHash('sha256').update(JSON.stringify({ runId, file })).digest('hex'));
         return { runId, resultSha256: hashes[0], sourceSha256: hashes[1], lifecycleSha256: hashes[2] };
       }));
@@ -599,10 +603,10 @@ describe('retained isolated runtime receipt custody', () => {
         writeFileSync(join(base, file), '{}');
       }
       rmSync(join(base, files[2]));
-      expect(collectIsolatedRuntimeReceipts(module)).toBeUndefined();
+      expect(collectReceipts(module)).toBeUndefined();
       writeFileSync(join(outside, 'lifecycle.json'), '{}');
       symlinkSync(join(outside, 'lifecycle.json'), join(base, files[2]));
-      expect(collectIsolatedRuntimeReceipts(module)).toBeUndefined();
+      expect(collectReceipts(module)).toBeUndefined();
     } finally {
       vi.unstubAllEnvs();
       rmSync(dir, { recursive: true, force: true });

@@ -35,7 +35,7 @@ import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, sta
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { defaultEvidenceRoot } from '@papercusp/verification-harness';
+// @papercusp/verification-harness is deliberately NOT imported statically — see loadEvidenceRootResolver.
 // This verifier is built-ins only; do not load operator stores in a reporter.
 import { findVerifierSourceRoot, readVerifierSourceReceipt, type VerifierSourceMutation } from './verifier-source.ts';
 import {
@@ -70,11 +70,38 @@ declare module 'vitest' {
   }
 }
 
+/** verification-harness's `defaultEvidenceRoot(harness)` — typed locally, so no import of the package is needed. */
+export type EvidenceRootResolver = (harness: string) => string;
+
+/**
+ * WI-6554700010018532 — this reporter is wired into every hive's Vitest config, including
+ * hives that do not ship @papercusp/verification-harness (SideStage has no libs/generic).
+ * A static import made the whole reporter module unloadable there (ERR_MODULE_NOT_FOUND
+ * from the module runner), so every router run in those hives lost its report
+ * (`no_report`). Isolated-runtime receipts are the only consumer and are optional by
+ * contract (collectIsolatedRuntimeReceipts already answers `undefined` on any failure), so
+ * the package is loaded lazily, here. An unresolvable package means "no receipts", never
+ * a broken reporter.
+ */
+export async function loadEvidenceRootResolver(
+  load: () => Promise<{ defaultEvidenceRoot?: unknown }> = () => import('@papercusp/verification-harness'),
+): Promise<EvidenceRootResolver | undefined> {
+  try {
+    const { defaultEvidenceRoot } = await load();
+    return typeof defaultEvidenceRoot === 'function' ? harness => defaultEvidenceRoot(harness) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Hash original bytes at recording time; a fixture-supplied digest is never trusted. */
-export function collectIsolatedRuntimeReceipts(testModule: TestModule): IsolatedRuntimeReceipt[] | undefined {
+export function collectIsolatedRuntimeReceipts(
+  testModule: TestModule, evidenceRoot: EvidenceRootResolver | undefined,
+): IsolatedRuntimeReceipt[] | undefined {
+  if (!evidenceRoot) return undefined;
   try {
     const receipts: IsolatedRuntimeReceipt[] = [];
-    const base = realpathSync(defaultEvidenceRoot('isolated-integration'));
+    const base = realpathSync(evidenceRoot('isolated-integration'));
     for (const test of testModule.children.allTests()) {
       const state = test.result()?.state;
       // Name-filtered siblings did not allocate a runtime. Only executed cases
@@ -2206,6 +2233,8 @@ export default class AdminTestRunsReporter implements Reporter {
   /** Optional structured assertion values for testing:run's private sidecar. */
   private failureDetails: TestFailureDetail[] = [];
   private failureDetailsFlushed = false;
+  /** WI-6554700010018532: resolved once in onInit; undefined when verification-harness is absent. */
+  private evidenceRoot: EvidenceRootResolver | undefined;
   private executionContext: Omit<NonNullable<TestRunRow['executionDetails']>,
     'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'commitSha' | 'worktreeDirty'> | null = null;
   /** The probe's invocation-level descriptor, read once per run (mutation-descriptor.ts). */
@@ -2326,6 +2355,8 @@ export default class AdminTestRunsReporter implements Reporter {
     // subprocess callbacks or move the "before" snapshot into test execution.
     // The reader already turns failures into dirty provenance without throwing.
     await this.worktreeBefore;
+    // After the bounded source read, for the same reason: module loading is synchronous work.
+    this.evidenceRoot = await loadEvidenceRootResolver();
   }
 
   /** Per-module hook — queue the row until the end snapshot is available. */
@@ -2363,7 +2394,7 @@ export default class AdminTestRunsReporter implements Reporter {
       // The receipt describes the isolated worker lifetime, independently of
       // whether the owning test exercises an integration seam or an e2e journey.
       if (executionDetails && (testLayer === 'integration' || testLayer === 'e2e')) {
-        const receipts = collectIsolatedRuntimeReceipts(testModule);
+        const receipts = collectIsolatedRuntimeReceipts(testModule, this.evidenceRoot);
         if (receipts) Object.assign(executionDetails, { isolatedRuntimeReceipts: receipts });
       }
       const mutation = executionDetails && this.mutationInvocation
