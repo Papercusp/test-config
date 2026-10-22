@@ -10,7 +10,13 @@
  * test, so each case overrides argv (then restores it) to drive it
  * deterministically — independent of the ambient vitest invocation.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readRealPgRailBlocks } from './silenced-console-census.ts';
+
+afterAll(() => {
+  const rail = readRealPgRailBlocks();
+  expect(rail.blocked, `real-PG attempts blocked: ${rail.callers.join(' | ')}`).toBe(0);
+});
 import { availableParallelism } from 'node:os';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
