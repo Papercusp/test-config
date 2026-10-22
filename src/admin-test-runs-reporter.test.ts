@@ -106,7 +106,7 @@ describe('Vitest before-source boundary', () => {
 describe('Vitest run-level ledger verdict', () => {
   async function recordRun(
     outcomes: Array<{ name: string; passed: number; failed: number; skipped: number }>,
-    errors: Array<{ message: string; code?: string }>,
+    errors: Array<{ message: string; code?: string; stack?: string }>,
     reason: 'passed' | 'failed',
   ) {
     const rows: TestRunRow[] = [];
@@ -138,13 +138,15 @@ describe('Vitest run-level ledger verdict', () => {
 
   it('records an unhandled run error despite eight passing assertions and preserves their counts', async () => {
     const rows = await recordRun([{ name: 'stop', passed: 8, failed: 0, skipped: 76 }],
-      [{ message: 'write after end', code: 'ERR_STREAM_WRITE_AFTER_END' }], 'failed');
+      [{ message: 'write after end', code: 'ERR_STREAM_WRITE_AFTER_END', stack: 'Error: write after end\n    at reporter.test.ts:12' }], 'failed');
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe('error');
     expect(rows[0].executionDetails).toMatchObject({ passed: 8, failed: 0, skipped: 76, collectionFailed: false });
     expect(rows[0].outputTail).toContain('run-level');
     expect(rows[0].outputTail).toContain('ERR_STREAM_WRITE_AFTER_END');
     expect(rows[0].outputTail).toContain('write after end');
+    expect(rows[0].outputTail).toContain('stack: Error: write after end');
+    expect(rows[0].outputTail).toContain('reporter.test.ts:12');
     expect(parseTestRunExecutionDetails(rows[0].executionDetails)?.passed).toBe(8);
   });
 

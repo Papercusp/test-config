@@ -2498,7 +2498,7 @@ export default class AdminTestRunsReporter implements Reporter {
       if (!this.flushed && unhandledErrors.length > 0) {
         const messages = unhandledErrors.slice(0, 8).map(error => {
           const code = errorField(error, 'code');
-          return `${code === undefined ? '' : `[${boundFailureText(stringifyFailureValue(code), 100)}] `}${formatTestCaseError(error)}`;
+          return `${code === undefined ? '' : `[${boundFailureText(stringifyFailureValue(code), 100)}] `}${formatTestCaseError(error, { includeStack: true })}`;
         }).join('\n').slice(0, 2_600);
         const runError = `Vitest run-level: ${unhandledErrors.length} unhandled error(s) (reason=${reason ?? 'unknown'}).\n${messages}`;
         for (const row of this.pending) {
