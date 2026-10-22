@@ -25,3 +25,6 @@
  * precedents. Prefer renaming such a file to `*.integration.test.ts`.
  */
 process.env.PAPERCUSP_FORBID_REAL_PG = '1';
+// getDoorConstantsSync can start a PG refresh before pool construction, so the
+// unit layer also disables that background read at its source.
+process.env.PAPERCUSP_DOORS_CONFIG_OFF = '1';

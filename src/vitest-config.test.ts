@@ -114,6 +114,14 @@ describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
     expect(rail, 'the unit layer arms one setup file the e2e layer omits (the real-PG rail)').toMatch(/pg/i);
   });
 
+  it('unit setup prevents background context-door refreshes as well as real PG connections', () => {
+    withArgv();
+    const setupFiles = defineVitestConfig({ layer: 'unit' }).test?.setupFiles as string[];
+    expect(setupFiles[0]).toMatch(/setup-no-real-pg\.ts$/);
+    expect(process.env.PAPERCUSP_FORBID_REAL_PG).toBe('1');
+    expect(process.env.PAPERCUSP_DOORS_CONFIG_OFF).toBe('1');
+  });
+
   it('routes an *.integration.test.ts remediation through the repository test router', () => {
     withArgv('lib/foo.integration.test.ts');
     expect(() => defineVitestConfig({ layer: 'unit' })).toThrow(/integration test/i);
