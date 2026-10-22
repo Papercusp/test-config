@@ -100,7 +100,7 @@ export function collectIsolatedRuntimeReceipts(
 ): IsolatedRuntimeReceipt[] | undefined {
   if (!evidenceRoot) return undefined;
   try {
-    const receipts: IsolatedRuntimeReceipt[] = [];
+    const receipts = new Map<string, IsolatedRuntimeReceipt>();
     const base = realpathSync(evidenceRoot('isolated-integration'));
     for (const test of testModule.children.allTests()) {
       const state = test.result()?.state;
@@ -119,9 +119,17 @@ export function collectIsolatedRuntimeReceipts(
         if (relative(base, path).startsWith('..') || statSync(path).size > 1_048_576) throw new Error('invalid runtime artifact');
         return createHash('sha256').update(readFileSync(path)).digest('hex');
       });
-      receipts.push({ runId, resultSha256: hashes[0], sourceSha256: hashes[1], lifecycleSha256: hashes[2] });
+      const receipt = { runId, resultSha256: hashes[0], sourceSha256: hashes[1], lifecycleSha256: hashes[2] };
+      const previous = receipts.get(runId);
+      // Several assertions can share one original worker lifetime. Preserve
+      // one witness without counting it twice, and re-read every occurrence
+      // so changed original bytes cannot masquerade as the same receipt.
+      if (previous && (previous.resultSha256 !== receipt.resultSha256
+        || previous.sourceSha256 !== receipt.sourceSha256
+        || previous.lifecycleSha256 !== receipt.lifecycleSha256)) return undefined;
+      receipts.set(runId, receipt);
     }
-    return parseIsolatedRuntimeReceipts(receipts);
+    return parseIsolatedRuntimeReceipts([...receipts.values()]);
   } catch { return undefined; }
 }
 

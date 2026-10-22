@@ -517,8 +517,10 @@ describe('original isolated runtime receipt recording', () => {
           provide: { papercuspTestLayer: 'e2e' } } } as never);
         reporter.onTestModuleEnd({ state: () => 'passed',
           project: { config: { provide: layer ? { papercuspTestLayer: layer } : {} } },
-          children: { allTests: () => [{ fullName: 'suite > isolated worker',
-            result: () => ({ state: 'passed' }), meta: () => ({ papercuspIsolatedRuntimeRunId: runId }) }] },
+          children: { allTests: () => ['threshold', 'unobservable census'].map(name => ({
+            fullName: 'suite > ' + name, result: () => ({ state: 'passed' }),
+            meta: () => ({ papercuspIsolatedRuntimeRunId: runId }),
+          })) },
           moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
           diagnostic: () => ({ duration: 1 }), errors: () => [],
         } as never);
@@ -532,7 +534,7 @@ describe('original isolated runtime receipt recording', () => {
       } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
     });
 
-  it('hashes the real bytes, refusing ordinary, partial and duplicate fixture claims', () => {
+  it('hashes the real bytes and coalesces shared originals while refusing ordinary or partial claims', () => {
     const dir = mkdtempSync(join(tmpdir(), 'isolated-reporter-'));
     vi.stubEnv('VH_EVIDENCE_ROOT_BASE', dir);
     const runId = '20261008T000000Z-100';
@@ -551,13 +553,33 @@ describe('original isolated runtime receipt recording', () => {
       expect(collectReceipts(module([skipped]))).toBeUndefined();
       expect(collectReceipts(module([test, { result: () => undefined }])))
         .toBeUndefined();
-      expect(collectReceipts(module([test, test]))).toBeUndefined();
+      expect(collectReceipts(module([test, test])))
+        .toEqual([{ runId, resultSha256: expected, sourceSha256: expected, lifecycleSha256: expected }]);
       expect(collectReceipts(module([{ ...test, meta: () => ({}) }]))).toBeUndefined();
       expect(collectReceipts(module([{ ...test, result: () => ({ state: 'failed' }) }]))).toBeUndefined();
       rmSync(join(base, files[2]));
       expect(collectReceipts(module([test]))).toBeUndefined();
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
+
+  it.each(['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json'])(
+    'refuses shared-original custody when %s changes between passing cases', changedFile => {
+      const dir = mkdtempSync(join(tmpdir(), 'isolated-reporter-shared-conflict-'));
+      const runId = '20261008T000000Z-100';
+      const base = join(dir, 'isolated-integration', runId);
+      vi.stubEnv('VH_EVIDENCE_ROOT_BASE', dir);
+      try {
+        for (const file of ['result.json', 'phases/prepare/source.json', 'phases/execute/lifecycle.json']) {
+          mkdirSync(join(base, file, '..'), { recursive: true });
+          writeFileSync(join(base, file), '{}');
+        }
+        const cases = [false, true].map(change => ({ result: () => ({ state: 'passed' }), meta: () => {
+          if (change) writeFileSync(join(base, changedFile), '{"changed":true}');
+          return { papercuspIsolatedRuntimeRunId: runId };
+        } }));
+        expect(collectReceipts({ children: { allTests: () => cases } } as never)).toBeUndefined();
+      } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+    });
 });
 
 describe('retained isolated runtime receipt custody', () => {
@@ -580,7 +602,7 @@ describe('retained isolated runtime receipt custody', () => {
       rmSync(join(dir, 'isolated-integration', runIds[0]), { recursive: true });
       // Retained originals remain authoritative while a live directory exists.
       writeFileSync(join(dir, 'isolated-integration', runIds[1], files[0]), 'changed live result');
-      const module = { children: { allTests: () => runIds.map(runId => ({
+      const module = { children: { allTests: () => [...runIds, runIds[0]].map(runId => ({
         result: () => ({ state: 'passed' }), meta: () => ({ papercuspIsolatedRuntimeRunId: runId }),
       })) } } as never;
       expect(collectReceipts(module)).toEqual(runIds.map(runId => {
