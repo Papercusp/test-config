@@ -23,6 +23,7 @@ import ExecutedSourceMapReporter, {
   normalizeExecutedKey,
   qualifyConfigSources,
   resolveConfigDependencies,
+  resolveConfigEntries,
   resolveRecordedGitDir,
   shouldRecordModule,
   type ExecutedSourceFlush,
@@ -51,6 +52,16 @@ describe('final worker module handoff', () => {
 });
 
 describe('resolveConfigDependencies', () => {
+  it('keeps native config entries separate from an unknown dependency population', () => {
+    const source = { vite: { config: { configFile: '/repo/config.ts', configFileDependencies: [] } },
+      projects: [{ vite: { config: { configFile: '/repo/second.ts' } } },
+        { vite: { config: { configFile: false } } }] };
+    expect(resolveConfigDependencies(source)).toBeNull();
+    expect(resolveConfigEntries(source)).toEqual(['/repo/config.ts', '/repo/second.ts']);
+    expect(resolveConfigEntries({ vite: { config: { configFile: 'relative.ts' } } })).toBeNull();
+    expect(resolveConfigEntries({ get vite(): never { throw new Error('unavailable'); } })).toBeNull();
+  });
+
   it('unions the root and per-project configFileDependencies, absolute paths only, sorted', () => {
     const ctx = {
       vite: { config: { configFileDependencies: ['/r/ws/vitest.config.ts', '/r/ws/helper.ts'] } },
@@ -494,6 +505,19 @@ describe('ExecutedSourceMapReporter', () => {
         sha256: hash, currentSha256: hash }],
     });
     expect(flushes[0]).not.toHaveProperty('configSources');
+  });
+
+  it('passes native config entries to diagnostics without inventing reusable dependencies', async () => {
+    const { r, flushes } = reporter();
+    r.onInit({ vite: { config: { configFile: '/unobserved/config.mjs', configFileDependencies: [] } } } as never);
+    r.onTestModuleEnd(fakeModule({}));
+    await r.onTestRunEnd();
+    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    expect(out.configLoadedSources).toMatchObject({ status: 'unknown',
+      importPopulation: { basis: 'node-resolve-and-load-observations', status: 'unknown', paths: [] } });
+    expect(out.configLoadedSources.importPopulation.unresolved).toContain('config-import-outside-repository');
+    expect(flushes[0]).not.toHaveProperty('configLoadedSources');
+    expect(flushes[0]).not.toHaveProperty('importPopulation');
   });
 
   describe('native runner outcomes in OUT', () => {

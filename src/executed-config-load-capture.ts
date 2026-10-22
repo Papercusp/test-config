@@ -13,7 +13,12 @@ import { observeProcessTermination } from './process-termination-observer.mjs';
 
 interface LoadedSource { path: string; sha256: string | null }
 interface Preload { kind: 'import' | 'loader' | 'require'; path: string | null; capture: boolean }
-interface Capture { sources: Map<string, Set<string | null>>; reasons: Set<string>; preloads: Preload[] }
+interface Capture {
+  sources: Map<string, Set<string | null>>;
+  imports?: Map<string, Set<string>>;
+  reasons: Set<string>;
+  preloads: Preload[];
+}
 const shared = pinModuleState<{ capture: Capture | null }>(
   '@papercusp/test-config.original-config-loads', () => ({ capture: null }));
 const hash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
@@ -137,7 +142,8 @@ export function configBundleSources(code: string): LoadedSource[] | null {
 function install(): void {
   if (shared.capture || process.env.PC_EXECUTED_SOURCE_MAP_PRELOAD !== '1' ||
       !process.env.PC_EXECUTED_SOURCE_MAP_OUT || !process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE) return;
-  const state: Capture = { sources: new Map(), reasons: new Set(), preloads: [] };
+  const imports = new Map<string, Set<string>>();
+  const state: Capture = { sources: new Map(), imports, reasons: new Set(), preloads: [] };
   shared.capture = state;
   // A later preload can wrap this hook and replace the bytes it observed.
   // Without a receipt for that layer, the intermediate bytes are not original
@@ -230,7 +236,19 @@ function install(): void {
     seen.add(sha256);
     state.sources.set(path, seen);
   };
-  nodeModule.registerHooks({ load(url, context, nextLoad) {
+  nodeModule.registerHooks({ resolve(specifier, context, nextResolve) {
+    const resolved = nextResolve(specifier, context);
+    try {
+      if (context.parentURL?.startsWith('file:') && resolved.url.startsWith('file:')) {
+        const parent = fileURLToPath(context.parentURL);
+        const child = fileURLToPath(resolved.url);
+        const children = imports.get(parent) ?? new Set<string>();
+        children.add(child);
+        imports.set(parent, children);
+      }
+    } catch { state.reasons.add('config-node-resolve-capture-failed'); }
+    return resolved;
+  }, load(url, context, nextLoad) {
     const loaded = nextLoad(url, context);
     try {
       if (!url.startsWith('file:')) return loaded;
@@ -270,6 +288,14 @@ export interface LoadedConfigSources {
   /** Diagnostic bytes at this hook's boundary, including embedded config
    * originals. Never proof of the final bytes returned by later loaders. */
   observedSources: Array<{ path: string; observedSha256: string | null }>;
+  /** Positive native-loader observations only; never an import census. */
+  importPopulation?: {
+    basis: 'node-resolve-and-load-observations';
+    status: 'unknown';
+    entrypoints: string[];
+    paths: string[];
+    unresolved: string[];
+  };
   reasons: string[];
   loaderChain: {
     scope: 'declared-node-preloads';
@@ -328,17 +354,66 @@ function qualifyLoadedSources(paths: string[] | null, repoRoot: string, prefix: 
   };
 }
 
-export function qualifyLoadedConfigSources(paths: string[] | null, repoRoot: string): LoadedConfigSources {
-  return { schemaVersion: 'node-loaded-config-sources-v1', scope: 'repository-vite-config-dependencies',
-    ...qualifyLoadedSources(paths, repoRoot, 'config') };
+/** Vite's native config loader reports dependencies: []. Follow only actual
+ * resolve edges from its resolved entry, and retain only inputs our load hook
+ * observed. Unexecuted imports, earlier cache entries and external code remain
+ * unknown. This does not change the reusable-pass dependency population. */
+function observedConfigImports(entries: string[], repoRoot: string) {
+  const localPath = (absolute: string): string | null => {
+    const path = relative(repoRoot, absolute).split(/[\\/]/).join('/');
+    return isAbsolute(absolute) && path && path !== '..' && !path.startsWith('../') &&
+      !isAbsolute(path) && !path.split('/').includes('node_modules') ? path : null;
+  };
+  const unresolved = new Set(['config-import-population-unmeasured', 'node-loader-chain-not-closed',
+    'node-preload-self-unmeasured', 'node-external-native-runtime-unmeasured']);
+  // A committed preload and a working-tree reporter can share this singleton.
+  // Older state has source observations but no resolve observations; retain
+  // that explicit gap rather than losing the entire diagnostic OUT file.
+  if (!shared.capture?.imports) unresolved.add('config-import-resolve-capture-unavailable');
+  const canonical = entries.map(entry => {
+    try { return realpathSync(entry); } catch { return entry; }
+  });
+  const pending = [...canonical];
+  const visited = new Set<string>();
+  const paths: string[] = [];
+  while (pending.length) {
+    const path = pending.pop()!;
+    if (visited.has(path)) continue;
+    visited.add(path);
+    if (!localPath(path)) { unresolved.add('config-import-outside-repository'); continue; }
+    if (shared.capture?.sources.has(path)) paths.push(path);
+    else unresolved.add(`config-import-original-load-unavailable:${localPath(path)}`);
+    for (const child of shared.capture?.imports?.get(path) ?? []) pending.push(child);
+  }
+  paths.sort();
+  return { paths, observation: {
+    basis: 'node-resolve-and-load-observations' as const, status: 'unknown' as const,
+    entrypoints: [...new Set(canonical.map(localPath).filter((path): path is string => path !== null))].sort(),
+    paths: paths.map(path => localPath(path)!), unresolved: [...unresolved].sort(),
+  } };
 }
 
-export function qualifyLoadedMainProcessSources(configPaths: string[] | null, repoRoot: string): LoadedMainProcessSources {
-  const config = new Set(configPaths ?? []);
+export function qualifyLoadedConfigSources(paths: string[] | null, repoRoot: string,
+  configEntries?: string[] | null): LoadedConfigSources {
+  const native = !paths?.length && configEntries?.length ? observedConfigImports(configEntries, repoRoot) : null;
+  const evidence = qualifyLoadedSources(native?.paths ?? paths, repoRoot, 'config');
+  if (native) {
+    if (evidence.status === 'stable') evidence.status = 'unknown';
+    evidence.reasons.push('config-import-population-unmeasured');
+  }
+  return { schemaVersion: 'node-loaded-config-sources-v1', scope: 'repository-vite-config-dependencies',
+    ...evidence, ...(native ? { importPopulation: native.observation } : {}) };
+}
+
+export function qualifyLoadedMainProcessSources(configPaths: string[] | null, repoRoot: string,
+  configEntries?: string[] | null): LoadedMainProcessSources {
+  const native = !configPaths?.length && configEntries?.length ? observedConfigImports(configEntries, repoRoot) : null;
+  const config = new Set(native?.paths ?? configPaths ?? []);
   const paths = [...(shared.capture?.sources.keys() ?? [])].filter(path => !config.has(path));
   const evidence = qualifyLoadedSources(paths, repoRoot, 'main-process');
   if (!configPaths?.length) {
-    evidence.reasons.push('main-process-config-population-unavailable');
+    evidence.reasons.push(native?.paths.length
+      ? 'main-process-config-population-unmeasured' : 'main-process-config-population-unavailable');
     if (evidence.status === 'stable') evidence.status = 'unknown';
   }
   return { schemaVersion: 'node-loaded-main-process-sources-v1', scope: 'repository-node-main-process-sources', ...evidence };

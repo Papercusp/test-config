@@ -124,8 +124,8 @@ export function classifyReadPaths(
 }
 
 interface ConfigDepsSource {
-  vite?: { config?: { configFileDependencies?: unknown } };
-  projects?: Array<{ vite?: { config?: { configFileDependencies?: unknown } } }>;
+  vite?: { config?: { configFileDependencies?: unknown; configFile?: unknown } };
+  projects?: Array<{ vite?: { config?: { configFileDependencies?: unknown; configFile?: unknown } } }>;
 }
 
 /**
@@ -153,6 +153,21 @@ export function resolveConfigDependencies(ctx: unknown): string[] | null {
     return null; // a getter that throws (server not ready) is an unknown config
   }
   return deps.size > 0 ? [...deps].sort() : null;
+}
+
+/** Resolved entrypoints for OUT-only native-load observations. An entrypoint
+ * alone is never a dependency population or reusable-pass input closure. */
+export function resolveConfigEntries(ctx: unknown): string[] | null {
+  const entries = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value === 'string' && isAbsolute(value)) entries.add(value);
+  };
+  try {
+    const source = ctx as ConfigDepsSource | null | undefined;
+    add(source?.vite?.config?.configFile);
+    for (const project of Array.isArray(source?.projects) ? source.projects : []) add(project?.vite?.config?.configFile);
+  } catch { return null; }
+  return entries.size ? [...entries].sort() : null;
 }
 
 /** Build `isTracked` from `git ls-files` output: a tracked file, or a directory holding one. */
@@ -777,11 +792,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   /** P-001: absolute paths of the vitest config(s) this run loaded + their relative imports; null = unknown. */
   private configDeps: string[] | null = null;
+  private configEntries: string[] | null = null;
   private configSourceCapture: ConfigSourceCapture | undefined;
 
   onInit(ctx: Vitest): void {
     if (!this.armed) return;
     this.configDeps = resolveConfigDependencies(ctx);
+    this.configEntries = resolveConfigEntries(ctx);
     this.configSourceCapture = this.armed.outPath
       ? captureConfigSources(this.configDeps, { repoRoot: this.repoRoot }) : undefined;
     this.pgLease ??= retainSharedPg();
@@ -954,8 +971,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
             skipped: this.skipped, rows, diagnostics: this.diagnostics,
             ...(this.nativeRun ? { nativeRun: this.nativeRun } : {}),
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
-            configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot),
-            mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot) }, null, 1),
+            configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
+            mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot, this.configEntries) }, null, 1),
         );
       } catch (e) {
         log(`out-file write failed (${e instanceof Error ? e.message : String(e)}) ${summary}`);

@@ -214,6 +214,85 @@ describe('capture diagnostic evidence retention', () => {
 });
 
 describe('original config load evidence', () => {
+  it('retains unknown native observations from an older preload singleton', () => {
+    const root = mkdtempSync(join(tmpdir(), 'native-config-old-state-'));
+    const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;
+    const singleton = pathToFileURL(createRequire(import.meta.url).resolve('@papercusp/module-singleton')).href;
+    const config = join(root, 'config.mjs');
+    const source = 'export default {};\n';
+    try {
+      writeFileSync(config, source);
+      const script = `const { pinModuleState } = await import(${JSON.stringify(singleton)});
+        pinModuleState('@papercusp/test-config.original-config-loads', () => ({ capture: null })).capture = {
+          sources: new Map([[${JSON.stringify(config)}, new Set([${JSON.stringify(digest(source))}])]]),
+          reasons: new Set(), preloads: [] };
+        const { qualifyLoadedConfigSources } = await import(${JSON.stringify(capture)});
+        console.log(JSON.stringify(qualifyLoadedConfigSources([], ${JSON.stringify(root)}, [${JSON.stringify(config)}])));`;
+      const env = { ...process.env };
+      delete env.NODE_OPTIONS;
+      for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
+      const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+        encoding: 'utf8', timeout: 10000, env,
+      }).trim());
+      expect(result).toMatchObject({ status: 'unknown', importPopulation: {
+        paths: ['config.mjs'], unresolved: expect.arrayContaining(['config-import-resolve-capture-unavailable']),
+      } });
+      expect(result.observedSources).toEqual([{ path: 'config.mjs', observedSha256: digest(source) }]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([true, false])('retains native Vite config import observations (armed=%s)', armed => {
+    const root = mkdtempSync(join(tmpdir(), 'native-config-population-'));
+    const capture = fileURLToPath(new URL('./executed-config-load-capture.ts', import.meta.url));
+    const vite = pathToFileURL(createRequire(import.meta.url).resolve('vite')).href;
+    const config = join(root, 'vite.config.mjs');
+    const helper = 'export const value = 7;\n';
+    try {
+      writeFileSync(config, "import { value } from './helper.mjs'; export default { define: { captured: value } };\n");
+      writeFileSync(join(root, 'helper.mjs'), helper);
+      writeFileSync(join(root, 'unloaded.mjs'), 'export const unused = true;\n');
+      const script = `const { loadConfigFromFile } = await import(${JSON.stringify(vite)});
+        const loaded = await loadConfigFromFile({ command: 'serve', mode: 'test' },
+          ${JSON.stringify(config)}, ${JSON.stringify(root)}, 'silent', undefined, 'native');
+        const { qualifyLoadedConfigSources, qualifyLoadedMainProcessSources } =
+          await import(${JSON.stringify(pathToFileURL(capture).href)});
+        console.log(JSON.stringify({ dependencies: loaded.dependencies, value: loaded.config.define.captured,
+          config: qualifyLoadedConfigSources(loaded.dependencies, ${JSON.stringify(root)}, [loaded.path]),
+          main: qualifyLoadedMainProcessSources(loaded.dependencies, ${JSON.stringify(root)}, [loaded.path]) }));`;
+      const env = { ...process.env };
+      for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
+          /^(PC_|VITEST|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_|AFFECTED_)/.test(key) || key === 'NODE_OPTIONS') delete env[key];
+      const result = JSON.parse(execFileSync(process.execPath,
+        ['--import', capture, '--input-type=module', '--eval', script], {
+          cwd: root, encoding: 'utf8', timeout: 30000,
+          env: { ...env, PC_EXECUTED_SOURCE_MAP_PRELOAD: armed ? '1' : '0',
+            PC_EXECUTED_SOURCE_MAP_WORKSPACE: 'native-config-population',
+            PC_EXECUTED_SOURCE_MAP_OUT: join(root, 'out.json') },
+        }).trim());
+      expect(result.dependencies).toEqual([]);
+      expect(result.value).toBe(7);
+      expect(result.config.status).toBe('unknown');
+      expect(result.config.importPopulation).toMatchObject({
+        basis: 'node-resolve-and-load-observations', status: 'unknown',
+        entrypoints: ['vite.config.mjs'], paths: armed ? ['helper.mjs', 'vite.config.mjs'] : [],
+        unresolved: expect.arrayContaining(['config-import-population-unmeasured', 'node-loader-chain-not-closed']),
+      });
+      if (armed) {
+        expect(result.config.observedSources).toEqual(expect.arrayContaining([
+          { path: 'helper.mjs', observedSha256: digest(helper) },
+        ]));
+        const mainPaths = result.main.sources.map((source: { path: string }) => source.path);
+        expect(mainPaths).not.toContain('helper.mjs');
+        expect(mainPaths).not.toContain('vite.config.mjs');
+      } else {
+        expect(result.config.observedSources).toEqual([]);
+        expect(result.config.reasons).toContain('config-node-load-capture-unavailable');
+      }
+      expect(result.config.importPopulation.paths).not.toContain('unloaded.mjs');
+      expect(result.config.loaderChain.status).toBe('unknown');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.skipIf(process.platform !== 'linux').each(['native snapshot', 'slow snapshot'] as const)
     ('retains real Vitest fork termination receipts (%s)', mode => {
     const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -280,7 +359,8 @@ describe('original config load evidence', () => {
       for (const key of Object.keys(env)) if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL/.test(key) ||
           /^(PC_|VITEST|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_|AFFECTED_)/.test(key) || key === 'NODE_OPTIONS') delete env[key];
       execFileSync(process.execPath, ['--import', parentObserver, bin, 'run', '--root', fixture,
-        '--config', join(fixture, 'vitest.config.ts'), '--pool=forks', '--maxWorkers=1', '--no-file-parallelism'], {
+        '--config', join(fixture, 'vitest.config.ts'), '--configLoader', 'native',
+        '--pool=forks', '--maxWorkers=1', '--no-file-parallelism'], {
         cwd: root, encoding: 'utf8', timeout: 90000,
         env: { ...env, NODE_OPTIONS: `--import=${pathToFileURL(committedLoader).href}` +
           ` --import=${pathToFileURL(capture).href} --import=${pathToFileURL(containment).href}` +
