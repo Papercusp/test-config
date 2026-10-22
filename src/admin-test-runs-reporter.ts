@@ -656,7 +656,7 @@ export async function captureWorktreeSnapshot(run: WorktreeGitRunner = runGit): 
   return { ...snapshot, porcelain: exemption ? exemptProbeSubject(porcelain, exemption) : porcelain };
 }
 
-function mutationSubjectForVerifierSource(root: string): VerifierSourceMutation | undefined {
+export function mutationSubjectForVerifierSource(root: string): VerifierSourceMutation | undefined {
   if (!isMutationProbeRun()) return undefined;
   const subject = process.env.PAPERCUSP_MUTATION_PROBE_SUBJECT?.trim();
   if (!subject || !isAbsolute(subject)) return undefined;
