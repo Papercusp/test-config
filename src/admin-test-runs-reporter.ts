@@ -43,6 +43,7 @@ import {
   MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
   parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment, type RuntimeEnvironmentCaptureStatus,
   parseIsolatedRuntimeReceipts, type IsolatedRuntimeReceipt,
+  parseExecutionBoundaryReceipt, type TestBoundaryObservation,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import {
@@ -67,11 +68,33 @@ export function sha256OfTestFile(absolutePath: string): string | null {
 declare module 'vitest' {
   interface TaskMeta {
     papercuspIsolatedRuntimeRunId?: string;
+    papercuspExecutionObservations?: unknown[];
   }
 }
 
 /** verification-harness's `defaultEvidenceRoot(harness)` — typed locally, so no import of the package is needed. */
 export type EvidenceRootResolver = (harness: string) => string;
+
+/** Framework case identities are independent of caller-supplied receipt fields. */
+export function collectBoundaryObservations(testModule: TestModule): TestBoundaryObservation[] | undefined {
+  const rows: TestBoundaryObservation[] = [];
+  const occurrences = new Map<string, number>();
+  for (const test of testModule.children.allTests()) {
+    const caseKey = test.fullName;
+    const occurrence = (occurrences.get(caseKey) ?? 0) + 1;
+    occurrences.set(caseKey, occurrence);
+    if (test.result()?.state === 'skipped') continue;
+    const values = test.meta()?.papercuspExecutionObservations;
+    if (values === undefined) continue;
+    if (!Array.isArray(values) || !isRecordedCaseTitle(caseKey)) return undefined;
+    for (const value of values) {
+      const receipt = parseExecutionBoundaryReceipt(value);
+      if (!receipt || rows.length >= 32) return undefined;
+      rows.push({ caseKey, occurrence, receipt });
+    }
+  }
+  return rows.length ? rows : undefined;
+}
 
 /**
  * WI-6554700010018532 — this reporter is wired into every hive's Vitest config, including
@@ -2399,6 +2422,10 @@ export default class AdminTestRunsReporter implements Reporter {
         : this.executionContext?.testLayer;
       const executionDetails = counts && this.executionContext
         ? { ...this.executionContext, testLayer, filePath, ...counts } : null;
+      if (executionDetails) {
+        const boundaryObservations = collectBoundaryObservations(testModule);
+        if (boundaryObservations) Object.assign(executionDetails, { boundaryObservations });
+      }
       // The receipt describes the isolated worker lifetime, independently of
       // whether the owning test exercises an integration seam or an e2e journey.
       if (executionDetails && (testLayer === 'integration' || testLayer === 'e2e')) {

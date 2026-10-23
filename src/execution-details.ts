@@ -135,6 +135,59 @@ export function stableRecordedRuntimeEnvironment(
   return first;
 }
 
+/** A local SDK child-span receipt. Reporter metadata is a hint until the
+ * server joins it to the independently written invocation ledger. */
+export interface ExecutionBoundaryReceipt {
+  boundary: 'graph:query:evidence';
+  callId: string;
+  workspaceId: string;
+  harness: string;
+  traceId: string;
+  spanId: string;
+  parentSpanId: string;
+  traceFlags: number;
+  startedAt: number;
+  endedAt: number;
+  outcome: 'ok' | 'error';
+  /** Hash of the loaded handler module, not of an arbitrary queried symbol. */
+  sourceFingerprint: string;
+  buildSha: string | null;
+  artifactFingerprint: string | null;
+  environmentFingerprint: string;
+  workflowId: null;
+}
+export interface TestBoundaryObservation {
+  caseKey: string;
+  occurrence: number;
+  receipt: ExecutionBoundaryReceipt;
+}
+export function parseExecutionBoundaryReceipt(value: unknown): ExecutionBoundaryReceipt | undefined {
+  if (!isRecord(value) || Object.keys(value).length !== 16
+    || Object.keys(value).some(key => !['boundary', 'callId', 'workspaceId', 'harness', 'traceId', 'spanId',
+      'parentSpanId', 'traceFlags', 'startedAt', 'endedAt', 'outcome', 'sourceFingerprint', 'buildSha',
+      'artifactFingerprint', 'environmentFingerprint', 'workflowId'].includes(key))) return undefined;
+  const digest = (v: unknown) => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);
+  const identity = (v: unknown) => typeof v === 'string' && v.length > 0 && v.length <= 200 && !/[\u0000-\u001f]/.test(v);
+  const span = (v: unknown, length: number) => typeof v === 'string' && new RegExp(`^[a-f0-9]{${length}}$`).test(v) && !/^0+$/.test(v);
+  if (!(value.boundary === 'graph:query:evidence' && identity(value.callId) && identity(value.workspaceId)
+    && identity(value.harness) && span(value.traceId, 32) && span(value.spanId, 16) && span(value.parentSpanId, 16)
+    && value.spanId !== value.parentSpanId && Number.isInteger(value.traceFlags) && (value.traceFlags as number) >= 0
+    && (value.traceFlags as number) <= 255 && Number.isFinite(value.startedAt) && Number.isFinite(value.endedAt)
+    && (value.startedAt as number) > 0 && (value.endedAt as number) >= (value.startedAt as number)
+    && ['ok', 'error'].includes(value.outcome as string) && digest(value.sourceFingerprint)
+    && digest(value.environmentFingerprint) && value.workflowId === null
+    && (value.buildSha === null || typeof value.buildSha === 'string' && /^[a-f0-9]{10,64}$/.test(value.buildSha))
+    && (value.artifactFingerprint === null || digest(value.artifactFingerprint)))) return undefined;
+  return value as unknown as ExecutionBoundaryReceipt;
+}
+export function parseTestBoundaryObservations(value: unknown): TestBoundaryObservation[] | undefined {
+  if (!Array.isArray(value) || value.length > 32 || value.some(row => !isRecord(row)
+    || Object.keys(row).length !== 3 || !isRecordedCaseTitle(row.caseKey)
+    || !Number.isSafeInteger(row.occurrence) || (row.occurrence as number) < 1
+    || !parseExecutionBoundaryReceipt(row.receipt))) return undefined;
+  return value as TestBoundaryObservation[];
+}
+
 export interface TestRunExecutionDetails {
   schemaVersion: typeof TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION;
   root: string;
@@ -147,6 +200,7 @@ export interface TestRunExecutionDetails {
   testLayer?: RecordedTestLayer;
   /** Identity of an individual live LLM scenario case; absent on other and older rows. */
   scenarioId?: string;
+  boundaryObservations?: TestBoundaryObservation[];
   passed: number;
   failed: number;
   /**
@@ -370,7 +424,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
-  'isolatedRuntimeReceipts', 'mutation', 'check', 'operational',
+  'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -463,6 +517,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
         || value.worktreeDirty !== true))
     || (value.runStartedAt !== undefined && !isRecordedInstant(value.runStartedAt))
     || (value.operational !== undefined && !parseRecordedOperationalExecution(value.operational))
+    || (value.boundaryObservations !== undefined && !parseTestBoundaryObservations(value.boundaryObservations))
     || (value.isolatedRuntimeReceipts !== undefined && !parseIsolatedRuntimeReceipts(value.isolatedRuntimeReceipts))
     || (value.runtimeEnvironmentBefore !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentBefore))
     || (value.runtimeEnvironmentAfter !== undefined && !parseRecordedRuntimeEnvironment(value.runtimeEnvironmentAfter))
