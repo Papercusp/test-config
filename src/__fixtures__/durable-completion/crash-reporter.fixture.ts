@@ -1,6 +1,6 @@
 import fs, { readFileSync, writeSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import type { TestModule, TestSpecification } from 'vitest/node';
+import type { TestModule, TestSpecification, Vitest } from 'vitest/node';
 import ExecutedSourceMapReporter, { writeExecutedSourceMapSnapshot } from '../../executed-source-map-reporter.ts';
 
 function interrupt(phase: string): void {
@@ -12,10 +12,10 @@ function interrupt(phase: string): void {
 }
 
 export default class CrashReporter extends ExecutedSourceMapReporter {
-  override async onTestRunStart(specifications: ReadonlyArray<TestSpecification>): Promise<void> {
+  override async onInit(ctx: Vitest): Promise<void> {
     const phase = process.env.PC_COMPLETION_CRASH_WINDOW;
     if (phase !== 'before-first-snapshot' && phase !== 'after-first-bank') {
-      super.onTestRunStart(specifications);
+      super.onInit(ctx);
       return;
     }
     if (!process.connected || !process.send) throw new Error('pre-snapshot crash fixture requires parent IPC');
@@ -30,9 +30,14 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
     });
     process.send({ kind: 'native-pre-snapshot-ready', pid: process.pid });
     await registered;
-    // Production enrolls before native execution starts. Keep that ordering in
-    // this IPC-controlled crash fixture too, including its native start clock.
+    // onInit records the native start clock, before onTestRunStart freezes the
+    // selection. Production enrolls before either hook; preserve that ordering.
+    super.onInit(ctx);
+  }
+
+  override onTestRunStart(specifications: ReadonlyArray<TestSpecification>): void {
     super.onTestRunStart(specifications);
+    const phase = process.env.PC_COMPLETION_CRASH_WINDOW;
     if (phase === 'before-first-snapshot') interrupt(phase);
   }
 

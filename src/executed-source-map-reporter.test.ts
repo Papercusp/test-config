@@ -1269,10 +1269,18 @@ describe('ExecutedSourceMapReporter', () => {
 
     it('reports a writer that never settles as timed-out, and leaves no timer behind', async () => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-      const r = new ExecutedSourceMapReporter(snapshot(clean), () => new Promise<void>(() => {}));
+      let entered!: () => void;
+      const writing = new Promise<void>(resolve => { entered = resolve; });
+      const r = new ExecutedSourceMapReporter(snapshot(clean), () => {
+        entered();
+        return new Promise<void>(() => {});
+      });
       r.onInit({} as never);
-      r.onTestModuleEnd(fakeModule({}));
+      await r.onTestModuleEnd(fakeModule({}));
       const done = r.onTestRunEnd();
+      // Snapshot I/O completes asynchronously before the row-write deadline starts.
+      await writing;
+      expect(vi.getTimerCount()).toBe(1);
       await vi.advanceTimersByTimeAsync(EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS);
       await done;
       expect(results()).toEqual([expect.objectContaining({ outcome: 'timed-out', rows: 1, error: null })]);
