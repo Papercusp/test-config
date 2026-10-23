@@ -149,7 +149,7 @@ export interface ExecutionBoundaryReceipt {
   startedAt: number;
   endedAt: number;
   outcome: 'ok' | 'error';
-  /** Hash of the loaded handler module, not of an arbitrary queried symbol. */
+  /** Hash of the loaded handler function body; no transitive-source claim. */
   sourceFingerprint: string;
   buildSha: string | null;
   artifactFingerprint: string | null;
