@@ -16,6 +16,7 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
     const original = this.coverageFiles;
     const cleanOnRerun = this.options.cleanOnRerun;
     const snapshots: TestCoverageSnapshot[] = [];
+    const rejected = { sharedBatch: 0, receipts: 0, source: 0, test: 0, schema: 0 };
     const observedAt = new Date().toISOString();
     try {
       const root = inferWorkspaceRoot(this.ctx.config.root);
@@ -35,7 +36,7 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
         for (const [tests, rawFile] of Object.entries(suites)) {
           const testFiles = tests.split(',');
           // A shared worker batch cannot establish which file executed a line.
-          if (testFiles.length !== 1 || snapshots.length >= COVERAGE_MAX_FILES) continue;
+          if (testFiles.length !== 1 || snapshots.length >= COVERAGE_MAX_FILES) { rejected.sharedBatch++; continue; }
           this.coverageFiles = new Map([[project, { [environment]: { [tests]: rawFile } } as typeof modes]]);
           const converted = await super.generateCoverage({ allTestsRun: false });
           const activeProject = this.ctx.getProjectByName(typeof project === 'string' ? project : '');
@@ -45,7 +46,7 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
             const set = hashes.get(receipt.id) ?? new Set<string>(); set.add(receipt.sha256); hashes.set(receipt.id, set);
           }
           const paths = converted.files();
-          if (!receipts || paths.length > COVERAGE_MAX_FILES) continue;
+          if (!receipts || paths.length > COVERAGE_MAX_FILES) { rejected.receipts++; continue; }
           const sources = await Promise.all(paths.map(async absolute => {
             const path = coveragePath(root, absolute);
             const sha256 = coverageHash(await readFile(absolute));
@@ -54,17 +55,20 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
           }));
           const testFile = coveragePath(root, testFiles[0]!);
           const test = population.find(s => s.path === testFile);
-          if (!test || hashes.get(testFiles[0]!)?.size !== 1 || !hashes.get(testFiles[0]!)?.has(test.sha256)
-            || sources.some(s => s === null)) continue;
+          if (sources.some(s => s === null)) { rejected.source++; continue; }
+          if (!test || hashes.get(testFiles[0]!)?.size !== 1 || !hashes.get(testFiles[0]!)?.has(test.sha256)) {
+            rejected.test++; continue;
+          }
           const snapshot = parseTestCoverage({ schemaVersion: 1, root, scopeRoot: this.ctx.config.root,
             testFile, testSha256: test.sha256, observedAt,
             populationComplete: complete, population, sources });
-          if (snapshot) snapshots.push(snapshot);
+          if (snapshot) snapshots.push(snapshot); else rejected.schema++;
         }
       }
       if (snapshots.length && !isMutationProbeRun()) {
         await this.publish(snapshots);
       }
+      if (original.size && !snapshots.length) this.ctx.logger.warn(`[test-file-coverage] no qualified observations: ${JSON.stringify(rejected)}`);
     } catch (error) {
       // Optional data must never change test outcomes; a missing observation is unknown.
       this.ctx.logger.warn(`[test-file-coverage] unavailable: ${error instanceof Error ? error.message : String(error)}`);

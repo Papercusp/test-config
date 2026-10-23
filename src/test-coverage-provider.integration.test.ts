@@ -33,9 +33,11 @@ coverage: { enabled: true, provider: 'custom', customProviderModule: './provider
       !/^(?:PC_|VITEST|AFFECTED_|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_)/.test(key)));
     Object.assign(env, { PAPERCUSP_DISABLE_TEST_RUNS_REPORTER: '1', HARNESS_ADMIN_DATABASE_URL: 'postgresql://127.0.0.1:1/unreachable',
       PAPERCUSP_TEST_RUNS_DB_URL: 'postgresql://127.0.0.1:1/unreachable' });
-    await promisify(execFile)(process.execPath, [vitest, 'run', '--root', dir, '--config', join(dir, 'vitest.config.ts')],
+    const result = await promisify(execFile)(process.execPath, [vitest, 'run', '--root', dir, '--config', join(dir, 'vitest.config.ts')],
       { cwd: resolve(here, '../../..'), env, timeout: 90_000, maxBuffer: 1_000_000 });
-    const snapshots = JSON.parse(await readFile(artifact, 'utf8')) as TestCoverageSnapshot[];
+    const snapshots = JSON.parse(await readFile(artifact, 'utf8').catch(error => {
+      throw new Error(`Native V8 capture missing: ${String(error)}\n${result.stdout}\n${result.stderr}`);
+    })) as TestCoverageSnapshot[];
     expect(snapshots).toHaveLength(1);
     expect(snapshots[0]?.testFile).toBe('subject.test.ts');
     expect(snapshots[0]?.sources).toEqual([expect.objectContaining({ path: 'subject.ts',
