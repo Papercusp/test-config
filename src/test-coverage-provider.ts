@@ -4,6 +4,7 @@ import { V8CoverageProvider } from '@vitest/coverage-v8/dist/provider.js';
 import type { ReportContext } from 'vitest/node';
 import type { Sql } from 'postgres';
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { readExecutedSourceOriginals } from './vitest-config.ts';
 import { inferWorkspaceRoot, isMutationProbeRun, tryGetPg } from './admin-test-runs-reporter.ts';
 import { COVERAGE_MAX_FILES, coverageHash, coverageLines, coveragePath, parseTestCoverage,
@@ -53,10 +54,13 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
             if (!path || hashes.get(absolute)?.size !== 1 || !hashes.get(absolute)?.has(sha256)) return null;
             return { path, sha256, ...coverageLines(converted.fileCoverageFor(absolute)) };
           }));
-          const testFile = coveragePath(root, testFiles[0]!);
+          // Vitest stores suite keys relative to the owning project, while original
+          // transform receipts and test specifications use absolute module IDs.
+          const testAbsolute = resolve(activeProject.config.root, testFiles[0]!);
+          const testFile = coveragePath(root, testAbsolute);
           const test = population.find(s => s.path === testFile);
           if (sources.some(s => s === null)) { rejected.source++; continue; }
-          if (!test || hashes.get(testFiles[0]!)?.size !== 1 || !hashes.get(testFiles[0]!)?.has(test.sha256)) {
+          if (!test || hashes.get(testAbsolute)?.size !== 1 || !hashes.get(testAbsolute)?.has(test.sha256)) {
             rejected.test++; continue;
           }
           const snapshot = parseTestCoverage({ schemaVersion: 1, root, scopeRoot: this.ctx.config.root,
