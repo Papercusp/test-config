@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,8 @@ const vitest = join(dirname(createRequire(import.meta.url).resolve('vitest/packa
 const directories: string[] = [];
 const expectedFiles = ['armed-capture/sample.armed-fixture.ts', 'case-ledger/cases.case-fixture.ts',
   'durable-completion/collection-error.fixture.ts'];
+const crashWindows = ['before-commit', 'file-synced-before-rename', 'committed-before-ack',
+  'acknowledged-before-kill'];
 
 async function runFixture(env: NodeJS.ProcessEnv) {
   const child = spawn(process.execPath, [vitest, 'run', '--root', fixture,
@@ -53,8 +55,8 @@ afterEach(() => {
 });
 
 describe('atomic completion through the real Vitest lifecycle', () => {
-  it.each(['before-commit', 'committed-before-ack', 'acknowledged-before-kill'])(
-    'recovers committed results and proof after %s', async phase => {
+  it.each((['SIGTERM', 'SIGKILL'] as const).flatMap(signal => crashWindows.map(phase => ({ signal, phase }))))(
+    'recovers committed results and proof after $phase with $signal', async ({ signal, phase }) => {
       const directory = mkdtempSync(join(tmpdir(), 'completion-crash-'));
       directories.push(directory);
       const outPath = join(directory, 'out.json');
@@ -71,6 +73,7 @@ describe('atomic completion through the real Vitest lifecycle', () => {
         PC_EXECUTED_SOURCE_MAP_NO_PERSIST: '1',
         PC_EXECUTED_INPUTS_DIR: join(directory, 'inputs'),
         PC_COMPLETION_CRASH_WINDOW: phase,
+        PC_COMPLETION_CRASH_SIGNAL: signal,
         PAPERCUSP_TEST_RUN_GROUP: `frozen-durability-${phase}`,
         PAPERCUSP_CHECKPOINT_QUALIFICATION_ATTEMPT_ID: 'frozen-durability-attempt',
         HARNESS_ADMIN_DATABASE_URL: 'postgresql://127.0.0.1:1/completion-crash-fixture',
@@ -79,7 +82,8 @@ describe('atomic completion through the real Vitest lifecycle', () => {
       const child = await runFixture(env);
       const output = `${child.stdout}\n${child.stderr}`;
       expect(child.error, output).toBeUndefined();
-      expect(child.signal, output).toBe('SIGKILL');
+      expect(child.signal, output).toBe(signal);
+      expect(output).toContain(`REAL_COMPLETION_WRITE_INTERRUPTED phase=${phase} signal=${signal}`);
       expect(existsSync(resultPath), output).toBe(false);
       const recovery = spawnSync(process.execPath, ['--input-type=module', '-e',
         "import {readFileSync} from 'node:fs'; process.stdout.write(readFileSync(process.argv[1], 'utf8'));", outPath],
@@ -90,22 +94,61 @@ describe('atomic completion through the real Vitest lifecycle', () => {
       expect(completionIntegrity).toEqual({ schemaVersion: 1,
         sha256: createHash('sha256').update(JSON.stringify(body)).digest('hex') });
       const files = checkpoint.nativeRun.files as Array<{ testFile: string; completionId: string;
-        state: string; proof: { inputs: unknown; sourceEvidence: unknown } }>;
-      const selected = checkpoint.nativeRun.selectedManifest.specifications as Array<{ testFile: string }>;
-      expect(selected).toHaveLength(expectedFiles.length);
-      for (const expectedFile of expectedFiles)
-        expect(selected.filter(specification => specification.testFile.endsWith(expectedFile))).toHaveLength(1);
-      expect(files).toHaveLength(phase === 'before-commit' ? 2 : 3);
+        observedAtMs: number; state: string;
+        proof: { inputs: unknown; sourceEvidence: { status: string; reasons: string[] } } }>;
+      const selected = checkpoint.nativeRun.selectedManifest.specifications as Array<{ testFile: string;
+        projectName: string; pool: string }>;
+      expect(selected.map(specification => specification.testFile).sort()).toEqual(expectedFiles
+        .map(file => `libs/test-config/src/__fixtures__/${file}`).sort());
+      expect(checkpoint.nativeRun.selectedManifest.sha256).toBe(createHash('sha256')
+        .update(JSON.stringify(selected)).digest('hex'));
+      for (const specification of selected) {
+        expect(typeof specification.projectName).toBe('string');
+        expect(specification.pool).toBe('forks');
+        expect(specification).toMatchObject({ testNamePattern: null, testLines: null, testIds: null,
+          testTagsFilter: null });
+      }
+      const beforeRename = phase === 'before-commit' || phase === 'file-synced-before-rename';
+      expect(files).toHaveLength(beforeRename ? 2 : 3);
+      const temporaries = readdirSync(directory).filter(file => file.startsWith('out.json.') && file.endsWith('.tmp'));
+      expect(temporaries).toHaveLength(beforeRename ? 1 : 0);
+      if (phase === 'before-commit')
+        expect(readFileSync(join(directory, temporaries[0]!), 'utf8')).toBe('{"nativeRun":');
+      if (phase === 'file-synced-before-rename')
+        expect(JSON.parse(readFileSync(join(directory, temporaries[0]!), 'utf8')).nativeRun.files).toHaveLength(3);
       const acknowledgmentIds = [...output.matchAll(/COMPLETION_ACK ids=(\[[^\n]+?\]) path=/g)]
         .flatMap(match => JSON.parse(match[1]!) as string[]);
       expect(acknowledgmentIds).toHaveLength(phase === 'acknowledged-before-kill' ? 3 : 2);
       for (const completionId of acknowledgmentIds)
         expect(files.filter(file => file.completionId === completionId)).toHaveLength(1);
-      for (const file of files) expect(file.proof).toHaveProperty('sourceEvidence');
+      expect(new Set(files.map(file => file.completionId)).size).toBe(files.length);
+      const unacknowledged = files.filter(file => !acknowledgmentIds.includes(file.completionId));
+      expect(unacknowledged).toHaveLength(phase === 'committed-before-ack' ? 1 : 0);
+      for (const file of files) {
+        expect(selected.some(specification => specification.testFile === file.testFile)).toBe(true);
+        expect(file.observedAtMs).toBeGreaterThanOrEqual(checkpoint.nativeRun.startedAtMs);
+        expect(file.proof).toHaveProperty('inputs');
+        expect(file.proof.sourceEvidence).toBeTruthy();
+        if (file.proof.inputs === null) {
+          expect(file.proof.sourceEvidence.status).toBe('unknown');
+          expect(file.proof.sourceEvidence.reasons.length).toBeGreaterThan(0);
+        }
+      }
       expect(checkpoint.nativeRun.terminalHook).toBeNull();
+      expect(checkpoint.nativeRun.reportedModulePaths).toBeNull();
+      expect(checkpoint.nativeRun.modulePopulationMatched).toBe(false);
+      expect(checkpoint.nativeRun.gaps).toEqual([]);
       expect(checkpoint.completionCheckpoint).toMatchObject({ state: 'partial',
-        runGroupId: `frozen-durability-${phase}`, qualificationAttemptId: 'frozen-durability-attempt', noPersist: true });
-      if (phase !== 'before-commit') {
+        runGroupId: `frozen-durability-${phase}`, qualificationAttemptId: 'frozen-durability-attempt', noPersist: true,
+        runContext: 'clean-local', runnerIdentity: `proof-v3 ${process.version} ${process.platform} ${process.arch}` });
+      expect(checkpoint.configSources).toMatchObject({ schemaVersion: 'vitest-config-disk-snapshots-v1',
+        scope: 'repository-vite-config-dependencies' });
+      expect(checkpoint.configSources.sources.length).toBeGreaterThan(0);
+      for (const source of checkpoint.configSources.sources) {
+        expect(source.path).toEqual(expect.any(String));
+        expect(source.sha256).toMatch(/^[a-f0-9]{64}$/);
+      }
+      if (!beforeRename) {
         expect(files.filter(file => file.state === 'passed')).toHaveLength(1);
         expect(files.filter(file => file.testFile.endsWith('cases.case-fixture.ts') && file.state !== 'passed')).toHaveLength(1);
         expect(files.filter(file => file.testFile.endsWith('collection-error.fixture.ts') && file.state !== 'passed')).toHaveLength(1);
