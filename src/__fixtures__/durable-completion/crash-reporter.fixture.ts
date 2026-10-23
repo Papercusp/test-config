@@ -1,6 +1,6 @@
 import fs, { readFileSync, writeSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import type { TestModule } from 'vitest/node';
+import type { TestModule, TestSpecification } from 'vitest/node';
 import ExecutedSourceMapReporter, { writeExecutedSourceMapSnapshot } from '../../executed-source-map-reporter.ts';
 
 function interrupt(phase: string): void {
@@ -12,6 +12,24 @@ function interrupt(phase: string): void {
 }
 
 export default class CrashReporter extends ExecutedSourceMapReporter {
+  override async onTestRunStart(specifications: ReadonlyArray<TestSpecification>): Promise<void> {
+    super.onTestRunStart(specifications);
+    if (process.env.PC_COMPLETION_CRASH_WINDOW !== 'before-first-snapshot') return;
+    if (!process.connected || !process.send) throw new Error('pre-snapshot crash fixture requires parent IPC');
+    // Bind the actual PID and independent selection before releasing the crash.
+    const registered = new Promise<void>(resolve => {
+      const listener = (message: unknown) => {
+        if ((message as { kind?: string })?.kind !== 'native-producer-registered') return;
+        process.off('message', listener);
+        resolve();
+      };
+      process.on('message', listener);
+    });
+    process.send({ kind: 'native-pre-snapshot-ready', pid: process.pid });
+    await registered;
+    interrupt('before-first-snapshot');
+  }
+
   constructor() {
     super(undefined, undefined, undefined, (path, payload) => {
       const checkpoint = payload as { nativeRun: { files: unknown[] } };
