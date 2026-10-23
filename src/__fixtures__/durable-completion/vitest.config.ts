@@ -6,7 +6,7 @@ const config = defineVitestConfig({
   include: ['../armed-capture/sample.armed-fixture.ts', '../case-ledger/cases.case-fixture.ts', 'collection-error.fixture.ts'],
 });
 
-config.test = { ...config.test, fileParallelism: false, maxWorkers: 1,
+config.test = { ...config.test, name: 'durable-completion-fixture', fileParallelism: false, maxWorkers: 1,
   reporters: [fileURLToPath(new URL('./crash-reporter.fixture.ts', import.meta.url))] };
 
 export default config;

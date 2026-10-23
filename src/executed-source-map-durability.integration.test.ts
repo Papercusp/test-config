@@ -3,11 +3,12 @@ import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const fixture = fileURLToPath(new URL('./__fixtures__/durable-completion', import.meta.url));
+const repoRoot = resolve(fixture, '../../../../..');
 const vitest = join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'vitest.mjs');
 const directories: string[] = [];
 const expectedFiles = ['armed-capture/sample.armed-fixture.ts', 'case-ledger/cases.case-fixture.ts',
@@ -95,7 +96,8 @@ describe('atomic completion through the real Vitest lifecycle', () => {
         sha256: createHash('sha256').update(JSON.stringify(body)).digest('hex') });
       const files = checkpoint.nativeRun.files as Array<{ testFile: string; completionId: string;
         observedAtMs: number; state: string;
-        proof: { inputs: unknown; sourceEvidence: { status: string; reasons: string[] } } }>;
+        proof: { inputs: { testFile: string; reads: string[]; opaque: string[] } | null;
+          sourceEvidence: { status: string; reasons: string[] } } }>;
       const selected = checkpoint.nativeRun.selectedManifest.specifications as Array<{ testFile: string;
         projectName: string; pool: string }>;
       expect(selected.map(specification => specification.testFile).sort()).toEqual(expectedFiles
@@ -103,7 +105,7 @@ describe('atomic completion through the real Vitest lifecycle', () => {
       expect(checkpoint.nativeRun.selectedManifest.sha256).toBe(createHash('sha256')
         .update(JSON.stringify(selected)).digest('hex'));
       for (const specification of selected) {
-        expect(typeof specification.projectName).toBe('string');
+        expect(specification.projectName).toBe('durable-completion-fixture');
         expect(specification.pool).toBe('forks');
         expect(specification).toMatchObject({ testNamePattern: null, testLines: null, testIds: null,
           testTagsFilter: null });
@@ -124,6 +126,7 @@ describe('atomic completion through the real Vitest lifecycle', () => {
       expect(new Set(files.map(file => file.completionId)).size).toBe(files.length);
       const unacknowledged = files.filter(file => !acknowledgmentIds.includes(file.completionId));
       expect(unacknowledged).toHaveLength(phase === 'committed-before-ack' ? 1 : 0);
+      expect(files.filter(file => file.proof.inputs !== null).length).toBeGreaterThan(0);
       for (const file of files) {
         expect(selected.some(specification => specification.testFile === file.testFile)).toBe(true);
         expect(file.observedAtMs).toBeGreaterThanOrEqual(checkpoint.nativeRun.startedAtMs);
@@ -132,7 +135,12 @@ describe('atomic completion through the real Vitest lifecycle', () => {
         if (file.proof.inputs === null) {
           expect(file.proof.sourceEvidence.status).toBe('unknown');
           expect(file.proof.sourceEvidence.reasons.length).toBeGreaterThan(0);
+        } else {
+          expect(file.proof.inputs.testFile).toBe(resolve(repoRoot, file.testFile));
+          expect(file.proof.inputs.reads).toEqual(expect.any(Array));
+          expect(file.proof.inputs.opaque).toEqual(expect.any(Array));
         }
+        if (file.state === 'passed') expect(file.proof.inputs).not.toBeNull();
       }
       expect(checkpoint.nativeRun.terminalHook).toBeNull();
       expect(checkpoint.nativeRun.reportedModulePaths).toBeNull();
@@ -147,6 +155,24 @@ describe('atomic completion through the real Vitest lifecycle', () => {
       for (const source of checkpoint.configSources.sources) {
         expect(source.path).toEqual(expect.any(String));
         expect(source.sha256).toMatch(/^[a-f0-9]{64}$/);
+      }
+      for (const [key, schemaVersion, scope] of [
+        ['configLoadedSources', 'node-loaded-config-sources-v1', 'repository-vite-config-dependencies'],
+        ['mainProcessLoadedSources', 'node-loaded-main-process-sources-v1', 'repository-node-main-process-sources'],
+      ]) {
+        const capture = checkpoint[key!];
+        expect(capture).toMatchObject({ schemaVersion, scope, basis: 'node-load-hook' });
+        expect(['stable', 'changed', 'unknown']).toContain(capture.status);
+        expect(capture.sources).toEqual(expect.any(Array));
+        expect(capture.observedSources).toEqual(expect.any(Array));
+        expect(capture.reasons).toEqual(expect.any(Array));
+        expect(capture.loaderChain).toMatchObject({ scope: 'declared-node-preloads', status: 'unknown' });
+        if (capture.status === 'unknown') expect(capture.reasons.length).toBeGreaterThan(0);
+        for (const source of capture.sources) {
+          expect(source.path).toEqual(expect.any(String));
+          if (source.sha256 === null) expect(capture.status).not.toBe('stable');
+          else expect(source.sha256).toMatch(/^[a-f0-9]{64}$/);
+        }
       }
       if (!beforeRename) {
         expect(files.filter(file => file.state === 'passed')).toHaveLength(1);
