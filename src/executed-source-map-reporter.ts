@@ -28,10 +28,10 @@
  * Fail-soft throughout (D-007, same contract as admin-test-runs-reporter.ts): nothing here can
  * change a test outcome, and every write is bounded by a timeout.
  */
-import type { Reporter, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
+import type { Reporter, TestModule, TestRunEndReason, TestSpecification, Vitest } from 'vitest/node';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -731,13 +731,38 @@ export function appendExecutedSourceMapResult(resultPath: string | null, result:
   }
 }
 
+export function writeExecutedSourceMapSnapshot(path: string, payload: unknown): void {
+  const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600);
+    writeFileSync(descriptor, JSON.stringify(payload));
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporary, path);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    rmSync(temporary, { force: true });
+  }
+}
+
 export default class ExecutedSourceMapReporter implements Reporter {
   private readonly armed = executedSourceMapArmed();
   private readonly repoRoot = inferWorkspaceRoot();
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: ExecutedSourceRowWriter;
   private readonly resolveGitDir: (repoRoot: string) => string | null;
+  private readonly writeSnapshot: typeof writeExecutedSourceMapSnapshot;
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
+  private checkpointWrites: Promise<void> = Promise.resolve();
+  private acknowledgedCompletionIds = new Set<string>();
+  private readonly completionContext = {
+    schemaVersion: 1,
+    runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+    runContext: executedSourceRunContext(),
+    runnerIdentity: executedSourceRunnerIdentity(),
+  };
   private pending: ExecutedSourceRow[] = [];
   private retired: string[] = [];
   private readonly inputsDir = process.env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim() || null;
@@ -759,8 +784,15 @@ export default class ExecutedSourceMapReporter implements Reporter {
     reason: TestRunEndReason | null; unhandledErrorCount: number | null;
     reportedModulePaths: Array<string | null> | null;
     modulePopulationMatched: boolean;
+    selectedManifest: { sha256: string; specifications: Array<{
+      testFile: string | null; projectName: string | null; pool: string;
+      testNamePattern: string | null; testLines: number[] | null; testIds: string[] | null;
+    }> } | null;
     files: Array<{ testFile: string; state: string; observedAtMs: number;
+      completionId: string;
+      projectName: string | null;
       firstAttemptVerdict: 'pass' | 'fail' | 'unknown';
+      proof: { inputs: InputsRecord | null; sourceEvidence: ExecutedSourceEvidence | null };
       execution: ReturnType<typeof collectModuleExecution>; cases: ReturnType<typeof collectTestCases> }>;
     gaps: string[];
   } | null = null;
@@ -778,12 +810,14 @@ export default class ExecutedSourceMapReporter implements Reporter {
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
     writeRows?: ExecutedSourceRowWriter,
     resolveGitDir?: (repoRoot: string) => string | null,
+    writeSnapshot?: typeof writeExecutedSourceMapSnapshot,
   ) {
     // Vitest constructs reporters with its options object; the unit suite injects seams.
     this.readWorktreeSnapshot =
       typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
     this.writeRows = writeRows ?? ((flush) => writeExecutedSourceRows(flush));
     this.resolveGitDir = resolveGitDir ?? resolveRecordedGitDir;
+    this.writeSnapshot = writeSnapshot ?? writeExecutedSourceMapSnapshot;
   }
 
   /** WI-10003715: lease on the shared PG client, so the sibling test-runs reporter's concurrent
@@ -803,6 +837,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
       ? captureConfigSources(this.configDeps, { repoRoot: this.repoRoot }) : undefined;
     this.pgLease ??= retainSharedPg();
     this.worktreeBefore = this.readWorktreeSnapshot();
+    this.checkpointWrites = Promise.resolve();
+    this.acknowledgedCompletionIds.clear();
     this.pending = [];
     this.retired = [];
     this.skipped = 0;
@@ -814,8 +850,29 @@ export default class ExecutedSourceMapReporter implements Reporter {
       schemaVersion: 'native-vitest-run-v1', scope: 'vitest-reporter-callbacks',
       pid: process.pid, ppid: process.ppid, startedAtMs: Date.now(), finishedAtMs: null,
       terminalHook: null, reason: null, unhandledErrorCount: null,
-      reportedModulePaths: null, modulePopulationMatched: false, files: [], gaps: [],
+      reportedModulePaths: null, modulePopulationMatched: false, selectedManifest: null, files: [], gaps: [],
     } : null;
+  }
+
+  onTestRunStart(specifications: ReadonlyArray<TestSpecification>): void {
+    if (!this.nativeRun) return;
+    try {
+      const selected = specifications.map(specification => ({
+        testFile: normalizeExecutedKey(specification.moduleId, this.repoRoot),
+        projectName: specification.project.name ?? null,
+        pool: specification.pool,
+        testNamePattern: specification.testNamePattern?.toString() ?? null,
+        testLines: specification.testLines ? [...specification.testLines] : null,
+        testIds: specification.testIds ? [...specification.testIds] : null,
+      })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+      this.nativeRun.selectedManifest = {
+        sha256: createHash('sha256').update(JSON.stringify(selected)).digest('hex'),
+        specifications: selected,
+      };
+    } catch {
+      this.nativeRun.selectedManifest = null;
+      this.nativeRun.gaps.push('selected-module-population-unreadable');
+    }
   }
 
   onTestModuleCollected(testModule: TestModule): void {
@@ -839,7 +896,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     }
   }
 
-  onTestModuleEnd(testModule: TestModule): void {
+  async onTestModuleEnd(testModule: TestModule): Promise<void> {
     if (!this.armed) return;
     try {
       let collectionImports: Record<string, ImportDurationLike> | undefined;
@@ -847,6 +904,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
       const inputs = readInputsRecord(this.inputsDir, testModule.moduleId);
       const observed = completeModuleImports(collectionImports, inputs);
       let sourceEvidence: ExecutedSourceEvidence | undefined;
+      let nativeFile: NonNullable<typeof this.nativeRun>['files'][number] | undefined;
       let state = 'error';
       try {
         state = testModule.state();
@@ -859,8 +917,11 @@ export default class ExecutedSourceMapReporter implements Reporter {
         this.fileResults.push({ testFile: resultFile, verdict });
         if (this.nativeRun) {
           const execution = collectModuleExecution(testModule), cases = collectTestCases(testModule);
-          this.nativeRun.files.push({ testFile: resultFile, state, observedAtMs: Date.now(),
-            firstAttemptVerdict: verdict, execution, cases });
+          nativeFile = { testFile: resultFile, state, observedAtMs: Date.now(),
+            completionId: randomUUID(), projectName: testModule.project.name ?? null,
+            firstAttemptVerdict: verdict, execution, cases,
+            proof: { inputs, sourceEvidence: null } };
+          this.nativeRun.files.push(nativeFile);
           if (execution === null || cases === null)
             this.nativeRun.gaps.push(`module-cases-unmeasured:${resultFile}`);
         }
@@ -882,6 +943,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
           }
           this.diagnostics.push({ testFile, state, sourceEvidence,
             ...(inputs?.moduleEvaluations ? { moduleEvaluations: inputs.moduleEvaluations } : {}) });
+          if (nativeFile) nativeFile.proof.sourceEvidence = sourceEvidence;
         }
       }
       // Mutation phases can report optional diagnostics and named verdicts, but must never
@@ -945,12 +1007,61 @@ export default class ExecutedSourceMapReporter implements Reporter {
       });
     } catch {
       /* swallow — D-007 */
+    } finally {
+      try {
+        await this.checkpointCompletedModules();
+      } catch (error) {
+        log(`completion checkpoint failed (${error instanceof Error ? error.message : String(error)})`);
+      }
     }
+  }
+
+  private checkpointCompletedModules(): Promise<void> {
+    const armed = this.armed;
+    if (!armed?.outPath || !this.nativeRun?.files.length ||
+      this.nativeRun.files.every(file => this.acknowledgedCompletionIds.has(file.completionId)))
+      return this.checkpointWrites;
+    const payload = structuredClone({
+      workspaceName: armed.workspaceName,
+      rows: this.pending,
+      diagnostics: this.diagnostics,
+      nativeRun: this.nativeRun,
+      skipped: this.skipped,
+      configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
+      configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
+      mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot, this.configEntries),
+      completionCheckpoint: {
+        ...this.completionContext,
+        state: 'partial',
+        noPersist: armed.noPersist,
+      },
+    });
+    this.checkpointWrites = this.checkpointWrites.then(async () => {
+      const before = this.worktreeBefore ? await this.worktreeBefore : null;
+      const after = await this.readWorktreeSnapshot();
+      const checkpoint = {
+        ...payload,
+        recordedSha: after.commit,
+        sourceSnapshot: before,
+        recordedGitDir: this.resolveGitDir(this.repoRoot),
+        worktreeDirty: before === null || computeWorktreeDirty(before, after),
+      };
+      this.writeSnapshot(armed.outPath!, checkpoint);
+      const completionIds = payload.nativeRun.files.map(file => file.completionId)
+        .filter(completionId => !this.acknowledgedCompletionIds.has(completionId));
+      for (const completionId of completionIds) this.acknowledgedCompletionIds.add(completionId);
+      if (completionIds.length)
+        log(`COMPLETION_ACK ids=${JSON.stringify(completionIds)} path=${JSON.stringify(armed.outPath)}`);
+    }).catch(error => {
+      log(`completion checkpoint failed (${error instanceof Error ? error.message : String(error)})`);
+    });
+    return this.checkpointWrites;
   }
 
   private async flushPending(): Promise<void> {
     if (!this.armed || this.flushed) return;
     this.flushed = true;
+    await this.checkpointWrites;
     const rows = this.pending.splice(0);
     let worktreeDirty = true;
     let recordedSha: string | null = null;
@@ -965,14 +1076,20 @@ export default class ExecutedSourceMapReporter implements Reporter {
     const summary = `ws=${this.armed.workspaceName} rows=${rows.length} skipped=${this.skipped} sha=${recordedSha ?? 'unknown'} dirty=${worktreeDirty}`;
     if (this.armed.outPath) {
       try {
-        writeFileSync(
+        this.writeSnapshot(
           this.armed.outPath,
-          JSON.stringify({ workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty,
+          { workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty,
+            recordedGitDir: this.resolveGitDir(this.repoRoot),
+            completionCheckpoint: {
+              ...this.completionContext,
+              state: this.nativeRun?.terminalHook === 'onTestRunEnd' ? 'terminal' : 'partial',
+              noPersist: this.armed.noPersist,
+            },
             skipped: this.skipped, rows, diagnostics: this.diagnostics,
             ...(this.nativeRun ? { nativeRun: this.nativeRun } : {}),
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
             configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
-            mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot, this.configEntries) }, null, 1),
+            mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot, this.configEntries) },
         );
       } catch (e) {
         log(`out-file write failed (${e instanceof Error ? e.message : String(e)}) ${summary}`);

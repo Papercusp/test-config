@@ -1,5 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -26,6 +27,7 @@ import ExecutedSourceMapReporter, {
   resolveConfigEntries,
   resolveRecordedGitDir,
   shouldRecordModule,
+  writeExecutedSourceMapSnapshot,
   type ExecutedSourceFlush,
   type ExecutedSourceMapResult,
 } from './executed-source-map-reporter';
@@ -533,6 +535,192 @@ describe('ExecutedSourceMapReporter', () => {
     function nativeOut() {
       return JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8')).nativeRun;
     }
+
+    it('saves passing, failing and infrastructure outcomes with their proofs before suite end', async () => {
+      const { r, flushes } = reporter();
+      r.onInit({} as never);
+      for (const state of ['passed', 'failed', 'error']) {
+        await r.onTestModuleEnd(nativeModule([state === 'passed' ? 'passed' : 'failed'], state));
+        const checkpoint = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+        expect(checkpoint).toMatchObject({ recordedSha: clean.commit, worktreeDirty: false,
+          recordedGitDir: GIT_DIR, completionCheckpoint: { schemaVersion: 1, state: 'partial',
+            runGroupId: 'grp-1', runnerIdentity: executedSourceRunnerIdentity(),
+            runContext: executedSourceRunContext() },
+          nativeRun: { terminalHook: null, finishedAtMs: null },
+        });
+        expect(checkpoint.nativeRun.files.at(-1)).toMatchObject({ state,
+          completionId: expect.any(String), proof: { inputs: null,
+            sourceEvidence: expect.objectContaining({ status: expect.any(String) }) },
+        });
+      }
+      expect(nativeOut().files.map((file: { state: string }) => file.state)).toEqual(['passed', 'failed', 'error']);
+      expect(new Set(nativeOut().files.map((file: { completionId: string }) => file.completionId)).size).toBe(3);
+      expect(flushes).toEqual([]);
+      await r.onExit();
+    });
+
+    it('pins the selected population and filters before completion rather than deriving them from finished files', async () => {
+      const { r } = reporter();
+      r.onInit({} as never);
+      const selected = [{ moduleId: TEST_FILE, project: { name: 'one' }, pool: 'forks',
+        testNamePattern: /exact case/, testLines: [12], testIds: ['selected-case'] },
+      { moduleId: SOURCE, project: { name: 'two' }, pool: 'forks' }];
+      r.onTestRunStart(selected as never);
+      selected[0]!.testIds!.push('late-change');
+      process.env.PAPERCUSP_TEST_RUN_GROUP = 'different-group-after-start';
+      await r.onTestModuleEnd(nativeModule(['passed']));
+      const saved = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+      const manifest = saved.nativeRun.selectedManifest;
+      expect(manifest.specifications).toHaveLength(2);
+      expect(manifest.specifications).toContainEqual(expect.objectContaining({ projectName: 'one',
+        testNamePattern: '/exact case/', testLines: [12], testIds: ['selected-case'] }));
+      expect(manifest.sha256).toBe(createHash('sha256').update(JSON.stringify(manifest.specifications)).digest('hex'));
+      expect(saved.nativeRun.files).toHaveLength(1);
+      expect(saved.completionCheckpoint.runGroupId).toBe('grp-1');
+      expect(saved.sourceSnapshot).toEqual(clean);
+      await r.onExit();
+    });
+
+    it('acknowledges only newly committed IDs, after the matching outcome and proof are readable', async () => {
+      const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const savedIds: string[] = [];
+        const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
+          (path, payload) => {
+            const acknowledged = writes.mock.calls.filter(([line]) => String(line).includes('COMPLETION_ACK')).length;
+            expect(acknowledged).toBe(savedIds.length);
+            writeExecutedSourceMapSnapshot(path, payload);
+            const saved = JSON.parse(readFileSync(path, 'utf8'));
+            savedIds.push(saved.nativeRun.files.at(-1).completionId);
+          });
+        recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        await recorder.onTestModuleEnd(nativeModule(['failed'], 'failed'));
+        const acknowledgments = writes.mock.calls.filter(([line]) => String(line).includes('COMPLETION_ACK'));
+        expect(acknowledgments).toHaveLength(2);
+        expect(String(acknowledgments[0]![0])).toContain(JSON.stringify([savedIds[0]]));
+        expect(String(acknowledgments[1]![0])).toContain(JSON.stringify([savedIds[1]]));
+      } finally {
+        writes.mockRestore();
+      }
+    });
+
+    it('does not acknowledge a failed write and retains the prior complete snapshot', async () => {
+      const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        let failWrite = false;
+        const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
+          (path, payload) => {
+            if (failWrite) throw new Error('injected write failure');
+            writeExecutedSourceMapSnapshot(path, payload);
+          });
+        recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        const previous = readFileSync(join(tmp, 'out.json'), 'utf8');
+        failWrite = true;
+        await expect(recorder.onTestModuleEnd(nativeModule(['failed'], 'failed'))).resolves.toBeUndefined();
+        expect(readFileSync(join(tmp, 'out.json'), 'utf8')).toBe(previous);
+        expect(writes.mock.calls.filter(([line]) => String(line).includes('COMPLETION_ACK'))).toHaveLength(1);
+        failWrite = false;
+        await recorder.onTestModuleEnd(nativeModule(['failed'], 'error'));
+        const lastAck = writes.mock.calls.filter(([line]) => String(line).includes('COMPLETION_ACK')).at(-1);
+        expect(String(lastAck?.[0])).toContain(JSON.stringify(nativeOut().files.slice(1)
+          .map((file: { completionId: string }) => file.completionId)));
+      } finally {
+        writes.mockRestore();
+      }
+    });
+
+    it('preserves the previous snapshot and removes the temporary file on serialization failure', () => {
+      const path = join(tmp, 'atomic.json');
+      writeExecutedSourceMapSnapshot(path, { outcome: 'pass', proof: { candidate: clean.commit } });
+      const previous = readFileSync(path, 'utf8');
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+      expect(() => writeExecutedSourceMapSnapshot(path, circular)).toThrow();
+      expect(readFileSync(path, 'utf8')).toBe(previous);
+      expect(readdirSync(tmp)).toEqual(['atomic.json']);
+    });
+
+    it('retains run-level errors after provisional per-file completion without claiming a complete checkpoint', async () => {
+      const { r } = reporter();
+      const module = nativeModule(['passed']);
+      r.onInit({} as never);
+      await r.onTestModuleEnd(module);
+      const completed = nativeOut().files[0];
+      await r.onTestRunEnd([module], [new Error('late run-level failure')], 'failed');
+      const final = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+      expect(final.nativeRun).toMatchObject({ terminalHook: 'onTestRunEnd', reason: 'failed', unhandledErrorCount: 1 });
+      expect(final.nativeRun.files[0]).toEqual(completed);
+      expect(final).toMatchObject({ recordedGitDir: GIT_DIR,
+        completionCheckpoint: { state: 'terminal', runGroupId: 'grp-1',
+          runContext: executedSourceRunContext(), runnerIdentity: executedSourceRunnerIdentity() } });
+    });
+
+    it.each(['SIGTERM', 'SIGKILL'] as const)('recovers exactly committed outcome/proof pairs after owned %s interruptions', signal => {
+      const script = `
+        import { readFileSync, writeFileSync, writeSync } from 'node:fs';
+        import Reporter, { writeExecutedSourceMapSnapshot } from ${JSON.stringify(new URL('./executed-source-map-reporter.ts', import.meta.url).href)};
+        const [phase, signal, outPath] = process.argv.slice(1);
+        process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE = '@papercusp/test-config';
+        process.env.PC_EXECUTED_SOURCE_MAP_OUT = outPath;
+        process.env.PAPERCUSP_TEST_RUN_GROUP = 'crash-window-frozen-group';
+        const recorder = new Reporter(async () => ({commit: 'frozen-candidate', porcelain: ''}),
+          async () => {}, () => '/frozen/.git', (path, payload) => {
+            if (payload.nativeRun.files.length === 3 && phase === 'before-commit') {
+              writeFileSync(path + '.incomplete.tmp', '{"nativeRun":');
+              process.kill(process.pid, signal);
+            }
+            writeExecutedSourceMapSnapshot(path, payload);
+            if (payload.nativeRun.files.length === 3 && phase === 'committed-before-ack')
+              process.kill(process.pid, signal);
+          });
+        recorder.onInit({});
+        recorder.onTestRunStart(['passed', 'failed', 'error'].map(state => ({
+          moduleId: process.cwd() + '/fixtures/' + state + '.test.ts', project: {name: 'crash-window'}, pool: 'forks'
+        })));
+        for (const state of ['passed', 'failed', 'error']) {
+          await recorder.onTestModuleEnd({moduleId: process.cwd() + '/fixtures/' + state + '.test.ts',
+            state: () => state, project: {config: {isolate: true}},
+            diagnostic: () => ({importDurations: {}}),
+            children: {allTests: () => [{fullName: state + ' case',
+              result: () => ({state: state === 'passed' ? 'passed' : 'failed'}),
+              diagnostic: () => ({duration: 1, retryCount: 0})}]}});
+        }
+        writeSync(1, 'HOOK_RETURNED\\n');
+        process.kill(process.pid, signal);
+      `;
+      for (const phase of ['before-commit', 'committed-before-ack', 'acknowledged-before-kill']) {
+        const outPath = join(tmp, `${signal}-${phase}.json`);
+        const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script,
+          phase, signal, outPath], { cwd: REPO_ROOT, env: process.env, encoding: 'utf8', timeout: 30_000 });
+        expect(child.error, child.stderr).toBeUndefined();
+        expect(child.signal, child.stderr).toBe(signal);
+        const recovery = spawnSync(process.execPath, ['--input-type=module', '-e',
+          "import {readFileSync} from 'node:fs'; process.stdout.write(readFileSync(process.argv[1], 'utf8'));", outPath],
+        { encoding: 'utf8', timeout: 10_000 });
+        expect(recovery.status, recovery.stderr).toBe(0);
+        const recovered = JSON.parse(recovery.stdout);
+        const expectedStates = phase === 'before-commit' ? ['passed', 'failed'] : ['passed', 'failed', 'error'];
+        expect(recovered.nativeRun.files.map((file: { state: string }) => file.state)).toEqual(expectedStates);
+        expect(recovered).toMatchObject({ recordedSha: 'frozen-candidate', worktreeDirty: false,
+          completionCheckpoint: { state: 'partial', runGroupId: 'crash-window-frozen-group' } });
+        expect(recovered.nativeRun.selectedManifest.specifications.map((specification: { testFile: string }) =>
+          specification.testFile).sort()).toEqual(['fixtures/error.test.ts', 'fixtures/failed.test.ts', 'fixtures/passed.test.ts']);
+        const acknowledgedIds = [...child.stderr.matchAll(/COMPLETION_ACK ids=(\[[^\n]+?\]) path=/g)]
+          .flatMap(match => JSON.parse(match[1]!) as string[]);
+        expect(acknowledgedIds).toHaveLength(phase === 'acknowledged-before-kill' ? 3 : 2);
+        for (const completionId of acknowledgedIds) {
+          const unit = recovered.nativeRun.files.find((file: { completionId: string }) => file.completionId === completionId);
+          expect(unit).toMatchObject({ completionId, proof: { inputs: null,
+            sourceEvidence: expect.objectContaining({ status: expect.any(String) }) },
+            execution: unit.state === 'error' ? null : expect.any(Object),
+            cases: unit.state === 'error' ? null : expect.any(Array) });
+        }
+        expect(child.stdout.includes('HOOK_RETURNED')).toBe(phase === 'acknowledged-before-kill');
+        expect(recovered.nativeRun.terminalHook).toBeNull();
+      }
+    }, 120_000);
 
     it('retains the actual case population, repeated titles, process and callback clocks', async () => {
       const { r, flushes } = reporter();
