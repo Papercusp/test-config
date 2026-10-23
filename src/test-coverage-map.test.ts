@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { coverageHash, coverageLines, coveragePath, parseTestCoverage } from './test-coverage-map.ts';
+import { coverageHash, coverageLines, coveragePath, parseTestCoverage, parseCoverageCollectionScope } from './test-coverage-map.ts';
 
 describe('P016 bounded source-mapped execution contract', () => {
+  it('requires a complete separate scope and exact candidate before accepting gate telemetry', () => {
+    const scope = { workspaceId: 'workspace', harnessSlug: 'harness', executionRoot: '/checkpoint',
+      repositoryRoot: '/canonical', candidate: 'a'.repeat(40) };
+    expect(parseCoverageCollectionScope(JSON.stringify(scope))).toEqual(scope);
+    for (const changed of [{ workspaceId: '' }, { harnessSlug: null }, { executionRoot: 'relative' },
+      { repositoryRoot: '../other' }, { candidate: 'unknown' }]) {
+      expect(parseCoverageCollectionScope(JSON.stringify({ ...scope, ...changed }))).toBeNull();
+    }
+    expect(parseCoverageCollectionScope('{')).toBeNull();
+  });
   it('requires positive hits on every statement starting at a line', () => {
     expect(coverageLines({ statementMap: {
       a: { start: { line: 2 }, end: { line: 8 } }, b: { start: { line: 2 }, end: { line: 2 } },

@@ -947,8 +947,8 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // per worker); unit retry=0; E2E (Playwright config) handles its own retries.
       retry: 0,
       // Coverage is TRACKED, not gated (testing-spec §1.13) — no thresholds here.
-      // Inert unless `--coverage` is passed, so it never slows routine
-      // `test:affected`. The block below is complete AND functional: verified
+      // The checkpoint's affected-test producer passes --coverage automatically
+      // for supported Vitest tasks (P016/D017); local runs opt in. Verified
       // 2026-09-02 (P-007, design-to-code-coverage-seam-2026-09-02) by running
       // `npx vitest run --coverage src/mock-sql.test.ts` in this workspace,
       // which wrote ./coverage/{coverage-final.json,lcov.info,index.html}.
@@ -967,8 +967,8 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       //     merges them into one repo-root-relative coverage/lcov.info.
       //   • `npm run gate:patch-coverage` (scripts/patch-coverage.ts) judges the
       //     lines the current diff ADDS against that report.
-      // Still inert unless someone passes the flag: no scheduled job instruments
-      // by default, so an ordinary `test:affected` pays nothing for this block.
+      // The same provider retains bounded per-test execution observations under
+      // a separate gate scope; missing/unsupported source receipts remain unknown.
       // ⚠ Do NOT re-add a CI coverage-upload step without a producer in the same
       // change — that arrangement (each end documenting the other, nothing in the
       // middle) is the exact trap coverage-wiring.test.ts was written to catch.

@@ -8,6 +8,7 @@ import { resolve } from 'node:path';
 import { readExecutedSourceOriginals } from './vitest-config.ts';
 import { inferWorkspaceRoot, isMutationProbeRun, tryGetPg } from './admin-test-runs-reporter.ts';
 import { COVERAGE_MAX_FILES, coverageHash, coverageLines, coveragePath, parseTestCoverage,
+  parseCoverageCollectionScope, qualifyCoverageSnapshots,
   type TestCoverageSnapshot } from './test-coverage-map.ts';
 import { writeTestCoverage } from './test-coverage-store.ts';
 
@@ -17,7 +18,7 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
     const original = this.coverageFiles;
     const cleanOnRerun = this.options.cleanOnRerun;
     const snapshots: TestCoverageSnapshot[] = [];
-    const rejected = { sharedBatch: 0, receipts: 0, source: 0, test: 0, schema: 0 };
+    const rejected = { sharedBatch: 0, receipts: 0, source: 0, test: 0, schema: 0, unmeasuredSources: 0 };
     const observedAt = new Date().toISOString();
     try {
       const root = inferWorkspaceRoot(this.ctx.config.root);
@@ -46,7 +47,11 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
           for (const receipt of receipts ?? []) {
             const set = hashes.get(receipt.id) ?? new Set<string>(); set.add(receipt.sha256); hashes.set(receipt.id, set);
           }
-          const paths = converted.files();
+          // Ordinary LCOV includes unloaded files as zero-hit entries. They have no
+          // execution receipt and must remain unknown in the per-test observation.
+          const mappedPaths = converted.files();
+          const paths = mappedPaths.filter(absolute => hashes.has(absolute));
+          rejected.unmeasuredSources += mappedPaths.length - paths.length;
           if (!receipts || paths.length > COVERAGE_MAX_FILES) { rejected.receipts++; continue; }
           const sources = await Promise.all(paths.map(async absolute => {
             const path = coveragePath(root, absolute);
@@ -73,6 +78,8 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
         await this.publish(snapshots);
       }
       if (original.size && !snapshots.length) this.ctx.logger.warn(`[test-file-coverage] no qualified observations: ${JSON.stringify(rejected)}`);
+      if (snapshots.length && rejected.unmeasuredSources) this.ctx.logger.log(
+        `[test-file-coverage] unmeasured sources without original execution receipts: ${rejected.unmeasuredSources}`);
     } catch (error) {
       // Optional data must never change test outcomes; a missing observation is unknown.
       this.ctx.logger.warn(`[test-file-coverage] unavailable: ${error instanceof Error ? error.message : String(error)}`);
@@ -84,11 +91,16 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
   }
 }
 async function persistSnapshots(snapshots: TestCoverageSnapshot[]): Promise<void> {
-  if (process.env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1') return;
+  const rawScope = process.env.PC_TEST_FILE_COVERAGE_SCOPE;
+  const scope = parseCoverageCollectionScope(rawScope);
+  if (rawScope && !scope) throw new Error('Invalid gate coverage scope');
+  if (process.env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' && !scope) return;
+  const qualified = scope ? await qualifyCoverageSnapshots(snapshots, scope) : snapshots;
   const pg = await tryGetPg();
-  const workspace = process.env.PAPERCUSP_WORKSPACE;
-  const harness = process.env.PAPERCUSP_HARNESS_SLUG;
-  if (pg && workspace && harness) await writeTestCoverage(pg.sql as unknown as Sql, workspace, harness, snapshots,
+  const workspace = scope?.workspaceId ?? process.env.PAPERCUSP_WORKSPACE;
+  const harness = scope?.harnessSlug ?? process.env.PAPERCUSP_HARNESS_SLUG;
+  if (!pg || !workspace || !harness) throw new Error('Coverage persistence scope or sink unavailable');
+  await writeTestCoverage(pg.sql as unknown as Sql, workspace, harness, qualified,
     process.env.PAPERCUSP_TEST_RUN_GROUP ?? null);
 }
 function hasSkipped(task: { mode: string; tasks?: readonly unknown[] }): boolean {
