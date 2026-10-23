@@ -101,5 +101,6 @@ declare module 'vitest' {
   // and read back by admin-test-runs-reporter's collectIsolatedRuntimeReceipts.
   interface TaskMeta {
     papercuspIsolatedRuntimeRunId?: string;
+    papercuspExecutionObservations?: unknown[];
   }
 }

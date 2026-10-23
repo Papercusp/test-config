@@ -25,6 +25,7 @@ import AdminTestRunsReporter, {
   captureWorktreeSnapshot,
   collectModuleExecution,
   collectIsolatedRuntimeReceipts,
+  collectBoundaryObservations,
   captureReporterSaturationSnapshot,
   classifyGitEntry,
   computeWorkspaceRootFrom,
@@ -72,6 +73,24 @@ import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceF
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 /** The resolver the reporter's onInit loads in a hive that ships verification-harness. */
+describe('framework boundary case identities', () => {
+  const receipt = { boundary: 'graph:query:evidence', callId: 'dispatch-1', workspaceId: 'ws', harness: 'repo',
+    traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), parentSpanId: 'c'.repeat(16), traceFlags: 1,
+    startedAt: 1, endedAt: 2, outcome: 'ok', sourceFingerprint: 'd'.repeat(64), buildSha: 'e'.repeat(40),
+    artifactFingerprint: null, environmentFingerprint: 'f'.repeat(64), workflowId: null };
+  it('counts duplicate names in framework order including skipped occurrences, and tolerates receipt-absent modules', () => {
+    const cases = [{ fullName: 'same case', result: () => ({ state: 'skipped' }) },
+      { fullName: 'same case', result: () => ({ state: 'passed' }), meta: () => ({ papercuspExecutionObservations: [receipt] }) }];
+    expect(collectBoundaryObservations({ children: { allTests: () => cases } } as never))
+      .toEqual([{ caseKey: 'same case', occurrence: 2, receipt }]);
+    expect(collectBoundaryObservations({ children: { allTests: () => [{ result: () => ({ state: 'passed' }) }] } } as never))
+      .toBeUndefined();
+    expect(collectBoundaryObservations({ children: { allTests: () => [{ fullName: 'case', result: () => ({ state: 'passed' }),
+      meta: () => ({ papercuspExecutionObservations: [{ ...receipt, spanId: receipt.parentSpanId }] }) }] } } as never))
+      .toBeUndefined();
+  });
+});
+
 const collectReceipts = (testModule: Parameters<typeof collectIsolatedRuntimeReceipts>[0]) =>
   collectIsolatedRuntimeReceipts(testModule, defaultEvidenceRoot);
 

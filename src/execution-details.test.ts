@@ -6,10 +6,30 @@ import {
   parseTestRunExecutionDetails,
   parseRecordedMeasurementProvenance,
   parseRecordedRubricCheck,
+  parseExecutionBoundaryReceipt,
+  parseTestBoundaryObservations,
   passedCaseTitlesIncomplete,
   stableRecordedRuntimeEnvironment,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
+
+describe('instrumented boundary custody', () => {
+  const receipt = () => ({ boundary: 'graph:query:evidence', callId: 'dispatch-1', workspaceId: 'ws', harness: 'repo',
+    traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), parentSpanId: 'c'.repeat(16), traceFlags: 1,
+    startedAt: 1, endedAt: 2, outcome: 'ok', sourceFingerprint: 'd'.repeat(64), buildSha: 'e'.repeat(40),
+    artifactFingerprint: null, environmentFingerprint: 'f'.repeat(64), workflowId: null });
+  it('preserves exact module, environment and case identities while rejecting malformed or expanded witnesses', () => {
+    expect(parseExecutionBoundaryReceipt(receipt())).toEqual(receipt());
+    expect(parseTestBoundaryObservations([{ caseKey: 'suite > test', occurrence: 2, receipt: receipt() }]))
+      .toEqual([{ caseKey: 'suite > test', occurrence: 2, receipt: receipt() }]);
+    for (const bad of [{ ...receipt(), spanId: receipt().parentSpanId }, { ...receipt(), traceId: '0'.repeat(32) },
+      { ...receipt(), observedChild: true }, { ...receipt(), endedAt: 0 }, { ...receipt(), workflowId: 'guessed' }]) {
+      expect(parseExecutionBoundaryReceipt(bad)).toBeUndefined();
+    }
+    expect(parseTestBoundaryObservations([{ caseKey: 'suite > test', occurrence: 0, receipt: receipt() }])).toBeUndefined();
+    expect(parseTestBoundaryObservations(Array(33).fill({ caseKey: 'test', occurrence: 1, receipt: receipt() }))).toBeUndefined();
+  });
+});
 
 describe('bounded historical measurement contract', () => {
   const provenance = () => ({ schemaVersion: 1, startedAt: '2026-10-23T00:00:00Z',

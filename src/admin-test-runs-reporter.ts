@@ -77,23 +77,25 @@ export type EvidenceRootResolver = (harness: string) => string;
 
 /** Framework case identities are independent of caller-supplied receipt fields. */
 export function collectBoundaryObservations(testModule: TestModule): TestBoundaryObservation[] | undefined {
-  const rows: TestBoundaryObservation[] = [];
-  const occurrences = new Map<string, number>();
-  for (const test of testModule.children.allTests()) {
-    const caseKey = test.fullName;
-    const occurrence = (occurrences.get(caseKey) ?? 0) + 1;
-    occurrences.set(caseKey, occurrence);
-    if (test.result()?.state === 'skipped') continue;
-    const values = test.meta()?.papercuspExecutionObservations;
-    if (values === undefined) continue;
-    if (!Array.isArray(values) || !isRecordedCaseTitle(caseKey)) return undefined;
-    for (const value of values) {
-      const receipt = parseExecutionBoundaryReceipt(value);
-      if (!receipt || rows.length >= 32) return undefined;
-      rows.push({ caseKey, occurrence, receipt });
+  try {
+    const rows: TestBoundaryObservation[] = [];
+    const occurrences = new Map<string, number>();
+    for (const test of testModule.children.allTests()) {
+      const caseKey = test.fullName;
+      const occurrence = (occurrences.get(caseKey) ?? 0) + 1;
+      occurrences.set(caseKey, occurrence);
+      if (test.result()?.state === 'skipped') continue;
+      const values = test.meta?.()?.papercuspExecutionObservations;
+      if (values === undefined) continue;
+      if (!Array.isArray(values) || !isRecordedCaseTitle(caseKey)) return undefined;
+      for (const value of values) {
+        const receipt = parseExecutionBoundaryReceipt(value);
+        if (!receipt || rows.length >= 32) return undefined;
+        rows.push({ caseKey, occurrence, receipt });
+      }
     }
-  }
-  return rows.length ? rows : undefined;
+    return rows.length ? rows : undefined;
+  } catch { return undefined; }
 }
 
 /**
