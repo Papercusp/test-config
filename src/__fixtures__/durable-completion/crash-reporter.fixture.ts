@@ -14,7 +14,8 @@ function interrupt(phase: string): void {
 export default class CrashReporter extends ExecutedSourceMapReporter {
   override async onTestRunStart(specifications: ReadonlyArray<TestSpecification>): Promise<void> {
     super.onTestRunStart(specifications);
-    if (process.env.PC_COMPLETION_CRASH_WINDOW !== 'before-first-snapshot') return;
+    const phase = process.env.PC_COMPLETION_CRASH_WINDOW;
+    if (phase !== 'before-first-snapshot' && phase !== 'after-first-bank') return;
     if (!process.connected || !process.send) throw new Error('pre-snapshot crash fixture requires parent IPC');
     // Bind the actual PID and independent selection before releasing the crash.
     const registered = new Promise<void>(resolve => {
@@ -27,7 +28,7 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
     });
     process.send({ kind: 'native-pre-snapshot-ready', pid: process.pid });
     await registered;
-    interrupt('before-first-snapshot');
+    if (phase === 'before-first-snapshot') interrupt(phase);
   }
 
   constructor() {
@@ -65,6 +66,10 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
 
   override async onTestModuleEnd(testModule: TestModule): Promise<void> {
     await super.onTestModuleEnd(testModule);
+    if (process.env.PC_COMPLETION_CRASH_WINDOW === 'after-first-bank') {
+      const checkpoint = JSON.parse(readFileSync(process.env.PC_EXECUTED_SOURCE_MAP_OUT!, 'utf8'));
+      if (checkpoint.nativeRun.files.length === 1) interrupt('after-first-bank');
+    }
     if (process.env.PC_COMPLETION_CRASH_WINDOW !== 'acknowledged-before-kill') return;
     const checkpoint = JSON.parse(readFileSync(process.env.PC_EXECUTED_SOURCE_MAP_OUT!, 'utf8'));
     if (checkpoint.nativeRun.files.length === 3) interrupt('acknowledged-before-kill');
