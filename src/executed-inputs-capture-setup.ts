@@ -13,6 +13,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as net from 'node:net';
 import * as workerThreads from 'node:worker_threads';
 import { afterAll, expect } from 'vitest';
+import { captureCurrentRuntimeProofIdentity } from '../../../scripts/lib/runtime-compatibility.mjs';
 import { inferWorkspaceRoot } from './admin-test-runs-reporter';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,
@@ -27,6 +28,10 @@ import {
 const dir = process.env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim();
 if (dir) {
   try {
+    // Measure before installing fs capture: runtime hashing is recorder overhead,
+    // not a test input. The final measurement follows endFile for the same reason.
+    const root = inferWorkspaceRoot();
+    const runtimeBefore = captureCurrentRuntimeProofIdentity({ root });
     // `import * as` yields the ESM namespace (read-only); the CJS module objects are what
     // callers and syncBuiltinESMExports see, so patch those.
     const cjs = (ns: object) => ((ns as { default?: object }).default ?? ns) as Record<string, unknown>;
@@ -39,7 +44,7 @@ if (dir) {
         netSocketPrototype: (cjs(net).Socket as { prototype: Record<string, unknown> } | undefined)?.prototype,
         syncBuiltinESMExports,
       },
-      inferWorkspaceRoot(),
+      root,
     );
     beginFile();
     if (process.env.PC_EXECUTED_SOURCE_MAP_OUT?.trim()) {
@@ -56,6 +61,8 @@ if (dir) {
         const filepath =
           (suite as { filepath?: string } | undefined)?.filepath ?? expect.getState().testPath ?? null;
         const record = endFile(filepath ?? '');
+        if (record) record.runtime = { before: runtimeBefore,
+          after: captureCurrentRuntimeProofIdentity({ root }) };
         if (record) record.moduleImports = captureModuleImports(
           (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__,
         );

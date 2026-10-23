@@ -1,7 +1,9 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
 
 import {
   PARTIAL_SKIP_LIST_SCHEMA,
@@ -21,7 +23,25 @@ import {
 // failure mode must run MORE tests (return no exclude entries), never fewer.
 
 const dirs: string[] = [];
+it('loads the reuse config in native Node ESM without a bundler supplying missing import extensions', () => {
+  const output = execFileSync(process.execPath, [
+    '--input-type=module', '-e',
+    'await import(process.argv[1]); process.stdout.write("native-config-loaded")',
+    new URL('./test-pass-reuse-skip.ts', import.meta.url).href,
+  ], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, NODE_OPTIONS: '' } });
+  expect(output).toContain('native-config-loaded');
+}, 30_000);
+
+beforeEach(() => {
+  vi.spyOn(runtimeProof, 'captureCurrentRuntimeProofIdentity').mockReturnValue({
+    name: 'node', version: '25.9.0', executable: '/pinned/node',
+    binarySha256: 'a'.repeat(64), platform: 'linux', arch: 'x64',
+    nativeDependencyGeneration: 'b'.repeat(64), lockfileSha256: 'c'.repeat(64),
+    configurationSha256: 'd'.repeat(64),
+  });
+});
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -48,6 +68,20 @@ describe('resolveReuseSkipExclude', () => {
   it('is inert when the channel is not in use', () => {
     expect(resolveReuseSkipExclude({}, log)).toEqual([]);
     expect(logs).toEqual([]);
+  });
+
+  it('runs fresh for an unknown generation even when both sides are unidentified', () => {
+    vi.mocked(runtimeProof.captureCurrentRuntimeProofIdentity).mockReturnValue(null);
+    const path = listFile({ ...here(), files: ['lib/a.test.ts'] });
+    expect(resolveReuseSkipFiles({ [PC_TEST_REUSE_SKIP_LIST_ENV]: path }, log)).toEqual([]);
+  });
+
+  it('refuses a Node pass when the actual interpreter is Bun with a Node-compatible version', () => {
+    const path = listFile({ ...here(), files: ['lib/a.test.ts'] });
+    const node = runtimeProof.captureCurrentRuntimeProofIdentity({ root: '/' })!;
+    vi.mocked(runtimeProof.captureCurrentRuntimeProofIdentity).mockReturnValue({ ...node, name: 'bun' });
+    expect(resolveReuseSkipFiles({ [PC_TEST_REUSE_SKIP_LIST_ENV]: path }, log)).toEqual([]);
+    expect(logs[0]).toContain('DECLINED');
   });
 
   it('excludes the listed files, escaped, when context and identity match', () => {
@@ -123,12 +157,23 @@ describe('resolvePartialResumeSkipExclude', () => {
   });
 
   it('escapes only the source-bound partial skip list and fails open on malformed input', () => {
-    const path = listFile({ schema: PARTIAL_SKIP_LIST_SCHEMA, taskKey: 'integration', sourceCommit: 'a', sourceDigest: 'b', files: ['lib/(a).integration.test.ts'] });
+    const path = listFile({ schema: PARTIAL_SKIP_LIST_SCHEMA, taskKey: 'integration', sourceCommit: 'a', sourceDigest: 'b',
+      runnerIdentity: executedSourceRunnerIdentity(), files: ['lib/(a).integration.test.ts'] });
     const logs: string[] = [];
     expect(resolvePartialResumeSkipExclude({ AFFECTED_PARTIAL_RESUME: '1', [PC_TEST_PARTIAL_SKIP_LIST_ENV]: path }, (line) => logs.push(line)))
       .toEqual(['lib/\\(a\\).integration.test.ts']);
     expect(logs[0]).toContain('partial run remains non-green');
     expect(resolvePartialResumeSkipExclude({ AFFECTED_PARTIAL_RESUME: '1', [PC_TEST_PARTIAL_SKIP_LIST_ENV]: listFile('bad') }))
       .toEqual([]);
+  });
+
+  it('runs fresh after a runtime change or for a legacy unbound partial list', () => {
+    const list = { schema: PARTIAL_SKIP_LIST_SCHEMA, taskKey: 'integration', sourceCommit: 'a', sourceDigest: 'b',
+      files: ['lib/a.integration.test.ts'] };
+    const previous = listFile({ ...list, runnerIdentity: executedSourceRunnerIdentity() });
+    vi.mocked(runtimeProof.captureCurrentRuntimeProofIdentity).mockReturnValue(null);
+    const env = { AFFECTED_PARTIAL_RESUME: '1' };
+    expect(resolvePartialResumeSkipExclude({ ...env, [PC_TEST_PARTIAL_SKIP_LIST_ENV]: previous }, () => {})).toEqual([]);
+    expect(resolvePartialResumeSkipExclude({ ...env, [PC_TEST_PARTIAL_SKIP_LIST_ENV]: listFile(list) }, () => {})).toEqual([]);
   });
 });

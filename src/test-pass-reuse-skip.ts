@@ -13,6 +13,8 @@
 // dropped here and every file runs. Every failure mode runs MORE tests, never fewer.
 
 import { readFileSync } from 'node:fs';
+import { captureCurrentRuntimeProofIdentity, runtimeProofFingerprint } from '../../../scripts/lib/runtime-compatibility.mjs';
+import { inferWorkspaceRoot } from './admin-test-runs-reporter.ts';
 
 export const PC_TEST_REUSE_SKIP_LIST_ENV = 'PC_TEST_REUSE_SKIP_LIST';
 export const REUSE_SKIP_LIST_SCHEMA = 1;
@@ -36,9 +38,12 @@ export function executedSourceRunContext(env: NodeJS.ProcessEnv = process.env): 
  */
 export const REUSE_PROOF_FORMAT = 'proof-v3';
 
-/** Proof format + node version + platform + arch of this process (D-004 rule 6, P-001). */
-export function executedSourceRunnerIdentity(): string {
-  return `${REUSE_PROOF_FORMAT} ${process.version} ${process.platform} ${process.arch}`;
+/** The recorder and skip consumer measure themselves, including actual Node/Bun identity. */
+export function executedSourceRunnerIdentity(): string | null {
+  const fingerprint = runtimeProofFingerprint(captureCurrentRuntimeProofIdentity({
+    root: inferWorkspaceRoot(),
+  }));
+  return fingerprint ? `${REUSE_PROOF_FORMAT} ${fingerprint}` : null;
 }
 
 export interface ReuseSkipList {
@@ -84,8 +89,11 @@ export function parseReuseSkipList(body: string): ReuseSkipList {
  */
 export function decideReuseSkip(
   list: ReuseSkipList,
-  here: { runContext: string; runnerIdentity: string },
+  here: { runContext: string; runnerIdentity: string | null },
 ): ReuseSkipDecision {
+  if (!here.runnerIdentity || !list.runnerIdentity) {
+    return { applied: false, reason: 'runtime identity unavailable', exclude: [] };
+  }
   if (list.runContext !== here.runContext) {
     return { applied: false, reason: `run context ${list.runContext} != ${here.runContext}`, exclude: [] };
   }
@@ -127,10 +135,13 @@ export function resolvePartialResumeSkipExclude(
   if (!path) return [];
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
-      schema?: unknown; taskKey?: unknown; sourceCommit?: unknown; sourceDigest?: unknown; files?: unknown;
+      schema?: unknown; taskKey?: unknown; sourceCommit?: unknown; sourceDigest?: unknown;
+      runnerIdentity?: unknown; files?: unknown;
     };
     if (parsed.schema !== PARTIAL_SKIP_LIST_SCHEMA || typeof parsed.taskKey !== 'string' ||
         typeof parsed.sourceCommit !== 'string' || typeof parsed.sourceDigest !== 'string' ||
+        typeof parsed.runnerIdentity !== 'string' || !parsed.runnerIdentity ||
+        parsed.runnerIdentity !== executedSourceRunnerIdentity() ||
         !Array.isArray(parsed.files) || !parsed.files.every((file) => typeof file === 'string' && file.length > 0)) {
       throw new Error(`not a schema-${PARTIAL_SKIP_LIST_SCHEMA} partial skip list`);
     }

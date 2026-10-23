@@ -73,6 +73,57 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
     await db?.drop();
   });
 
+  it('P005 a Bun failure preserves the current Node proof, while a Node failure retires it', async () => {
+    const workspaceName = '@probe/runtime-separated';
+    const testFile = 'src/runtime.test.ts';
+    const nodeIdentity = 'proof-v3 node-25 linux x64 binary-node';
+    const bunIdentity = 'proof-v3 bun-1 linux x64 binary-bun';
+    const write = (runnerIdentity: string, retiredFiles?: string[]) => writeExecutedSourceRows({
+      rows: retiredFiles ? [] : [row(testFile, { workspaceName, inputsCaptured: true })],
+      recordedSha: SHA_A, recordedGitDir: GIT_DIR, runGroupId: null,
+      workspaceName, runContext: 'green-checkpoint', runnerIdentity, retiredFiles,
+    }, handle);
+    await write(nodeIdentity);
+    await write(bunIdentity);
+    expect(await sql`SELECT runner_identity FROM harness_shared.test_executed_sources
+      WHERE workspace_name = ${workspaceName} ORDER BY runner_identity`).toEqual([
+      { runner_identity: bunIdentity }, { runner_identity: nodeIdentity },
+    ]);
+    await write(bunIdentity, [testFile]);
+    const preserved = await sql`
+      SELECT runner_identity FROM harness_shared.test_executed_sources
+       WHERE workspace_name = ${workspaceName} AND test_file = ${testFile}`;
+    expect(preserved).toEqual([{ runner_identity: nodeIdentity }]);
+    await writeExecutedSourceRows({ rows: [], recordedSha: SHA_A, recordedGitDir: GIT_DIR,
+      runGroupId: null, workspaceName, runContext: 'green-checkpoint', retiredFiles: [testFile] }, handle);
+    expect(await sql`SELECT runner_identity FROM harness_shared.test_executed_sources
+      WHERE workspace_name = ${workspaceName}`).toEqual([{ runner_identity: nodeIdentity }]);
+    await write(nodeIdentity, [testFile]);
+    expect(await sql`SELECT 1 FROM harness_shared.test_executed_sources
+      WHERE workspace_name = ${workspaceName}`).toHaveLength(0);
+  });
+
+  it('P005 a new Node sha supersedes only Node, preserving Bun at the old sha', async () => {
+    const workspaceName = '@probe/runtime-supersession';
+    const testFile = 'src/runtime.test.ts';
+    const write = (runnerIdentity: string | null, recordedSha: string) => writeExecutedSourceRows({
+      rows: [row(testFile, { workspaceName, inputsCaptured: true })],
+      recordedSha, recordedGitDir: GIT_DIR, runGroupId: null,
+      workspaceName, runContext: 'green-checkpoint', runnerIdentity,
+    }, handle);
+    await write('node', SHA_A);
+    await write('bun', SHA_A);
+    await write(null, SHA_A);
+    await write(null, SHA_A);
+    await write('node', SHA_B);
+    expect(await sql`SELECT runner_identity, recorded_sha FROM harness_shared.test_executed_sources
+      WHERE workspace_name = ${workspaceName} ORDER BY runner_identity NULLS LAST`).toEqual([
+      { runner_identity: 'bun', recorded_sha: SHA_A },
+      { runner_identity: 'node', recorded_sha: SHA_B },
+      { runner_identity: null, recorded_sha: SHA_A },
+    ]);
+  });
+
   it('persists a gate-shaped proof with inputs_captured=true, its read paths and run context', async () => {
     await writeExecutedSourceRows(
       {
@@ -166,7 +217,11 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
     }
   });
 
-  it('a newer sha supersedes the same-context proof, and a retired file loses every proof', async () => {
+  it('a newer sha supersedes the same-runtime proof, and retirement removes that runtime\'s proof', async () => {
+    const retiredFile = 'src/same-runtime-retired.test.ts';
+    await writeExecutedSourceRows({ rows: [row(retiredFile, { inputsCaptured: true })],
+      recordedSha: SHA_A, recordedGitDir: GIT_DIR, runGroupId: null, workspaceName: '@probe/ws',
+      runContext: 'green-checkpoint', runnerIdentity: 'v22.12.0 linux x64' }, handle);
     await writeExecutedSourceRows(
       {
         rows: [row('src/gate.test.ts', { inputsCaptured: true })],
@@ -175,14 +230,15 @@ describe('writeExecutedSourceRows against real Postgres (WI-10003597)', () => {
         runGroupId: null,
         workspaceName: '@probe/ws',
         runContext: 'green-checkpoint',
-        retiredFiles: ['src/m1.test.ts'],
+        runnerIdentity: 'v22.12.0 linux x64',
+        retiredFiles: [retiredFile],
       },
       handle,
     );
     const shas = await sql<{ recorded_sha: string }[]>`
       SELECT recorded_sha FROM harness_shared.test_executed_sources WHERE test_file = 'src/gate.test.ts'`;
     expect(shas.map((r) => r.recorded_sha)).toEqual([SHA_B]);
-    const retired = await sql`SELECT 1 FROM harness_shared.test_executed_sources WHERE test_file = 'src/m1.test.ts'`;
+    const retired = await sql`SELECT 1 FROM harness_shared.test_executed_sources WHERE test_file = ${retiredFile}`;
     expect(retired).toHaveLength(0);
   });
 

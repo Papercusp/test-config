@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TestModule } from 'vitest/node';
+import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
 import { executedSourceOriginalsPlugin } from './vitest-config';
 // The router stays plain Node; exercise its output routing with the real reporter.
 // @ts-expect-error the executable .mjs router has no declaration file
@@ -21,6 +22,7 @@ import ExecutedSourceMapReporter, {
   captureConfigSources,
   collectExecutedModules,
   completeModuleImports,
+  completeWorkerRuntime,
   executedSourceRunContext,
   executedSourceRunnerIdentity,
   isolatedByConfig,
@@ -38,6 +40,33 @@ import ExecutedSourceMapReporter, {
 
 // gate-test-reuse-yield-2026-10-01 P-001: the config that ran a file is one of its proof inputs.
 describe('final worker module handoff', () => {
+  const runtime = { name: 'node', version: '25.1.0', executable: '/runtime/node',
+    binarySha256: 'a'.repeat(64), platform: 'linux', arch: 'x64',
+    nativeDependencyGeneration: 'b'.repeat(64), lockfileSha256: 'c'.repeat(64),
+    configurationSha256: 'd'.repeat(64) };
+
+  it('requires actual worker before/after measurements and rejects every changed identity dimension', async () => {
+    const { runtimeProofFingerprint } = await import('../../../scripts/lib/runtime-compatibility.mjs');
+    const reporterIdentity = `proof-v3 ${runtimeProofFingerprint(runtime)}`;
+    const inputs = { testFile: '/repo/test.ts', reads: [], opaque: [],
+      runtime: { before: runtime, after: { ...runtime } } };
+    expect(completeWorkerRuntime(inputs, reporterIdentity)).toEqual([]);
+    for (const field of Object.keys(runtime)) {
+      const value = runtime[field as keyof typeof runtime];
+      const changed = { ...runtime, [field]: field === 'name' ? 'bun'
+        : field === 'executable' ? '/runtime/other' : value.length === 64 ? 'e'.repeat(64) : `${value}-changed` };
+      expect(completeWorkerRuntime({ ...inputs, runtime: { before: changed, after: changed } }, reporterIdentity))
+        .toContain('worker-runtime-mismatch');
+      expect(completeWorkerRuntime({ ...inputs, runtime: { before: runtime, after: changed } }, reporterIdentity))
+        .toContain('worker-runtime-changed');
+    }
+    for (const missing of [null, { ...inputs, runtime: undefined },
+      { ...inputs, runtime: { before: runtime, after: null } }]) {
+      expect(completeWorkerRuntime(missing, reporterIdentity)).toContain('worker-runtime-unavailable');
+    }
+    expect(completeWorkerRuntime(inputs, null)).toContain('worker-runtime-unavailable');
+  });
+
   it('unions body imports omitted from collection diagnostics, preserving external flags', () => {
     const collection = { '/repo/static.ts': {} };
     expect(completeModuleImports(collection, { testFile: '/repo/test.ts', reads: [], opaque: [],
@@ -321,6 +350,7 @@ describe('ExecutedSourceMapReporter', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -351,13 +381,44 @@ describe('ExecutedSourceMapReporter', () => {
           // No input record for this module (capture not armed) => never reusable (D-004 rule 2).
           inputsCaptured: false,
           readPaths: [],
-          opaqueReasons: ['worker-module-imports-unavailable'],
+          opaqueReasons: ['worker-module-imports-unavailable', 'worker-runtime-unavailable'],
         },
       ],
     });
     const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
     expect(out).toMatchObject({ workspaceName: '@papercusp/test-config', recordedSha: clean.commit, worktreeDirty: false, skipped: 0 });
     expect(out.rows).toHaveLength(1);
+  });
+
+  it('binds persisted passes and failed-file retirement to a stable actual worker runtime', async () => {
+    const node = { name: 'node', version: '25.1.0', executable: '/runtime/node',
+      binarySha256: 'a'.repeat(64), platform: 'linux', arch: 'x64',
+      nativeDependencyGeneration: 'b'.repeat(64), lockfileSha256: 'c'.repeat(64),
+      configurationSha256: 'd'.repeat(64) };
+    vi.spyOn(runtimeProof, 'captureCurrentRuntimeProofIdentity').mockReturnValue(node);
+    const expected = executedSourceRunnerIdentity();
+    process.env[PC_EXECUTED_INPUTS_DIR_ENV] = tmp;
+    for (const state of ['passed', 'failed']) {
+      for (const worker of [node, { ...node, name: 'bun' }, null]) {
+        const mod = fakeModule({ state, workerImports: true });
+        const recordPath = inputsFilePath(tmp, TEST_FILE);
+        const inputs = JSON.parse(readFileSync(recordPath, 'utf8'));
+        inputs.runtime = { before: worker, after: worker };
+        writeFileSync(recordPath, JSON.stringify(inputs));
+        const { r, flushes } = reporter();
+        r.onInit({} as never);
+        await r.onTestModuleEnd(mod);
+        await r.onTestRunEnd();
+        expect(flushes).toHaveLength(1);
+        expect(flushes[0]!.runnerIdentity).toBe(worker === node ? expected : null);
+        if (state === 'passed' && worker !== node) {
+          expect(flushes[0]!.rows[0]!.opaqueReasons).toContain(
+            worker ? 'worker-runtime-mismatch' : 'worker-runtime-unavailable');
+        }
+        const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+        expect(out.completionCheckpoint.runnerIdentity).toBe(worker === node ? expected : null);
+      }
+    }
   });
 
   it('records NOTHING for a failed, a non-isolated, an import-less or a foreign module', async () => {

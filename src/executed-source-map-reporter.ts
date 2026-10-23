@@ -36,6 +36,7 @@ import { open, rename, rm } from 'node:fs/promises';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runtimeProofFingerprint } from '../../../scripts/lib/runtime-compatibility.mjs';
 
 import {
   captureWorktreeSnapshot,
@@ -90,7 +91,7 @@ export interface ExecutedSourceFlush {
 // The run context + runner identity a row is stamped with. ONE definition, shared with the
 // consumer side (test-pass-reuse-skip.ts re-checks both before skipping a file), so the value
 // recorded and the value compared can never drift apart (D-004 rules 1 and 6).
-import { executedSourceRunContext, executedSourceRunnerIdentity } from './test-pass-reuse-skip';
+import { executedSourceRunContext, executedSourceRunnerIdentity, REUSE_PROOF_FORMAT } from './test-pass-reuse-skip';
 export { executedSourceRunContext, executedSourceRunnerIdentity };
 
 /** Cap on how many untracked read paths an opaque reason names (the rest are counted). */
@@ -263,6 +264,18 @@ export function completeModuleImports(
     imports[path] = info;
   }
   return { imports, reasons: [] };
+}
+
+/** Parent identity alone cannot establish the interpreter that executed a file. */
+export function completeWorkerRuntime(inputs: InputsRecord | null, reporterIdentity: string | null): string[] {
+  const before = runtimeProofFingerprint(inputs?.runtime?.before);
+  const after = runtimeProofFingerprint(inputs?.runtime?.after);
+  if (!before || !after || !reporterIdentity) return ['worker-runtime-unavailable'];
+  const reasons: string[] = [];
+  if (before !== after) reasons.push('worker-runtime-changed');
+  if (`${REUSE_PROOF_FORMAT} ${before}` !== reporterIdentity ||
+      `${REUSE_PROOF_FORMAT} ${after}` !== reporterIdentity) reasons.push('worker-runtime-mismatch');
+  return reasons;
 }
 
 /**
@@ -578,8 +591,8 @@ function moduleIsIsolated(testModule: TestModule): boolean {
 /**
  * Default writer, per chunk: replace this run context's row for (workspace, file, sha) with
  * the newest observation (delete + target-less insert, WI-10004880), then retire this
- * context's rows at OTHER shas for the same files, so the table holds one row per test file
- * per workspace per run context per install (recorded_git_dir) rather than one per gate run.
+ * runtime's rows at OTHER shas for the same files. A result from another interpreter must never
+ * retire this runtime's proofs, even when both run in the same install and context.
  */
 export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: PgHandle): Promise<void> {
   const handle = pg ?? (await tryGetPg());
@@ -613,6 +626,7 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
          AND recorded_sha = ${flush.recordedSha}
          AND run_context IS NOT DISTINCT FROM ${flush.runContext ?? null}::text
          AND recorded_git_dir = ${flush.recordedGitDir}
+         AND runner_identity IS NOT DISTINCT FROM ${flush.runnerIdentity ?? null}::text
     `;
     await sql`
       INSERT INTO harness_shared.test_executed_sources
@@ -643,17 +657,18 @@ export async function writeExecutedSourceRows(flush: ExecutedSourceFlush, pg?: P
          AND recorded_sha <> ${flush.recordedSha}
          AND (run_context IS NULL OR run_context IS NOT DISTINCT FROM ${flush.runContext ?? null}::text)
          AND recorded_git_dir = ${flush.recordedGitDir}
+         AND runner_identity IS NOT DISTINCT FROM ${flush.runnerIdentity ?? null}::text
     `;
   }
-  // D-004 rule 5: a failure on this clean run retires EVERY pass proof this install holds for that
-  // file, including pre-1552 rows a reader could still fall back to. Another install's proofs are
-  // judged by that install's own runs.
+  // D-004 rule 5 applies to this runtime. A Bun failure says nothing about a Node pass. Unknown
+  // runtime identity can retire only unknown-identity proofs; absence is never a wildcard.
   if (flush.retiredFiles && flush.retiredFiles.length > 0 && flush.workspaceName) {
     await sql`
       DELETE FROM harness_shared.test_executed_sources
        WHERE workspace_name = ${flush.workspaceName}
          AND test_file = ANY(ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(flush.retiredFiles)}::text::jsonb)))
          AND (recorded_git_dir = ${flush.recordedGitDir} OR recorded_git_dir IS NULL)
+         AND runner_identity IS NOT DISTINCT FROM ${flush.runnerIdentity ?? null}::text
     `;
   }
 }
@@ -686,7 +701,7 @@ export interface ExecutedSourceMapResult {
    * The launcher must snapshot its initial result file before any separate retry. */
   fileResults?: {
     version: 1;
-    runnerIdentity: string;
+    runnerIdentity: string | null;
     runContext: string;
     runGroupId: string | null;
     files: Array<{ testFile: string; verdict: 'pass' | 'fail' | 'unknown' }>;
@@ -861,6 +876,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   onInit(ctx: Vitest): void {
     if (!this.armed) return;
+    this.completionContext.runnerIdentity = executedSourceRunnerIdentity();
     this.configDeps = resolveConfigDependencies(ctx);
     this.configEntries = resolveConfigEntries(ctx);
     this.configSourceCapture = this.armed.outPath
@@ -934,6 +950,10 @@ export default class ExecutedSourceMapReporter implements Reporter {
       try { collectionImports = testModule.diagnostic().importDurations as typeof collectionImports; } catch { /* unknown */ }
       const inputs = readInputsRecord(this.inputsDir, testModule.moduleId);
       const observed = completeModuleImports(collectionImports, inputs);
+      const runtimeReasons = completeWorkerRuntime(inputs, this.completionContext.runnerIdentity);
+      // A mixed or unmeasured worker population cannot stamp a reusable checkpoint
+      // or retire the reporter runtime's proofs. Null scopes retirement to unknown rows.
+      if (runtimeReasons.length) this.completionContext.runnerIdentity = null;
       let sourceEvidence: ExecutedSourceEvidence | undefined;
       let nativeFile: NonNullable<typeof this.nativeRun>['files'][number] | undefined;
       let state = 'error';
@@ -1031,7 +1051,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
         inputsCaptured: inputs !== null,
         // Absolute until flush, where classifyReadPaths relativises them against the tracked tree.
         readPaths: [...(inputs?.reads ?? []), ...(configDeps ?? [])],
-        opaqueReasons: [...(inputs?.opaque ?? []), ...observed.reasons,
+        opaqueReasons: [...(inputs?.opaque ?? []), ...observed.reasons, ...runtimeReasons,
           ...(configDeps === null ? ['config-deps-unavailable'] : [])],
         ...(sourceEvidence ? { sourceEvidence } : {}),
         ...(this.armed.outPath && inputs?.moduleEvaluations ? { moduleEvaluations: inputs.moduleEvaluations } : {}),
@@ -1094,6 +1114,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.flushed = true;
     await this.checkpointWrites;
     const rows = this.pending.splice(0);
+    if (executedSourceRunnerIdentity() !== this.completionContext.runnerIdentity)
+      this.completionContext.runnerIdentity = null;
+    if (!this.completionContext.runnerIdentity) {
+      for (const row of rows) row.opaqueReasons = [...new Set([
+        ...(row.opaqueReasons ?? []), 'worker-runtime-unavailable',
+      ])];
+    }
     let worktreeDirty = true;
     let recordedSha: string | null = null;
     try {
@@ -1140,7 +1167,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
         error,
         fileResults: {
           version: 1,
-          runnerIdentity: executedSourceRunnerIdentity(),
+          runnerIdentity: this.completionContext.runnerIdentity,
           runContext: executedSourceRunContext(),
           runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
           files: [...this.fileResults],
@@ -1200,7 +1227,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
         retiredFiles,
         workspaceName: armed.workspaceName,
         runContext: executedSourceRunContext(),
-        runnerIdentity: executedSourceRunnerIdentity(),
+        runnerIdentity: this.completionContext.runnerIdentity,
       }).then(
         () => ({ outcome: 'written' as const, error: null }),
         (e: unknown) => ({ outcome: 'failed' as const, error: e instanceof Error ? e.message : String(e) }),

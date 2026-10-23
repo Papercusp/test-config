@@ -28,6 +28,11 @@ import { pinModuleState } from '@papercusp/module-singleton';
 export const PC_EXECUTED_INPUTS_DIR_ENV = 'PC_EXECUTED_INPUTS_DIR';
 
 export interface InputsRecord {
+  /** The actual worker measures itself on both sides of this file's execution. */
+  runtime?: {
+    before: import('../../../scripts/lib/runtime-compatibility.mjs').RuntimeProofIdentity | null;
+    after: import('../../../scripts/lib/runtime-compatibility.mjs').RuntimeProofIdentity | null;
+  };
   /** Absolute path of the test file the inputs belong to. */
   testFile: string;
   /** Absolute paths read, listed or stat-ed inside the repo root (node_modules excluded). */

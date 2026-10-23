@@ -91,6 +91,11 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       expect(existsSync(run.mapPath), run.output.slice(-4000)).toBe(true);
       const map = JSON.parse(readFileSync(run.mapPath, 'utf8')) as {
         workspaceName: string;
+        completionCheckpoint: { runnerIdentity: string | null };
+        nativeRun: { files: Array<{ proof: { inputs: {
+          runtime?: { before: { name: string; executable: string } | null;
+            after: { name: string; executable: string } | null };
+        } | null } }> };
         rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[];
           executedModules?: string[]; moduleEvaluations?: { basis: string; reasons: string[];
             entries: Array<{ id: string; sha256: string; byteLength: number; codeRef?: string }>;
@@ -104,6 +109,18 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       expect(map.rows).toHaveLength(1);
       // The setup's afterAll wrote the file's inputs record and the reporter consumed it.
       expect(map.rows[0]?.inputsCaptured).toBe(true);
+      const runtime = map.nativeRun.files[0]?.proof.inputs?.runtime;
+      expect(runtime).toHaveProperty('before');
+      expect(runtime).toHaveProperty('after');
+      if (!runtime?.before || !runtime.after) {
+        expect(map.rows[0]?.opaqueReasons).toContain('worker-runtime-unavailable');
+        expect(map.completionCheckpoint.runnerIdentity).toBeNull();
+      } else {
+        // This child is launched with process.execPath; its worker must measure
+        // that interpreter rather than infer Node from Vitest's shebang.
+        expect(runtime.before.name).toBe(process.versions.bun ? 'bun' : 'node');
+        expect(runtime.after).toEqual(runtime.before);
+      }
       // P-001 (proof-v2): the config that ran the file is recorded as one of its inputs (absolute
       // in the out file, relativised at flush), so a change to it voids exactly this proof.
       expect(map.rows[0]?.readPaths).toContain(FIXTURE_CONFIG);
