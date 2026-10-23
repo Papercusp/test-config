@@ -13,6 +13,22 @@ import {
   type TestRunExecutionDetails,
 } from './execution-details.ts';
 
+describe('original LLM block custody', () => {
+  const custody = () => ({ experimentId: 'prospective', blockIndex: 0, scenarioId: 'scenario', arm: 'compact',
+    variantId: 'prospective-compact', beforeSha256: 'a'.repeat(64), afterSha256: 'b'.repeat(64),
+    requestManifestSha256: 'c'.repeat(64), pid: 123, processStartTicks: '456', runIds: ['one', 'two', 'three'] });
+  it('preserves exact metadata and leaves legacy rows valid', () => {
+    expect(parseTestRunExecutionDetails(details({ llmBlockCustody: custody() }))).toMatchObject({ llmBlockCustody: custody() });
+    expect(parseTestRunExecutionDetails(details())).toBeDefined();
+  });
+  it('rejects missing, expanded, duplicated or malformed identities', () => {
+    for (const value of [{ ...custody(), arm: 'unknown' }, { ...custody(), blockIndex: 10 },
+      { ...custody(), beforeSha256: '' }, { ...custody(), runIds: ['one', 'one', 'two'] },
+      { ...custody(), trusted: true }, { ...custody(), processStartTicks: undefined }])
+      expect(parseTestRunExecutionDetails(details({ llmBlockCustody: value }))).toBeUndefined();
+  });
+});
+
 describe('instrumented boundary custody', () => {
   const receipt = () => ({ boundary: 'graph:query:evidence', callId: 'dispatch-1', workspaceId: 'ws', harness: 'repo',
     traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), parentSpanId: 'c'.repeat(16), traceFlags: 1,

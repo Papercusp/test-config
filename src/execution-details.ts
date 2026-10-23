@@ -188,6 +188,34 @@ export function parseTestBoundaryObservations(value: unknown): TestBoundaryObser
   return value as TestBoundaryObservation[];
 }
 
+export interface RecordedLlmBlockCustody {
+  experimentId: string;
+  blockIndex: number;
+  scenarioId: string;
+  arm: 'compact' | 'full';
+  variantId: string;
+  beforeSha256: string;
+  afterSha256: string;
+  requestManifestSha256: string;
+  pid: number;
+  processStartTicks: string;
+  runIds: string[];
+}
+
+export function parseRecordedLlmBlockCustody(value: unknown): RecordedLlmBlockCustody | undefined {
+  const keys = ['experimentId', 'blockIndex', 'scenarioId', 'arm', 'variantId', 'beforeSha256', 'afterSha256',
+    'requestManifestSha256', 'pid', 'processStartTicks', 'runIds'];
+  if (!isRecord(value) || Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))
+      || !['experimentId', 'scenarioId', 'variantId'].every(key => typeof value[key] === 'string' && value[key].length > 0)
+      || !Number.isSafeInteger(value.blockIndex) || (value.blockIndex as number) < 0 || (value.blockIndex as number) > 9
+      || !['compact', 'full'].includes(value.arm as string)
+      || !['beforeSha256', 'afterSha256', 'requestManifestSha256'].every(key => typeof value[key] === 'string' && /^[a-f0-9]{64}$/.test(value[key]))
+      || !Number.isSafeInteger(value.pid) || (value.pid as number) < 1 || typeof value.processStartTicks !== 'string'
+      || !/^\d+$/.test(value.processStartTicks) || !Array.isArray(value.runIds) || value.runIds.length !== 3
+      || value.runIds.some(id => typeof id !== 'string' || !id) || new Set(value.runIds).size !== 3) return undefined;
+  return value as unknown as RecordedLlmBlockCustody;
+}
+
 export interface TestRunExecutionDetails {
   schemaVersion: typeof TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION;
   root: string;
@@ -200,6 +228,7 @@ export interface TestRunExecutionDetails {
   testLayer?: RecordedTestLayer;
   /** Identity of an individual live LLM scenario case; absent on other and older rows. */
   scenarioId?: string;
+  llmBlockCustody?: RecordedLlmBlockCustody;
   boundaryObservations?: TestBoundaryObservation[];
   passed: number;
   failed: number;
@@ -424,7 +453,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
-  'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations',
+  'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -490,6 +519,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || !isNullableString(value.runGroupId) || !isNullableString(value.workspaceId)
     || !isNullableString(value.harnessSlug) || !isNullableString(value.testNamePattern)
     || (value.scenarioId !== undefined && (typeof value.scenarioId !== 'string' || value.scenarioId.length === 0))
+    || (value.llmBlockCustody !== undefined && !parseRecordedLlmBlockCustody(value.llmBlockCustody))
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
     || (value.failedCaseTitles !== undefined && (
