@@ -4,10 +4,41 @@ import {
   MAX_RECORDED_PASSED_CASES,
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
   parseTestRunExecutionDetails,
+  parseRecordedMeasurementProvenance,
+  parseRecordedRubricCheck,
   passedCaseTitlesIncomplete,
   stableRecordedRuntimeEnvironment,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
+
+describe('bounded historical measurement contract', () => {
+  const provenance = () => ({ schemaVersion: 1, startedAt: '2026-10-23T00:00:00Z',
+    finishedAt: '2026-10-23T00:00:01Z', procedure: { sha256: 'a'.repeat(64), snapshot: '{"kind":"sql"}' },
+    diagnostics: [{ path: '$.rows[0].sample_count', value: 7 }], truncated: false, redacted: false, gaps: [] });
+  it('preserves native readings and accepts provenance-absent legacy rows', () => {
+    for (const value of [42, '9007199254740993', true, null]) {
+      const check = { id: 'c:0', rubricRef: 'r', criterionKey: 'c', kind: 'probe', value, unit: null };
+      expect(parseRecordedRubricCheck(check)).toEqual(check);
+      expect(parseRecordedRubricCheck({ ...check, provenance: provenance() }))
+        .toEqual({ ...check, provenance: provenance() });
+    }
+  });
+  it('rejects malformed, nested, nonfinite, inconsistent and UTF8-over-budget provenance', () => {
+    const p = provenance();
+    expect(parseRecordedMeasurementProvenance(p)).toEqual(p);
+    for (const invalid of [
+      { ...p, extra: true }, { ...p, startedAt: '2026-10-24T00:00:00Z' },
+      { ...p, procedure: { ...p.procedure, snapshot: JSON.stringify('界'.repeat(3000)) } },
+      { ...p, procedure: { ...p.procedure, snapshot: 'broken json' } },
+      { ...p, diagnostics: [{ path: '$.n', value: { nested: 1 } }] },
+      { ...p, diagnostics: [{ path: '$.n', value: Infinity }] },
+      { ...p, diagnostics: [{ path: '$.n', value: 'a'.repeat(257) }] },
+      { ...p, diagnostics: Array(65).fill({ path: '$.n', value: 1 }) },
+      { ...p, diagnostics: Array.from({ length: 64 }, (_, i) => ({ path: '$.' + i, value: '界'.repeat(256) })) },
+      { ...p, redacted: true }, { ...p, truncated: true }, { ...p, gaps: ['invented'] },
+    ]) expect(parseRecordedMeasurementProvenance(invalid)).toBeUndefined();
+  });
+});
 
 describe('recorded operational command scope', () => {
   it('preserves exact producer, install and window arguments while accepting legacy rows without them', () => {

@@ -241,6 +241,71 @@ export interface RecordedRubricCheck {
    * threshold change cannot silently reinterpret history. Absent when the check carried none.
    */
   expect?: RecordedRubricCheckExpect;
+  /** Original bounded measurement context; absent on legacy scalar-only rows. */
+  provenance?: RecordedMeasurementProvenance;
+}
+
+export const MAX_MEASUREMENT_PROVENANCE_BYTES = 16_384;
+export const MAX_MEASUREMENT_PROCEDURE_BYTES = 8_192;
+export const MEASUREMENT_PROVENANCE_GAPS = [
+  'procedure-truncated', 'diagnostics-truncated', 'redacted', 'transaction-clock-unavailable',
+] as const;
+
+export interface RecordedMeasurementProvenance {
+  schemaVersion: 1;
+  startedAt: string;
+  finishedAt: string;
+  transactionAt?: string;
+  /** Snapshot is sanitized canonical JSON, never an executable replay instruction. */
+  procedure: { sha256: string; snapshot: string };
+  diagnostics: Array<{ path: string; value: number | string | boolean | null }>;
+  truncated: boolean;
+  redacted: boolean;
+  gaps: Array<typeof MEASUREMENT_PROVENANCE_GAPS[number]>;
+}
+
+/** UTF8 JSON bytes, shared by producers and the strict historical reader. */
+export function measurementJsonBytes(value: unknown): number {
+  try {
+    const json = JSON.stringify(value);
+    return typeof json === 'string' ? new TextEncoder().encode(json).length : Infinity;
+  } catch { return Infinity; }
+}
+
+export function parseRecordedMeasurementProvenance(value: unknown): RecordedMeasurementProvenance | undefined {
+  if (!isRecord(value) || Object.keys(value).some(key => ![
+    'schemaVersion', 'startedAt', 'finishedAt', 'transactionAt', 'procedure', 'diagnostics', 'truncated', 'redacted', 'gaps',
+  ].includes(key)) || value.schemaVersion !== 1
+    || !isRecordedInstant(value.startedAt) || !isRecordedInstant(value.finishedAt)
+    || Date.parse(value.startedAt) > Date.parse(value.finishedAt)
+    || (value.transactionAt !== undefined && !isRecordedInstant(value.transactionAt))
+    || typeof value.truncated !== 'boolean' || typeof value.redacted !== 'boolean'
+    || !Array.isArray(value.gaps) || value.gaps.length > MEASUREMENT_PROVENANCE_GAPS.length
+    || new Set(value.gaps).size !== value.gaps.length
+    || value.gaps.some(gap => !MEASUREMENT_PROVENANCE_GAPS.includes(gap))
+    || value.redacted !== value.gaps.includes('redacted')
+    || value.truncated !== value.gaps.some(gap => gap === 'procedure-truncated' || gap === 'diagnostics-truncated')
+    || !isRecord(value.procedure) || Object.keys(value.procedure).length !== 2
+    || Object.keys(value.procedure).some(key => key !== 'sha256' && key !== 'snapshot')
+    || typeof value.procedure.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.procedure.sha256)
+    || typeof value.procedure.snapshot !== 'string'
+    || new TextEncoder().encode(value.procedure.snapshot).length > MAX_MEASUREMENT_PROCEDURE_BYTES
+    || !Array.isArray(value.diagnostics) || value.diagnostics.length > 64
+    || measurementJsonBytes(value) > MAX_MEASUREMENT_PROVENANCE_BYTES) return undefined;
+  try { JSON.parse(value.procedure.snapshot); } catch { return undefined; }
+  const paths = new Set<string>();
+  for (const entry of value.diagnostics) {
+    if (!isRecord(entry) || Object.keys(entry).length !== 2
+      || Object.keys(entry).some(key => key !== 'path' && key !== 'value')
+      || typeof entry.path !== 'string' || !entry.path.length || entry.path.length > 256
+      || paths.has(entry.path)) return undefined;
+    paths.add(entry.path);
+    const scalar = entry.value;
+    if (!(scalar === null || typeof scalar === 'boolean'
+      || (typeof scalar === 'number' && Number.isFinite(scalar))
+      || (typeof scalar === 'string' && scalar.length <= 256))) return undefined;
+  }
+  return value as unknown as RecordedMeasurementProvenance;
 }
 
 export const RECORDED_RUBRIC_CHECK_OPS = ['lt', 'lte', 'gt', 'gte', 'eq'] as const;
@@ -249,7 +314,7 @@ export interface RecordedRubricCheckExpect {
   value: number;
 }
 
-const recordedRubricCheckKeys = new Set(['id', 'rubricRef', 'criterionKey', 'kind', 'value', 'unit', 'expect']);
+const recordedRubricCheckKeys = new Set(['id', 'rubricRef', 'criterionKey', 'kind', 'value', 'unit', 'expect', 'provenance']);
 
 function isRecordedRubricCheckExpect(value: unknown): value is RecordedRubricCheckExpect {
   return isRecord(value)
@@ -269,6 +334,7 @@ export function parseRecordedRubricCheck(value: unknown): RecordedRubricCheck | 
   }
   if (!(value.unit === null || nonEmpty(value.unit))) return undefined;
   if (value.expect !== undefined && !isRecordedRubricCheckExpect(value.expect)) return undefined;
+  if (value.provenance !== undefined && !parseRecordedMeasurementProvenance(value.provenance)) return undefined;
   return value as unknown as RecordedRubricCheck;
 }
 
