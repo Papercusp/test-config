@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,6 +23,28 @@ import {
 // failure mode must run MORE tests (return no exclude entries), never fewer.
 
 const dirs: string[] = [];
+it('loads against an older runtime-proof module and runs every file when the new API is absent', () => {
+  const root = mkdtempSync(join(tmpdir(), 'legacy-proof-api-'));
+  dirs.push(root);
+  const sourceDir = join(root, 'libs/test-config/src');
+  mkdirSync(sourceDir, { recursive: true });
+  mkdirSync(join(root, 'scripts/lib'), { recursive: true });
+  writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+  writeFileSync(join(root, 'scripts/lib/runtime-compatibility.mjs'), 'export function measureRuntime() {}\n');
+  writeFileSync(join(sourceDir, 'admin-test-runs-reporter.ts'), 'export function inferWorkspaceRoot() { return "/unused"; }\n');
+  const consumer = join(sourceDir, 'test-pass-reuse-skip.ts');
+  writeFileSync(consumer, readFileSync(new URL('./test-pass-reuse-skip.ts', import.meta.url)));
+  const list = join(root, 'skip.json');
+  writeFileSync(list, JSON.stringify({ schema: REUSE_SKIP_LIST_SCHEMA, files: ['a.test.ts'],
+    runContext: 'clean-local', runnerIdentity: 'old-runtime', judgedSha: 'a'.repeat(40) }));
+  const output = execFileSync(process.execPath, ['--input-type=module', '-e',
+    'const m=await import(process.argv[1]); if(m.executedSourceRunnerIdentity()!==null)throw Error("invented identity");' +
+    'if(m.resolveReuseSkipFiles({PC_TEST_REUSE_SKIP_LIST:process.argv[2]},()=>{}).length)throw Error("unproven skip");' +
+    'process.stdout.write("legacy-runtime-proof:ran-fresh")',
+    consumer, list], { env: { ...process.env }, encoding: 'utf8', timeout: 20_000 });
+  expect(output).toContain('legacy-runtime-proof:ran-fresh');
+}, 30_000);
+
 it('loads the reuse config in native Node ESM without a bundler supplying missing import extensions', () => {
   const output = execFileSync(process.execPath, [
     '--input-type=module', '-e',

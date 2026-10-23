@@ -13,7 +13,7 @@
 // dropped here and every file runs. Every failure mode runs MORE tests, never fewer.
 
 import { readFileSync } from 'node:fs';
-import { captureCurrentRuntimeProofIdentity, runtimeProofFingerprint } from '../../../scripts/lib/runtime-compatibility.mjs';
+import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
 import { inferWorkspaceRoot } from './admin-test-runs-reporter.ts';
 
 export const PC_TEST_REUSE_SKIP_LIST_ENV = 'PC_TEST_REUSE_SKIP_LIST';
@@ -40,9 +40,11 @@ export const REUSE_PROOF_FORMAT = 'proof-v3';
 
 /** The recorder and skip consumer measure themselves, including actual Node/Bun identity. */
 export function executedSourceRunnerIdentity(): string | null {
-  const fingerprint = runtimeProofFingerprint(captureCurrentRuntimeProofIdentity({
+  // The helper and this package can commit separately. An older guarded helper
+  // means no reusable identity, rather than an ESM missing-export failure.
+  const fingerprint = runtimeProof.runtimeProofFingerprint?.(runtimeProof.captureCurrentRuntimeProofIdentity?.({
     root: inferWorkspaceRoot(),
-  }));
+  }) ?? null) ?? null;
   return fingerprint ? `${REUSE_PROOF_FORMAT} ${fingerprint}` : null;
 }
 

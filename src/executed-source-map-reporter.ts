@@ -36,7 +36,7 @@ import { open, rename, rm } from 'node:fs/promises';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runtimeProofFingerprint } from '../../../scripts/lib/runtime-compatibility.mjs';
+import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
 
 import {
   captureWorktreeSnapshot,
@@ -268,8 +268,8 @@ export function completeModuleImports(
 
 /** Parent identity alone cannot establish the interpreter that executed a file. */
 export function completeWorkerRuntime(inputs: InputsRecord | null, reporterIdentity: string | null): string[] {
-  const before = runtimeProofFingerprint(inputs?.runtime?.before);
-  const after = runtimeProofFingerprint(inputs?.runtime?.after);
+  const before = runtimeProof.runtimeProofFingerprint?.(inputs?.runtime?.before) ?? null;
+  const after = runtimeProof.runtimeProofFingerprint?.(inputs?.runtime?.after) ?? null;
   if (!before || !after || !reporterIdentity) return ['worker-runtime-unavailable'];
   const reasons: string[] = [];
   if (before !== after) reasons.push('worker-runtime-changed');
