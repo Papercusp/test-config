@@ -1,6 +1,7 @@
 /** P-016: file-level execution observations, never case-level or universal coverage. */
 import { createHash } from 'node:crypto';
-import { isAbsolute, relative } from 'node:path';
+import { isAbsolute, relative, join } from 'node:path';
+import { readFile, realpath } from 'node:fs/promises';
 
 export const COVERAGE_MAX_FILES = 200;
 export const COVERAGE_MAX_LINES = 10_000;
@@ -16,9 +17,10 @@ export interface CoverageSource {
 }
 export interface TestCoverageSnapshot {
   schemaVersion: 1;
-  /** Both roots are physical: two checkouts must never share observations. */
+  /** Physical roots, or a gate scope rebased only after every source hash agrees. */
   root: string;
   scopeRoot: string;
+  provenance?: { executionRoot: string; candidate: string };
   testFile: string;
   testSha256: string;
   observedAt: string;
@@ -26,6 +28,44 @@ export interface TestCoverageSnapshot {
   populationComplete: boolean;
   population: { path: string; sha256: string }[];
   sources: CoverageSource[];
+}
+export interface CoverageCollectionScope {
+  workspaceId: string; harnessSlug: string; executionRoot: string; repositoryRoot: string; candidate: string;
+}
+/** Separate telemetry scope: never mutate CI test_runs workspace/harness identity. */
+export function parseCoverageCollectionScope(raw: string | undefined): CoverageCollectionScope | null {
+  if (!raw || raw.length > 8_192) return null;
+  try {
+    const s = JSON.parse(raw) as CoverageCollectionScope;
+    return s && typeof s.workspaceId === 'string' && s.workspaceId.length > 0 && s.workspaceId.length <= 200
+      && typeof s.harnessSlug === 'string' && s.harnessSlug.length > 0 && s.harnessSlug.length <= 200
+      && typeof s.executionRoot === 'string' && isAbsolute(s.executionRoot)
+      && typeof s.repositoryRoot === 'string' && isAbsolute(s.repositoryRoot)
+      && typeof s.candidate === 'string' && /^[a-f0-9]{40,64}$/.test(s.candidate) ? s : null;
+  } catch { return null; }
+}
+/** Rebase only when the canonical checkout still contains every observed source byte. */
+export async function qualifyCoverageSnapshots(rows: readonly TestCoverageSnapshot[], scope: CoverageCollectionScope): Promise<TestCoverageSnapshot[]> {
+  if (await realpath(scope.executionRoot) !== scope.executionRoot
+    || await realpath(scope.repositoryRoot) !== scope.repositoryRoot) throw new Error('Coverage scope is not canonical');
+  const files = new Map<string, string>();
+  for (const row of rows) {
+    if (!parseTestCoverage(row) || row.root !== scope.executionRoot
+      || (row.scopeRoot !== row.root && coveragePath(row.root, row.scopeRoot) === null)) throw new Error('Coverage scope does not own observation');
+    for (const file of [...row.sources, ...row.population]) {
+      if (files.has(file.path) && files.get(file.path) !== file.sha256) throw new Error('Ambiguous coverage source');
+      files.set(file.path, file.sha256);
+    }
+  }
+  if (files.size > COVERAGE_MAX_FILES * 2) throw new Error('Coverage source population exceeds bound');
+  await Promise.all([...files].map(async ([path, hash]) => {
+    const absolute = await realpath(join(scope.repositoryRoot, path));
+    if (!coveragePath(scope.repositoryRoot, absolute) || coverageHash(await readFile(absolute)) !== hash)
+      throw new Error('Coverage canonical source mismatch');
+  }));
+  return rows.map(row => ({ ...row, root: scope.repositoryRoot,
+    scopeRoot: join(scope.repositoryRoot, relative(row.root, row.scopeRoot)),
+    provenance: { executionRoot: scope.executionRoot, candidate: scope.candidate } }));
 }
 export function coveragePath(root: string, absolute: string): string | null {
   const path = relative(root, absolute).replaceAll('\\', '/');
@@ -41,6 +81,8 @@ const lines = (s: unknown): s is number[] => Array.isArray(s) && s.length <= COV
 export function parseTestCoverage(value: unknown): TestCoverageSnapshot | null {
   if (!value || typeof value !== 'object') return null;
   const v = value as TestCoverageSnapshot;
+  if (v.provenance && (typeof v.provenance.executionRoot !== 'string' || !isAbsolute(v.provenance.executionRoot)
+    || typeof v.provenance.candidate !== 'string' || !/^[a-f0-9]{40,64}$/.test(v.provenance.candidate))) return null;
   if (v.schemaVersion !== 1 || typeof v.root !== 'string' || !isAbsolute(v.root)
     || typeof v.scopeRoot !== 'string' || !isAbsolute(v.scopeRoot) || !safePath(v.testFile)
     || !digest(v.testSha256) || typeof v.observedAt !== 'string' || !Number.isFinite(Date.parse(v.observedAt))
