@@ -24,7 +24,7 @@ import v8 from ${JSON.stringify(createRequire(import.meta.url).resolve('@vitest/
 import { writeFile } from 'node:fs/promises';
 export default { ...v8, getProvider: () => new TestFileCoverageProvider(rows => writeFile(${JSON.stringify(artifact)}, JSON.stringify(rows))) };
 `);
-    await writeFile(join(dir, 'vitest.config.ts'), `import { defineConfig } from ${JSON.stringify(createRequire(import.meta.url).resolve('vitest/config'))};
+    await writeFile(join(dir, 'vitest.config.ts'), `import { defineConfig } from ${JSON.stringify(join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'dist/config.js'))};
 import { executedSourceOriginalsPlugin } from ${JSON.stringify(join(here, 'vitest-config.ts'))};
 export default defineConfig({ plugins: [executedSourceOriginalsPlugin()], test: { include: ['subject.test.ts'], maxWorkers: 1,
 coverage: { enabled: true, provider: 'custom', customProviderModule: './provider.ts', include: ['subject.ts'], reporter: ['json'], reportsDirectory: './reports' } } });
