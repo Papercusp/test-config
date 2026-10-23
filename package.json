@@ -77,6 +77,8 @@
       "default": "./src/test-run-paths.ts"
     },
     "./verifier-source": "./src/verifier-source.ts",
+    "./test-coverage-map": "./src/test-coverage-map.ts",
+    "./test-coverage-store": "./src/test-coverage-store.ts",
     "./execution-details": {
       "types": "./src/execution-details.ts",
       "import": "./src/execution-details.ts",

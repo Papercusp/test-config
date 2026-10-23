@@ -292,8 +292,11 @@ interface GateOwnedParts {
 
 function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedParts {
   const executedSourceMap = executedSourceMapConfig(env);
+  const coverageRequested = process.argv.some(arg => /^--coverage(?:$|\.(?:enabled|provider)(?:=|$)|=true$)/.test(arg));
   return {
-    plugins: executedSourceMap.plugins ?? [],
+    plugins: [...(executedSourceMap.plugins ?? []),
+      ...(coverageRequested && !executedSourceMap.plugins?.some(p => p.name === 'papercusp-executed-source-originals')
+        ? [executedSourceOriginalsPlugin()] : [])],
     reporters: [
       ...(env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' ? [] : [ADMIN_TEST_RUNS_REPORTER]),
       ...executedSourceMap.reporters,
@@ -970,7 +973,9 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // change — that arrangement (each end documenting the other, nothing in the
       // middle) is the exact trap coverage-wiring.test.ts was written to catch.
       coverage: {
-        provider: 'v8',
+        // V8 collection/remapping/reports, plus bounded per-test-file observations.
+        provider: 'custom',
+        customProviderModule: resolve(__dirname, 'test-coverage-provider.ts'),
         reporter: ['text-summary', 'json', 'html', 'lcov'],
         reportsDirectory: './coverage',
         // `include` — WI-2142887. By DEFAULT v8 reports only the files a run actually
