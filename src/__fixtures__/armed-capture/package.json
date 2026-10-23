@@ -1,0 +1,8 @@
+{
+  "name": "native-channel-capture-fixture",
+  "private": true,
+  "scripts": {
+    "test": "npm run native",
+    "native": "vitest run --config vitest.config.ts --configLoader native"
+  }
+}
