@@ -288,6 +288,7 @@ describe('ExecutedSourceMapReporter', () => {
       PC_EXECUTED_SOURCE_MAP_OUT_ENV,
       PC_EXECUTED_SOURCE_MAP_RESULT_ENV,
       'PAPERCUSP_TEST_RUN_GROUP',
+      'PAPERCUSP_CHECKPOINT_QUALIFICATION_ATTEMPT_ID',
       'PAPERCUSP_MUTATION_PROBE',
       'PAPERCUSP_MUTATION_PHASE',
       PC_EXECUTED_INPUTS_DIR_ENV,
@@ -305,6 +306,7 @@ describe('ExecutedSourceMapReporter', () => {
     process.env[PC_EXECUTED_SOURCE_MAP_OUT_ENV] = join(tmp, 'out.json');
     process.env[PC_EXECUTED_SOURCE_MAP_RESULT_ENV] = join(tmp, 'result.jsonl');
     process.env.PAPERCUSP_TEST_RUN_GROUP = 'grp-1';
+    process.env.PAPERCUSP_CHECKPOINT_QUALIFICATION_ATTEMPT_ID = 'frozen-qualification-attempt';
   });
 
   const results = (): ExecutedSourceMapResult[] =>
@@ -577,6 +579,7 @@ describe('ExecutedSourceMapReporter', () => {
       expect(manifest.sha256).toBe(createHash('sha256').update(JSON.stringify(manifest.specifications)).digest('hex'));
       expect(saved.nativeRun.files).toHaveLength(1);
       expect(saved.completionCheckpoint.runGroupId).toBe('grp-1');
+      expect(saved.completionCheckpoint.qualificationAttemptId).toBe('frozen-qualification-attempt');
       expect(saved.sourceSnapshot).toEqual(clean);
       await r.onExit();
     });
@@ -635,6 +638,11 @@ describe('ExecutedSourceMapReporter', () => {
       const path = join(tmp, 'atomic.json');
       writeExecutedSourceMapSnapshot(path, { outcome: 'pass', proof: { candidate: clean.commit } });
       const previous = readFileSync(path, 'utf8');
+      const { completionIntegrity, ...body } = JSON.parse(previous);
+      expect(completionIntegrity).toEqual({ schemaVersion: 1,
+        sha256: createHash('sha256').update(JSON.stringify(body)).digest('hex') });
+      body.proof.candidate = 'corrupted';
+      expect(createHash('sha256').update(JSON.stringify(body)).digest('hex')).not.toBe(completionIntegrity.sha256);
       const circular: Record<string, unknown> = {};
       circular.self = circular;
       expect(() => writeExecutedSourceMapSnapshot(path, circular)).toThrow();

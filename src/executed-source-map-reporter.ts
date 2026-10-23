@@ -735,8 +735,12 @@ export function writeExecutedSourceMapSnapshot(path: string, payload: unknown): 
   const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
   let descriptor: number | undefined;
   try {
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload))
+      throw new Error('completion snapshot must be an object');
+    const { completionIntegrity: _priorIntegrity, ...body } = payload as Record<string, unknown>;
+    const sha256 = createHash('sha256').update(JSON.stringify(body)).digest('hex');
     descriptor = openSync(temporary, 'wx', 0o600);
-    writeFileSync(descriptor, JSON.stringify(payload));
+    writeFileSync(descriptor, JSON.stringify({ ...body, completionIntegrity: { schemaVersion: 1, sha256 } }));
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
@@ -759,6 +763,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private acknowledgedCompletionIds = new Set<string>();
   private readonly completionContext = {
     schemaVersion: 1,
+    qualificationAttemptId: process.env.PAPERCUSP_CHECKPOINT_QUALIFICATION_ATTEMPT_ID?.trim() || null,
     runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
     runContext: executedSourceRunContext(),
     runnerIdentity: executedSourceRunnerIdentity(),
@@ -786,7 +791,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     modulePopulationMatched: boolean;
     selectedManifest: { sha256: string; specifications: Array<{
       testFile: string | null; projectName: string | null; pool: string;
-      testNamePattern: string | null; testLines: number[] | null; testIds: string[] | null;
+      testNamePattern: string | null; testLines: number[] | null; testIds: string[] | null; testTagsFilter: string[] | null;
     }> } | null;
     files: Array<{ testFile: string; state: string; observedAtMs: number;
       completionId: string;
@@ -864,6 +869,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
         testNamePattern: specification.testNamePattern?.toString() ?? null,
         testLines: specification.testLines ? [...specification.testLines] : null,
         testIds: specification.testIds ? [...specification.testIds] : null,
+        testTagsFilter: specification.testTagsFilter ? [...specification.testTagsFilter] : null,
       })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
       this.nativeRun.selectedManifest = {
         sha256: createHash('sha256').update(JSON.stringify(selected)).digest('hex'),
