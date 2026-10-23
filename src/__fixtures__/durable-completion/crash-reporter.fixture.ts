@@ -13,9 +13,11 @@ function interrupt(phase: string): void {
 
 export default class CrashReporter extends ExecutedSourceMapReporter {
   override async onTestRunStart(specifications: ReadonlyArray<TestSpecification>): Promise<void> {
-    super.onTestRunStart(specifications);
     const phase = process.env.PC_COMPLETION_CRASH_WINDOW;
-    if (phase !== 'before-first-snapshot' && phase !== 'after-first-bank') return;
+    if (phase !== 'before-first-snapshot' && phase !== 'after-first-bank') {
+      super.onTestRunStart(specifications);
+      return;
+    }
     if (!process.connected || !process.send) throw new Error('pre-snapshot crash fixture requires parent IPC');
     // Bind the actual PID and independent selection before releasing the crash.
     const registered = new Promise<void>(resolve => {
@@ -28,6 +30,9 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
     });
     process.send({ kind: 'native-pre-snapshot-ready', pid: process.pid });
     await registered;
+    // Production enrolls before native execution starts. Keep that ordering in
+    // this IPC-controlled crash fixture too, including its native start clock.
+    super.onTestRunStart(specifications);
     if (phase === 'before-first-snapshot') interrupt(phase);
   }
 
