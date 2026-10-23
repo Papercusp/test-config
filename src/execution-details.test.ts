@@ -13,6 +13,20 @@ import {
   type TestRunExecutionDetails,
 } from './execution-details.ts';
 
+describe('native LLM report identities', () => {
+  it('preserves exact report identities and accepts older rows without them', () => {
+    expect(parseTestRunExecutionDetails(details({ testLayer: 'llm', llmRunIds: ['run-a', 'run-b'] })))
+      .toMatchObject({ llmRunIds: ['run-a', 'run-b'] });
+    expect(parseTestRunExecutionDetails(details())).toBeDefined();
+  });
+  it('rejects duplicate, empty, excessive and incorrectly layered report identities', () => {
+    for (const llmRunIds of [[], [''], ['run-a', 'run-a'], [42], Array(1001).fill('run'), ['x'.repeat(201)]]) {
+      expect(parseTestRunExecutionDetails(details({ testLayer: 'llm', llmRunIds }))).toBeUndefined();
+    }
+    expect(parseTestRunExecutionDetails(details({ testLayer: 'unit', llmRunIds: ['run-a'] }))).toBeUndefined();
+  });
+});
+
 describe('original LLM block custody', () => {
   const custody = () => ({ experimentId: 'prospective', blockIndex: 0, scenarioId: 'scenario', arm: 'compact',
     variantId: 'prospective-compact', beforeSha256: 'a'.repeat(64), afterSha256: 'b'.repeat(64),

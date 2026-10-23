@@ -228,6 +228,8 @@ export interface TestRunExecutionDetails {
   testLayer?: RecordedTestLayer;
   /** Identity of an individual live LLM scenario case; absent on other and older rows. */
   scenarioId?: string;
+  /** Exact rich reports emitted by this native LLM execution. */
+  llmRunIds?: string[];
   llmBlockCustody?: RecordedLlmBlockCustody;
   boundaryObservations?: TestBoundaryObservation[];
   passed: number;
@@ -449,7 +451,7 @@ export type RuntimeEnvironmentCaptureStatus =
 
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
-  'testNamePattern', 'scenarioId', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
+  'testNamePattern', 'scenarioId', 'llmRunIds', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
@@ -519,6 +521,10 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || !isNullableString(value.runGroupId) || !isNullableString(value.workspaceId)
     || !isNullableString(value.harnessSlug) || !isNullableString(value.testNamePattern)
     || (value.scenarioId !== undefined && (typeof value.scenarioId !== 'string' || value.scenarioId.length === 0))
+    || (value.llmRunIds !== undefined && (value.testLayer !== 'llm'
+      || !Array.isArray(value.llmRunIds) || value.llmRunIds.length === 0 || value.llmRunIds.length > 1000
+      || value.llmRunIds.some(id => typeof id !== 'string' || id.length === 0 || id.length > 200)
+      || new Set(value.llmRunIds).size !== value.llmRunIds.length))
     || (value.llmBlockCustody !== undefined && !parseRecordedLlmBlockCustody(value.llmBlockCustody))
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
