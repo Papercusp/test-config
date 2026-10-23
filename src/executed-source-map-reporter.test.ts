@@ -1,6 +1,9 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -28,6 +31,7 @@ import ExecutedSourceMapReporter, {
   resolveRecordedGitDir,
   shouldRecordModule,
   writeExecutedSourceMapSnapshot,
+  writeExecutedSourceMapSnapshotAsync,
   type ExecutedSourceFlush,
   type ExecutedSourceMapResult,
 } from './executed-source-map-reporter';
@@ -613,9 +617,9 @@ describe('ExecutedSourceMapReporter', () => {
       try {
         let failWrite = false;
         const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
-          (path, payload) => {
+          async (path, payload) => {
             if (failWrite) throw new Error('injected write failure');
-            writeExecutedSourceMapSnapshot(path, payload);
+            await writeExecutedSourceMapSnapshotAsync(path, payload);
           });
         recorder.onInit({} as never);
         await recorder.onTestModuleEnd(nativeModule(['passed']));
@@ -634,9 +638,118 @@ describe('ExecutedSourceMapReporter', () => {
       }
     });
 
-    it('preserves the previous snapshot and removes the temporary file on serialization failure', () => {
+    it('awaits an asynchronous snapshot before acknowledging completion or finishing the run', async () => {
+      const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      let release!: () => void;
+      const ready = new Promise<void>(resolve => { release = resolve; });
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      try {
+        const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
+          async (path, payload) => {
+            entered();
+            await ready;
+            await writeExecutedSourceMapSnapshotAsync(path, payload);
+          });
+        recorder.onInit({} as never);
+        let completed = false;
+        const pending = recorder.onTestModuleEnd(nativeModule(['passed'])).then(() => { completed = true; });
+        await started;
+        await new Promise(resolve => setImmediate(resolve));
+        expect(completed).toBe(false);
+        expect(writes.mock.calls.some(([line]) => String(line).includes('COMPLETION_ACK'))).toBe(false);
+        release();
+        await pending;
+        expect(writes.mock.calls.filter(([line]) => String(line).includes('COMPLETION_ACK'))).toHaveLength(1);
+        await recorder.onTestRunEnd();
+        expect(JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8')).completionCheckpoint.state).toBe('terminal');
+      } finally {
+        release();
+        writes.mockRestore();
+      }
+    });
+
+    it('allows real Vitest fork shutdown during delayed snapshot fsync', async () => {
+      const require = createRequire(import.meta.url);
+      writeFileSync(join(tmp, 'probe.test.ts'), 'test("tiny fork", () => expect(true).toBe(true));\n');
+      const probe = join(tmp, 'snapshot-stop.mjs');
+      writeFileSync(probe, `
+        import fs from 'node:fs';
+        import { open } from 'node:fs/promises';
+        import { syncBuiltinESMExports } from 'node:module';
+        import { Writable } from 'node:stream';
+        import { join } from 'node:path';
+        const { createVitest, ForksPoolWorker } = await import(${JSON.stringify(pathToFileURL(require.resolve('vitest/node')).href)});
+        const { writeExecutedSourceMapSnapshot, writeExecutedSourceMapSnapshotAsync } = await import(${JSON.stringify(new URL('./executed-source-map-reporter.ts', import.meta.url).href)});
+        const [root, mode] = process.argv.slice(2), events = [], logs = [];
+        const handle = await open(join(root, 'handle-' + mode), 'wx');
+        const prototype = Object.getPrototypeOf(handle), originalSync = prototype.sync;
+        await handle.close();
+        const sync = fs.fsyncSync;
+        fs.fsyncSync = function(fd) {
+          events.push('fsync-start');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
+          return sync(fd);
+        };
+        syncBuiltinESMExports();
+        prototype.sync = async function() {
+          events.push('fsync-start');
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          return originalSync.call(this);
+        };
+        let notifyStop;
+        const stopped = new Promise(resolve => { notifyStop = resolve; });
+        const stream = new Writable({ write(chunk, encoding, done) { logs.push(String(chunk)); done(); } });
+        const runner = await createVitest('test', { root, config: false, watch: false,
+          globals: true, include: ['probe.test.ts'], maxWorkers: 1, teardownTimeout: 300,
+          pool: { name: 'snapshot-forks', createPoolWorker(options) {
+            events.push('pool-created');
+            const worker = new ForksPoolWorker(options), send = worker.send.bind(worker), stop = worker.stop.bind(worker);
+            worker.send = message => {
+              send(message);
+              if (message.type === 'stop') { events.push('stop-request'); notifyStop(); }
+            };
+            worker.stop = async () => { await stop(); events.push('worker-exited'); };
+            return worker;
+          } },
+          reporters: [{ async onTestRunEnd(modules, errors, reason) {
+            if (reason !== 'passed' || errors.length || modules.length !== 1) throw new Error('tiny test did not pass');
+            await stopped;
+            await (mode === 'sync' ? writeExecutedSourceMapSnapshot : writeExecutedSourceMapSnapshotAsync)(
+              join(root, mode + '.json'), { outcome: 'pass', proof: 'same payload' });
+            events.push('snapshot-end');
+          } }],
+        }, undefined, { stdout: stream, stderr: stream });
+        try { await runner.start(); } finally { await runner.close(); }
+        const { completionIntegrity, ...body } = JSON.parse(fs.readFileSync(join(root, mode + '.json'), 'utf8'));
+        console.log(JSON.stringify({ mode, events, body, completionIntegrity,
+          warning: logs.join('').includes('Timeout terminating snapshot-forks worker') }));
+      `);
+      const results = [];
+      for (const mode of ['sync', 'async']) {
+        const { stdout } = await promisify(execFile)(process.execPath,
+          ['--import', require.resolve('tsx'), probe, tmp, mode],
+          { timeout: 20_000, maxBuffer: 1024 * 1024 });
+        results.push(JSON.parse(stdout.trim().split('\n').at(-1)!));
+      }
+      const [sync, async] = results;
+      for (const result of results) {
+        expect(result.events, JSON.stringify(result)).toContain('pool-created');
+        expect(result.events, JSON.stringify(result)).toContain('fsync-start');
+        expect(result.body).toEqual({ outcome: 'pass', proof: 'same payload' });
+        expect(result.completionIntegrity).toEqual({ schemaVersion: 1,
+          sha256: createHash('sha256').update(JSON.stringify(result.body)).digest('hex') });
+      }
+      expect(sync.warning, JSON.stringify(sync)).toBe(true);
+      expect(sync.events.indexOf('snapshot-end'), JSON.stringify(sync)).toBeLessThan(sync.events.indexOf('worker-exited'));
+      expect(async.warning, JSON.stringify(async)).toBe(false);
+      expect(async.events.indexOf('worker-exited'), JSON.stringify(async)).toBeLessThan(async.events.indexOf('snapshot-end'));
+    }, 45_000);
+
+    it.each([writeExecutedSourceMapSnapshot, writeExecutedSourceMapSnapshotAsync])(
+      'preserves the previous snapshot and removes the temporary file on serialization failure (%#)', async writer => {
       const path = join(tmp, 'atomic.json');
-      writeExecutedSourceMapSnapshot(path, { outcome: 'pass', proof: { candidate: clean.commit } });
+      await writer(path, { outcome: 'pass', proof: { candidate: clean.commit } });
       const previous = readFileSync(path, 'utf8');
       const { completionIntegrity, ...body } = JSON.parse(previous);
       expect(completionIntegrity).toEqual({ schemaVersion: 1,
@@ -645,7 +758,7 @@ describe('ExecutedSourceMapReporter', () => {
       expect(createHash('sha256').update(JSON.stringify(body)).digest('hex')).not.toBe(completionIntegrity.sha256);
       const circular: Record<string, unknown> = {};
       circular.self = circular;
-      expect(() => writeExecutedSourceMapSnapshot(path, circular)).toThrow();
+      await expect(Promise.resolve().then(() => writer(path, circular))).rejects.toThrow();
       expect(readFileSync(path, 'utf8')).toBe(previous);
       expect(readdirSync(tmp)).toEqual(['atomic.json']);
     });

@@ -32,6 +32,7 @@ import type { Reporter, TestModule, TestRunEndReason, TestSpecification, Vitest 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { open, rename, rm } from 'node:fs/promises';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -751,13 +752,37 @@ export function writeExecutedSourceMapSnapshot(path: string, payload: unknown): 
   }
 }
 
+/** Keep disk synchronization off the controller's fork-stop callback path. */
+export async function writeExecutedSourceMapSnapshotAsync(path: string, payload: unknown): Promise<void> {
+  const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
+  let descriptor: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload))
+      throw new Error('completion snapshot must be an object');
+    const { completionIntegrity: _priorIntegrity, ...body } = payload as Record<string, unknown>;
+    const sha256 = createHash('sha256').update(JSON.stringify(body)).digest('hex');
+    const bytes = JSON.stringify({ ...body, completionIntegrity: { schemaVersion: 1, sha256 } });
+    descriptor = await open(temporary, 'wx', 0o600);
+    await descriptor.writeFile(bytes);
+    await descriptor.sync();
+    await descriptor.close();
+    descriptor = undefined;
+    await rename(temporary, path);
+  } finally {
+    try { if (descriptor !== undefined) await descriptor.close(); }
+    finally { await rm(temporary, { force: true }); }
+  }
+}
+
+type SnapshotWriter = (path: string, payload: unknown) => void | Promise<void>;
+
 export default class ExecutedSourceMapReporter implements Reporter {
   private readonly armed = executedSourceMapArmed();
   private readonly repoRoot = inferWorkspaceRoot();
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: ExecutedSourceRowWriter;
   private readonly resolveGitDir: (repoRoot: string) => string | null;
-  private readonly writeSnapshot: typeof writeExecutedSourceMapSnapshot;
+  private readonly writeSnapshot: SnapshotWriter;
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
   private checkpointWrites: Promise<void> = Promise.resolve();
   private acknowledgedCompletionIds = new Set<string>();
@@ -815,14 +840,14 @@ export default class ExecutedSourceMapReporter implements Reporter {
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
     writeRows?: ExecutedSourceRowWriter,
     resolveGitDir?: (repoRoot: string) => string | null,
-    writeSnapshot?: typeof writeExecutedSourceMapSnapshot,
+    writeSnapshot?: SnapshotWriter,
   ) {
     // Vitest constructs reporters with its options object; the unit suite injects seams.
     this.readWorktreeSnapshot =
       typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
     this.writeRows = writeRows ?? ((flush) => writeExecutedSourceRows(flush));
     this.resolveGitDir = resolveGitDir ?? resolveRecordedGitDir;
-    this.writeSnapshot = writeSnapshot ?? writeExecutedSourceMapSnapshot;
+    this.writeSnapshot = writeSnapshot ?? writeExecutedSourceMapSnapshotAsync;
   }
 
   /** WI-10003715: lease on the shared PG client, so the sibling test-runs reporter's concurrent
@@ -1052,7 +1077,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
         recordedGitDir: this.resolveGitDir(this.repoRoot),
         worktreeDirty: before === null || computeWorktreeDirty(before, after),
       };
-      this.writeSnapshot(armed.outPath!, checkpoint);
+      await this.writeSnapshot(armed.outPath!, checkpoint);
       const completionIds = payload.nativeRun.files.map(file => file.completionId)
         .filter(completionId => !this.acknowledgedCompletionIds.has(completionId));
       for (const completionId of completionIds) this.acknowledgedCompletionIds.add(completionId);
@@ -1082,7 +1107,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     const summary = `ws=${this.armed.workspaceName} rows=${rows.length} skipped=${this.skipped} sha=${recordedSha ?? 'unknown'} dirty=${worktreeDirty}`;
     if (this.armed.outPath) {
       try {
-        this.writeSnapshot(
+        await this.writeSnapshot(
           this.armed.outPath,
           { workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty,
             recordedGitDir: this.resolveGitDir(this.repoRoot),
