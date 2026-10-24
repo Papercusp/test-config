@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
 
 const fixture = fileURLToPath(new URL('./__fixtures__/durable-completion', import.meta.url));
 const repoRoot = resolve(fixture, '../../../../..');
@@ -80,6 +81,11 @@ describe('atomic completion through the real Vitest lifecycle', () => {
         HARNESS_ADMIN_DATABASE_URL: 'postgresql://127.0.0.1:1/completion-crash-fixture',
         PAPERCUSP_TEST_RUNS_DB_URL: 'postgresql://127.0.0.1:1/completion-crash-fixture',
       });
+      // Probe the exact interpreter and final environment passed to this child.
+      // A mutable install without a published generation has no reusable identity.
+      const childRuntime = runtimeProof.captureRuntimeProofIdentity({ root: repoRoot,
+        cwd: fixture, environment: env, executable: process.execPath });
+      const childFingerprint = runtimeProof.runtimeProofFingerprint(childRuntime);
       const child = await runFixture(env);
       const output = `${child.stdout}\n${child.stderr}`;
       expect(child.error, output).toBeUndefined();
@@ -96,7 +102,9 @@ describe('atomic completion through the real Vitest lifecycle', () => {
         sha256: createHash('sha256').update(JSON.stringify(body)).digest('hex') });
       const files = checkpoint.nativeRun.files as Array<{ testFile: string; completionId: string;
         observedAtMs: number; state: string;
-        proof: { inputs: { testFile: string; reads: string[]; opaque: string[] } | null;
+        proof: { inputs: { testFile: string; reads: string[]; opaque: string[];
+          runtime?: { before: runtimeProof.RuntimeProofIdentity | null;
+            after: runtimeProof.RuntimeProofIdentity | null } } | null;
           sourceEvidence: { status: string; reasons: string[] } } }>;
       const selected = checkpoint.nativeRun.selectedManifest.specifications as Array<{ testFile: string;
         projectName: string; pool: string }>;
@@ -139,6 +147,10 @@ describe('atomic completion through the real Vitest lifecycle', () => {
           expect(file.proof.inputs.testFile).toBe(resolve(repoRoot, file.testFile));
           expect(file.proof.inputs.reads).toEqual(expect.any(Array));
           expect(file.proof.inputs.opaque).toEqual(expect.any(Array));
+          expect(file.proof.inputs.runtime).toHaveProperty('before');
+          expect(file.proof.inputs.runtime).toHaveProperty('after');
+          expect(file.proof.inputs.runtime?.before).toEqual(childRuntime);
+          expect(file.proof.inputs.runtime?.after).toEqual(childRuntime);
         }
         if (file.state === 'passed') expect(file.proof.inputs).not.toBeNull();
       }
@@ -146,9 +158,12 @@ describe('atomic completion through the real Vitest lifecycle', () => {
       expect(checkpoint.nativeRun.reportedModulePaths).toBeNull();
       expect(checkpoint.nativeRun.modulePopulationMatched).toBe(false);
       expect(checkpoint.nativeRun.gaps).toEqual([]);
+      const workersMatch = childFingerprint !== null && files.every(file =>
+        runtimeProof.runtimeProofFingerprint(file.proof.inputs?.runtime?.before) === childFingerprint
+        && runtimeProof.runtimeProofFingerprint(file.proof.inputs?.runtime?.after) === childFingerprint);
       expect(checkpoint.completionCheckpoint).toMatchObject({ state: 'partial',
         runGroupId: `frozen-durability-${phase}`, qualificationAttemptId: 'frozen-durability-attempt', noPersist: true,
-        runContext: 'clean-local', runnerIdentity: `proof-v3 ${process.version} ${process.platform} ${process.arch}` });
+        runContext: 'clean-local', runnerIdentity: workersMatch ? `proof-v3 ${childFingerprint}` : null });
       expect(checkpoint.configSources).toMatchObject({ schemaVersion: 'vitest-config-disk-snapshots-v1',
         scope: 'repository-vite-config-dependencies' });
       expect(checkpoint.configSources.sources.length).toBeGreaterThan(0);
