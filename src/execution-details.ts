@@ -319,7 +319,7 @@ export const RUBRIC_CHECK_FRAMEWORK = 'rubric-check' as const;
  * test file), as the spec-conformance run does for a requirement whose check is a tests check.
  * Its value is the count of passing files; the deciding test-file rows stay in the same ledger.
  */
-export const RECORDED_RUBRIC_CHECK_KINDS = ['probe', 'instrument', 'tests'] as const;
+export const RECORDED_RUBRIC_CHECK_KINDS = ['probe', 'instrument', 'tests', 'requirements'] as const;
 export type RecordedRubricCheckKind = typeof RECORDED_RUBRIC_CHECK_KINDS[number];
 
 /** One executed probe or instrument check: its id, the measured value, and that value's unit. */

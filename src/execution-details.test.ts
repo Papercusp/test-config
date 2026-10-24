@@ -13,6 +13,16 @@ import {
   type TestRunExecutionDetails,
 } from './execution-details.ts';
 
+describe('recorded requirement realization checks', () => {
+  it('roundtrips the canonical check kind without admitting unknown kinds', () => {
+    const check = { id: 'R-1:done-when', rubricRef: 'conformance:repo/plan', criterionKey: 'R-1',
+      kind: 'requirements', value: 0, unit: 'unrealized requirements' };
+    expect(parseRecordedRubricCheck(check)).toEqual(check);
+    expect(parseTestRunExecutionDetails(details({ check }))).toMatchObject({ check });
+    expect(parseRecordedRubricCheck({ ...check, kind: 'unregistered' })).toBeUndefined();
+  });
+});
+
 describe('native LLM report identities', () => {
   it('preserves exact report identities and accepts older rows without them', () => {
     expect(parseTestRunExecutionDetails(details({ testLayer: 'llm', llmRunIds: ['run-a', 'run-b'] })))
