@@ -38,6 +38,42 @@ function withArgv(...tokens: string[]): void {
   process.argv = ['node', 'vitest', 'run', ...tokens];
 }
 
+describe('native built-ins in Node-based test environments', () => {
+  it.each(['test', 'production'])('preserves built-in identities in the client resolver with NODE_ENV=%s', async nodeEnv => {
+    withArgv();
+    vi.stubEnv('NODE_ENV', nodeEnv);
+    const root = mkdtempSync(join(tmpdir(), 'vitest-native-builtins-'));
+    let server: Awaited<ReturnType<typeof createServer>> | undefined;
+    try {
+      const plugin = defineVitestConfig({ layer: 'unit' }).plugins!.find(
+        candidate => candidate && typeof candidate === 'object'
+          && 'name' in candidate && candidate.name === 'papercusp-native-node-builtins',
+      ) as Plugin;
+      writeFileSync(join(root, 'importer.ts'), "import 'node:fs';\n");
+      server = await createServer({ configFile: false, root, plugins: [plugin],
+        server: { watch: null }, optimizeDeps: { noDiscovery: true } });
+      // This is the same client resolver used by jsdom setup files. Exercise
+      // Vite itself so a production browser placeholder cannot look native.
+      for (const id of ['node:fs', 'node:os', 'node:path', 'fs/promises']) {
+        expect(await server.environments.client.pluginContainer.resolveId(id, join(root, 'importer.ts')))
+          .toMatchObject({ id, external: true });
+      }
+    } finally {
+      await server?.close();
+      rmSync(root, { recursive: true, force: true });
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('leaves real browser runs without native Node resolution', () => {
+    withArgv();
+    expect(defineVitestConfig({ layer: 'browser' }).plugins!.some(
+      candidate => candidate && typeof candidate === 'object'
+        && 'name' in candidate && candidate.name === 'papercusp-native-node-builtins',
+    )).toBe(false);
+  });
+});
+
 describe('tsconfig discovery excludes archived and generated checkouts', () => {
   it.each(['.papercusp', '_retired', 'dist', '.next'])(
     'keeps live workspace aliases without discovering %s aliases', async excluded => {
