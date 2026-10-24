@@ -1693,7 +1693,10 @@ export function missingTestRunReceiptPaths(
   return [...new Set(expectedPaths.map(path => path.replaceAll('\\', '/')))].filter(path => !inserted.has(path));
 }
 
-export function appendTestRunReceipts(env: NodeJS.ProcessEnv, receipts: readonly TestRunReceipt[]): void {
+export function appendTestRunReceipts(
+  env: Readonly<Record<string, string | undefined>>,
+  receipts: readonly TestRunReceipt[],
+): void {
   const file = env[TEST_RUN_RECEIPT_ENV]?.trim();
   if (!file || receipts.length === 0) return;
   try {
