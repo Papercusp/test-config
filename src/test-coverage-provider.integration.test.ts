@@ -43,7 +43,10 @@ coverage: { provider: 'custom', customProviderModule: ${JSON.stringify(join(here
         !/^(?:PC_|VITEST|AFFECTED_|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_|PAPERCUSP_WORKSPACE|PAPERCUSP_HARNESS)/.test(key)));
       Object.assign(env, { GREEN_CHECKPOINT: '1', PAPERCUSP_TEST_RUN_SOURCE: 'ci', PAPERCUSP_DISABLE_TEST_RUNS_REPORTER: '1',
         PC_TEST_FILE_COVERAGE_SCOPE: JSON.stringify(scope), PAPERCUSP_TEST_RUNS_DB_URL: pg.getConnectionUri() });
-      const result = await promisify(execFile)(process.execPath, [vitest, 'run', '--coverage', '--root', dir, '--config', join(dir, 'vitest.config.ts')],
+      // Load generated fixture config as native source so committed import hooks
+      // verify its dependencies individually rather than a Vite timestamp bundle.
+      const result = await promisify(execFile)(process.execPath, [vitest, 'run', '--coverage', '--root', dir,
+        '--config', join(dir, 'vitest.config.ts'), '--configLoader', 'native'],
         { cwd: resolve(here, '../../..'), env, timeout: 90_000, maxBuffer: 1_000_000 });
       const rows = await readTestCoverage(sql, scope.workspaceId, scope.harnessSlug, canonical, ['subject.ts']);
       expect(rows, result.stdout + result.stderr).toHaveLength(1);
@@ -80,7 +83,8 @@ coverage: { enabled: true, provider: 'custom', customProviderModule: './provider
       !/^(?:PC_|VITEST|AFFECTED_|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_)/.test(key)));
     Object.assign(env, { PAPERCUSP_DISABLE_TEST_RUNS_REPORTER: '1', HARNESS_ADMIN_DATABASE_URL: 'postgresql://127.0.0.1:1/unreachable',
       PAPERCUSP_TEST_RUNS_DB_URL: 'postgresql://127.0.0.1:1/unreachable' });
-    const result = await promisify(execFile)(process.execPath, [vitest, 'run', '--root', dir, '--config', join(dir, 'vitest.config.ts')],
+    const result = await promisify(execFile)(process.execPath, [vitest, 'run', '--root', dir,
+      '--config', join(dir, 'vitest.config.ts'), '--configLoader', 'native'],
       { cwd: resolve(here, '../../..'), env, timeout: 90_000, maxBuffer: 1_000_000 });
     const snapshots = JSON.parse(await readFile(artifact, 'utf8').catch(error => {
       throw new Error(`Native V8 capture missing: ${String(error)}\n${result.stdout}\n${result.stderr}`);
