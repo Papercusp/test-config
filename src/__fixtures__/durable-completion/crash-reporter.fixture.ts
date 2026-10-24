@@ -14,7 +14,7 @@ function interrupt(phase: string): void {
 export default class CrashReporter extends ExecutedSourceMapReporter {
   override async onInit(ctx: Vitest): Promise<void> {
     const phase = process.env.PC_COMPLETION_CRASH_WINDOW;
-    if (phase !== 'before-first-snapshot' && phase !== 'after-first-bank') {
+    if (phase !== 'before-first-snapshot' && phase !== 'after-first-bank' && phase !== 'primary-yield') {
       super.onInit(ctx);
       return;
     }
@@ -76,6 +76,16 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
 
   override async onTestModuleEnd(testModule: TestModule): Promise<void> {
     await super.onTestModuleEnd(testModule);
+    if (process.env.PC_COMPLETION_CRASH_WINDOW === 'primary-yield') {
+      const checkpoint = JSON.parse(readFileSync(process.env.PC_EXECUTED_SOURCE_MAP_OUT!, 'utf8'));
+      if (checkpoint.nativeRun.files.length === 1) {
+        if (!process.connected || !process.send) throw new Error('primary yield fixture requires parent IPC');
+        process.send({ kind: 'native-first-bank-ready', pid: process.pid });
+        // Keep the unfinished selection pending while the real parent boundary
+        // validates and persists its cursor. The parent owns bounded cleanup.
+        await new Promise<void>(() => {});
+      }
+    }
     if (process.env.PC_COMPLETION_CRASH_WINDOW === 'after-first-bank') {
       const checkpoint = JSON.parse(readFileSync(process.env.PC_EXECUTED_SOURCE_MAP_OUT!, 'utf8'));
       if (checkpoint.nativeRun.files.length === 1) interrupt('after-first-bank');
