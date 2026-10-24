@@ -495,6 +495,10 @@ export function describeWorktreeDirt(before: WorktreeGitSnapshot, after: Worktre
   }
   for (const [when, porcelain] of [['before', before.porcelain], ['after', after.porcelain]] as const) {
     const lines = porcelain.split('\n').filter((line) => line.trim().length > 0);
+    const summary = /^# reporter git-status summary: bytes=(\d+) lines=(\d+) sha256=([a-f0-9]{64})$/.exec(lines[0] ?? '');
+    if (summary) {
+      return `${summary[2]} porcelain line(s) ${when} the run (${summary[1]} bytes; sha256=${summary[3]}; bounded sample): ${lines.slice(1, 6).join(' | ')}`;
+    }
     if (lines.length > 0) return `${lines.length} porcelain line(s) ${when} the run: ${lines.slice(0, 5).join(' | ')}`;
   }
   return null;

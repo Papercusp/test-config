@@ -2744,6 +2744,44 @@ describe('completed Git reads across a delayed parent timer (EI-2683065978401391
   }, 15_000);
 });
 
+describe('oversized Git status provenance (EI-26835807023614872)', () => {
+  it.skipIf(process.platform === 'win32')('summarizes the complete status without losing dirty evidence or its digest', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-large-status-'));
+    const failures: string[] = [];
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'generated'));
+      for (let index = 0; index < 6_000; index++) {
+        writeFileSync(join(root, 'generated', `${String(index).padStart(5, '0')}-${'x'.repeat(175)}`), '');
+      }
+      const raw = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'],
+        { cwd: root, maxBuffer: 2 * 1024 * 1024 });
+      expect(raw.byteLength).toBeGreaterThan(1024 * 1024);
+
+      const output = await runGit('git status --porcelain --untracked-files=all', root, 10_000,
+        detail => failures.push(detail));
+      expect(output).not.toBeNull();
+      expect(failures).toEqual([]);
+      expect(output!.length).toBeLessThan(9_000);
+      expect(output).toContain(`bytes=${raw.byteLength} lines=6000 sha256=${createHash('sha256').update(raw).digest('hex')}`);
+      expect(output).toContain('?? generated/00000-');
+      const before = { commit: 'same-commit', porcelain: '' };
+      const after = { commit: 'same-commit', porcelain: output };
+      expect(computeWorktreeDirty(before, after)).toBe(true);
+      expect(describeWorktreeDirt(before, after)).toContain('6000 porcelain line(s) after the run');
+      expect(describeWorktreeDirt(before, after)).toContain('bounded sample');
+
+      // Exempting an intentional mutation must not erase omitted dirty paths.
+      const subjectRel = `generated/00000-${'x'.repeat(175)}`;
+      const exempted = exemptProbeSubject(output!, { subjectRel, nested: null });
+      expect(computeWorktreeDirty(before, { ...after, porcelain: exempted })).toBe(true);
+      expect(exempted).toContain('# reporter git-status summary:');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
 describe('runGit failure diagnostics (EI-25879692352233544)', () => {
   it.skipIf(process.platform === 'win32').each(['stdout', 'stderr'] as const)(
     'bounds %s while terminating the command without throwing (EI-26096532443968552)', async stream => {
