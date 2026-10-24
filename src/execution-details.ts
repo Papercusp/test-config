@@ -65,7 +65,7 @@ export const REGISTERED_VITEST_FILE_PROJECTS = [
     root: 'apps/operator-public',
     name: 'artifact-storage-integration',
     layer: 'integration',
-    files: ['src/routes/gcs-storage.test.ts', 'src/routes/workspace-host-artifacts.test.ts'],
+    files: ['src/routes/gcs-storage.test.ts', 'src/routes/workspace-host-artifacts.test.ts', 'src/routes/release-files.test.ts'],
   },
   {
     root: 'apps/papercusp-publish',
