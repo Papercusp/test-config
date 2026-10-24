@@ -29,10 +29,12 @@ export async function writeTestCoverage(sql: Sql, workspace: string, harness: st
 }
 
 export async function readTestCoverage(sql: Sql, workspace: string, harness: string, root: string,
-  paths: readonly string[]): Promise<TestCoverageSnapshot[]> {
+  paths: readonly string[], runGroup?: string): Promise<TestCoverageSnapshot[]> {
   if (!paths.length || paths.length > 50) return [];
+  if (runGroup !== undefined && !runGroup.trim()) return [];
   const rows = await sql<{ snapshot: unknown }[]>`SELECT snapshot FROM harness_shared.test_coverage_maps
     WHERE workspace_id = ${workspace} AND harness_slug = ${harness} AND root_path = ${root}
+      AND (${runGroup ?? null}::text IS NULL OR run_group_id = ${runGroup ?? null})
       AND observed_at > ${new Date(Date.now() - COVERAGE_RETENTION_MS).toISOString()}::timestamptz
       AND EXISTS (SELECT 1 FROM jsonb_array_elements(snapshot->'sources') s WHERE s->>'path' = ANY(${[...paths]}::text[]))
     ORDER BY observed_at DESC LIMIT 200`;
