@@ -17,7 +17,7 @@ const vitest = join(dirname(createRequire(import.meta.url).resolve('vitest/packa
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
 describe('P016 native V8 per-file collector', () => {
-  it('ingests child execution into its canonical scope and rejects source drift without changing LCOV', async () => {
+  it.each(['gate', 'reporter'] as const)('ingests child execution into its %s scope and rejects source drift without changing LCOV', async mode => {
     const pg = await startDedicatedNativePg();
     const sql = postgres(pg.getConnectionUri(), { max: 2, onnotice: () => {} });
     try {
@@ -38,26 +38,33 @@ export default defineConfig({ plugins: [executedSourceOriginalsPlugin()], test: 
 coverage: { provider: 'custom', customProviderModule: ${JSON.stringify(join(here, 'test-coverage-provider.ts'))}, include: ['subject.ts'], reporter: ['json','lcov'], reportsDirectory: './reports' } } });
 `);
       const scope = { workspaceId: 'coverage-workspace', harnessSlug: 'coverage-harness',
-        executionRoot: dir, repositoryRoot: canonical, candidate: 'a'.repeat(40) };
+        executionRoot: dir, repositoryRoot: mode === 'gate' ? canonical : dir, candidate: 'a'.repeat(40) };
       const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
         !/^(?:PC_|VITEST|AFFECTED_|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_|PAPERCUSP_WORKSPACE|PAPERCUSP_HARNESS)/.test(key)));
-      Object.assign(env, { GREEN_CHECKPOINT: '1', PAPERCUSP_TEST_RUN_SOURCE: 'ci', PAPERCUSP_DISABLE_TEST_RUNS_REPORTER: '1',
-        PC_TEST_FILE_COVERAGE_SCOPE: JSON.stringify(scope), PAPERCUSP_TEST_RUNS_DB_URL: pg.getConnectionUri() });
+      Object.assign(env, { PAPERCUSP_TEST_RUNS_DB_URL: pg.getConnectionUri(), PAPERCUSP_TEST_RUN_GROUP: 'coverage-bound-run',
+        ...(mode === 'gate' ? { GREEN_CHECKPOINT: '1', PAPERCUSP_TEST_RUN_SOURCE: 'ci',
+          PAPERCUSP_DISABLE_TEST_RUNS_REPORTER: '1', PC_TEST_FILE_COVERAGE_SCOPE: JSON.stringify(scope) }
+          : { PAPERCUSP_WORKSPACE: 'inherited-workspace', PAPERCUSP_HARNESS_SLUG: 'inherited-harness',
+            PAPERCUSP_TEST_RUN_WORKSPACE: scope.workspaceId, PAPERCUSP_TEST_RUN_HARNESS: scope.harnessSlug }) });
       // Load generated fixture config as native source so committed import hooks
       // verify its dependencies individually rather than a Vite timestamp bundle.
       const result = await promisify(execFile)(process.execPath, [vitest, 'run', '--coverage', '--root', dir,
         '--config', join(dir, 'vitest.config.ts'), '--configLoader', 'native'],
         { cwd: resolve(here, '../../..'), env, timeout: 90_000, maxBuffer: 1_000_000 });
-      const rows = await readTestCoverage(sql, scope.workspaceId, scope.harnessSlug, canonical, ['subject.ts']);
+      const rows = await readTestCoverage(sql, scope.workspaceId, scope.harnessSlug, scope.repositoryRoot,
+        ['subject.ts'], 'coverage-bound-run');
       expect(rows, result.stdout + result.stderr).toHaveLength(1);
-      expect(rows[0]).toMatchObject({ root: canonical, scopeRoot: canonical, testFile: 'subject.test.ts',
-        provenance: { executionRoot: dir, candidate: scope.candidate }, populationComplete: true });
+      expect(rows[0]).toMatchObject({ root: scope.repositoryRoot, scopeRoot: scope.repositoryRoot,
+        testFile: 'subject.test.ts', populationComplete: true,
+        ...(mode === 'gate' ? { provenance: { executionRoot: dir, candidate: scope.candidate } } : {}) });
       expect(rows[0]!.sources[0]!.covered).toContain(2);
       expect(rows[0]!.sources[0]!.covered).not.toContain(3);
-      expect(await readTestCoverage(sql, 'other-workspace', scope.harnessSlug, canonical, ['subject.ts'])).toEqual([]);
+      expect(await readTestCoverage(sql, 'inherited-workspace', 'inherited-harness', dir, ['subject.ts'])).toEqual([]);
+      expect(await readTestCoverage(sql, scope.workspaceId, scope.harnessSlug, scope.repositoryRoot,
+        ['subject.ts'], 'another-run')).toEqual([]);
       expect(await readFile(join(dir, 'reports/lcov.info'), 'utf8')).toContain('SF:subject.ts');
       expect(await readFile(join(dir, 'reports/coverage-final.json'), 'utf8')).toContain('subject.ts');
-      await writeFile(join(canonical, 'subject.ts'), source + '// newer source\n');
+      await writeFile(join(scope.repositoryRoot, 'subject.ts'), source + '// newer source\n');
       await expect(qualifyCoverageSnapshots([{ ...rows[0]!, root: dir, scopeRoot: dir }], scope))
         .rejects.toThrow('canonical source mismatch');
     } finally { await sql.end({ timeout: 3 }); await pg.stop(); }
