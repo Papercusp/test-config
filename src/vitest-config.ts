@@ -5,7 +5,6 @@ import { configDefaults, defineConfig, type ViteUserConfig as UserConfig } from 
 import tsconfigPaths from 'vite-tsconfig-paths';
 import type { Plugin } from 'vite';
 import { createHash } from 'node:crypto';
-import { isBuiltin } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -772,17 +771,7 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
     // and archived checkouts cannot add resolvers or delay every focused run.
     plugins: [tsconfigPaths({ ignoreConfigErrors: true,
       skip: dir => ['.papercusp', '_retired', 'dist', '.next'].includes(dir),
-    }), ...(layer === 'browser' ? [] : [{
-      name: 'papercusp-native-node-builtins',
-      enforce: 'pre' as const,
-      resolveId(id: string) {
-        // jsdom uses Vite's client transform while still executing in Node.
-        // In production mode Vite drops the built-in name from its browser
-        // placeholder, so Vitest attempts to import the invalid module node:.
-        // Preserve native resolution in Node workers, including setup files.
-        if (isBuiltin(id)) return { id, external: true };
-      },
-    } satisfies Plugin]), ...gate.plugins],
+    }), ...gate.plugins],
     // Use a project-local Vite cache dir instead of os.tmpdir() (which is
     // TMPDIR=/tmp/claude on this dev box — a read-only path that doesn't
     // exist, causing every vitest run to ENOENT on the ssr/ sub-directory
