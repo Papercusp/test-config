@@ -6,7 +6,8 @@ import type { Sql } from 'postgres';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { readExecutedSourceOriginals } from './vitest-config.ts';
-import { inferWorkspaceRoot, isMutationProbeRun, tryGetPg } from './admin-test-runs-reporter.ts';
+import { inferWorkspaceRoot, isMutationProbeRun, resolveTestRunHarnessSlug,
+  resolveTestRunWorkspaceId, tryGetPg } from './admin-test-runs-reporter.ts';
 import { COVERAGE_MAX_FILES, coverageHash, coverageLines, coveragePath, parseTestCoverage,
   parseCoverageCollectionScope, qualifyCoverageSnapshots,
   type TestCoverageSnapshot } from './test-coverage-map.ts';
@@ -99,8 +100,10 @@ async function persistSnapshots(snapshots: TestCoverageSnapshot[]): Promise<void
   if (process.env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' && !scope) return;
   const qualified = scope ? await qualifyCoverageSnapshots(snapshots, scope) : snapshots;
   const pg = await tryGetPg();
-  const workspace = scope?.workspaceId ?? process.env.PAPERCUSP_WORKSPACE;
-  const harness = scope?.harnessSlug ?? process.env.PAPERCUSP_HARNESS_SLUG;
+  // Coverage and test_runs must share the reporter's ledger-only overrides.
+  // Private native runtimes intentionally inherit a different caller harness.
+  const workspace = scope?.workspaceId ?? resolveTestRunWorkspaceId();
+  const harness = scope?.harnessSlug ?? resolveTestRunHarnessSlug();
   if (!pg || !workspace || !harness) throw new Error('Coverage persistence scope or sink unavailable');
   await writeTestCoverage(pg.sql as unknown as Sql, workspace, harness, qualified,
     process.env.PAPERCUSP_TEST_RUN_GROUP ?? null);
