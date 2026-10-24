@@ -30,7 +30,8 @@
 
 import type { Reporter, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
-import { exec, spawn } from 'node:child_process';
+import { exec } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -549,79 +550,48 @@ export function runGit(
   });
 }
 
-/** Built-ins only, like the reporter; the script runner's group-kill helper cannot be loaded here. */
+/** Built-ins-only bridge to the independent deadline and process-group owner. */
 function runGitProcessGroup(
   cmd: string, cwd: string, timeoutMs: number, onFailure?: (diagnostic: string) => void,
 ): Promise<string | null> {
   return new Promise((resolveP) => {
     const startedAt = Date.now();
     let settled = false;
-    let killed = false;
-    let stdout = '';
-    let stderr = '';
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let timeoutTurn: ReturnType<typeof setImmediate> | undefined;
-    let child: ReturnType<typeof spawn> | undefined;
-    let terminationReason: string | undefined;
-    const finish = (error?: unknown, code: string | number | null = null, signal: string | null = null) => {
+    let groupPid: number | undefined;
+    const finish = (output: string | null, diagnostic?: string) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
-      if (timeoutTurn) clearImmediate(timeoutTurn);
-      if (error || killed || code !== 0) {
-        const failure = error as { code?: string | number; message?: string } | undefined;
-        try {
-          onFailure?.(JSON.stringify({ command: cmd, timeoutMs, elapsedMs: Date.now() - startedAt,
-            code: failure?.code ?? code, signal, killed,
-            message: (terminationReason ?? failure?.message ?? '').slice(0, 512),
-            stderr: stderr.trim().slice(-512) }));
-        } catch { /* Diagnostics must obey the reporter's fail-soft contract too. */ }
-        resolveP(null);
-      } else resolveP(stdout.trim());
+      try { if (diagnostic) onFailure?.(diagnostic); }
+      catch { /* Diagnostics obey the reporter's fail-soft contract too. */ }
+      resolveP(output);
     };
-    const stop = (reason: string) => {
-      if (settled || killed) return;
-      killed = true;
-      terminationReason = reason;
-      // SIGKILL makes the read budget a bound even for a Git helper that ignores
-      // SIGTERM. The group may survive its shell, so signal it before the child.
-      try { if (child?.pid) process.kill(-child.pid, 'SIGKILL'); }
-      catch { try { child?.kill('SIGKILL'); } catch { /* Already gone. */ } }
-      child?.stdout?.destroy();
-      child?.stderr?.destroy();
-      // A blocked event loop can run this timer before reading an already-exited
-      // child's output. Such an attempt is still unreadable, never false-clean.
-      finish(undefined, child?.exitCode ?? null, child?.signalCode ?? 'SIGKILL');
+    const failedWorker = (error: unknown) => {
+      if (settled) return;
+      try { if (groupPid) process.kill(-groupPid, 'SIGKILL'); }
+      catch { /* The worker may already have reaped the command. */ }
+      finish(null, JSON.stringify({ command: cmd, timeoutMs, elapsedMs: Date.now() - startedAt,
+        code: null, signal: null, killed: Boolean(groupPid),
+        message: `git reader worker: ${error instanceof Error ? error.message : String(error)}`.slice(0, 512),
+        stderr: '' }));
     };
     try {
-      child = spawn(cmd, { cwd, shell: true, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-      child.stdout?.setEncoding('utf8');
-      child.stderr?.setEncoding('utf8');
-      child.stdout?.on('data', (chunk: string) => {
-        stdoutBytes += Buffer.byteLength(chunk);
-        if (stdoutBytes > 1024 * 1024) stop('stdout maxBuffer length exceeded');
-        else stdout += chunk;
+      // Own the command deadline and pipe collection outside Vitest's event
+      // loop. A synchronous reporter/import must not kill a child that already
+      // completed, or turn unread stdout into a clean reading. The worker uses
+      // the existing process-group, output-limit and null-on-failure contract.
+      const worker = new Worker(new URL('./git-read-worker.mjs', import.meta.url), {
+        workerData: { cmd, cwd, timeoutMs }, execArgv: [],
       });
-      child.stderr?.on('data', (chunk: string) => {
-        stderrBytes += Buffer.byteLength(chunk);
-        if (stderrBytes > 1024 * 1024) stop('stderr maxBuffer length exceeded');
-        else stderr += chunk;
+      worker.on('message', (message: { type: string; pid?: number; output?: string | null; diagnostic?: string }) => {
+        if (message.type === 'spawned' && Number.isSafeInteger(message.pid)) groupPid = message.pid;
+        else if (message.type === 'result') finish(typeof message.output === 'string' ? message.output : null,
+          message.diagnostic);
       });
-      child.once('error', error => finish(error));
-      child.once('close', (code, signal) => finish(undefined, code, signal));
-      if (timeoutMs > 0) timer = setTimeout(() => {
-        // A delayed timer can precede pending I/O from an already-exited child.
-        // Allow a poll/close pass to deliver its complete reading before killing
-        // the group. Only a successful close accepts output; a still-running or
-        // incomplete command keeps the same bounded kill/null path.
-        timeoutTurn = setImmediate(() => {
-          if (settled) return;
-          timeoutTurn = setImmediate(() => stop('command timed out'));
-        });
-      }, timeoutMs);
-    } catch (error) { finish(error); }
+      worker.once('error', failedWorker);
+      worker.once('exit', code => {
+        if (!settled) failedWorker(`exited ${code} without a complete reading`);
+      });
+    } catch (error) { failedWorker(error); }
   });
 }
 async function resolveGitContext(): Promise<GitContext> {

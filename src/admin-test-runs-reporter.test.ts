@@ -2710,12 +2710,11 @@ describe('completed Git reads across a delayed parent timer (EI-2683065978401391
       'fs.writeSync(1, process.argv[3]);',
       'process.on("exit", () => fs.writeFileSync(process.argv[2], String(process.pid)));',
     ].join('\n'));
-    // Only the deadline is fake. Keep child I/O and immediate callbacks real,
-    // and independently observe kernel exit before delivering the overdue timer.
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    // Observe real kernel exit while the reporter loop is blocked, then keep
+    // that loop blocked beyond its deadline. The reader must own its own clock.
     const pending = runGit(
       `${quote(process.execPath)} ${quote(script)} ${quote(marker)} ${quote(output)}`,
-      root, 500, detail => failures.push(detail),
+      root, 2_000, detail => failures.push(detail),
     );
     try {
       const deadline = Date.now() + 5_000;
@@ -2735,12 +2734,10 @@ describe('completed Git reads across a delayed parent timer (EI-2683065978401391
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
       }
       expect(exited, 'the independent producer must exit before timer delivery').toBe(true);
-      vi.advanceTimersByTime(500);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_100);
       expect(await pending).toBe(output);
       expect(failures).toEqual([]);
     } finally {
-      vi.runOnlyPendingTimers();
-      vi.useRealTimers();
       await pending;
       rmSync(root, { recursive: true, force: true });
     }
