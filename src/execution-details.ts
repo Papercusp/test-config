@@ -63,6 +63,18 @@ export function isRecordedTestLayer(value: unknown): value is RecordedTestLayer 
 export const REGISTERED_VITEST_FILE_PROJECTS = [
   {
     root: 'apps/operator-public',
+    name: 'artifact-storage-integration',
+    layer: 'integration',
+    files: ['src/routes/gcs-storage.test.ts', 'src/routes/workspace-host-artifacts.test.ts'],
+  },
+  {
+    root: 'apps/papercusp-publish',
+    name: 'archive-storage-integration',
+    layer: 'integration',
+    files: ['src/archive-storage.test.ts'],
+  },
+  {
+    root: 'apps/operator-public',
     name: 'wallet-binding-calibration-integration',
     layer: 'integration',
     files: ['src/__tests__/wallet-binding-calibration.test.ts'],
