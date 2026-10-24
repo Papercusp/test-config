@@ -12,7 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -2695,6 +2695,56 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     expect(rows[0].executionDetails).toMatchObject({ worktreeDirty: true,
       worktreeDirtyReason: 'git status unreadable before the run: status code=128 stderr=denied' });
   });
+});
+
+describe('completed Git reads across a delayed parent timer (EI-26830659784013914)', () => {
+  it.skipIf(process.platform !== 'linux').each(['', '?? untracked-positive-control.ts'])
+  ('retains the complete %j reading when the producer exited before timeout delivery', async output => {
+    const root = mkdtempSync(join(tmpdir(), 'completed-git-read-'));
+    const marker = join(root, 'exited.pid');
+    const script = join(root, 'producer.cjs');
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const failures: string[] = [];
+    writeFileSync(script, [
+      'const fs = require("node:fs");',
+      'fs.writeSync(1, process.argv[3]);',
+      'process.on("exit", () => fs.writeFileSync(process.argv[2], String(process.pid)));',
+    ].join('\n'));
+    // Only the deadline is fake. Keep child I/O and immediate callbacks real,
+    // and independently observe kernel exit before delivering the overdue timer.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const pending = runGit(
+      `${quote(process.execPath)} ${quote(script)} ${quote(marker)} ${quote(output)}`,
+      root, 500, detail => failures.push(detail),
+    );
+    try {
+      const deadline = Date.now() + 5_000;
+      let exited = false;
+      while (Date.now() < deadline) {
+        if (existsSync(marker)) {
+          const pid = Number(readFileSync(marker, 'utf8'));
+          try {
+            const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+            exited = stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z ');
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') exited = true;
+            else throw error;
+          }
+          if (exited) break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+      expect(exited, 'the independent producer must exit before timer delivery').toBe(true);
+      vi.advanceTimersByTime(500);
+      expect(await pending).toBe(output);
+      expect(failures).toEqual([]);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      await pending;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 describe('runGit failure diagnostics (EI-25879692352233544)', () => {

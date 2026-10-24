@@ -562,12 +562,14 @@ function runGitProcessGroup(
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutTurn: ReturnType<typeof setImmediate> | undefined;
     let child: ReturnType<typeof spawn> | undefined;
     let terminationReason: string | undefined;
     const finish = (error?: unknown, code: string | number | null = null, signal: string | null = null) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (timeoutTurn) clearImmediate(timeoutTurn);
       if (error || killed || code !== 0) {
         const failure = error as { code?: string | number; message?: string } | undefined;
         try {
@@ -609,7 +611,16 @@ function runGitProcessGroup(
       });
       child.once('error', error => finish(error));
       child.once('close', (code, signal) => finish(undefined, code, signal));
-      if (timeoutMs > 0) timer = setTimeout(() => stop('command timed out'), timeoutMs);
+      if (timeoutMs > 0) timer = setTimeout(() => {
+        // A delayed timer can precede pending I/O from an already-exited child.
+        // Allow a poll/close pass to deliver its complete reading before killing
+        // the group. Only a successful close accepts output; a still-running or
+        // incomplete command keeps the same bounded kill/null path.
+        timeoutTurn = setImmediate(() => {
+          if (settled) return;
+          timeoutTurn = setImmediate(() => stop('command timed out'));
+        });
+      }, timeoutMs);
     } catch (error) { finish(error); }
   });
 }
