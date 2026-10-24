@@ -4,7 +4,7 @@
  */
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Worker } from 'node:worker_threads';
 
@@ -135,6 +135,10 @@ export function verifierSourceFiles(root: string, {
   includedPaths?: ReadonlySet<string>;
   progress?: (record: VerifierSourceProgress) => void } = {}): VerifierSourceFile[] {
   const rows: VerifierSourceFile[] = [];
+  // Archives include large recorded binaries. Allocating a complete Buffer for
+  // each file repeatedly faults/collects gigabytes on every completion census.
+  // Reuse bounded storage, but still open and hash every byte on every census.
+  const readBuffer = Buffer.allocUnsafe(1024 * 1024);
   let bytesRead = 0;
   let lastReportedFiles = -256;
   let nextReportAt = 0;
@@ -230,8 +234,9 @@ export function verifierSourceFiles(root: string, {
         // file count/time, and name a large read before it can block or be killed.
         if (progress && (rows.length - lastReportedFiles >= 256 || Date.now() >= nextReportAt
           || stat.size >= 16 * 1024 * 1024)) report(rel);
-        const bytes = stat.isSymbolicLink() ? readlinkSync(path) : readFileSync(path);
+        const hash = createHash('sha256');
         if (stat.isSymbolicLink()) {
+          const bytes = readlinkSync(path);
           const target = resolve(dirname(path), String(bytes));
           const boundary = resolve(symlinkRoot);
           if (isAbsolute(String(bytes)) || target !== boundary && !target.startsWith(`${boundary}${sep}`)) {
@@ -244,10 +249,22 @@ export function verifierSourceFiles(root: string, {
             if (actual !== boundary && !actual.startsWith(`${boundary}${sep}`))
               throw new VerifierSourceError(`dependency symlink escapes source root: ${rel}`);
           }
+          hash.update(bytes);
+          bytesRead += Buffer.byteLength(bytes);
+        } else {
+          const fd = openSync(path, 'r');
+          try {
+            let length: number;
+            while ((length = readSync(fd, readBuffer, 0, readBuffer.length, null)) !== 0) {
+              hash.update(readBuffer.subarray(0, length));
+              bytesRead += length;
+            }
+          } finally {
+            closeSync(fd);
+          }
         }
         rows.push({ path: rel, kind: stat.isSymbolicLink() ? 'symlink' : 'file',
-          executable: Boolean(stat.mode & 0o111), sha256: createHash('sha256').update(bytes).digest('hex') });
-        bytesRead += Buffer.byteLength(bytes);
+          executable: Boolean(stat.mode & 0o111), sha256: hash.digest('hex') });
       }
     }
   }
