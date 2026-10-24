@@ -14,7 +14,9 @@ import { writeTestCoverage } from './test-coverage-store.ts';
 
 export class TestFileCoverageProvider extends V8CoverageProvider {
   constructor(private readonly publish: (snapshots: TestCoverageSnapshot[]) => Promise<void> = persistSnapshots) { super(); }
-  override async generateCoverage(context: ReportContext) {
+  // Keep declaration emission independent of the donor node_modules realpath
+  // when the maintained committed verifier links dependencies into its clone.
+  override async generateCoverage(context: ReportContext): Promise<Awaited<ReturnType<V8CoverageProvider['generateCoverage']>>> {
     const original = this.coverageFiles;
     const cleanOnRerun = this.options.cleanOnRerun;
     const snapshots: TestCoverageSnapshot[] = [];
