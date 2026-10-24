@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TestModule } from 'vitest/node';
 import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
+import { jsonChunks, jsonSha256, readCompletionJsonSync } from '../../../scripts/lib/completion-snapshot.mjs';
 import { executedSourceOriginalsPlugin } from './vitest-config';
 // The router stays plain Node; exercise its output routing with the real reporter.
 // @ts-expect-error the executable .mjs router has no declaration file
@@ -37,6 +38,54 @@ import ExecutedSourceMapReporter, {
   type ExecutedSourceFlush,
   type ExecutedSourceMapResult,
 } from './executed-source-map-reporter';
+
+describe('bounded completion JSON', () => {
+  it('matches JSON serialization and digest semantics across chunk and UTF-8 boundaries', () => {
+    const value = { absent: undefined, arrays: [undefined, null, NaN, Infinity, -0],
+      date: new Date('2026-10-24T00:00:00Z'), unicode: '\ud83d\ude42é\ud800',
+      many: Array.from({ length: 1000 }, (_, i) => ({ i, text: 'é🙂'.repeat(80) })),
+      special: JSON.parse('{"__proto__":{"safe":true},"duplicate":1,"duplicate":2}') };
+    const expected = JSON.stringify(value);
+    expect([...jsonChunks(value)].join('')).toBe(expected);
+    expect(jsonSha256(value)).toBe(createHash('sha256').update(expected).digest('hex'));
+    const dir = mkdtempSync(join(tmpdir(), 'completion-json-'));
+    try {
+      const path = join(dir, 'out.json');
+      writeFileSync(path, expected);
+      expect(readCompletionJsonSync(path, 7)).toEqual(JSON.parse(expected));
+      for (const invalid of ['{"a":', '{"a":1', '{"a":1} trailing', '{"a":1,}', '[1,]']) {
+        writeFileSync(path, invalid);
+        expect(() => readCompletionJsonSync(path, 7)).toThrow();
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([writeExecutedSourceMapSnapshot, writeExecutedSourceMapSnapshotAsync])(
+    'round-trips a large completion population without serializing its aggregate (%#)', async writer => {
+      const dir = mkdtempSync(join(tmpdir(), 'completion-population-'));
+      const payload = { rows: Array.from({ length: 1000 }, (_, i) => ({
+        testFile: `tests/${i}.test.ts`, proof: 'observed-source-🙂'.repeat(100),
+      })), completionIntegrity: { schemaVersion: 0, sha256: 'stale' } };
+      const expectedHash = createHash('sha256').update(JSON.stringify({ rows: payload.rows })).digest('hex');
+      const stringify = JSON.stringify;
+      const guard = vi.spyOn(JSON, 'stringify').mockImplementation(((value: unknown, ...args: unknown[]) => {
+        if (Array.isArray(value) || (value && typeof value === 'object' && 'rows' in value))
+          throw new RangeError('Invalid string length: aggregate serialization forbidden');
+        return Reflect.apply(stringify, JSON, [value, ...args]);
+      }) as typeof JSON.stringify);
+      try {
+        const path = join(dir, 'out.json');
+        await writer(path, payload);
+        const saved = readCompletionJsonSync(path);
+        expect(saved.rows).toEqual(payload.rows);
+        expect(saved.completionIntegrity).toEqual({ schemaVersion: 1, sha256: expectedHash });
+        expect(jsonSha256({ rows: saved.rows })).toBe(expectedHash);
+      } finally {
+        guard.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+});
 
 // gate-test-reuse-yield-2026-10-01 P-001: the config that ran a file is one of its proof inputs.
 describe('final worker module handoff', () => {

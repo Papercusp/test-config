@@ -37,6 +37,7 @@ import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from '.
 import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
+import { completionSnapshotChunks } from '../../../scripts/lib/completion-snapshot.mjs';
 
 import {
   captureWorktreeSnapshot,
@@ -751,12 +752,8 @@ export function writeExecutedSourceMapSnapshot(path: string, payload: unknown): 
   const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
   let descriptor: number | undefined;
   try {
-    if (payload === null || typeof payload !== 'object' || Array.isArray(payload))
-      throw new Error('completion snapshot must be an object');
-    const { completionIntegrity: _priorIntegrity, ...body } = payload as Record<string, unknown>;
-    const sha256 = createHash('sha256').update(JSON.stringify(body)).digest('hex');
     descriptor = openSync(temporary, 'wx', 0o600);
-    writeFileSync(descriptor, JSON.stringify({ ...body, completionIntegrity: { schemaVersion: 1, sha256 } }));
+    for (const chunk of completionSnapshotChunks(payload)) writeFileSync(descriptor, chunk);
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
@@ -772,13 +769,8 @@ export async function writeExecutedSourceMapSnapshotAsync(path: string, payload:
   const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
   let descriptor: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    if (payload === null || typeof payload !== 'object' || Array.isArray(payload))
-      throw new Error('completion snapshot must be an object');
-    const { completionIntegrity: _priorIntegrity, ...body } = payload as Record<string, unknown>;
-    const sha256 = createHash('sha256').update(JSON.stringify(body)).digest('hex');
-    const bytes = JSON.stringify({ ...body, completionIntegrity: { schemaVersion: 1, sha256 } });
     descriptor = await open(temporary, 'wx', 0o600);
-    await descriptor.writeFile(bytes);
+    for (const chunk of completionSnapshotChunks(payload)) await descriptor.writeFile(chunk);
     await descriptor.sync();
     await descriptor.close();
     descriptor = undefined;
