@@ -949,7 +949,12 @@ afterEach(() => {
 describe('WI-1702898 — a test_runs row must be joinable to the sha it judged', () => {
   const saved = { ...process.env };
   afterEach(() => {
-    process.env = { ...saved };
+    // Keep Node's native environment object. Replacing it with an ordinary
+    // object detaches later stubEnv writes from new Worker environments.
+    for (const key of Object.keys(process.env)) {
+      if (!Object.hasOwn(saved, key)) delete process.env[key];
+    }
+    Object.assign(process.env, saved);
   });
 
   it('refuses to record a DIRTY-TREE run as source=ci', () => {
