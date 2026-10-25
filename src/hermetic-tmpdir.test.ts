@@ -31,7 +31,8 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -305,6 +306,37 @@ describe('cloud tutorial Chromium netlog retention', () => {
 });
 
 describe('sweepStaleTestScratch', () => {
+  it.skipIf(process.platform !== 'linux')('retains an aged live postmaster, while rejecting dead and recycled ownership', async () => {
+    const age = GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 3;
+    const live = seedNamed('papercusp-test-pg-live', age);
+    const child = spawn(process.execPath, ['-e',
+      "process.stdout.write('ready'); setInterval(() => {}, 1000)", '--', '-D', live],
+    { argv0: 'postgres', stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      await once(child.stdout, 'data');
+      writeFileSync(join(live, 'postmaster.pid'), `${child.pid}\n${live}\n`);
+      const dead = seedNamed('papercusp-test-pg-dead', age);
+      writeFileSync(join(dead, 'postmaster.pid'), `0\n${dead}\n`);
+      const recycled = seedNamed('papercusp-test-pg-recycled', age);
+      writeFileSync(join(recycled, 'postmaster.pid'), `${process.pid}\n${recycled}\n`);
+      const wrongDir = seedNamed('papercusp-test-pg-wrong-dir', age);
+      writeFileSync(join(wrongDir, 'postmaster.pid'), `${child.pid}\n${wrongDir}\n`);
+      // Writing the ownership records changes directory mtime; retain the
+      // expired-age precondition after constructing the real process evidence.
+      for (const path of [live, dead, recycled, wrongDir]) {
+        const when = (Date.now() - age) / 1000;
+        utimesSync(path, when, when);
+      }
+      expect(sweepStaleTestScratch(root, { startAt: 0 }).removed).toBe(3);
+      expect(existsSync(live)).toBe(true);
+      expect([dead, recycled, wrongDir].map(existsSync)).toEqual([false, false, false]);
+    } finally {
+      const exited = once(child, 'exit');
+      child.kill();
+      await exited;
+    }
+  });
+
   // These dirs are NOT pid-stamped (17 real test files mint their own prefix
   // directly at the TMPDIR root — WI-38869), so every case here is a non-pid name.
 

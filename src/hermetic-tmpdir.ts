@@ -132,7 +132,7 @@
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 // This source package is also imported by native Node CLI entry points.
@@ -158,9 +158,8 @@ export const HERMETIC_SWEEP_SCAN_CAP = 400;
 
 /**
  * For the ROOT-LEVEL, age-only sweep (`sweepStaleTestScratch`) only — entries here
- * are not pid-stamped, so age is the only safe signal (see the module doc's
- * "SAME leak, unbounded" section). 4h is far longer than any real test run
- * (integration suites run tens of minutes) and far shorter than useful.
+ * are not pid-stamped, so age bounds unowned scratch. A live postmaster's
+ * directory has separate process/path evidence and can outlive a full test run.
  */
 export const GENERIC_SCRATCH_SWEEP_MAX_AGE_MS = 4 * 60 * 60 * 1_000;
 /**
@@ -269,6 +268,25 @@ export interface SweepResult {
  * concurrently. A racing peer that removes an entry between our readdir and our
  * rm is the NORMAL case, not an error, and cleanup must never fail a test run.
  */
+function hasLivePostmaster(path: string): boolean {
+  try {
+    const [rawPid, dataDir] = readFileSync(join(path, 'postmaster.pid'), 'utf8').split('\n');
+    const pid = Number(rawPid);
+    if (!creatorIsAlive(pid) || !dataDir || realpathSync(dataDir) !== realpathSync(path)) return false;
+    // Binding the process to this exact data directory also rejects a recycled
+    // PID. On other platforms, retain a live recorded owner conservatively.
+    if (process.platform !== 'linux') return true;
+    const argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+    const dataIndex = argv.indexOf('-D');
+    return /(?:^|\/)postgres$/.test(argv[0]) && dataIndex >= 0 &&
+      realpathSync(argv[dataIndex + 1]) === realpathSync(path);
+  } catch (error) {
+    // An unreadable ownership record is not evidence that its data is unused.
+    return (error as NodeJS.ErrnoException).code === 'EACCES' ||
+      (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}): SweepResult {
   const now = opts.now ?? Date.now();
   const minAgeMs = opts.minAgeMs ?? HERMETIC_SWEEP_MIN_AGE_MS;
@@ -318,6 +336,12 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
     }
     if (ageMs < minAgeMs) {
       result.keptYoung += 1;
+      continue;
+    }
+    // A long R6 run can hold a private database beyond the generic four-hour
+    // cutoff. Its postmaster, rather than directory mtime, owns that lifetime.
+    if (isDirectory && hasLivePostmaster(path)) {
+      result.keptAlive += 1;
       continue;
     }
     // EI-25707158668505432: generic test startup does not own source custody.
