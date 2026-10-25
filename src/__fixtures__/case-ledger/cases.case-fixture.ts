@@ -9,7 +9,7 @@ describe('case ledger fixture', () => {
   });
 
   it('fails with a readable message', () => {
-    expect('case-ledger-actual').toBe('case-ledger-expected');
+    throw new Error('case-ledger-expected' + String.fromCharCode(0) + 'binary-bytes');
   });
 
   it.skip('is skipped', () => {

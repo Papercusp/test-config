@@ -125,9 +125,9 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  async function fixtureRun(): Promise<{ id: string; status: string }> {
-    const rows = await sql<{ id: string; status: string }[]>`
-      SELECT id::text AS id, status FROM harness_shared.test_runs
+  async function fixtureRun(): Promise<{ id: string; status: string; output_tail: string }> {
+    const rows = await sql<{ id: string; status: string; output_tail: string }[]>`
+      SELECT id::text AS id, status, output_tail FROM harness_shared.test_runs
        WHERE file_path LIKE ${'%cases.case-fixture.ts'}`;
     expect(rows, child.output.slice(-3000)).toHaveLength(1);
     return rows[0]!;
@@ -160,6 +160,8 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
       expect(c.duration_ms!, c.case_key).toBeGreaterThanOrEqual(0);
     }
     expect(cases[1]!.error_tail).toContain('case-ledger-expected');
+    expect(cases[1]!.error_tail).toContain('\\0binary-bytes');
+    expect(run.output_tail).toContain('\\0binary-bytes');
     expect(cases.filter((row) => row.status !== 'fail').every((row) => row.error_tail === null)).toBe(true);
   });
 
