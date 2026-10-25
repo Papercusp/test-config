@@ -18,6 +18,7 @@ let tracePending = '';
 let traceDiscarding = false;
 let traceEvents = 0;
 let traceDroppedLines = 0;
+let traceRootProcessId;
 const traceTail = [];
 const traceRegions = new Map();
 const statusDigest = summarizeStatus ? createHash('sha256') : null;
@@ -57,8 +58,16 @@ function captureTrace(chunk) {
         if (typeof value === 'string') phase[key] = value.slice(0, 96);
         else if (typeof value === 'number' && Number.isFinite(value)) phase[key] = value;
       }
+      if (typeof event.sid === 'string') {
+        // Correlate root/submodule phases without retaining raw session IDs.
+        const token = sid => createHash('sha256').update(sid).digest('hex').slice(0, 12);
+        phase.processId = token(event.sid);
+        const parentEnd = event.sid.lastIndexOf('/');
+        if (parentEnd > 0) phase.parentProcessId = token(event.sid.slice(0, parentEnd));
+        if (event.event === 'start' && !traceRootProcessId) traceRootProcessId = phase.processId;
+      }
       // sid distinguishes submodule/helper processes whose nesting starts at 1
-      // again. It is an internal matching key, not copied into the diagnostic.
+      // again. The full ID stays an internal matching key.
       const regionKey = JSON.stringify([event.sid, event.thread, event.nesting]);
       if (event.event === 'region_enter') {
         traceRegions.set(regionKey, phase);
@@ -86,6 +95,7 @@ function failureContext() {
   return {
     identity: { uid: process.getuid?.(), gid: process.getgid?.(), namespaces },
     ...(traceGit ? { gitTrace: { events: traceEvents, droppedLines: traceDroppedLines,
+      rootProcessId: traceRootProcessId,
       lastEvents: traceTail, openRegions: [...traceRegions.values()] } } : {}),
   };
 }
