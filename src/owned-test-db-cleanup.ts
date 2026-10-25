@@ -5,6 +5,16 @@ import { randomUUID } from 'node:crypto';
 import type { DropDatabaseWithLockOptions, TestDbDropResult } from './pg-migrate.ts';
 
 export const OWNED_TEST_DB_DIR_ENV = 'PAPERCUSP_TEST_OWNED_DB_DIR';
+/** Shared by generated names, private receipts and the unmarked database janitor. */
+export const GENERATED_TEST_DB_NAME_PATTERN = '^[a-z][a-z0-9_-]*_[0-9a-f]{8,}$';
+const generatedName = new RegExp(GENERATED_TEST_DB_NAME_PATTERN);
+export function assertOwnedTestDatabaseName(name: string): void {
+  // ASCII only: length is also the PG identifier byte length. Reject truncation,
+  // paths, SQL delimiters and trailing newlines (JS $ can match before one).
+  if (typeof name !== 'string' || name.length > 63 || generatedName.exec(name)?.[0] !== name) {
+    throw new Error('invalid owned test database name');
+  }
+}
 export interface OwnedTestDatabase {
   runId: string;
   name: string;
@@ -20,7 +30,7 @@ function directory(env: NodeJS.ProcessEnv): string | undefined {
   return dir;
 }
 function registryPath(dir: string, name: string): string {
-  if (!/^[a-z][a-z0-9_]*_[0-9a-f]{8,}$/.test(name)) throw new Error('invalid owned test database name');
+  assertOwnedTestDatabaseName(name);
   return join(dir, `${name}.json`);
 }
 function save(dir: string, record: OwnedTestDatabase): void {
@@ -44,6 +54,7 @@ export function recordOwnedTestDbCleanupStage(
 export function registerOwnedTestDatabase(
   name: string, adminUri: string, env: NodeJS.ProcessEnv = process.env,
 ): (outcome: OwnedTestDatabase['outcome']) => void {
+  assertOwnedTestDatabaseName(name);
   const dir = directory(env);
   if (!dir) return () => {};
   const runId = env.PAPERCUSP_TEST_RUN_GROUP;

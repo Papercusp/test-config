@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { cleanupOwnedTestDatabases, registerOwnedTestDatabase } from './owned-test-db-cleanup';
@@ -13,6 +13,40 @@ function fixture() {
 afterEach(() => { vi.useRealTimers(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('maintained owned database cleanup', () => {
+  it.each(['org', 'admission-recovery', 'mixed_prefix-2', 'a'.repeat(50)])(
+    'registers and cleans the exact generated name for safe prefix %s', async prefix => {
+      const { dir, env } = fixture();
+      const name = `${prefix}_0123456789ab`;
+      registerOwnedTestDatabase(name, 'postgres://private@localhost/test', env);
+      expect(statSync(join(dir, `${name}.json`)).mode & 0o777).toBe(0o600);
+      const drop = vi.fn(async () => 'dropped' as const);
+      const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop });
+      expect(result).toEqual({ complete: true, databases: [{ name, outcome: 'dropped' }], errors: [] });
+      expect(drop).toHaveBeenCalledWith('postgres://private@localhost/test', name,
+        { waitMs: expect.any(Number), sweepBudgetMs: 0 });
+      expect(JSON.parse(readFileSync(join(dir, `${name}.json`), 'utf8')).outcome).toBe('dropped');
+    },
+  );
+
+  it.each(['../org_0123456789ab', 'org/child_0123456789ab', 'org\\child_0123456789ab',
+    'org"; DROP DATABASE postgres; --_0123456789ab', 'org_0123456789ab\n', 'org_0123456789ab\0',
+    'Org_0123456789ab', 'org_nohex', 'org_0123456', `${'a'.repeat(51)}_0123456789ab`])(
+    'rejects unsafe registry name %j before writing or dropping it', async name => {
+      const { dir, env } = fixture();
+      expect(() => registerOwnedTestDatabase(name, 'postgres://private@localhost/test', env))
+        .toThrow('invalid owned test database name');
+      expect(readdirSync(dir)).toEqual([]);
+      // A forged receipt must not turn cleanup into a path or SQL identifier escape.
+      writeFileSync(join(dir, 'forged.json'), JSON.stringify({ runId: 'run-a', name,
+        adminUri: 'postgres://private@localhost/test', outcome: 'owned' }));
+      const drop = vi.fn();
+      const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop });
+      expect(result.complete).toBe(false);
+      expect(result.errors).toHaveLength(1);
+      expect(drop).not.toHaveBeenCalled();
+    },
+  );
+
   it('retains a private registration and preserves an observed normal drop', async () => {
     const { dir, env } = fixture();
     const record = registerOwnedTestDatabase('org_0123456789ab', 'postgres://private@localhost/test', env);

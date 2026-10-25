@@ -29,7 +29,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import postgres from 'postgres';
 import { getTestPg } from './pg-container.ts';
-import { registerOwnedTestDatabase } from './owned-test-db-cleanup.ts';
+import { assertOwnedTestDatabaseName, GENERATED_TEST_DB_NAME_PATTERN, registerOwnedTestDatabase } from './owned-test-db-cleanup.ts';
 
 export interface MigratedTestDb {
   /** Connection URL for the freshly-provisioned database. Open your own client against it. */
@@ -97,16 +97,15 @@ export async function withConnectRetry<T>(
   throw lastErr;
 }
 
-async function createFreshDb(prefix = 'it'): Promise<{ url: string; name: string; adminUri: string }> {
+async function createFreshDb(name: string): Promise<{ url: string; name: string; adminUri: string }> {
   const adminUri = await getTestPg();
-  const name = `${prefix}_${randomBytes(6).toString('hex')}`;
   // Pre-register the generated name so a forced exit during CREATE/provision
   // still leaves the supervisor an exact, owned, idempotent cleanup target.
   registerOwnedTestDatabase(name, adminUri);
   await withConnectRetry(async () => {
     const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
     try {
-      await admin.unsafe(`CREATE DATABASE "${name}"`);
+      await admin.unsafe(`CREATE DATABASE ${quoteIdentifier(name)}`);
     } finally {
       await admin.end({ timeout: 5 });
     }
@@ -167,7 +166,7 @@ export const TEMPLATE_LAST_USED_SETTING = 'papercusp.template_last_used';
 const TEMPLATE_USE_STAMP_INTERVAL_MS = 10 * 60 * 1000;
 const TEMPLATE_USE_STAMP_TIMEOUT_MS = 2_000;
 /** Random-suffix shape every per-test database helper uses (`<prefix>_<hex>`). */
-const UNMARKED_TEST_DB_NAME_PATTERN = '^[a-z][a-z0-9_]*_[0-9a-f]{8,}$';
+const UNMARKED_TEST_DB_NAME_PATTERN = GENERATED_TEST_DB_NAME_PATTERN;
 
 const TEST_DB_DEFER_MARK_TIMEOUT_MS = 2_000;
 
@@ -648,7 +647,7 @@ async function applySqlFiles(url: string, paths: string[]): Promise<void> {
 }
 
 export interface CreateFreshTestDbOptions {
-  /** Database-name prefix (default `it`). Useful to tag a suite, e.g. `eng`, `cart`. */
+  /** Default `it`; 1–50 lowercase ASCII letters/digits/_/-, starting with a letter. */
   prefix?: string;
   /**
    * Materialize the schema into the fresh database. Receives the connection URL;
@@ -1071,9 +1070,8 @@ export async function getOrBuildTemplate(
   return p;
 }
 
-async function createDbFromTemplate(prefix: string, template: string): Promise<{ url: string; name: string; adminUri: string }> {
+async function createDbFromTemplate(name: string, template: string): Promise<{ url: string; name: string; adminUri: string }> {
   const adminUri = await getTestPg();
-  const name = `${prefix}_${randomBytes(6).toString('hex')}`;
   registerOwnedTestDatabase(name, adminUri);
   // EI-10571: this is the HOT path every `createOrgTestDb`-style fixture takes
   // on every integration test file's beforeAll — see withConnectRetry's docstring.
@@ -1083,7 +1081,7 @@ async function createDbFromTemplate(prefix: string, template: string): Promise<{
       // The clone needs NO active session on the source; the template's builder closed
       // its connection, and nothing connects to a template directly. Serial integration
       // runs never overlap clones; Postgres serializes them defensively regardless.
-      await admin.unsafe(`CREATE DATABASE "${name}" TEMPLATE "${template}"`);
+      await admin.unsafe(`CREATE DATABASE ${quoteIdentifier(name)} TEMPLATE ${quoteIdentifier(template)}`);
       await stampTemplateUse(admin, template);
     } finally {
       await admin.end({ timeout: 5 });
@@ -1112,24 +1110,27 @@ function isMissingTemplate(e: unknown): boolean {
  * Call once per test file in `beforeAll`; `drop()` in `afterAll`. Requires Docker.
  */
 export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Promise<FreshTestDb> {
+  const name = `${opts.prefix ?? 'it'}_${randomBytes(6).toString('hex')}`;
+  // Validate before PG discovery or template provisioning, including when the
+  // runner has no ownership directory configured.
+  assertOwnedTestDatabaseName(name);
   // Template-clone path: build the schema ONCE into a cached template, then clone.
   if (opts.template) {
     const { key, provision, lockTimeoutMs } = opts.template;
-    const prefix = opts.prefix ?? 'it';
     const tmpl = await getOrBuildTemplate(key, provision, { lockTimeoutMs });
     let created: { url: string; name: string; adminUri: string };
     try {
-      created = await createDbFromTemplate(prefix, tmpl);
+      created = await createDbFromTemplate(name, tmpl);
     } catch (e) {
       // The template janitor (sweepIdleTemplates) may have dropped a template this
       // process cached as built. Forget the cached build and rebuild it once.
       if (!isMissingTemplate(e)) throw e;
       if (templateBuilds.has(key)) templateBuilds.delete(key);
-      created = await createDbFromTemplate(prefix, await getOrBuildTemplate(key, provision, { lockTimeoutMs }));
+      created = await createDbFromTemplate(name, await getOrBuildTemplate(key, provision, { lockTimeoutMs }));
     }
     return recordedFreshTestDb(created.url, created.name, created.adminUri);
   }
-  const { url, name, adminUri } = await createFreshDb(opts.prefix);
+  const { url, adminUri } = await createFreshDb(name);
   if (opts.provision) {
     try {
       await opts.provision(url);

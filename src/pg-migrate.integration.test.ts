@@ -23,7 +23,11 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import postgres from 'postgres';
+import { cleanupOwnedTestDatabases } from './owned-test-db-cleanup.ts';
 import {
   createFreshTestDb,
   dropDatabaseWithLock,
@@ -452,6 +456,66 @@ describe('buildTemplate hardening (WI-1992)', () => {
     // Clone succeeds because the build terminated the leaked backend.
     const db = await createFreshTestDb({ prefix: 'zzhard', template: { key, provision: async () => {} } });
     await db.drop();
+  });
+});
+
+describe('generated database name ownership contract (EI-26928617449609761)', () => {
+  it.each([false, true])('registers and cleans a hyphenated database (template=%s)', async template => {
+    const dir = mkdtempSync(join(tmpdir(), 'dbname-contract-'));
+    const previousDir = process.env.PAPERCUSP_TEST_OWNED_DB_DIR;
+    const previousRun = process.env.PAPERCUSP_TEST_RUN_GROUP;
+    vi.stubEnv('PAPERCUSP_TEST_OWNED_DB_DIR', dir);
+    vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'dbname-contract');
+    let db: Awaited<ReturnType<typeof createFreshTestDb>> | undefined;
+    try {
+      db = await createFreshTestDb({ prefix: 'admission-recovery',
+        ...(template ? { template: { key: freshKey(), provision: async () => {} } } : {}) });
+      expect(db.name).toMatch(/^admission-recovery_[0-9a-f]{12}$/);
+      const receipt = () => JSON.parse(readFileSync(join(dir, `${db!.name}.json`), 'utf8'));
+      expect(receipt()).toMatchObject({ name: db.name, runId: 'dbname-contract', outcome: 'owned' });
+      const admin = await adminClient();
+      expect(await admin.unsafe('SELECT datname FROM pg_database WHERE datname = $1', [db.name]))
+        .toEqual([{ datname: db.name }]);
+      const cleanup = await cleanupOwnedTestDatabases({ dir, runId: 'dbname-contract',
+        deadlineAtMs: Date.now() + 10_000, drop: async (_uri, name) => {
+          expect(name).toBe(db!.name);
+          return db!.dropWithResult();
+        } });
+      expect(cleanup).toEqual({ complete: true, databases: [{ name: db.name, outcome: 'dropped' }], errors: [] });
+      expect(receipt().outcome).toBe('dropped');
+      expect(await admin.unsafe('SELECT datname FROM pg_database WHERE datname = $1', [db.name])).toEqual([]);
+    } finally {
+      try { await db?.drop(); } finally {
+        vi.stubEnv('PAPERCUSP_TEST_OWNED_DB_DIR', previousDir);
+        vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', previousRun);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it.each([false, true])('rejects unsafe prefixes before PG/template work (registry=%s)', async registry => {
+    const dir = mkdtempSync(join(tmpdir(), 'dbname-rejection-'));
+    const previousDir = process.env.PAPERCUSP_TEST_OWNED_DB_DIR;
+    vi.stubEnv('PAPERCUSP_TEST_OWNED_DB_DIR', registry ? dir : undefined);
+    // Even an unusable PG endpoint must never be consulted for invalid input.
+    vi.stubEnv('PAPERCUSP_TEST_PG_ADMIN_URL', 'postgres://postgres@127.0.0.1:1/postgres');
+    try {
+      for (const prefix of ['', '../escape', 'path/name', 'path\\name', 'bad"; SELECT 1; --',
+        'bad\n', 'bad\0', 'Upper', 'a'.repeat(51)]) {
+        for (const template of [false, true]) {
+          const provision = vi.fn(async () => {});
+          await expect(createFreshTestDb({ prefix,
+            ...(template ? { template: { key: freshKey(), provision } } : { provision }) }))
+            .rejects.toThrow('invalid owned test database name');
+          expect(provision).not.toHaveBeenCalled();
+        }
+      }
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      vi.stubEnv('PAPERCUSP_TEST_PG_ADMIN_URL', ownedPg!.getConnectionUri());
+      vi.stubEnv('PAPERCUSP_TEST_OWNED_DB_DIR', previousDir);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
