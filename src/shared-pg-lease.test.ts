@@ -12,8 +12,11 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { pinModuleState } from '@papercusp/module-singleton';
+import { fileURLToPath } from 'node:url';
+import type { TestModule } from 'vitest/node';
 
 import { closeSharedPg, closeSharedPgIfUnheld, insertTestRunRowsWithSql, retainSharedPg, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
+import ExecutedSourceMapReporter, { EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS } from './executed-source-map-reporter.ts';
 
 const shared = pinModuleState('@papercusp/test-config.shared-pg', () => ({
   promise: undefined as Promise<PgHandle> | undefined,
@@ -49,6 +52,69 @@ afterEach(async () => {
 });
 
 describe('shared PG lease (WI-10003715)', () => {
+  it.each(['resolve', 'reject'] as const)('keeps a source-map flush alive after its timeout until the writer %ss', async settlement => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const envKeys = ['PC_EXECUTED_SOURCE_MAP_WORKSPACE', 'PC_EXECUTED_SOURCE_MAP_OUT',
+      'PC_EXECUTED_SOURCE_MAP_RESULT', 'PC_EXECUTED_SOURCE_MAP_NO_PERSIST', 'PC_EXECUTED_INPUTS_DIR'];
+    const saved = envKeys.map(key => process.env[key]);
+    for (const key of envKeys) delete process.env[key];
+    process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE = '@papercusp/test-config';
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    let resolveStatement!: () => void;
+    let rejectStatement!: (error: Error) => void;
+    const first = new Promise<void>((resolve, reject) => {
+      resolveStatement = resolve;
+      rejectStatement = reject;
+    });
+    let ended = false;
+    const end = vi.fn(async () => { ended = true; });
+    const statement = vi.fn(async () => {
+      if (ended) throw new Error('CONNECTION_ENDED');
+      if (statement.mock.calls.length === 1) { enter(); await first; }
+      return [];
+    });
+    const sql = Object.assign(statement, { end }) as unknown as PgSql;
+    shared.promise = Promise.resolve({ sql });
+    const sibling = retainSharedPg();
+    const reporter = new ExecutedSourceMapReporter(
+      async () => ({ commit: 'c0ffee0000000000000000000000000000000000', porcelain: '' }),
+      undefined, () => '/fake/install/.git',
+    );
+    const moduleId = fileURLToPath(import.meta.url);
+    let done: Promise<void> | undefined;
+    try {
+      reporter.onInit({} as never);
+      await reporter.onTestModuleEnd({ moduleId, state: () => 'passed',
+        project: { config: { isolate: true } }, diagnostic: () => ({ importDurations: { [moduleId]: {} } }),
+      } as unknown as TestModule);
+      done = reporter.onTestRunEnd();
+      await vi.waitFor(() => expect(statement).toHaveBeenCalledTimes(1));
+      await entered;
+      await sibling();
+      await vi.advanceTimersByTimeAsync(EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS);
+      await done;
+      await reporter.onExit();
+      expect(statement).toHaveBeenCalledTimes(1);
+      expect(end).not.toHaveBeenCalled();
+      if (settlement === 'resolve') resolveStatement();
+      else rejectStatement(new Error('source-map insert rejected'));
+      await vi.waitFor(() => expect(end).toHaveBeenCalledTimes(1));
+      expect(statement).toHaveBeenCalledTimes(settlement === 'resolve' ? 3 : 1);
+    } finally {
+      resolveStatement();
+      await done;
+      await sibling();
+      await reporter.onExit();
+      await closeSharedPgIfUnheld();
+      for (const [index, key] of envKeys.entries()) {
+        if (saved[index] === undefined) delete process.env[key];
+        else process.env[key] = saved[index];
+      }
+      vi.useRealTimers();
+    }
+  });
+
   it('control: the OLD unconditional close from a sibling breaks an in-flight chunked write', async () => {
     const { state } = installFakeClient();
     const write = chunkedWrite(20);

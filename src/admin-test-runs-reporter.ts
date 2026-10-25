@@ -1399,7 +1399,7 @@ export function retainSharedPg(): () => Promise<void> {
  * SQL seams used by unit tests are not shared-client operations), and let the last
  * operation completion drain a deferred close request.
  */
-function trackSharedPgOperation<T>(operation: Promise<T>): Promise<T> {
+export function trackSharedPgOperation<T>(operation: Promise<T>): Promise<T> {
   if (sharedPg.holders === 0) return operation;
   sharedPg.inFlight += 1;
   return operation.finally(async () => {

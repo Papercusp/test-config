@@ -46,6 +46,7 @@ import {
   collectModuleExecution,
   collectTestCases,
   retainSharedPg,
+  trackSharedPgOperation,
   inferWorkspaceRoot,
   isMutationProbeRun,
   tryGetPg,
@@ -852,7 +853,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
     // Vitest constructs reporters with its options object; the unit suite injects seams.
     this.readWorktreeSnapshot =
       typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
-    this.writeRows = writeRows ?? ((flush) => writeExecutedSourceRows(flush));
+    // A flush timeout releases the reporter lease, but the default writer can
+    // still be between SQL chunks. Keep the whole write alive until settlement.
+    this.writeRows = writeRows ?? ((flush) => trackSharedPgOperation(writeExecutedSourceRows(flush)));
     this.resolveGitDir = resolveGitDir ?? resolveRecordedGitDir;
     this.writeSnapshot = writeSnapshot ?? writeExecutedSourceMapSnapshotAsync;
   }
