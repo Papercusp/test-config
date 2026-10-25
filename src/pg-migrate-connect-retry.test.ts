@@ -15,6 +15,8 @@ import {
   TEST_DB_MANAGED_MARKER,
   TEST_DB_ORPHAN_MIN_AGE_MS,
   TEST_DB_DEFERRED_SWEEP_LIMIT,
+  TEST_TEMPLATE_GC_KEEP_PER_FAMILY,
+  TEMPLATE_LAST_USED_SETTING,
   PG_INVALID_DATABASE_CONNLIMIT,
   dropDatabaseWithLock,
   markManagedTestDatabase,
@@ -133,9 +135,27 @@ describe('dropDatabaseWithLock (WI-42514 recurrence guard)', () => {
       'DROP DATABASE IF EXISTS "it_guarded" WITH (FORCE)',
       expect.stringContaining(`WHERE c.description = '${TEST_DB_DEFERRED_MARKER}'`),
       expect.stringContaining(`c.description ~ '^${TEST_DB_MANAGED_MARKER}[0-9]{13}$'`),
+      expect.stringContaining(`WHERE current_setting('fsync') = 'off'`),
+      expect.stringContaining('WITH ready AS MATERIALIZED'),
       `SET statement_timeout = '0'`,
       `SELECT pg_advisory_unlock(hashtext('${TEST_DB_DROP_LOCK_KEY}'))`,
     ]);
+    const unmarkedSweep = queries[6];
+    expect(unmarkedSweep).toContain('AND NOT d.datistemplate');
+    expect(unmarkedSweep).toContain("AND d.datname NOT LIKE 'tmpl\\_%'");
+    expect(unmarkedSweep).toContain('NOT EXISTS (\n              SELECT 1 FROM pg_shdescription c');
+    expect(unmarkedSweep).toContain('NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)');
+    expect(unmarkedSweep).toContain("pg_stat_file('base/' || c.oid || '/PG_VERSION', true)");
+    expect(unmarkedSweep).toContain(`LIMIT ${TEST_DB_DEFERRED_SWEEP_LIMIT}`);
+    const idleTemplateSweep = queries[7];
+    expect(idleTemplateSweep).toContain("WHERE c.description = 'pc-template-ready'");
+    expect(idleTemplateSweep).toContain("AND d.datname NOT LIKE 'tmpl\\_bld\\_%'");
+    expect(idleTemplateSweep).toContain(`cfg LIKE '${TEMPLATE_LAST_USED_SETTING}=%'`);
+    expect(idleTemplateSweep).toContain(`WHERE k.newest_rank > ${TEST_TEMPLATE_GC_KEEP_PER_FAMILY}`);
+    expect(idleTemplateSweep).toContain('AND k.idle_since_ms IS NOT NULL');
+    expect(idleTemplateSweep).toMatch(/AND k\.idle_since_ms <= \d+/);
+    expect(idleTemplateSweep).toContain('NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = k.datname)');
+    expect(idleTemplateSweep).toContain(`LIMIT ${TEST_DB_DEFERRED_SWEEP_LIMIT}`);
     expectNoDropUnderStatementTimeout(queries);
   });
 
