@@ -2798,6 +2798,7 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
   );
 
   it.skipIf(process.platform === 'win32')('stops Git descendants that ignore SIGTERM when the read times out (EI-26096532443968552)', async () => {
+    vi.stubEnv('GIT_TRACE2_EVENT', '');
     const root = mkdtempSync(join(tmpdir(), 'git-descendant-timeout-'));
     const pidPath = join(root, 'descendant.pid');
     const script = join(root, 'blocked.cjs');
@@ -2817,6 +2818,11 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
     };
     writeFileSync(script, [
       'process.on("SIGTERM", () => {});',
+      // A real Git alias inherits Trace2's fd. Malformed/oversized events must
+      // not hide the following phase or turn a timed-out read into clean proof.
+      'const fs = require("node:fs");',
+      'fs.writeSync(3, "invalid-json\\n" + "x".repeat(20_000) + "\\n");',
+      'fs.writeSync(3, JSON.stringify({event:"region_enter",sid:"blocked-helper",thread:"main",nesting:1,category:"reporter-test",label:"blocked-descendant"}) + "\\n");',
       'require("node:fs").writeFileSync(process.argv[2], String(process.pid));',
       'setInterval(() => {}, 1000);',
     ].join('\n'));
@@ -2833,6 +2839,16 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
       expect(result).toBeNull();
       expect(failures).toHaveLength(1);
       expect(JSON.parse(failures[0])).toMatchObject({ timeoutMs: 5_000, killed: true });
+      const failure = JSON.parse(failures[0]);
+      expect(failure.identity).toMatchObject({ uid: process.getuid!(), gid: process.getgid!() });
+      expect(failure.gitTrace.events).toBeGreaterThan(0);
+      expect(failure.gitTrace.droppedLines).toBeGreaterThanOrEqual(2);
+      expect(failure.gitTrace.openRegions).toContainEqual(expect.objectContaining({
+        category: 'reporter-test', label: 'blocked-descendant',
+      }));
+      expect(failure.gitTrace.lastEvents.length).toBeLessThanOrEqual(12);
+      expect(failure.gitTrace.openRegions.length).toBeLessThanOrEqual(12);
+      expect(failures[0].length).toBeLessThan(8_000);
       await vi.waitFor(() => expect(running(descendant!)).toBe(false), { timeout: 1_000, interval: 20 });
     } finally {
       if (deadline) clearTimeout(deadline);
@@ -2843,8 +2859,27 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
         try { process.kill(descendant, 'SIGKILL'); } catch { /* Already exited. */ }
       }
       rmSync(root, { recursive: true, force: true });
+      vi.unstubAllEnvs();
     }
   }, 15_000);
+
+  it.skipIf(process.platform === 'win32')('preserves an explicit Git trace destination and keeps it out of the reading', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'git-explicit-trace-'));
+    const tracePath = join(root, 'trace.jsonl');
+    vi.stubEnv('GIT_TRACE2_EVENT', tracePath);
+    try {
+      const failures: string[] = [];
+      expect(await runGit('git status --porcelain', root, 5_000,
+        detail => failures.push(detail))).toBeNull();
+      expect(readFileSync(tracePath, 'utf8')).toContain('"event":"start"');
+      expect(failures).toHaveLength(1);
+      expect(JSON.parse(failures[0])).toMatchObject({ code: 128, killed: false });
+      expect(JSON.parse(failures[0])).not.toHaveProperty('gitTrace');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   it('retains a real Git exit code and bounded stderr without changing null semantics', async () => {
     const root = mkdtempSync(join(tmpdir(), 'git-diagnostic-'));
