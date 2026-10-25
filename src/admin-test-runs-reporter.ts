@@ -1761,6 +1761,18 @@ type TestRunInsertContext = {
   configurationSnapshot?: ConfigurationSnapshot | null;
 };
 
+/** PostgreSQL text/jsonb cannot store NUL. Preserve binary diagnostics visibly
+ * without dropping the failed file or its cases from the evidence ledger. */
+function escapeLedgerNul<T>(value: T): T {
+  if (typeof value === 'string') return value.replaceAll('\0', '\\0') as T;
+  if (Array.isArray(value)) return value.map(escapeLedgerNul) as T;
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) =>
+      [escapeLedgerNul(key), escapeLedgerNul(entry)])) as T;
+  }
+  return value;
+}
+
 function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   return new Promise((resolveP) => {
     let settled = false;
@@ -1814,7 +1826,7 @@ export async function insertTestRunRowsWithSql(
     return receipts;
   };
   const insertBatch = (sourceRows: readonly ReceiptIdentifiedTestRunRow[]) => sourceRows
-    .map((row) => ({
+    .map((row) => escapeLedgerNul({
       file_path: row.filePath,
       framework: 'vitest',
       status: row.status,
@@ -2041,14 +2053,14 @@ export async function insertTestCaseRowsWithSql(
   parents: ReadonlyArray<{ testRunId: string; cases: readonly TestCaseRecord[] }>,
   limits: { deadline: number; insertTimeoutMs: number },
 ): Promise<TestCaseInsertOutcome> {
-  const rows = parents.flatMap(({ testRunId, cases }) => cases.map((testCase) => ({
+  const rows = parents.flatMap(({ testRunId, cases }) => cases.map((testCase) => escapeLedgerNul({
     test_run_id: testRunId,
     case_index: testCase.caseIndex,
-    case_key: testCase.caseKey.slice(0, TEST_CASE_KEY_MAX_CHARS),
+    case_key: escapeLedgerNul(testCase.caseKey).slice(0, TEST_CASE_KEY_MAX_CHARS),
     occurrence: testCase.occurrence,
     status: testCase.status,
     duration_ms: testCase.durationMs,
-    error_tail: testCase.errorTail === null ? null : testCase.errorTail.slice(0, TEST_CASE_ERROR_TAIL_MAX_CHARS),
+    error_tail: testCase.errorTail === null ? null : escapeLedgerNul(testCase.errorTail).slice(0, TEST_CASE_ERROR_TAIL_MAX_CHARS),
   })));
   let written = 0;
   for (let offset = 0; offset < rows.length; offset += TEST_CASE_INSERT_BATCH_SIZE) {

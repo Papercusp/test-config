@@ -1196,6 +1196,35 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(stored).toEqual(details);
   });
 
+  it('retains binary failure diagnostics in file, JSON and case inserts without PostgreSQL NULs', async () => {
+    const batches: Record<string, unknown>[][] = [];
+    let batch: Record<string, unknown>[] = [];
+    const sql = Object.assign((first: unknown) => {
+      if (Array.isArray(first) && !('raw' in first)) {
+        batch = first as Record<string, unknown>[];
+        batches.push(batch);
+        return {};
+      }
+      return Promise.resolve(batch[0]?.file_path ? [{ id: '901', file_path: batch[0].file_path }] : []);
+    }, { end: async () => undefined }) as unknown as PgSql;
+    const at = new Date('2026-10-25T00:00:00.000Z');
+    const diagnostic = 'raster' + String.fromCharCode(0) + 'bytes';
+    const details = { schemaVersion: 1, passedCases: [diagnostic] } as unknown as NonNullable<TestRunRow['executionDetails']>;
+    const receipts = await insertTestRunRowsWithSql(sql, [{
+      filePath: 'binary.test.ts', status: 'fail', durationMs: 1, startedAt: at, finishedAt: at,
+      outputTail: diagnostic, isScratchConfig: false, worktreeDirty: false, commitSha: 'abc123',
+      executionDetails: details, cases: [{ caseIndex: 0, caseKey: diagnostic, occurrence: 1,
+        status: 'fail', durationMs: 1, errorTail: diagnostic }],
+    }], { branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: null,
+      harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null });
+    expect(receipts).toMatchObject([{ outcome: 'inserted', id: '901' }]);
+    expect(batches).toHaveLength(2);
+    expect(batches[0][0]).toMatchObject({ output_tail: 'raster\\0bytes',
+      execution_details: { passedCases: ['raster\\0bytes'] } });
+    expect(batches[1][0]).toMatchObject({ case_key: 'raster\\0bytes', error_tail: 'raster\\0bytes' });
+    expect(details.passedCases).toEqual([diagnostic]);
+  });
+
   describe('per-row write receipts (WI-10006245)', () => {
     const context = {
       branch: 'staging', inferredCommit: null, declaredSource: 'mutation-probe' as const, runGroupId: null,
