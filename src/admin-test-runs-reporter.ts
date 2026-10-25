@@ -1572,6 +1572,22 @@ export type TestRunReceiptBase = {
   filePath: string;
   status: string;
   row: SerializedTestRunReceiptRow;
+  /** Client observations, not server execution or commit timestamps. */
+  insertDiagnostics?: TestRunInsertDiagnostics;
+};
+
+export type TestRunInsertDiagnostics = {
+  schemaVersion: 1;
+  statementId: string;
+  clientPid: number;
+  backendPid: number | null;
+  startedAt: string;
+  observedAt: string;
+  elapsedMs: number;
+  settledAt: string | null;
+  settledElapsedMs: number | null;
+  /** Remaining total write budget when this statement was created. */
+  budgetMs: number;
 };
 
 export type TestRunReceipt =
@@ -1719,13 +1735,14 @@ function unwrittenReceipts(
   rows: readonly TestRunRow[],
   outcome: 'timeout' | 'failed',
   reason: string,
-  options: { error?: unknown; replayable?: boolean } = {},
+  options: { error?: unknown; replayable?: boolean; insertDiagnostics?: TestRunInsertDiagnostics } = {},
 ): TestRunReceipt[] {
   const code = options.error === undefined ? undefined : errorCode(options.error);
   return receiptIdentifiedRows(rows).map(row => ({
     ...receiptBase(row),
     outcome,
     reason,
+    ...(options.insertDiagnostics ? { insertDiagnostics: options.insertDiagnostics } : {}),
     ...(code ? { errorCode: code } : {}),
     replayable: options.replayable === true && row.receiptAttempt === 0,
   }));
@@ -1828,17 +1845,43 @@ export async function insertTestRunRowsWithSql(
   const executeBatch = async (batch: ReturnType<typeof insertBatch>) => {
     const remainingMs = Math.max(0, deadline - Date.now());
     if (remainingMs === 0) {
-      return { completed: false, failure: null, timeoutMs: 0, readWritten: () => undefined, query: null };
+      return { completed: false, failure: null, timeoutMs: 0, readWritten: () => undefined,
+        readDiagnostics: () => undefined, query: null };
     }
+    const statementId = randomUUID();
+    const startedAt = new Date().toISOString();
+    const started = performance.now();
     let written: unknown;
     let failure: unknown = null;
-    const query = trackSharedPgOperation(Promise.resolve(sql`
+    let settledAt: string | null = null;
+    let settledElapsedMs: number | null = null;
+    let settledBackendPid: number | null = null;
+    // Keep the original postgres-js Query: Promise.resolve/then lose its state.
+    // Copy ONLY pid; state also contains a cancellation secret, never receipt data.
+    const pending = sql`
       INSERT INTO harness_shared.test_runs
         ${sql(batch, ...columns)}
       RETURNING id, file_path
-    `).then(
-      (value) => { written = value; },
-      (error) => { failure = error ?? new Error('insert_rejected'); throw failure; },
+    `;
+    const backendPid = (value: unknown): number | null => {
+      const pid = (value as { state?: { pid?: unknown } } | null)?.state?.pid;
+      return typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+    };
+    const recordSettlement = (value: unknown) => {
+      settledAt = new Date().toISOString();
+      settledElapsedMs = Math.max(0, performance.now() - started);
+      settledBackendPid = backendPid(pending) ?? backendPid(value);
+    };
+    const readDiagnostics = (): TestRunInsertDiagnostics => ({
+      schemaVersion: 1, statementId, clientPid: process.pid,
+      backendPid: settledAt === null ? backendPid(pending) : settledBackendPid,
+      startedAt, observedAt: new Date().toISOString(),
+      elapsedMs: Math.max(0, performance.now() - started),
+      settledAt, settledElapsedMs, budgetMs: remainingMs,
+    });
+    const query = trackSharedPgOperation(Promise.resolve(pending).then(
+      (value) => { written = value; recordSettlement(value); },
+      (error) => { recordSettlement(null); failure = error ?? new Error('insert_rejected'); throw failure; },
     ));
     let timeoutMs = Math.min(budget.insertTimeoutMs, remainingMs);
     let completed = await settleWithin(query, timeoutMs);
@@ -1854,7 +1897,7 @@ export async function insertTestRunRowsWithSql(
         timeoutMs = budget.totalInsertMs;
       }
     }
-    return { completed, failure, timeoutMs, readWritten: () => written, query };
+    return { completed, failure, timeoutMs, readWritten: () => written, readDiagnostics, query };
   };
   for (let offset = 0; offset < identifiedRows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
     const remainingMs = deadline - Date.now();
@@ -1880,7 +1923,7 @@ export async function insertTestRunRowsWithSql(
       if (!replayed && attempt.failure && isDefinitePreSubmitFailure(attempt.failure) &&
           sourceRows.every((row) => row.receiptAttempt === 0) && Date.now() < deadline) {
         receipts.push(...unwrittenReceipts(sourceRows, 'failed', receiptReason(attempt.failure), {
-          error: attempt.failure, replayable: true,
+          error: attempt.failure, replayable: true, insertDiagnostics: attempt.readDiagnostics(),
         }));
         sourceRows = sourceRows.map((row) => ({ ...row, receiptAttempt: row.receiptAttempt + 1 }));
         replayed = true;
@@ -1890,14 +1933,15 @@ export async function insertTestRunRowsWithSql(
       break;
     }
     const { completed, failure, timeoutMs, query } = attempt;
+    const insertDiagnostics = attempt.readDiagnostics();
     if (!completed) {
       const replayable = Boolean(failure && isDefinitePreSubmitFailure(failure));
       receipts.push(
         ...(failure
           ? unwrittenReceipts(sourceRows, 'failed', receiptReason(failure), {
-              error: failure, replayable,
+              error: failure, replayable, insertDiagnostics,
             })
-          : unwrittenReceipts(sourceRows, 'timeout', `pg_insert_timeout_${timeoutMs}ms`)),
+          : unwrittenReceipts(sourceRows, 'timeout', `pg_insert_timeout_${timeoutMs}ms`, { insertDiagnostics })),
         // Later batches are never attempted once one has not completed.
         ...unwrittenReceipts(
           identifiedRows.slice(offset + TEST_RUN_INSERT_BATCH_SIZE),
@@ -1912,14 +1956,16 @@ export async function insertTestRunRowsWithSql(
         // The wait expired, not the INSERT. Preserve its eventual RETURNING ids
         // without retrying the statement or extending the foreground budget.
         void query.then(
-          () => appendTestRunReceipts(receiptEnv, insertedReceipts(sourceRows, attempt.readWritten())),
-          (error) => appendTestRunReceipts(receiptEnv, unwrittenReceipts(sourceRows, 'failed', receiptReason(error))),
+          () => appendTestRunReceipts(receiptEnv, insertedReceipts(sourceRows, attempt.readWritten(), attempt.readDiagnostics())),
+          (error) => appendTestRunReceipts(receiptEnv, unwrittenReceipts(sourceRows, 'failed', receiptReason(error), {
+            error, insertDiagnostics: attempt.readDiagnostics(),
+          })),
         );
       }
       return receipts;
     }
     const written = attempt.readWritten();
-    receipts.push(...insertedReceipts(sourceRows, written));
+    receipts.push(...insertedReceipts(sourceRows, written, insertDiagnostics));
     pairInsertedIds(sourceRows, written).forEach((testRunId, index) => {
       const cases = sourceRows[index]?.cases;
       if (testRunId !== undefined && cases && cases.length > 0) caseParents.push({ testRunId, cases });
@@ -1933,16 +1979,19 @@ export async function insertTestRunRowsWithSql(
  * Pair RETURNING rows back to the rows we sent. Matched by file_path (multiset), not
  * position: Postgres does not promise RETURNING order for a multi-row insert.
  */
-function insertedReceipts(sourceRows: readonly ReceiptIdentifiedTestRunRow[], written: unknown): TestRunReceipt[] {
+function insertedReceipts(
+  sourceRows: readonly ReceiptIdentifiedTestRunRow[], written: unknown, insertDiagnostics?: TestRunInsertDiagnostics,
+): TestRunReceipt[] {
   const ids = pairInsertedIds(sourceRows, written);
   return sourceRows.map((row, index): TestRunReceipt => {
     const id = ids[index];
     return id === undefined
       ? {
           ...receiptBase(row),
+          ...(insertDiagnostics ? { insertDiagnostics } : {}),
           outcome: 'failed', reason: 'insert_returned_no_id', replayable: false,
         }
-      : { ...receiptBase(row), outcome: 'inserted', id };
+      : { ...receiptBase(row), ...(insertDiagnostics ? { insertDiagnostics } : {}), outcome: 'inserted', id };
   });
 }
 

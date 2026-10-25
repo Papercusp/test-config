@@ -1225,9 +1225,28 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       ]);
     });
 
+    it('records client timing and only the backend pid from the postgres result', async () => {
+      const result = Object.assign([{ id: '901', file_path: 'a.test.ts' }], {
+        state: { pid: 1198083, secret: 987654321 },
+      });
+      const statement = vi.fn(async () => result);
+      const [receipt] = await insertTestRunRowsWithSql(fakeSql(statement), [row('a.test.ts')], context);
+      const diagnostics = receipt?.insertDiagnostics;
+      expect(diagnostics).toMatchObject({
+        schemaVersion: 1, statementId: expect.any(String), clientPid: process.pid, backendPid: 1198083,
+        startedAt: expect.any(String), observedAt: expect.any(String), settledAt: expect.any(String),
+        elapsedMs: expect.any(Number), settledElapsedMs: expect.any(Number), budgetMs: expect.any(Number),
+      });
+      expect(diagnostics!.elapsedMs).toBeGreaterThanOrEqual(diagnostics!.settledElapsedMs!);
+      expect(diagnostics!.settledElapsedMs).toBeGreaterThanOrEqual(0);
+      expect(JSON.stringify(receipt)).not.toContain('987654321');
+      expect(statement).toHaveBeenCalledTimes(1);
+    });
+
     it('bounds a permanently pending insert by the total budget without replaying it', async () => {
       vi.useFakeTimers();
-      const statement = vi.fn(() => new Promise(() => {}));
+      const pending = Object.assign(new Promise(() => {}), { state: null as { pid: number } | null });
+      const statement = vi.fn(() => pending);
       const sql = fakeSql(statement);
       let finished = false;
       const write = insertTestRunRowsWithSql(sql, [row('a.test.ts')], context, {
@@ -1239,9 +1258,11 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       try {
         await vi.advanceTimersByTimeAsync(999);
         expect(finished).toBe(false);
+        pending.state = { pid: 1198083 }; // postgres-js assigns this after dispatch, not at construction.
         await vi.advanceTimersByTimeAsync(1);
         expect(await write).toMatchObject([
-          { filePath: 'a.test.ts', status: 'fail', outcome: 'timeout', reason: 'pg_insert_timeout_1000ms' },
+          { filePath: 'a.test.ts', status: 'fail', outcome: 'timeout', reason: 'pg_insert_timeout_1000ms',
+            insertDiagnostics: { backendPid: 1198083, settledAt: null, budgetMs: 1_000 } },
         ]);
         expect(statement).toHaveBeenCalledTimes(1);
       } finally {
@@ -1282,6 +1303,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       ]);
       expect(receipts[0]).toMatchObject({ outcome: 'failed', replayable: true, errorCode: 'CONNECT_TIMEOUT' });
       expect(receipts[1]).toMatchObject({ outcome: 'inserted', id: '901', row: { executionDetails: details } });
+      expect(receipts[0]?.insertDiagnostics).toMatchObject({ backendPid: null, settledAt: expect.any(String) });
+      expect(receipts[1]?.insertDiagnostics?.statementId).not.toBe(receipts[0]?.insertDiagnostics?.statementId);
     });
 
     it('does not replay a CONNECT_TIMEOUT more than once', async () => {
@@ -1350,13 +1373,19 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       const file = join(dir, 'original.jsonl');
       const otherFile = join(dir, 'other.jsonl');
       let resolveInsert!: (value: unknown) => void;
-      const statement = vi.fn(() => new Promise(resolve => { resolveInsert = resolve; }));
+      const pending = Object.assign(new Promise(resolve => { resolveInsert = resolve; }), {
+        state: { pid: 1198083, secret: 987654321 },
+      });
+      const statement = vi.fn(() => pending);
       vi.stubEnv(TEST_RUN_RECEIPT_ENV, file);
       try {
         const receipts = await insertTestRunRowsWithSql(fakeSql(statement), [row('a.test.ts'), row('b.test.ts', 'pass')], context, {
           insertTimeoutMs: 20, totalInsertMs: 1_000,
         });
         expect(receipts.map(receipt => receipt.outcome)).toEqual(['timeout', 'timeout']);
+        const diagnostics = receipts[0]!.insertDiagnostics;
+        expect(diagnostics).toMatchObject({ backendPid: 1198083, settledAt: null, settledElapsedMs: null });
+        expect(receipts[1]?.insertDiagnostics).toEqual(diagnostics);
         appendTestRunReceipts(process.env, receipts);
         vi.stubEnv(TEST_RUN_RECEIPT_ENV, otherFile);
         resolveInsert([{ id: '902', file_path: 'b.test.ts' }, { id: '901', file_path: 'a.test.ts' }]);
@@ -1366,6 +1395,14 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
             { filePath: 'b.test.ts', status: 'pass', outcome: 'inserted', id: '902' },
           ]);
         });
+        const late = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(late[2].insertDiagnostics).toMatchObject({
+          statementId: diagnostics!.statementId, backendPid: 1198083, settledAt: expect.any(String),
+        });
+        expect(late[2].insertDiagnostics.settledElapsedMs).toBeGreaterThanOrEqual(diagnostics!.elapsedMs);
+        expect(diagnostics?.settledAt).toBeNull(); // The timeout remains an immutable observation.
+        expect(late[3].insertDiagnostics).toEqual(late[2].insertDiagnostics);
+        expect(readFileSync(file, 'utf8')).not.toContain('987654321');
         expect(statement).toHaveBeenCalledTimes(1);
         expect(() => readFileSync(otherFile, 'utf8')).toThrow();
       } finally {
@@ -1389,6 +1426,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         await vi.waitFor(() => {
           expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({
             filePath: 'a.test.ts', status: 'fail', outcome: 'failed', reason: 'connection closed after timeout',
+            insertDiagnostics: { statementId: receipts[0]?.insertDiagnostics?.statementId,
+              backendPid: null, settledAt: expect.any(String), settledElapsedMs: expect.any(Number) },
           });
         });
         expect(statement).toHaveBeenCalledTimes(1);
