@@ -1292,6 +1292,35 @@ export type PgSql = {
 };
 export type PgHandle = { sql: PgSql } | null;
 
+type PgSetupFailure = {
+  phase: 'module-import' | 'client-construction';
+  code?: string;
+};
+
+// Error messages and arbitrary error.code values can contain the connection URL.
+// Preserve only known nonsecret runtime codes on the existing receipt surface.
+const PG_SETUP_ERROR_CODES = new Set([
+  'ERR_MODULE_NOT_FOUND', 'MODULE_NOT_FOUND', 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+  'ERR_DLOPEN_FAILED', 'ERR_REQUIRE_ESM', 'ERR_INVALID_URL', 'ERR_INVALID_ARG_TYPE',
+  'ERR_INVALID_ARG_VALUE',
+]);
+
+function pgSetupFailure(phase: PgSetupFailure['phase'], error: unknown): PgSetupFailure {
+  // Module loaders may wrap the original import failure in Error.cause.
+  // Bound traversal and retain no message, URL, or arbitrary property value.
+  for (let depth = 0; depth < 4 && error != null; depth += 1) {
+    try {
+      const detail = error as { code?: unknown; cause?: unknown };
+      const code = detail.code;
+      if (typeof code === 'string' && PG_SETUP_ERROR_CODES.has(code)) {
+        return { phase, code };
+      }
+      error = detail.cause;
+    } catch { break; /* error metadata must not break the fail-soft reporter */ }
+  }
+  return { phase };
+}
+
 // ONE shared pg client reused for EVERY per-file insert across the whole run,
 // memoized as a PROMISE so the fire-and-forget per-file inserts can't race into
 // creating multiple clients. A fresh client per file exhausted PG's connection
@@ -1311,6 +1340,7 @@ export type PgHandle = { sql: PgSql } | null;
 // record cannot give the two reporters separate counts.
 const sharedPg = pinModuleState('@papercusp/test-config.shared-pg', () => ({
   promise: undefined as Promise<PgHandle> | undefined,
+  setupFailure: undefined as PgSetupFailure | undefined,
   holders: 0,
   /** Queries submitted while a reporter lease is held must settle before sql.end(). */
   inFlight: 0,
@@ -1337,11 +1367,14 @@ function validReporterPgPort(raw: string | undefined): number {
 
 export function tryGetPg(): Promise<PgHandle> {
   if (sharedPg.promise) return sharedPg.promise;
+  sharedPg.setupFailure = undefined;
   sharedPg.promise = (async (): Promise<PgHandle> => {
+    let phase: PgSetupFailure['phase'] = 'module-import';
     try {
       // `?? mod` handles both the ESM-default and CJS-namespace interop shapes
       // without relying on esModuleInterop in every consumer's tsconfig.
       const mod = (await import('postgres')) as { default?: unknown };
+      phase = 'client-construction';
       const pg = (mod.default ?? mod) as (url: string, opts: Record<string, unknown>) => PgSql;
       // The dedicated ledger variable wins (WI-10006736): an isolated verifier exports
       // HARNESS_ADMIN_DATABASE_URL at its throwaway database, so a run that must keep its
@@ -1361,10 +1394,11 @@ export function tryGetPg(): Promise<PgHandle> {
       });
       return { sql };
     } catch (e) {
+      sharedPg.setupFailure = pgSetupFailure(phase, e);
       if (process.env.PAPERCUSP_DEBUG_REPORTER) {
         try {
           const fs = await import('node:fs');
-          fs.appendFileSync('/tmp/_rep_dbg', `${new Date().toISOString()} tryGetPg-fail: ${e instanceof Error ? e.message : String(e)}\n`);
+          fs.appendFileSync('/tmp/_rep_dbg', `${new Date().toISOString()} tryGetPg-fail: ${JSON.stringify(sharedPg.setupFailure)}\n`);
         } catch { /* swallow */ }
       }
       return null;
@@ -1429,6 +1463,7 @@ export async function closeSharedPg(): Promise<void> {
     return;
   }
   sharedPg.promise = undefined;
+  sharedPg.setupFailure = undefined;
   sharedPg.closeRequested = false;
   const closing = (async () => {
     try {
@@ -1596,6 +1631,7 @@ export type TestRunReceipt =
       outcome: 'timeout' | 'failed';
       reason: string;
       errorCode?: string;
+      pgSetupFailure?: PgSetupFailure;
       replayable: boolean;
     });
 
@@ -1735,7 +1771,7 @@ function unwrittenReceipts(
   rows: readonly TestRunRow[],
   outcome: 'timeout' | 'failed',
   reason: string,
-  options: { error?: unknown; replayable?: boolean; insertDiagnostics?: TestRunInsertDiagnostics } = {},
+  options: { error?: unknown; replayable?: boolean; insertDiagnostics?: TestRunInsertDiagnostics; pgSetupFailure?: PgSetupFailure } = {},
 ): TestRunReceipt[] {
   const code = options.error === undefined ? undefined : errorCode(options.error);
   return receiptIdentifiedRows(rows).map(row => ({
@@ -1744,6 +1780,7 @@ function unwrittenReceipts(
     reason,
     ...(options.insertDiagnostics ? { insertDiagnostics: options.insertDiagnostics } : {}),
     ...(code ? { errorCode: code } : {}),
+    ...(options.pgSetupFailure ? { pgSetupFailure: options.pgSetupFailure } : {}),
     replayable: options.replayable === true && row.receiptAttempt === 0,
   }));
 }
@@ -2105,7 +2142,9 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
 
   const pg = await tryGetPg();
   if (!pg) {
-    appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'failed', 'pg_unavailable'));
+    appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'failed', 'pg_unavailable', {
+      pgSetupFailure: sharedPg.setupFailure,
+    }));
     return;
   }
 
