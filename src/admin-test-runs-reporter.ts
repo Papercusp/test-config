@@ -110,7 +110,7 @@ export function collectBoundaryObservations(testModule: TestModule): TestBoundar
  * a broken reporter.
  */
 export async function loadEvidenceRootResolver(
-  load: () => Promise<{ defaultEvidenceRoot?: unknown }> = () => import('@papercusp/verification-harness'),
+  load: () => Promise<{ defaultEvidenceRoot?: unknown }> = () => import('@papercusp/verification-harness/evidence-root'),
 ): Promise<EvidenceRootResolver | undefined> {
   try {
     const { defaultEvidenceRoot } = await load();

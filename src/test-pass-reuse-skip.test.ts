@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
+import * as runtimeProof from './runtime-proof.ts';
 
 import {
   PARTIAL_SKIP_LIST_SCHEMA,
@@ -23,17 +23,18 @@ import {
 // failure mode must run MORE tests (return no exclude entries), never fewer.
 
 const dirs: string[] = [];
-it('loads against an older runtime-proof module and runs every file when the new API is absent', () => {
+it.each(['absent', 'legacy'])('loads with %s host runtime-proof support and runs every file without proof', (support) => {
   const root = mkdtempSync(join(tmpdir(), 'legacy-proof-api-'));
   dirs.push(root);
   const sourceDir = join(root, 'libs/test-config/src');
   mkdirSync(sourceDir, { recursive: true });
   mkdirSync(join(root, 'scripts/lib'), { recursive: true });
   writeFileSync(join(root, 'package.json'), '{"type":"module"}');
-  writeFileSync(join(root, 'scripts/lib/runtime-compatibility.mjs'), 'export function measureRuntime() {}\n');
+  if (support === 'legacy') writeFileSync(join(root, 'scripts/lib/runtime-compatibility.mjs'), 'export function measureRuntime() {}\n');
   writeFileSync(join(sourceDir, 'admin-test-runs-reporter.ts'), 'export function inferWorkspaceRoot() { return "/unused"; }\n');
   const consumer = join(sourceDir, 'test-pass-reuse-skip.ts');
   writeFileSync(consumer, readFileSync(new URL('./test-pass-reuse-skip.ts', import.meta.url)));
+  writeFileSync(join(sourceDir, 'runtime-proof.ts'), readFileSync(new URL('./runtime-proof.ts', import.meta.url)));
   const list = join(root, 'skip.json');
   writeFileSync(list, JSON.stringify({ schema: REUSE_SKIP_LIST_SCHEMA, files: ['a.test.ts'],
     runContext: 'clean-local', runnerIdentity: 'old-runtime', judgedSha: 'a'.repeat(40) }));

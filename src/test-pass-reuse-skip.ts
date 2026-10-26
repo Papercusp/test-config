@@ -13,7 +13,7 @@
 // dropped here and every file runs. Every failure mode runs MORE tests, never fewer.
 
 import { readFileSync } from 'node:fs';
-import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
+import * as runtimeProof from './runtime-proof.ts';
 import { inferWorkspaceRoot } from './admin-test-runs-reporter.ts';
 
 export const PC_TEST_REUSE_SKIP_LIST_ENV = 'PC_TEST_REUSE_SKIP_LIST';

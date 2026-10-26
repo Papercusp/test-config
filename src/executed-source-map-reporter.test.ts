@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TestModule } from 'vitest/node';
-import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
+import * as runtimeProof from './runtime-proof.ts';
 import { jsonChunks, jsonSha256, readCompletionJsonSync } from '../../../scripts/lib/completion-snapshot.mjs';
 import { executedSourceOriginalsPlugin } from './vitest-config';
 // The router stays plain Node; exercise its output routing with the real reporter.

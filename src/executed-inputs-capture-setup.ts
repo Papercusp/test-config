@@ -13,7 +13,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as net from 'node:net';
 import * as workerThreads from 'node:worker_threads';
 import { afterAll, expect } from 'vitest';
-import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
+import * as runtimeProof from './runtime-proof.ts';
 import { inferWorkspaceRoot } from './admin-test-runs-reporter';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,

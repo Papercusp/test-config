@@ -36,7 +36,7 @@ import { open, rename, rm } from 'node:fs/promises';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
+import * as runtimeProof from './runtime-proof.ts';
 import { completionSnapshotChunks } from '../../../scripts/lib/completion-snapshot.mjs';
 
 import {
