@@ -13,9 +13,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { pinModuleState } from '@papercusp/module-singleton';
 import { fileURLToPath } from 'node:url';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { TestModule } from 'vitest/node';
 
-import { closeSharedPg, closeSharedPgIfUnheld, insertTestRunRowsWithSql, retainSharedPg, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
+import { closeSharedPg, closeSharedPgIfUnheld, insertRows, insertTestRunRowsWithSql, retainSharedPg, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
 import ExecutedSourceMapReporter, { EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS } from './executed-source-map-reporter.ts';
 
 const shared = pinModuleState('@papercusp/test-config.shared-pg', () => ({
@@ -49,6 +52,87 @@ async function chunkedWrite(chunks: number): Promise<void> {
 afterEach(async () => {
   shared.holders = 0;
   shared.promise = undefined;
+});
+
+describe('shared PG setup failure receipts', () => {
+  it.each([
+    ['module-import', 'ERR_MODULE_NOT_FOUND'],
+    ['client-construction', 'ERR_INVALID_URL'],
+    ['client-construction', 'credential-bearing-code-sentinel'],
+    ['client-construction', 'changing-code-sentinel'],
+  ] as const)('retains only safe %s failure metadata (%s)', async (phase, code) => {
+    const directory = mkdtempSync(join(tmpdir(), 'reporter-setup-'));
+    const file = join(directory, 'receipts.jsonl');
+    const previous = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    const NEVER_EMIT_MARKER = 'never-emit-me';
+    const failure = Object.assign(new Error(`postgresql://reporter:${NEVER_EMIT_MARKER}@localhost/private`), { code });
+    if (code === 'changing-code-sentinel') {
+      let reads = 0;
+      Object.defineProperty(failure, 'code', { get: () => ++reads <= 2 ? 'ERR_INVALID_URL' : NEVER_EMIT_MARKER });
+    }
+    const expectedCode = code === 'changing-code-sentinel' ? 'ERR_INVALID_URL'
+      : code.startsWith('ERR_') ? code : undefined;
+    vi.doMock('postgres', () => {
+      if (phase === 'module-import') throw failure;
+      return { default: () => { throw failure; } };
+    });
+    process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = file;
+    const at = new Date('2026-10-26T20:00:00Z');
+    const row: TestRunRow = { filePath: 'setup.test.ts', status: 'pass', durationMs: 1,
+      startedAt: at, finishedAt: at, outputTail: null, isScratchConfig: false,
+      worktreeDirty: false, commitSha: 'abc123', executionDetails: null };
+    try {
+      await closeSharedPg();
+      await insertRows([row]);
+      // Every file shares the cached setup failure rather than losing its cause.
+      await insertRows([{ ...row, filePath: 'second.test.ts' }]);
+      const text = readFileSync(file, 'utf8');
+      const receipts = text.trim().split('\n').map(line => JSON.parse(line));
+      expect(receipts).toHaveLength(2);
+      for (const receipt of receipts) {
+        expect(receipt).toMatchObject({ outcome: 'failed', reason: 'pg_unavailable',
+          pgSetupFailure: { phase, ...(expectedCode ? { code: expectedCode } : {}) } });
+        expect(receipt.pgSetupFailure).toEqual({ phase, ...(expectedCode ? { code: expectedCode } : {}) });
+      }
+      expect(text).not.toContain(NEVER_EMIT_MARKER);
+      expect(text).not.toContain('postgresql://');
+      expect(text).not.toContain('credential-bearing-code-sentinel');
+    } finally {
+      await closeSharedPg();
+      vi.doUnmock('postgres');
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+      else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps query failure distinct from successful client setup', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'reporter-query-'));
+    const file = join(directory, 'receipts.jsonl');
+    const previous = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    const failure = Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' });
+    const sql = Object.assign((first: unknown) => Array.isArray(first) && !('raw' in first)
+      ? {} : Promise.reject(failure), { end: async () => undefined });
+    vi.doMock('postgres', () => ({ default: () => sql }));
+    process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = file;
+    const at = new Date('2026-10-26T20:00:00Z');
+    try {
+      await closeSharedPg();
+      await insertRows([{ filePath: 'query.test.ts', status: 'pass', durationMs: 1,
+        startedAt: at, finishedAt: at, outputTail: null, isScratchConfig: false,
+        worktreeDirty: false, commitSha: 'abc123', executionDetails: null }]);
+      const receipt = JSON.parse(readFileSync(file, 'utf8').trim());
+      expect(receipt).toMatchObject({ outcome: 'failed', errorCode: 'ECONNREFUSED' });
+      expect(receipt).not.toHaveProperty('pgSetupFailure');
+      expect(receipt.reason).not.toBe('pg_unavailable');
+    } finally {
+      await closeSharedPg();
+      vi.doUnmock('postgres');
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+      else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('shared PG lease (WI-10003715)', () => {
