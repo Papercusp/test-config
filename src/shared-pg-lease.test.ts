@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TestModule } from 'vitest/node';
 
-import { closeSharedPg, closeSharedPgIfUnheld, insertRows, insertTestRunRowsWithSql, retainSharedPg, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
+import AdminTestRunsReporter, { closeSharedPg, closeSharedPgIfUnheld, insertRows, insertTestRunRowsWithSql, preflightTestRunLedger, retainSharedPg, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
 import ExecutedSourceMapReporter, { EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS } from './executed-source-map-reporter.ts';
 
 const shared = pinModuleState('@papercusp/test-config.shared-pg', () => ({
@@ -131,6 +131,130 @@ describe('shared PG setup failure receipts', () => {
       if (previous === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
       else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previous;
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('same-process evidence ledger preflight', () => {
+  it.each(['module-import', 'client-construction', 'sink-query'] as const)(
+    'refuses %s before source discovery without exposing credentials', async phase => {
+      const previous = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+      process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = 'unused-preflight-receipts.jsonl';
+      const NEVER_EMIT_MARKER = 'never-emit-me';
+      const error = Object.assign(new Error(`postgresql://reporter:${NEVER_EMIT_MARKER}@localhost/private`),
+        { code: phase === 'module-import' ? 'ERR_MODULE_NOT_FOUND' : phase === 'client-construction' ? 'ERR_INVALID_URL' : '42501' });
+      const end = vi.fn(async () => {});
+      const sql = Object.assign(vi.fn(async () => { throw error; }), { end });
+      vi.doMock('postgres', () => {
+        if (phase === 'module-import') throw error;
+        return { default: () => { if (phase === 'client-construction') throw error; return sql; } };
+      });
+      const snapshot = vi.fn(async () => ({ commit: 'abc', porcelain: '' }));
+      const reporter = new AdminTestRunsReporter(snapshot);
+      try {
+        await closeSharedPg();
+        const failure = await reporter.onInit({} as never).catch(error => error);
+        expect(failure).toBeInstanceOf(Error);
+        expect(failure.message).toContain(`TEST_FILE_LEDGER_RECEIPT_PREFLIGHT status=not-measured phase=${phase}`);
+        expect(failure.message).not.toContain(NEVER_EMIT_MARKER);
+        expect(failure.message).not.toContain('postgresql://');
+        expect(snapshot).not.toHaveBeenCalled();
+        expect(shared.holders).toBe(0);
+        if (phase === 'sink-query') expect(end).toHaveBeenCalledOnce();
+      } finally {
+        await closeSharedPg();
+        vi.doUnmock('postgres');
+        if (previous === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+        else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previous;
+      }
+    });
+
+  it('plans the real INSERT without executing it and keeps the shared client for the run', async () => {
+    const statements: string[] = [];
+    const end = vi.fn(async () => {});
+    const sql = Object.assign(vi.fn((first: unknown) => {
+      if (Array.isArray(first) && 'raw' in first) {
+        statements.push((first as unknown as TemplateStringsArray).join('?'));
+        return Promise.resolve([]);
+      }
+      return {};
+    }), { end });
+    shared.promise = Promise.resolve({ sql: sql as unknown as PgSql });
+    const release = retainSharedPg();
+    try {
+      await expect(preflightTestRunLedger()).resolves.toEqual({ ok: true });
+      expect(statements).toHaveLength(1);
+      expect(statements[0]).toMatch(/^EXPLAIN INSERT INTO harness_shared.test_runs/);
+      expect(statements[0]).not.toContain('ANALYZE');
+      expect(await tryGetPg()).toEqual({ sql });
+      expect(end).not.toHaveBeenCalled();
+    } finally { await release(); }
+    expect(end).toHaveBeenCalledOnce();
+  });
+
+  it('destroys a hung startup query at the budget and releases its lease', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const previous = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = 'unused-preflight-receipts.jsonl';
+    let rejectQuery!: (error: Error) => void;
+    const pending = new Promise((_, reject) => { rejectQuery = reject; });
+    const end = vi.fn(async () => { rejectQuery(new Error('CONNECTION_DESTROYED')); });
+    const sql = Object.assign(vi.fn((first: unknown) =>
+      Array.isArray(first) && 'raw' in first ? pending : {}), { end });
+    shared.promise = Promise.resolve({ sql: sql as unknown as PgSql });
+    const reporter = new AdminTestRunsReporter(vi.fn(async () => ({ commit: 'abc', porcelain: '' })));
+    const failed = reporter.onInit({} as never).catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect((await failed).message).toContain('status=not-measured phase=sink-query');
+      expect(end).toHaveBeenCalledWith({ timeout: 0 });
+      expect(shared.holders).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      await closeSharedPg();
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+      else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previous;
+    }
+  });
+
+  it('uses the writer compatibility fallback when only configuration_snapshot is missing', async () => {
+    const selectedColumns: string[][] = [];
+    let queries = 0;
+    const sql = Object.assign(vi.fn((first: unknown, ...columns: string[]) => {
+      if (Array.isArray(first) && 'raw' in first) {
+        return ++queries === 1 ? Promise.reject(Object.assign(
+          new Error('column "configuration_snapshot" of relation "test_runs" does not exist'), { code: '42703' }))
+          : Promise.resolve([]);
+      }
+      selectedColumns.push(columns);
+      return {};
+    }), { end: vi.fn(async () => {}) });
+    shared.promise = Promise.resolve({ sql: sql as unknown as PgSql });
+    try {
+      expect(await preflightTestRunLedger()).toEqual({ ok: true });
+      expect(selectedColumns).toHaveLength(2);
+      expect(selectedColumns[0]).toContain('configuration_snapshot');
+      expect(selectedColumns[1]).not.toContain('configuration_snapshot');
+      expect(selectedColumns[1]).toContain('execution_details');
+    } finally { await closeSharedPg(); }
+  });
+
+  it('keeps ordinary reporter initialization fail-soft when no receipt was requested', async () => {
+    const previous = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    const pg = vi.fn(() => { throw new Error('unavailable'); });
+    vi.doMock('postgres', () => ({ default: pg }));
+    const snapshot = vi.fn(async () => ({ commit: 'abc', porcelain: '' }));
+    const reporter = new AdminTestRunsReporter(snapshot);
+    try {
+      await reporter.onInit({ config: { root: process.cwd() } } as never);
+      expect(snapshot).toHaveBeenCalledOnce();
+      expect(pg).not.toHaveBeenCalled();
+    } finally {
+      await reporter.onExit();
+      vi.doUnmock('postgres');
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+      else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previous;
     }
   });
 });

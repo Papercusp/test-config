@@ -11,11 +11,14 @@
  * fail to LOAD in a lib that lacks operator-core; the 3 helpers it used to import
  * (resolveGitContext / inferWorkspaceRoot / resolveTestRunSource) are inlined below.
  *
- * D-007 fail-soft contract — LOAD-BEARING:
+ * D-007 ordinary-run fail-soft contract — LOAD-BEARING:
  *   - 1s connect timeout; ONE shared pg client reused for the whole run
  *   - rows flush in bounded bulk inserts, never one queued query per test file
  *   - swallow every PG / git / fs error; never throw out of any hook
  *   - never taint test output; never affect the process exit code
+ * An explicit PAPERCUSP_TEST_RUN_RECEIPT_FILE opts into evidence admission:
+ * onInit refuses before test discovery if the real loader/sink preflight fails.
+ * Result persistence after admission remains fail-soft and receipt-verified.
  *
  * Opt-out via PAPERCUSP_DISABLE_TEST_RUNS_REPORTER=1 (defineVitestConfig drops it).
  * Mutation probes set PAPERCUSP_MUTATION_PROBE=1; those deliberate baseline and
@@ -1293,7 +1296,7 @@ export type PgSql = {
 export type PgHandle = { sql: PgSql } | null;
 
 type PgSetupFailure = {
-  phase: 'module-import' | 'client-construction';
+  phase: 'module-import' | 'client-construction' | 'sink-query';
   code?: string;
 };
 
@@ -1303,6 +1306,8 @@ const PG_SETUP_ERROR_CODES = new Set([
   'ERR_MODULE_NOT_FOUND', 'MODULE_NOT_FOUND', 'ERR_PACKAGE_PATH_NOT_EXPORTED',
   'ERR_DLOPEN_FAILED', 'ERR_REQUIRE_ESM', 'ERR_INVALID_URL', 'ERR_INVALID_ARG_TYPE',
   'ERR_INVALID_ARG_VALUE',
+  'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'CONNECT_TIMEOUT',
+  '28P01', '3D000', '42501', '42P01', '42703',
 ]);
 
 function pgSetupFailure(phase: PgSetupFailure['phase'], error: unknown): PgSetupFailure {
@@ -1822,6 +1827,42 @@ function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boo
     const timer = setTimeout(() => finish(false), timeoutMs);
     promise.then(() => finish(true), () => finish(false));
   });
+}
+
+/** Validate the actual reporter loader/client and INSERT plan before discovery.
+ * EXPLAIN without ANALYZE checks the sink without inserting a fictitious test
+ * result or consuming a sequence value. It does not prove a later write commits.
+ */
+export async function preflightTestRunLedger(): Promise<{ ok: true } | ({ ok: false } & PgSetupFailure)> {
+  const pg = await tryGetPg();
+  if (!pg) return { ok: false, ...(sharedPg.setupFailure ?? { phase: 'module-import' as const }) };
+  let failure: unknown;
+  let columns: readonly (typeof TEST_RUN_INSERT_COLUMNS)[number][] = TEST_RUN_INSERT_COLUMNS;
+  const probe = Object.fromEntries(columns.map(column => [column, null]));
+  const query = trackSharedPgOperation((async () => {
+    try {
+      const explain = () => pg.sql`EXPLAIN INSERT INTO harness_shared.test_runs
+        ${pg.sql([probe], ...columns)} RETURNING id, file_path`;
+      try { await explain(); }
+      catch (error) {
+        // Match the existing writer's compatibility path for pre-1448 ledgers.
+        if (!isMissingConfigurationSnapshotColumn(error)) throw error;
+        columns = columns.filter(column => column !== 'configuration_snapshot');
+        await explain();
+      }
+    } catch (error) { failure = error; throw error; }
+  })());
+  const settled = await settleWithin(query, reporterWriteBudget(process.env).insertTimeoutMs);
+  if (!settled) {
+    if (failure === undefined) {
+      // A timed-out waiter does not cancel postgres.js's queued query. Startup
+      // has no test results to drain: destroy this client so lease release can
+      // finish even when the server never answers the EXPLAIN.
+      try { await pg.sql.end({ timeout: 0 }); } catch { /* preserve the safe failure */ }
+    }
+    return { ok: false, ...pgSetupFailure('sink-query', failure) };
+  }
+  return { ok: true };
 }
 
 /**
@@ -2443,6 +2484,19 @@ export default class AdminTestRunsReporter implements Reporter {
     const preferredTitles = process.env.PAPERCUSP_TEST_RUN_CASE_TITLE_PATTERN?.trim();
     this.preferredPassedCasePattern = preferredTitles ? new RegExp(preferredTitles) : undefined;
     this.pgLease ??= retainSharedPg();
+    // Evidence consumers must fail before importing expensive test modules.
+    // Ordinary reporter runs retain D-007's fail-soft behavior. This executes in
+    // the same Vitest process/module cache that will later persist the results.
+    if (this.writeRows === insertRows && process.env[TEST_RUN_RECEIPT_ENV]?.trim()) {
+      const preflight = await preflightTestRunLedger();
+      if (!preflight.ok) {
+        const release = this.pgLease;
+        this.pgLease = null;
+        await release();
+        throw new Error(`TEST_FILE_LEDGER_RECEIPT_PREFLIGHT status=not-measured phase=${preflight.phase}` +
+          (preflight.code ? ` code=${preflight.code}` : ''));
+      }
+    }
     // WI-10000776 — FIRST (after the lease above, which reads no root), before anything reads a root. Vitest calls onInit before it
     // executes any test module, so this is the one moment the checkout under test is
     // known and nothing has been relativized yet. Both statements below resolve a root
