@@ -31,6 +31,11 @@
       "import": "./src/silenced-console-census.ts",
       "default": "./src/silenced-console-census.ts"
     },
+    "./sensitive-text": {
+      "types": "./src/sensitive-text.ts",
+      "import": "./src/sensitive-text.ts",
+      "default": "./src/sensitive-text.ts"
+    },
     "./vitest-config": {
       "types": "./src/vitest-config.ts",
       "import": "./src/vitest-config.ts",
