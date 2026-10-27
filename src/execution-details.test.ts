@@ -21,6 +21,19 @@ describe('recorded requirement realization checks', () => {
     expect(parseTestRunExecutionDetails(details({ check }))).toMatchObject({ check });
     expect(parseRecordedRubricCheck({ ...check, kind: 'unregistered' })).toBeUndefined();
   });
+
+  it('roundtrips a per-subject check and refuses a malformed subject (crm plan D-049)', () => {
+    const check = { id: 'usage:instrument', rubricRef: 'lead-qualification', criterionKey: 'usage',
+      kind: 'instrument', value: 40, unit: 'score' };
+    for (const subject of [{ ref: 'PER-1' }, { kind: 'person', ref: 'PER-1' }]) {
+      expect(parseRecordedRubricCheck({ ...check, subject })).toEqual({ ...check, subject });
+      expect(parseTestRunExecutionDetails(details({ check: { ...check, subject } }))).toMatchObject({ check: { subject } });
+    }
+    for (const subject of [{}, { ref: '' }, { ref: '   ' }, { ref: 'x'.repeat(201) }, { ref: 'PER-1', extra: 1 },
+      { kind: '', ref: 'PER-1' }, { kind: 7, ref: 'PER-1' }, 'PER-1', null]) {
+      expect(parseRecordedRubricCheck({ ...check, subject })).toBeUndefined();
+    }
+  });
 });
 
 describe('native LLM report identities', () => {

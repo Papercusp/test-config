@@ -340,6 +340,26 @@ export interface RecordedRubricCheck {
   expect?: RecordedRubricCheckExpect;
   /** Original bounded measurement context; absent on legacy scalar-only rows. */
   provenance?: RecordedMeasurementProvenance;
+  /**
+   * The one subject this measurement describes (a lead, a run, a work-item), mirroring a
+   * scorecard's observation.subject. Absent on a rubric-wide check. A subject row is never
+   * read as another subject's or as the rubric-wide result (crm plan D-049).
+   */
+  subject?: RecordedRubricCheckSubject;
+}
+
+export interface RecordedRubricCheckSubject {
+  kind?: string;
+  ref: string;
+}
+
+export const MAX_RECORDED_SUBJECT_REF_CHARS = 200;
+
+export function parseRecordedRubricCheckSubject(value: unknown): RecordedRubricCheckSubject | undefined {
+  if (!isRecord(value) || Object.keys(value).some((key) => key !== 'kind' && key !== 'ref')) return undefined;
+  if (typeof value.ref !== 'string' || !value.ref.trim().length || value.ref.length > MAX_RECORDED_SUBJECT_REF_CHARS) return undefined;
+  if (value.kind !== undefined && (typeof value.kind !== 'string' || !value.kind.length || value.kind.length > 64)) return undefined;
+  return value as unknown as RecordedRubricCheckSubject;
 }
 
 export const MAX_MEASUREMENT_PROVENANCE_BYTES = 16_384;
@@ -411,7 +431,7 @@ export interface RecordedRubricCheckExpect {
   value: number;
 }
 
-const recordedRubricCheckKeys = new Set(['id', 'rubricRef', 'criterionKey', 'kind', 'value', 'unit', 'expect', 'provenance']);
+const recordedRubricCheckKeys = new Set(['id', 'rubricRef', 'criterionKey', 'kind', 'value', 'unit', 'expect', 'provenance', 'subject']);
 
 function isRecordedRubricCheckExpect(value: unknown): value is RecordedRubricCheckExpect {
   return isRecord(value)
@@ -432,6 +452,7 @@ export function parseRecordedRubricCheck(value: unknown): RecordedRubricCheck | 
   if (!(value.unit === null || nonEmpty(value.unit))) return undefined;
   if (value.expect !== undefined && !isRecordedRubricCheckExpect(value.expect)) return undefined;
   if (value.provenance !== undefined && !parseRecordedMeasurementProvenance(value.provenance)) return undefined;
+  if (value.subject !== undefined && !parseRecordedRubricCheckSubject(value.subject)) return undefined;
   return value as unknown as RecordedRubricCheck;
 }
 
