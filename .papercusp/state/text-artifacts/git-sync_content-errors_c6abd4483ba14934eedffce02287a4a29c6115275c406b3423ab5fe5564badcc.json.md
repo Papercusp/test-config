@@ -1,0 +1,7 @@
+---
+rel_path: "git-sync/content-errors/c6abd4483ba14934eedffce02287a4a29c6115275c406b3423ab5fe5564badcc.json"
+updated_at: 1793127519003
+_body: "content"
+---
+
+{"schemaVersion":1,"workspaceId":"papercusp-workspace","harness":"papercusp/libs/test-config","files":[{"scope":"superproject","file":"src/admin-test-runs-reporter.test.ts","detectorKey":"secrets","error":"credential-shaped content would enter git history (1 finding(s) at line 1766 [secret-assignment]). This file is EXCLUDED from the commit and left on disk — fix it in place, do not retry the write. If this is a credential STAND-IN for a test, replace it with a low-entropy, role-named constant (the in-tree convention is NEVER_EMIT_MARKER = 'never-emit-me'; six social adapter suites use it with zero incidents) — the conformance check is a plain substring search, so a realistic-looking value buys nothing. Only if the file must genuinely carry credential shapes as fixtures, register the exact path: pot_git:secrets_exemptions { action:'add', path:'src/admin-test-runs-reporter.test.ts', reason:'<why this is a false positive>' }. Detail: refusing to publish — 1 secret(s): src/admin-test-runs-reporter.test.ts:1766 [secret-assignment] fake…89 (52 chars)","fixerRole":"content-fixer","contentHash":"567bad49c09de46e73893bb106dd50936f7ae80cfa17bd844b6ed92604c0af81","detectorResultHash":"c1d47ad32c733826acab781800f91c33ead8b56eb4966dd23b3d9bb7f0454dc7"}]}
