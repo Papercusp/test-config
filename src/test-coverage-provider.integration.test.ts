@@ -103,4 +103,42 @@ coverage: { enabled: true, provider: 'custom', customProviderModule: './provider
     expect(snapshots[0]?.sources[0]?.covered).not.toContain(3);
     expect(await readFile(join(dir, 'reports/coverage-final.json'), 'utf8')).toContain('unused.ts');
   }, 120_000);
+  // WI-6554700010030139: test:file passes exact files as CLI filters into a project whose include
+  // matches thousands of specs. The population must be the run's selected specs, not the first
+  // COVERAGE_MAX_FILES of the whole project (which omitted the executed file: rejected.test).
+  it('takes its population from the run file filters, not the whole project glob', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'test-file-v8-filtered-')); dirs.push(dir);
+    const artifact = join(dir, 'captured.json');
+    await writeFile(join(dir, 'package.json'), '{"type":"module"}');
+    await writeFile(join(dir, 'subject.ts'), 'export function choose(flag: boolean) {\n  if (flag) return 1;\n  return 2;\n}\n');
+    await writeFile(join(dir, 'subject.test.ts'), `import { test, expect } from ${JSON.stringify(join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'dist/index.js'))};\nimport { choose } from './subject';\ntest('positive', () => expect(choose(true)).toBe(1));\n`);
+    // More unselected specs than COVERAGE_MAX_FILES (200); never executed by this run.
+    await Promise.all(Array.from({ length: 201 }, (_, i) =>
+      writeFile(join(dir, `filler-${String(i).padStart(3, '0')}.test.ts`), 'throw new Error("unselected spec ran");\n')));
+    await writeFile(join(dir, 'provider.ts'), `import { TestFileCoverageProvider } from ${JSON.stringify(join(here, 'test-coverage-provider.ts'))};
+import v8 from ${JSON.stringify(createRequire(import.meta.url).resolve('@vitest/coverage-v8'))};
+import { writeFile } from 'node:fs/promises';
+export default { ...v8, getProvider: () => new TestFileCoverageProvider(rows => writeFile(${JSON.stringify(artifact)}, JSON.stringify(rows))) };
+`);
+    await writeFile(join(dir, 'vitest.config.ts'), `import { defineConfig } from ${JSON.stringify(join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'dist/config.js'))};
+import { executedSourceOriginalsPlugin } from ${JSON.stringify(join(here, 'vitest-config.ts'))};
+export default defineConfig({ plugins: [executedSourceOriginalsPlugin()], test: { include: ['*.test.ts'], maxWorkers: 1,
+coverage: { enabled: true, provider: 'custom', customProviderModule: './provider.ts', include: ['subject.ts'], reporter: ['json'], reportsDirectory: './reports' } } });
+`);
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+      !/^(?:PC_|VITEST|AFFECTED_|PAPERCUSP_TEST_|PAPERCUSP_MUTATION_)/.test(key)));
+    Object.assign(env, { PAPERCUSP_DISABLE_TEST_RUNS_REPORTER: '1', HARNESS_ADMIN_DATABASE_URL: 'postgresql://127.0.0.1:1/unreachable',
+      PAPERCUSP_TEST_RUNS_DB_URL: 'postgresql://127.0.0.1:1/unreachable' });
+    // cwd = the fixture root: Vitest resolves CLI filters against process.cwd(), as test:file does.
+    const result = await promisify(execFile)(process.execPath, [vitest, 'run', 'subject.test.ts', '--root', dir,
+      '--config', join(dir, 'vitest.config.ts'), '--configLoader', 'native'],
+      { cwd: dir, env, timeout: 90_000, maxBuffer: 4_000_000 });
+    const snapshots = JSON.parse(await readFile(artifact, 'utf8').catch(error => {
+      throw new Error(`Filtered-run capture missing: ${String(error)}\n${result.stdout}\n${result.stderr}`);
+    })) as TestCoverageSnapshot[];
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toMatchObject({ testFile: 'subject.test.ts', populationComplete: true,
+      population: [expect.objectContaining({ path: 'subject.test.ts' })] });
+    expect(snapshots[0]?.sources[0]?.covered).toContain(2);
+  }, 120_000);
 });

@@ -25,7 +25,9 @@ export class TestFileCoverageProvider extends V8CoverageProvider {
     const observedAt = new Date().toISOString();
     try {
       const root = inferWorkspaceRoot(this.ctx.config.root);
-      const specs = await this.ctx.globTestSpecifications();
+      // The population is what THIS run selected. Unfiltered, Vitest globs every spec of every
+      // project, and the first COVERAGE_MAX_FILES of a large package omit the executed file.
+      const specs = await this.ctx.globTestSpecifications(runFileFilters(this.ctx));
       const population = await Promise.all(specs.slice(0, COVERAGE_MAX_FILES).map(async spec => ({
         path: coveragePath(root, spec.moduleId)!, sha256: coverageHash(await readFile(spec.moduleId)),
       })));
@@ -107,6 +109,12 @@ async function persistSnapshots(snapshots: TestCoverageSnapshot[]): Promise<void
   if (!pg || !workspace || !harness) throw new Error('Coverage persistence scope or sink unavailable');
   await writeTestCoverage(pg.sql as unknown as Sql, workspace, harness, qualified,
     process.env.PAPERCUSP_TEST_RUN_GROUP ?? null);
+}
+/** The run's CLI file filters (`vitest run a.test.ts`), which Vitest keeps on the untyped
+ * `filenamePattern` and resolves against process.cwd(). None means every spec was selected. */
+function runFileFilters(ctx: object): string[] {
+  const pattern = (ctx as { filenamePattern?: unknown }).filenamePattern;
+  return Array.isArray(pattern) ? pattern.filter((p): p is string => typeof p === 'string') : [];
 }
 function hasSkipped(task: { mode: string; tasks?: readonly unknown[] }): boolean {
   return task.mode === 'skip' || task.mode === 'todo'
