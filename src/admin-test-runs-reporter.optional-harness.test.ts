@@ -10,6 +10,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 // Type-only: erased at compile time, so it does not load the reporter before vi.mock applies.
@@ -81,5 +82,17 @@ describe('loadEvidenceRootResolver', () => {
     expect(resolver?.('isolated-integration')).toBe('/evidence/isolated-integration');
     expect(await loadEvidenceRootResolver(async () => ({}))).toBeUndefined();
     expect(await loadEvidenceRootResolver(() => Promise.reject(new Error('boom')))).toBeUndefined();
+  });
+
+  // WI-2146323: Vite's client import analysis (jsdom / happy-dom projects) resolves every
+  // string-literal import specifier at transform time, so a literal reference to the optional
+  // package fails the transform in a hive that does not ship it, before any runtime catch.
+  // The node-environment cases above cannot see that: SSR transforms leave bare specifiers alone.
+  it('never names the optional package in a string-literal import specifier', () => {
+    const source = readFileSync(join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.ts'), 'utf8');
+    const literalImport = /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)?['"`]@papercusp\/verification-harness|\bfrom\s+['"]@papercusp\/verification-harness/;
+    expect(source).not.toMatch(literalImport);
+    expect(literalImport.test("() => import('@papercusp/verification-harness/evidence-root')")).toBe(true);
+    expect(literalImport.test('() => import(/* @vite-ignore */ "@papercusp/verification-harness")')).toBe(true);
   });
 });

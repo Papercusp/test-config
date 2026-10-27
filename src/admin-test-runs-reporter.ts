@@ -111,9 +111,16 @@ export function collectBoundaryObservations(testModule: TestModule): TestBoundar
  * contract (collectIsolatedRuntimeReceipts already answers `undefined` on any failure), so
  * the package is loaded lazily, here. An unresolvable package means "no receipts", never
  * a broken reporter.
+ *
+ * WI-2146323: the specifier is non-literal and marked @vite-ignore on purpose. Vite's client
+ * import analysis resolves a string-literal `import('…')` at TRANSFORM time, so a jsdom or
+ * happy-dom project in a hive without the package failed to transform the setup file that
+ * imports this module ("Failed to resolve import …") before this try/catch could run.
  */
+const EVIDENCE_ROOT_SPECIFIER = '@papercusp/verification-harness/evidence-root';
+
 export async function loadEvidenceRootResolver(
-  load: () => Promise<{ defaultEvidenceRoot?: unknown }> = () => import('@papercusp/verification-harness/evidence-root'),
+  load: () => Promise<{ defaultEvidenceRoot?: unknown }> = () => import(/* @vite-ignore */ EVIDENCE_ROOT_SPECIFIER),
 ): Promise<EvidenceRootResolver | undefined> {
   try {
     const { defaultEvidenceRoot } = await load();
