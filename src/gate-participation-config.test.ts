@@ -35,6 +35,7 @@ import {
   REUSE_SKIP_LIST_SCHEMA,
   executedSourceRunnerIdentity,
 } from './test-pass-reuse-skip.ts';
+import * as runtimeProof from './runtime-proof.ts';
 
 const EXECUTED_SOURCE_MAP_REPORTER = /executed-source-map-reporter\.ts$/;
 const INPUTS_CAPTURE_SETUP = /executed-inputs-capture-setup\.ts$/;
@@ -46,9 +47,20 @@ beforeEach(() => {
   savedArgv = process.argv;
   // defineVitestConfig's unit-layer guard reads argv; keep it free of positional filters.
   process.argv = ['node', 'vitest', 'run'];
+  // WI-6554700010029866: a real runtime proof exists only in a pinned release/checkpoint
+  // install (node_modules/.papercusp-dependency-generation). The mutable canonical tree
+  // has none, so reuse is disabled there by design — pin one identity so these cases
+  // test the config wiring, not which checkout they happen to run in.
+  vi.spyOn(runtimeProof, 'captureCurrentRuntimeProofIdentity').mockReturnValue({
+    name: 'node', version: '25.9.0', executable: '/pinned/node',
+    binarySha256: 'a'.repeat(64), platform: 'linux', arch: 'x64',
+    nativeDependencyGeneration: 'b'.repeat(64), lockfileSha256: 'c'.repeat(64),
+    configurationSha256: 'd'.repeat(64),
+  });
 });
 afterEach(() => {
   process.argv = savedArgv;
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   rmSync(scratch, { recursive: true, force: true });
 });
@@ -70,7 +82,8 @@ function writeSkipList(files: string[], runnerIdentity = executedSourceRunnerIde
 
 function writePartialSkipList(files: string[]): string {
   const path = join(scratch, 'partial-skip.json');
-  writeFileSync(path, JSON.stringify({ schema: PARTIAL_SKIP_LIST_SCHEMA, taskKey: 'integration', sourceCommit: 'a', sourceDigest: 'b', files }));
+  writeFileSync(path, JSON.stringify({ schema: PARTIAL_SKIP_LIST_SCHEMA, taskKey: 'integration', sourceCommit: 'a', sourceDigest: 'b',
+    runnerIdentity: executedSourceRunnerIdentity(), files }));
   return path;
 }
 

@@ -176,11 +176,16 @@ describe('Vitest run-level ledger verdict', () => {
       { name: 'assertion', passed: 0, failed: 1, skipped: 0 },
       { name: 'skipped', passed: 0, failed: 0, skipped: 1 },
     ], [{ message: 'uncaught rejection' }], 'failed');
-    expect(rows.map(row => row.status)).toEqual(['error', 'error', 'fail', 'error']);
-    expect(rows.every(row => row.outputTail?.includes('uncaught rejection'))).toBe(true);
-    expect(rows[2].outputTail).toContain('assertion mismatch');
-    expect(rows[2].executionDetails).toMatchObject({ passed: 0, failed: 1, collectionFailed: false });
-    expect(rows[3].executionDetails).toMatchObject({ passed: 0, failed: 0, skipped: 1, collectionFailed: false });
+    const byName = (name: string) => rows.find(row => row.filePath.endsWith(`src/${name}.test.ts`))!;
+    expect(rows).toHaveLength(4);
+    expect(['first', 'second', 'assertion', 'skipped'].map(name => byName(name).status))
+      .toEqual(['error', 'error', 'fail', 'error']);
+    // EI-26701962157024953: the failing row is written mid-run (it survives a SIGKILL), before
+    // any run-level error exists, so only the demoted rows carry the run-level diagnostic.
+    expect(['first', 'second', 'skipped'].every(name => byName(name).outputTail?.includes('uncaught rejection'))).toBe(true);
+    expect(byName('assertion').outputTail).toContain('assertion mismatch');
+    expect(byName('assertion').executionDetails).toMatchObject({ passed: 0, failed: 1, collectionFailed: false });
+    expect(byName('skipped').executionDetails).toMatchObject({ passed: 0, failed: 0, skipped: 1, collectionFailed: false });
   });
 
   it('preserves a clean successful invocation', async () => {
@@ -198,9 +203,11 @@ describe('Vitest run-level ledger verdict', () => {
       { name: 'clean', passed: 1, failed: 0, skipped: 0 },
       { name: 'assertion', passed: 0, failed: 1, skipped: 0 },
     ], [], 'failed');
-    expect(rows.map(row => row.status)).toEqual(['pass', 'fail']);
-    expect(rows[0].outputTail).toBeNull();
-    expect(rows[1].outputTail).toContain('assertion mismatch');
+    // The failing row is written first (mid-run, EI-26701962157024953); the pass at the end.
+    expect(rows.map(row => [row.filePath.split('/').pop(), row.status]))
+      .toEqual([['assertion.test.ts', 'fail'], ['clean.test.ts', 'pass']]);
+    expect(rows[1].outputTail).toBeNull();
+    expect(rows[0].outputTail).toContain('assertion mismatch');
   });
 
   it('keeps run-level diagnostics bounded while recording the full error count', async () => {
@@ -1792,7 +1799,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       await first.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
       first.onTestModuleEnd(makeModule('src/first.test.ts', 'first', 'actual-a', 'expected-a') as never);
       // A hard-killed run reaches neither final hook. Its completed failures
-      // must already be readable, while ledger verdicts still await provenance.
+      // must already be readable synchronously; the interim ledger write is
+      // asynchronous (it waits for its own snapshot), pinned separately below.
       expect(JSON.parse(readFileSync(detailsPath, 'utf8')).failures).toEqual([
         expect.objectContaining({ test: 'first', actual: 'actual-a', expected: 'expected-a' }),
       ]);
@@ -1817,6 +1825,188 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       else process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = previous;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('EI-26701962157024953: persists failures before final hooks and drains failures arriving during a write', async () => {
+    const writes: Array<Array<{ filePath: string; status: string; worktreeDirty: boolean; commitSha: string | null }>> = [];
+    let release: () => void = () => undefined;
+    const writeRows = vi.fn(async (rows: Array<{ filePath: string; status: string; worktreeDirty: boolean; commitSha: string | null }>) => {
+      writes.push(rows.map(({ filePath, status, worktreeDirty, commitSha }) => ({ filePath, status, worktreeDirty, commitSha })));
+      // Hold the first interim write open so a second failure arrives mid-write.
+      if (writes.length === 1) await new Promise<void>(r => { release = r; });
+    });
+    const reporter = new AdminTestRunsReporter(
+      async () => ({ commit: 'abc', porcelain: '' }),
+      undefined,
+      writeRows as never,
+    );
+    const makeModule = (file: string, state: 'passed' | 'failed') => ({
+      moduleId: join(TEST_CONFIG_ROOT, file),
+      state: () => state,
+      diagnostic: () => ({ duration: 1 }),
+      errors: () => [],
+      children: { allTests: () => [{ fullName: file, result: () => ({ state, errors: [] }) }] },
+    });
+    const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r)); };
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+
+    reporter.onTestModuleEnd(makeModule('src/passes.test.ts', 'passed') as never);
+    reporter.onTestModuleEnd(makeModule('src/fails-a.test.ts', 'failed') as never);
+    await settle();
+    // The failure is persisted with no final hook at all, stamped by its own snapshot.
+    expect(writes).toEqual([[expect.objectContaining({
+      filePath: expect.stringMatching(/fails-a\.test\.ts$/), status: 'fail', worktreeDirty: false, commitSha: 'abc' })]]);
+
+    reporter.onTestModuleEnd(makeModule('src/fails-b.test.ts', 'failed') as never);
+    release();
+    await settle();
+    // The follow-up batch picks up the failure that arrived during the first write.
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toEqual([expect.objectContaining({ filePath: expect.stringMatching(/fails-b\.test\.ts$/), status: 'fail' })]);
+    // A SIGKILL here loses only the pass: it was never written, so it never claims proof.
+    expect(writes.flat().some(row => row.status === 'pass')).toBe(false);
+
+    // A run that does finish writes the remaining pass exactly once and no failure twice.
+    await reporter.onTestRunEnd();
+    expect(writes).toHaveLength(3);
+    expect(writes[2]).toEqual([expect.objectContaining({ filePath: expect.stringMatching(/passes\.test\.ts$/), status: 'pass' })]);
+  });
+
+  it('EI-26701962157024953: failure receipts and diagnostics survive an actual SIGKILL', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reporter-sigkill-'));
+    const ledgerPath = join(dir, 'ledger.json');
+    const detailsPath = join(dir, 'failure-details.json');
+    const exitPath = join(dir, 'exit-hook');
+    const require = createRequire(import.meta.url);
+    const program = `
+      import { writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      const { default: Reporter } = await import(${JSON.stringify(new URL('./admin-test-runs-reporter.ts', import.meta.url).href)});
+      process.on('exit', () => writeFileSync(${JSON.stringify(exitPath)}, 'exit'));
+      const reporter = new Reporter(async () => ({ commit: 'abc', porcelain: '' }), undefined, async rows => {
+        writeFileSync(${JSON.stringify(ledgerPath)}, JSON.stringify(rows));
+        process.kill(process.pid, 'SIGKILL');
+      });
+      await reporter.onInit({ vite: { config: { root: ${JSON.stringify(TEST_CONFIG_ROOT)}, configFile: join(${JSON.stringify(TEST_CONFIG_ROOT)}, 'vitest.config.ts') } } });
+      const module = (file, state) => ({ moduleId: join(${JSON.stringify(TEST_CONFIG_ROOT)}, 'src', file),
+        state: () => state, diagnostic: () => ({ duration: 1 }), errors: () => [],
+        children: { allTests: () => [{ fullName: file, result: () => ({ state,
+          errors: state === 'failed' ? [{ message: 'expected result', actual: 'actual', expected: 'expected' }] : [] }) }] } });
+      reporter.onTestModuleEnd(module('surviving-pass.test.ts', 'passed'));
+      reporter.onTestModuleEnd(module('surviving-failure.test.ts', 'failed'));
+      setInterval(() => {}, 1_000);
+    `;
+    try {
+      const result = await promisify(execFile)(process.execPath,
+        ['--import', require.resolve('tsx'), '--input-type=module', '-e', program], {
+          // Match Vitest's worker: exercise the working source under test. The
+          // router's parent-only committed-source preload would substitute HEAD.
+          timeout: 15_000, env: { ...process.env, NODE_OPTIONS: '', PAPERCUSP_TEST_FAILURE_DETAILS_PATH: detailsPath },
+        }).then(() => ({ signal: null, stderr: '' }), error => error as { signal: string | null; stderr: string });
+      expect(result.signal, result.stderr).toBe('SIGKILL');
+      expect(existsSync(exitPath)).toBe(false);
+      expect(JSON.parse(readFileSync(ledgerPath, 'utf8'))).toEqual([
+        expect.objectContaining({ filePath: expect.stringMatching(/surviving-failure\.test\.ts$/),
+          status: 'fail', commitSha: 'abc', worktreeDirty: false }),
+      ]);
+      expect(JSON.parse(readFileSync(detailsPath, 'utf8')).failures).toEqual([
+        expect.objectContaining({ test: 'surviving-failure.test.ts', actual: 'actual', expected: 'expected' }),
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('EI-26701962157024953: a timed-out interim writer never overlaps final persistence', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-timeout-'));
+    const receiptPath = join(dir, 'receipts.jsonl');
+    const previous = process.env[TEST_RUN_RECEIPT_ENV];
+    process.env[TEST_RUN_RECEIPT_ENV] = receiptPath;
+    let release: () => void = () => undefined;
+    const writeRows = vi.fn(async () => { await new Promise<void>(resolve => { release = resolve; }); });
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }), undefined, writeRows);
+    const module = (state: 'passed' | 'failed') => ({
+      moduleId: join(TEST_CONFIG_ROOT, `src/${state}.test.ts`), state: () => state,
+      diagnostic: () => ({ duration: 1 }), errors: () => [], children: { allTests: () => [] },
+    });
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    vi.useFakeTimers();
+    try {
+      reporter.onTestModuleEnd(module('failed') as never);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      reporter.onTestModuleEnd(module('passed') as never);
+      const final = reporter.onTestRunEnd();
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      await final;
+      const receipts = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(receipts).toEqual(expect.arrayContaining([
+        expect.objectContaining({ filePath: expect.stringMatching(/passed\.test\.ts$/), outcome: 'timeout' }),
+      ]));
+    } finally {
+      release();
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+      await reporter.onExit();
+      if (previous === undefined) delete process.env[TEST_RUN_RECEIPT_ENV];
+      else process.env[TEST_RUN_RECEIPT_ENV] = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('EI-26701962157024953: queued failures resume after a timed-out writer actually settles', async () => {
+    let release: () => void = () => undefined;
+    const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => {
+      if (writeRows.mock.calls.length === 1) await new Promise<void>(resolve => { release = resolve; });
+    });
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }), undefined, writeRows);
+    const module = (file: string) => ({ moduleId: join(TEST_CONFIG_ROOT, file), state: () => 'failed',
+      diagnostic: () => ({ duration: 1 }), errors: () => [], children: { allTests: () => [] } });
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    vi.useFakeTimers();
+    try {
+      reporter.onTestModuleEnd(module('src/first.test.ts') as never);
+      await vi.advanceTimersByTimeAsync(0);
+      reporter.onTestModuleEnd(module('src/second.test.ts') as never);
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writeRows).toHaveBeenCalledTimes(2);
+      expect(writeRows.mock.calls[1][0]).toEqual([
+        expect.objectContaining({ filePath: expect.stringMatching(/second\.test\.ts$/), status: 'fail' }),
+      ]);
+    } finally {
+      release();
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+      await reporter.onTestRunEnd();
+    }
+  });
+
+  it('EI-26701962157024953: run-level unhandled errors still demote the passes that were held back', async () => {
+    const written: Array<{ filePath: string; status: string }> = [];
+    const reporter = new AdminTestRunsReporter(
+      async () => ({ commit: 'abc', porcelain: '' }),
+      undefined,
+      (async (rows: Array<{ filePath: string; status: string }>) => { written.push(...rows); }) as never,
+    );
+    const makeModule = (file: string, state: 'passed' | 'failed') => ({
+      moduleId: join(TEST_CONFIG_ROOT, file),
+      state: () => state,
+      diagnostic: () => ({ duration: 1 }),
+      errors: () => [],
+      children: { allTests: () => [{ fullName: file, result: () => ({ state, errors: [] }) }] },
+    });
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    reporter.onTestModuleEnd(makeModule('src/fails.test.ts', 'failed') as never);
+    reporter.onTestModuleEnd(makeModule('src/passes.test.ts', 'passed') as never);
+    await reporter.onTestRunEnd([], [new Error('stream exploded')], 'failed' as never);
+    expect(written.map(row => [row.filePath.split('/').pop(), row.status])).toEqual([
+      ['fails.test.ts', 'fail'],
+      ['passes.test.ts', 'error'],
+    ]);
   });
 
   it('EI-22137062583459326: a beforeAll collection crash (no test cases ever registered) surfaces its real error in the sidecar under "(file failed to collect)", not silently as nothing', async () => {

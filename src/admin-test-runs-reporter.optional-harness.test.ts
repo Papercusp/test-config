@@ -20,6 +20,14 @@ vi.mock('@papercusp/verification-harness', () => {
     code: 'ERR_MODULE_NOT_FOUND',
   });
 });
+// The reporter loads the evidence-root SUBPATH; vi.mock matches specifiers exactly, so an
+// absent package must make that entry unresolvable too (it is what a hive without the
+// package would see).
+vi.mock('@papercusp/verification-harness/evidence-root', () => {
+  throw Object.assign(new Error("Cannot find package '@papercusp/verification-harness'"), {
+    code: 'ERR_MODULE_NOT_FOUND',
+  });
+});
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
 

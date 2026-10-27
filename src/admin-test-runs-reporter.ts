@@ -1285,6 +1285,11 @@ function moduleStatus(m: TestModule): TestRunRow['status'] {
   }
 }
 
+/** Verdicts that no later run-level evidence can weaken, so they may be written mid-run. */
+function isInterimFlushStatus(status: TestRunRow['status']): boolean {
+  return status === 'fail' || status === 'error';
+}
+
 // Minimal structural type for the postgres-js client — avoids depending on the
 // package's CJS default-export typing (which needs esModuleInterop and tripped a
 // standalone tsc across the 22 workspaces that inherit this reporter).
@@ -2389,6 +2394,10 @@ export default class AdminTestRunsReporter implements Reporter {
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
   /** Vitest can call both onTestRunEnd and onExit; flush rows exactly once. */
   private flushed = false;
+  /** EI-26701962157024953: the in-flight mid-run write of failing rows, if any. */
+  private interimFlush: Promise<void> | null = null;
+  /** A flush deadline does not cancel the underlying writer. Keep its ownership until settlement. */
+  private pendingWrite: Promise<void> | null = null;
   /** EI-18767688096795873: computed once in onInit from the run's resolved
    *  config file — see computeIsScratchConfig / isScratchConfigFile. */
   private isScratchConfig = false;
@@ -2534,7 +2543,7 @@ export default class AdminTestRunsReporter implements Reporter {
     this.evidenceRoot = await loadEvidenceRootResolver();
   }
 
-  /** Per-module hook — queue the row until the end snapshot is available. */
+  /** Per-module hook — persist failures early; hold passes for the final snapshot. */
   onTestModuleEnd(testModule: TestModule): void {
     try {
       const filePath = toWorkspaceRel(testModule.moduleId);
@@ -2552,7 +2561,7 @@ export default class AdminTestRunsReporter implements Reporter {
       const details = collectTestFailureDetails(testModule, filePath);
       this.failureDetails.push(...details);
       // A watchdog SIGKILL reaches neither final hook. Persist diagnostic
-      // evidence now; ledger verdicts still await the end-of-run snapshot.
+      // evidence now; passing ledger verdicts still await the end-of-run snapshot.
       // Retain details for the final merge/retry if this fail-soft write fails.
       writeFailureDetails(details);
 
@@ -2584,16 +2593,73 @@ export default class AdminTestRunsReporter implements Reporter {
       this.pending.push({ filePath, status, durationMs, startedAt, finishedAt, outputTail,
         isScratchConfig: this.isScratchConfig, executionDetails, verifierSourceReason,
         cases: collectTestCases(testModule) });
+      if (isInterimFlushStatus(status)) this.scheduleInterimFlush();
     } catch {
       /* swallow — D-007 */
     }
   }
 
+  /**
+   * EI-26701962157024953: a watchdog SIGKILL reaches neither final hook, so every
+   * completed module's verdict used to die with the process. A failing verdict can
+   * be written early: run-level unhandled errors only ever DEMOTE pass/skip rows
+   * (onTestRunEnd), so a fail/error can never be weakened by what happens later.
+   * A pass can, so passes stay queued for the end-of-run snapshot. Every interim
+   * batch is stamped by its own before/after snapshot, so stability is still proven
+   * for the window in which the failure was observed. At most one write is in flight;
+   * failures that arrive meanwhile are picked up by the follow-up batch.
+   */
+  private scheduleInterimFlush(): void {
+    if (this.flushed || this.interimFlush || this.pendingWrite ||
+      !this.pending.some(row => isInterimFlushStatus(row.status))) return;
+    this.interimFlush = (async () => {
+      try {
+        while (!this.flushed && !this.pendingWrite) {
+          const failing = this.pending.filter(row => isInterimFlushStatus(row.status));
+          if (failing.length === 0) return;
+          this.pending = this.pending.filter(row => !isInterimFlushStatus(row.status));
+          await this.persistRows(failing);
+        }
+      } catch {
+        /* swallow — D-007 */
+      } finally {
+        this.interimFlush = null;
+        this.scheduleInterimFlush();
+      }
+    })();
+  }
+
   private async flushPending(): Promise<void> {
     if (this.flushed) return;
     this.flushed = true;
+    const { flushBudgetMs } = reporterWriteBudget(process.env);
+    if (this.interimFlush) {
+      // Never race the final write against an interim one on the shared client,
+      // and never let a hung interim write consume more than the flush budget.
+      let interimTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.interimFlush,
+        new Promise<void>((r) => { interimTimer = setTimeout(r, flushBudgetMs); }),
+      ]);
+      if (interimTimer) clearTimeout(interimTimer);
+    }
     if (this.pending.length === 0) return;
+    if (this.interimFlush || this.pendingWrite) {
+      // Promise.race bounds waiting, not the operation. A second writer here
+      // would overlap the interim writer (or its unfinished provenance read).
+      // Keep the missing final rows explicit without issuing competing inserts.
+      appendTestRunReceipts(process.env, unwrittenReceipts(this.pending.splice(0).map(row => ({
+        ...row, worktreeDirty: true, commitSha: null,
+        executionDetails: row.executionDetails
+          ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
+      })), 'timeout', 'interim_flush_incomplete'));
+      return;
+    }
+    await this.persistRows(this.pending.splice(0));
+  }
 
+  private async persistRows(pendingRows: PendingTestRunRow[]): Promise<void> {
+    if (pendingRows.length === 0) return;
     let worktreeDirty = true;
     let dirtReason: string | null = 'snapshot not taken';
     let commitSha: string | null = null;
@@ -2608,7 +2674,7 @@ export default class AdminTestRunsReporter implements Reporter {
       worktreeDirty = true;
       dirtReason = `snapshot threw: ${err instanceof Error ? err.message : String(err)}`;
     }
-    const verifierSourceReasons = [...new Set(this.pending
+    const verifierSourceReasons = [...new Set(pendingRows
       .map(row => row.verifierSourceReason)
       .filter((reason): reason is string => Boolean(reason)))];
     if (verifierSourceReasons.length > 0) {
@@ -2623,12 +2689,12 @@ export default class AdminTestRunsReporter implements Reporter {
       // WI-10004076: the demotion erases every row of this invocation from source='ci'
       // triage, and the tree that caused it is gone by the next run — say why, once.
       process.stderr.write(
-        `[admin-test-runs] ${this.pending.length} row(s) recorded source=local, not ci: worktree not proven stable — ${dirtReason}\n`,
+        `[admin-test-runs] ${pendingRows.length} row(s) recorded source=local, not ci: worktree not proven stable — ${dirtReason}\n`,
       );
     }
 
     const runtimeEnvironmentAfter = await this.captureRuntimeEnvironment();
-    const rows = this.pending.splice(0).map((row) => ({
+    const rows = pendingRows.map((row) => ({
       ...row,
       worktreeDirty,
       commitSha,
@@ -2641,9 +2707,18 @@ export default class AdminTestRunsReporter implements Reporter {
         : null,
     }));
     const { flushBudgetMs } = reporterWriteBudget(process.env);
+    const write = Promise.resolve().then(() => this.writeRows(rows));
+    this.pendingWrite = write;
+    const settled = () => {
+      if (this.pendingWrite === write) this.pendingWrite = null;
+      // A timed-out write may finish while the test run is still progressing.
+      // Resume queued failures only after that actual settlement.
+      this.scheduleInterimFlush();
+    };
+    void write.then(settled, settled);
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
     const finished = await Promise.race([
-      this.writeRows(rows.map((row) => ({ ...row, worktreeDirty, commitSha }))).then(() => true),
+      write.then(() => true),
       new Promise<false>((r) => {
         flushTimer = setTimeout(() => r(false), flushBudgetMs);
       }),
