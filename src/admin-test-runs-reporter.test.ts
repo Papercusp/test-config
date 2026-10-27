@@ -424,7 +424,11 @@ describe('receipt-backed native archive reporter', () => {
     vi.stubEnv('VERIFY_TAURI_SOURCE_REF', receipt.sourceCommit);
     vi.stubEnv('OPERATOR_SOURCE_ROOT', root);
     const persisted: TestRunRow[] = [];
-    const reporter = new AdminTestRunsReporter(captureWorktreeSnapshot, async row => { persisted.push(row); });
+    const snapshotPhases: string[] = [];
+    const reporter = new AdminTestRunsReporter(async phase => {
+      snapshotPhases.push(phase ?? 'unspecified');
+      return captureWorktreeSnapshot(undefined, phase);
+    }, async row => { persisted.push(row); });
     try {
       await reporter.onInit({ config: { root: project, configFile: join(project, 'vitest.config.ts') } } as never);
       expect(computeWorkspaceRootFrom(project)).toBe(root);
@@ -436,6 +440,7 @@ describe('receipt-backed native archive reporter', () => {
       expect(persisted).toHaveLength(1);
       expect(persisted[0]).toMatchObject({ filePath: 'packages/operator-core/journey.e2e.test.ts',
         commitSha: mutate ? null : receipt.sourceCommit, worktreeDirty: mutate });
+      expect(snapshotPhases).toEqual(['before', 'after']);
       if (mutate) expect(persisted[0].executionDetails?.worktreeDirtyReason).toContain('changed packages/operator-core/journey.e2e.test.ts');
     } finally { setRunRoot(null); vi.unstubAllEnvs(); rmSync(parent, { recursive: true, force: true }); }
   });
@@ -2880,6 +2885,72 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     };
     return { run, calls };
   };
+
+  function preparedRootReceiptFixture() {
+    const parent = mkdtempSync(join(tmpdir(), 'prepared-root-receipt-'));
+    const root = join(parent, 'source');
+    mkdirSync(join(root, '.git'), { recursive: true });
+    const sourceCommit = 'a'.repeat(40);
+    const markerBytes = JSON.stringify({ pid: process.pid, sha: sourceCommit });
+    writeFileSync(join(root, '.git', 'lint-as-committed-owner.json'), markerBytes);
+    const receiptPath = join(parent, 'prepared-root.json');
+    writeFileSync(receiptPath, JSON.stringify({
+      schemaVersion: 'lint-as-committed-prepared-root-v1',
+      root,
+      sourceCommit,
+      ownerMarkerSha256: createHash('sha256').update(markerBytes).digest('hex'),
+    }), { mode: 0o600 });
+    vi.stubEnv('PAPERCUSP_LINT_AS_COMMITTED_CLONE', '1');
+    vi.stubEnv('PAPERCUSP_LINT_AS_COMMITTED_PREPARED_ROOT_RECEIPT', receiptPath);
+    setRunRoot(root);
+    return { parent, root, receiptPath, sourceCommit };
+  }
+
+  it('consumes the prepared receipt for the before snapshot and still checks after-run dirt', async () => {
+    const fixture = preparedRootReceiptFixture();
+    const { run, calls } = fakeGit({
+      'git rev-parse HEAD': [fixture.sourceCommit, fixture.sourceCommit],
+      [STATUS]: ['?? unrelated.txt'],
+    });
+    try {
+      const before = await captureWorktreeSnapshot(run, 'before');
+      expect(before).toEqual({ commit: fixture.sourceCommit, porcelain: '' });
+      expect(calls.map(call => call.cmd)).toEqual(['git rev-parse HEAD']);
+      expect(existsSync(fixture.receiptPath)).toBe(false);
+
+      const after = await captureWorktreeSnapshot(run, 'after');
+      expect(calls.map(call => call.cmd)).toEqual([
+        'git rev-parse HEAD', 'git rev-parse HEAD', STATUS,
+      ]);
+      expect(after.porcelain).toBe('?? unrelated.txt');
+      expect(describeWorktreeDirt(before, after)).toContain('after the run: ?? unrelated.txt');
+    } finally {
+      setRunRoot(null);
+      vi.unstubAllEnvs();
+      rmSync(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a receipt with the wrong owner-marker digest and falls back to Git status', async () => {
+    const fixture = preparedRootReceiptFixture();
+    const receipt = JSON.parse(readFileSync(fixture.receiptPath, 'utf8'));
+    receipt.ownerMarkerSha256 = '0'.repeat(64);
+    writeFileSync(fixture.receiptPath, JSON.stringify(receipt), { mode: 0o600 });
+    const { run, calls } = fakeGit({
+      'git rev-parse HEAD': [fixture.sourceCommit],
+      [STATUS]: ['?? unrelated.txt'],
+    });
+    try {
+      const snapshot = await captureWorktreeSnapshot(run, 'before');
+      expect(snapshot.porcelain).toBe('?? unrelated.txt');
+      expect(calls.some(call => call.cmd === STATUS)).toBe(true);
+      expect(existsSync(fixture.receiptPath)).toBe(false);
+    } finally {
+      setRunRoot(null);
+      vi.unstubAllEnvs();
+      rmSync(fixture.parent, { recursive: true, force: true });
+    }
+  });
 
   it('a status read that times out once and then answers empty proves the tree CLEAN', async () => {
     const { run, calls } = fakeGit({ 'git rev-parse HEAD': ['abc123'], [STATUS]: [null, ''] });

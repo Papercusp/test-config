@@ -35,8 +35,8 @@ import type { Reporter, TestModule, TestRunEndReason, Vitest } from 'vitest/node
 import { pinModuleState } from '@papercusp/module-singleton';
 import { exec } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
-import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
+import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 // @papercusp/verification-harness is deliberately NOT imported statically — see loadEvidenceRootResolver.
@@ -654,7 +654,95 @@ export function resolveWorktreeSnapshotRoot(): string {
  * row. The fail-safe null handling in computeWorktreeDirty makes git timeout
  * or failure visible as dirty instead of silently restoring the old default.
  */
-export async function captureWorktreeSnapshot(run: WorktreeGitRunner = runGit): Promise<WorktreeGitSnapshot> {
+export type WorktreeSnapshotPhase = 'before' | 'after';
+
+interface PreparedRootReceipt {
+  schemaVersion: 'lint-as-committed-prepared-root-v1';
+  root: string;
+  sourceCommit: string;
+  ownerMarkerSha256: string;
+}
+
+function isLiveProcess(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as { code?: string })?.code === 'EPERM';
+  }
+}
+
+/**
+ * Consume the runner's one-use proof that its fresh committed clone was prepared
+ * at the requested HEAD. It is valid only for the reporter's pre-run snapshot;
+ * the post-run snapshot still reads Git status so test mutations remain visible.
+ */
+async function consumePreparedRootSnapshot(
+  root: string,
+  run: WorktreeGitRunner,
+  onFailure: (diagnostic: string) => void,
+): Promise<WorktreeGitSnapshot | null> {
+  if (process.env.PAPERCUSP_LINT_AS_COMMITTED_CLONE !== '1') return null;
+  const configuredPath = process.env.PAPERCUSP_LINT_AS_COMMITTED_PREPARED_ROOT_RECEIPT?.trim();
+  if (!configuredPath) return null;
+  const fail = (reason: string): null => {
+    onFailure(`prepared-root receipt: ${reason}`);
+    return null;
+  };
+  if (!isAbsolute(configuredPath)) return fail('path is not absolute');
+
+  let canonicalRoot: string;
+  let receiptPath: string;
+  try {
+    canonicalRoot = realpathSync(root);
+    receiptPath = join(realpathSync(dirname(resolve(configuredPath))), basename(resolve(configuredPath)));
+  } catch {
+    return fail('root or receipt parent is unavailable');
+  }
+  const relativeReceipt = relative(canonicalRoot, receiptPath);
+  const receiptInsideRoot = relativeReceipt === '' || (!isAbsolute(relativeReceipt) &&
+    relativeReceipt !== '..' && !relativeReceipt.startsWith(`..${sep}`));
+  if (receiptInsideRoot)
+    return fail('receipt is inside the committed source root');
+
+  // Rename is the atomic claim: two reporters sharing an environment cannot both
+  // accept the same baseline proof. The runner removes the private temp directory
+  // after its child exits; this claimed file is also removed on every path here.
+  const claimedPath = `${receiptPath}.claimed-${process.pid}-${randomUUID()}`;
+  try {
+    renameSync(receiptPath, claimedPath);
+  } catch {
+    return fail('file is missing or could not be claimed');
+  }
+  try {
+    const receiptStat = lstatSync(claimedPath);
+    if (!receiptStat.isFile() || receiptStat.isSymbolicLink() || (receiptStat.mode & 0o077) !== 0)
+      return fail('file is not a private regular file');
+    const receipt = JSON.parse(readFileSync(claimedPath, 'utf8')) as Partial<PreparedRootReceipt>;
+    const markerPath = join(canonicalRoot, '.git', 'lint-as-committed-owner.json');
+    const markerBytes = readFileSync(markerPath);
+    const marker = JSON.parse(markerBytes.toString('utf8')) as { pid?: unknown; sha?: unknown };
+    if (receipt.schemaVersion !== 'lint-as-committed-prepared-root-v1' || receipt.root !== canonicalRoot ||
+        typeof receipt.sourceCommit !== 'string' || !/^[a-f0-9]{40}$/.test(receipt.sourceCommit) ||
+        marker.sha !== receipt.sourceCommit ||
+        receipt.ownerMarkerSha256 !== createHash('sha256').update(markerBytes).digest('hex'))
+      return fail('receipt does not match the committed root owner marker');
+    if (typeof marker.pid !== 'number' || !Number.isSafeInteger(marker.pid) || marker.pid <= 0 || !isLiveProcess(marker.pid))
+      return fail('prepared root owner is no longer live');
+    const head = await runGitWithRetry(run, 'git rev-parse HEAD', canonicalRoot, onFailure);
+    if (head !== receipt.sourceCommit) return fail('HEAD does not match the prepared commit');
+    return { commit: head, porcelain: '' };
+  } catch {
+    return fail('receipt or owner marker is unreadable');
+  } finally {
+    try { unlinkSync(claimedPath); } catch { /* the runner's temp-directory cleanup owns residue */ }
+  }
+}
+
+export async function captureWorktreeSnapshot(
+  run: WorktreeGitRunner = runGit,
+  phase?: WorktreeSnapshotPhase,
+): Promise<WorktreeGitSnapshot> {
   const root = resolveWorktreeSnapshotRoot();
   if (existsSync(join(root, '.verifier-source.json'))) {
     try {
@@ -667,6 +755,10 @@ export async function captureWorktreeSnapshot(run: WorktreeGitRunner = runGit): 
   }
   const errors: string[] = [];
   const failed = (diagnostic: string) => errors.push(diagnostic);
+  if (phase === 'before') {
+    const prepared = await consumePreparedRootSnapshot(root, run, failed);
+    if (prepared) return prepared;
+  }
   const [commit, porcelain] = await Promise.all([
     runGitWithRetry(run, 'git rev-parse HEAD', root, failed),
     runGitWithRetry(run, 'git status --porcelain --untracked-files=all', root, failed),
@@ -1135,7 +1227,7 @@ function writeFailureDetails(details: TestFailureDetail[]): void {
   }
 }
 
-export type WorktreeSnapshotReader = () => Promise<WorktreeGitSnapshot>;
+export type WorktreeSnapshotReader = (phase?: WorktreeSnapshotPhase) => Promise<WorktreeGitSnapshot>;
 export type TestRunRowWriter = (row: TestRunRow) => Promise<void>;
 export type TestRunRowsWriter = (rows: readonly TestRunRow[]) => Promise<void>;
 
@@ -2421,13 +2513,14 @@ export default class AdminTestRunsReporter implements Reporter {
     // Vitest constructs reporters with its options object. Keep that runtime
     // contract intact while allowing the unit suite to inject deterministic
     // snapshot/writer seams.
-    const snapshotReader =
-      typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
+    const snapshotReader: WorktreeSnapshotReader = typeof readWorktreeSnapshotOrOptions === 'function'
+      ? readWorktreeSnapshotOrOptions
+      : (phase) => captureWorktreeSnapshot(runGit, phase);
     // Snapshot collection starts before any tests run. Handle synchronous
     // throws and rejected promises immediately and retain dirty provenance.
-    this.readWorktreeSnapshot = async () => {
+    this.readWorktreeSnapshot = async (phase?: WorktreeSnapshotPhase) => {
       try {
-        return await snapshotReader();
+        return await snapshotReader(phase);
       } catch (error) {
         return {
           commit: null,
@@ -2513,7 +2606,7 @@ export default class AdminTestRunsReporter implements Reporter {
     // ordering here is load-bearing, not stylistic.
     setRunRoot(readRunConfigRoot(ctx));
     this.isScratchConfig = computeIsScratchConfig(ctx);
-    this.worktreeBefore = this.readWorktreeSnapshot();
+    this.worktreeBefore = this.readWorktreeSnapshot('before');
     this.flushed = false;
     this.failureDetails = [];
     this.failureDetailsFlushed = false;
@@ -2664,8 +2757,8 @@ export default class AdminTestRunsReporter implements Reporter {
     let dirtReason: string | null = 'snapshot not taken';
     let commitSha: string | null = null;
     try {
-      const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot();
-      const after = await this.readWorktreeSnapshot();
+      const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot('before');
+      const after = await this.readWorktreeSnapshot('after');
       dirtReason = describeWorktreeDirt(before, after);
       worktreeDirty = dirtReason !== null;
       commitSha = after.commit;
