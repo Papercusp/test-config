@@ -54,6 +54,7 @@ import {
   mutationDescriptorForRow, readMutationInvocationDescriptor, type MutationInvocationDescriptor,
 } from './mutation-descriptor.ts';
 import { isRestoredCheckoutPath } from './test-run-paths.ts';
+import { redactSensitiveText } from './sensitive-text.ts';
 
 /** sha256 of the test file a row ran (its execution_details.mutation.testFileSha256), or null. */
 export function sha256OfTestFile(absolutePath: string): string | null {
@@ -1116,7 +1117,8 @@ const FAILURE_DETAILS_MAX_RECORDS = 2_000;
 
 function boundFailureText(value: string, maxChars = FAILURE_DETAIL_VALUE_MAX_CHARS): string {
   if (maxChars <= 0) return '';
-  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 1)}…`;
+  const sanitized = redactSensitiveText(value);
+  return sanitized.length <= maxChars ? sanitized : `${sanitized.slice(0, maxChars - 1)}…`;
 }
 
 function stringifyFailureValue(value: unknown): string {
