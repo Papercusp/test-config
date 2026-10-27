@@ -147,7 +147,14 @@ describe('case rows ride behind their file rows', () => {
     const outcomes: TestCaseInsertOutcome[] = [];
     const receipts = await insertTestRunRowsWithSql(fake.sql, [row('a.test.ts', [testCase(0)])], context,
       { insertTimeoutMs: 1_000, totalInsertMs: 4_000 }, (outcome) => outcomes.push(outcome));
-    expect(receipts).toEqual([{ filePath: 'a.test.ts', status: 'pass', outcome: 'inserted', id: '100' }]);
+    // Receipts carry their identity (receiptId + attempt) and the serialized row since the
+    // reporter's receipt-identity change; the file receipt itself must still be `inserted`.
+    expect(receipts).toEqual([{
+      filePath: 'a.test.ts', status: 'pass', outcome: 'inserted', id: '100',
+      receiptId: expect.any(String), attempt: 0,
+      row: expect.objectContaining({ filePath: 'a.test.ts', status: 'pass' }),
+      insertDiagnostics: expect.objectContaining({ schemaVersion: 1 }),
+    }]);
     expect(outcomes).toEqual([{ written: 0, unwritten: 1, reason: 'test_case_runs_missing' }]);
   });
 
