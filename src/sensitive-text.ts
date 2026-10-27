@@ -36,6 +36,14 @@ export function isSensitiveValueKey(key: string): boolean {
   return SENSITIVE_VALUE_KEY_RE.test(key) && !SAFE_REFERENCE_KEY_RE.test(key);
 }
 
+function sensitiveEnvironmentValues(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): string[] {
+  return [...new Set(Object.entries(environment)
+    .filter(([key, value]) => isSensitiveValueKey(key) && typeof value === 'string' && value.length >= 16)
+    .map(([, value]) => value!))].sort((a, b) => b.length - a.length);
+}
+
 /**
  * The self-identifying set as plain data, for a redactor that must rebuild it
  * elsewhere — capability:bash streams it chunk-safely and ships it to its
@@ -101,10 +109,11 @@ function redactPostgresUrlUserInfo(text: string): string {
 export function redactSensitiveText(
   text: string,
   knownSecrets: readonly (string | null | undefined)[] = [],
+  environment: Readonly<Record<string, string | undefined>> = process.env,
 ): string {
   return redactKnownSecrets(
     redactPostgresUrlUserInfo(redactKeyDirectedSecrets(redactSelfIdentifyingSecrets(text))),
-    knownSecrets,
+    [...knownSecrets, ...sensitiveEnvironmentValues(environment)],
   );
 }
 
@@ -134,9 +143,10 @@ const STRUCTURED_STRING_SECRET_SIGNAL_RE = new RegExp(
 
 function redactStructuredString(text: string): string {
   const selfIdentifyingRedacted = redactPostgresUrlUserInfo(redactSelfIdentifyingSecrets(text));
-  return STRUCTURED_STRING_SECRET_SIGNAL_RE.test(selfIdentifyingRedacted)
+  const structuredRedacted = STRUCTURED_STRING_SECRET_SIGNAL_RE.test(selfIdentifyingRedacted)
     ? redactKeyDirectedSecrets(selfIdentifyingRedacted)
     : selfIdentifyingRedacted;
+  return redactKnownSecrets(structuredRedacted, sensitiveEnvironmentValues());
 }
 
 /**

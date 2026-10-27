@@ -2329,14 +2329,14 @@ export function buildOutputTail(
   testModule: TestModule,
   status: TestRunRow['status'],
 ): string | null {
+  const boundedTail = (value: string): string => redactSensitiveText(value).slice(-4000);
   let tail: string | null = null;
   try {
     const errs = testModule.errors?.() ?? [];
     if (errs.length > 0) {
-      tail = errs
+      tail = boundedTail(errs
         .map((e: unknown) => formatTestCaseError(e, { includeStack: true }))
-        .join('\n')
-        .slice(-4000);
+        .join('\n'));
     }
   } catch { /* fail-soft */ }
   if (tail || status !== 'fail') return tail;
@@ -2358,7 +2358,7 @@ export function buildOutputTail(
       }
       if (lines.length >= 20) break;
     }
-    if (lines.length > 0) tail = lines.join('\n').slice(-4000);
+    if (lines.length > 0) tail = boundedTail(lines.join('\n'));
   } catch { /* fail-soft */ }
   return tail;
 }

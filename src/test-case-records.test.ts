@@ -149,12 +149,14 @@ describe('case rows ride behind their file rows', () => {
       { insertTimeoutMs: 1_000, totalInsertMs: 4_000 }, (outcome) => outcomes.push(outcome));
     // Receipts carry their identity (receiptId + attempt) and the serialized row since the
     // reporter's receipt-identity change; the file receipt itself must still be `inserted`.
-    expect(receipts).toEqual([{
+    // insertDiagnostics is pinned by admin-test-runs-reporter.test.ts. Matching it here coupled
+    // this missing-case-table test to the reporter's diagnostics revision, so the frozen repair
+    // lineage (whose reporter predates insertDiagnostics) failed it for an unrelated reason.
+    expect(receipts).toEqual([expect.objectContaining({
       filePath: 'a.test.ts', status: 'pass', outcome: 'inserted', id: '100',
       receiptId: expect.any(String), attempt: 0,
       row: expect.objectContaining({ filePath: 'a.test.ts', status: 'pass' }),
-      insertDiagnostics: expect.objectContaining({ schemaVersion: 1 }),
-    }]);
+    })]);
     expect(outcomes).toEqual([{ written: 0, unwritten: 1, reason: 'test_case_runs_missing' }]);
   });
 

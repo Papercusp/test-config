@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { defaultEvidenceRoot } from '@papercusp/verification-harness';
 import { MAX_RECORDED_CASE_TITLE_CHARS, MAX_RECORDED_PASSED_CASES } from './execution-details.ts';
+import { redactSensitiveText } from './sensitive-text.ts';
 import AdminTestRunsReporter, {
   buildOutputTail,
   captureWorktreeSnapshot,
@@ -1759,6 +1760,48 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     } as unknown as Parameters<typeof buildOutputTail>[0];
     const tail = buildOutputTail(fakeModule, 'fail');
     expect(tail).toBe('suite > fails: expected 1 to be 2');
+  });
+
+  it('redacts inherited credential values before reporter tail and sidecar clipping', async () => {
+    const secret = 'r'.repeat(48);
+    const previousKey = process.env.PAPERCUSP_API_KEY;
+    const previousDetailsPath = process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+    const dir = mkdtempSync(join(tmpdir(), 'papercusp-reporter-secret-redaction-'));
+    const detailsPath = join(dir, 'failure-details.json');
+    process.env.PAPERCUSP_API_KEY = secret;
+    process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = detailsPath;
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }), async () => undefined);
+    const tailMessage = `${'x'.repeat(995)}${secret}${'y'.repeat(5000 - 995 - secret.length)}`;
+    const sidecarActual = `${'x'.repeat(1990)}${secret}${'y'.repeat(80)}`;
+    const failure = { message: tailMessage, actual: sidecarActual, expected: 'expected value' };
+    const module = {
+      moduleId: join(TEST_CONFIG_ROOT, 'src/secret-redaction.test.ts'),
+      state: () => 'failed',
+      diagnostic: () => ({ duration: 1 }),
+      errors: () => [],
+      children: { allTests: () => [{ fullName: 'suite > leaks no key', result: () => ({ state: 'failed', errors: [failure] }) }] },
+    };
+    try {
+      await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      const outputTail = buildOutputTail(module as never, 'fail')!;
+      expect(outputTail).toContain('[redacted]');
+      expect(outputTail).not.toContain(secret.slice(5));
+      expect(redactSensitiveText(`inherited=${secret}`)).toBe('inherited=[redacted]');
+
+      reporter.onTestModuleEnd(module as never);
+      await reporter.onTestRunEnd();
+      const sidecar = JSON.parse(readFileSync(detailsPath, 'utf8')) as {
+        failures: Array<{ actual?: string }>;
+      };
+      expect(sidecar.failures[0]?.actual).toBe(`${'x'.repeat(1990)}[redacted]`);
+      expect(readFileSync(detailsPath, 'utf8')).not.toContain(secret);
+    } finally {
+      if (previousKey === undefined) delete process.env.PAPERCUSP_API_KEY;
+      else process.env.PAPERCUSP_API_KEY = previousKey;
+      if (previousDetailsPath === undefined) delete process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+      else process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = previousDetailsPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('formats TestCase.result errors with bounded actual and expected values', () => {
