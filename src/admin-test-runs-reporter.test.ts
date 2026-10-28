@@ -22,6 +22,7 @@ import { defaultEvidenceRoot } from '@papercusp/verification-harness';
 import { MAX_RECORDED_CASE_TITLE_CHARS, MAX_RECORDED_PASSED_CASES } from './execution-details.ts';
 import { redactSensitiveText } from './sensitive-text.ts';
 import AdminTestRunsReporter, {
+  nativeTestRunAttribution,
   buildOutputTail,
   captureWorktreeSnapshot,
   collectModuleExecution,
@@ -73,6 +74,33 @@ import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+describe('native test execution custody', () => {
+  it('requires an explicit item, actor and stable group rather than a guessed goal', () => {
+    const env = { PAPERCUSP_SID: 'agent-a', PAPERCUSP_TEST_RUN_WORK_ITEM: 'EI-123',
+      PAPERCUSP_TEST_RUN_GROUP: 'native-1' };
+    expect(nativeTestRunAttribution(env)).toEqual({ attribution: { ownerId: 'agent-a', workItemId: 'EI-123' } });
+    for (const missing of ['PAPERCUSP_SID', 'PAPERCUSP_TEST_RUN_WORK_ITEM', 'PAPERCUSP_TEST_RUN_GROUP'])
+      expect(nativeTestRunAttribution({ ...env, [missing]: '' })).toEqual({});
+    expect(nativeTestRunAttribution({ ...env, PAPERCUSP_TEST_RUN_WORK_ITEM: 'unrelated-goal' })).toEqual({});
+  });
+  it('persists custody through the real reporter hooks', async () => {
+    vi.stubEnv('PAPERCUSP_SID', 'agent-native');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_WORK_ITEM', 'EI-123');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'native-hooks');
+    const persisted: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+      async row => { persisted.push(row); });
+    await reporter.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as Parameters<typeof reporter.onInit>[0]);
+    reporter.onTestModuleEnd({ moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
+      state: () => 'passed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+      children: { allTests: () => [{ fullName: 'native custody', result: () => ({ state: 'passed' }) }] },
+    } as unknown as Parameters<typeof reporter.onTestModuleEnd>[0]);
+    await reporter.onTestRunEnd();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].executionDetails).toMatchObject({ runGroupId: 'native-hooks',
+      attribution: { ownerId: 'agent-native', workItemId: 'EI-123' } });
+  });
+});
 /** The resolver the reporter's onInit loads in a hive that ships verification-harness. */
 describe('framework boundary case identities', () => {
   const receipt = { boundary: 'graph:query:evidence', callId: 'dispatch-1', workspaceId: 'ws', harness: 'repo',
@@ -1793,7 +1821,10 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       const sidecar = JSON.parse(readFileSync(detailsPath, 'utf8')) as {
         failures: Array<{ actual?: string }>;
       };
-      expect(sidecar.failures[0]?.actual).toBe(`${'x'.repeat(1990)}[redacted]`);
+      // Redaction precedes the 2,000-character diagnostic budget, including its
+      // ellipsis. The marker itself can cross that budget; the secret cannot.
+      expect(sidecar.failures[0]?.actual).toBe(`${'x'.repeat(1990)}[redacted…`);
+      expect(sidecar.failures[0]?.actual).toHaveLength(2000);
       expect(readFileSync(detailsPath, 'utf8')).not.toContain(secret);
     } finally {
       if (previousKey === undefined) delete process.env.PAPERCUSP_API_KEY;
