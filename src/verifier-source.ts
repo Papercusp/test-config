@@ -179,6 +179,27 @@ export function verifierSourceFiles(root: string, {
         if (!lstatSync(path).isDirectory()) throw new VerifierSourceError(`verification Git metadata is not independent: ${rel}`);
         continue;
       }
+      // The maintained installer records its external generation store here.
+      // Admit only its two exact regular metadata files, never the state
+      // directory wholesale or any path already attested as source.
+      if (runtimeArtifacts && !recordedPaths.includes(rel)
+        && (rel === '.papercusp/dependency-generation-root'
+          || rel === '.papercusp/dependency-generation-root.state/.gitignore')) {
+        const metadata = lstatSync(path);
+        if (!metadata.isFile() || (metadata.mode & 0o111) !== 0 || metadata.size > 65536)
+          throw new VerifierSourceError(`generation root metadata is not an independent file: ${rel}`);
+        const text = readFileSync(path, 'utf8');
+        const roots = text.endsWith('\n') ? text.slice(0, -1).split('\n') : [];
+        const valid = rel.endsWith('/.gitignore') ? text === '*\n'
+          : roots.length > 0 && new Set(roots).size === roots.length
+            && roots.every(value => !/[\0\r]/.test(value) && isAbsolute(value) && resolve(value) === value);
+        if (!valid) throw new VerifierSourceError(`invalid generation root metadata: ${rel}`);
+        continue;
+      }
+      if (runtimeArtifacts && rel === '.papercusp/dependency-generation-root.state'
+        && !recordedPaths.some(value => value === rel || value.startsWith(`${rel}/`))
+        && !lstatSync(path).isDirectory())
+        throw new VerifierSourceError(`generation root state is not an independent directory: ${rel}`);
       // TanStack derives this file from the recorded routes/config on startup.
       // A tracked tree remains source, and a redirect is never a build output.
       // Vitest writes its result cache beneath the shared config's .vitest-tmp.

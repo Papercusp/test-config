@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, mkdtempSync, openSync, rmSync, statSync, symlinkSync,
+import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, symlinkSync,
   truncateSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +18,49 @@ afterEach(() => {
 });
 
 describe('full verifier source census', () => {
+  it('admits only independent maintained generation-root metadata in runtime mode', () => {
+    const root = archive();
+    writeFileSync(join(root, 'source.ts'), 'export {};');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    const state = join(root, '.papercusp/dependency-generation-root.state');
+    mkdirSync(state, { recursive: true });
+    const record = join(root, '.papercusp/dependency-generation-root');
+    const ignore = join(state, '.gitignore');
+    writeFileSync(record, `${join(root, 'generations')}\n`);
+    writeFileSync(ignore, '*\n');
+    expect(() => verifyVerifierSourceSync(root, receipt)).toThrow('added .papercusp/');
+    expect(verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true })).toEqual(receipt);
+    writeFileSync(record, 'relative-store\n');
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true })).toThrow('generation root');
+    writeFileSync(record, `${join(root, 'generations')}\n`);
+    writeFileSync(ignore, '*\n!payload.ts\n');
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true })).toThrow('generation root');
+    writeFileSync(ignore, '*\n');
+    writeFileSync(join(state, 'payload.ts'), 'unexpected');
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true })).toThrow('added .papercusp/');
+    rmSync(join(state, 'payload.ts'));
+    rmSync(record);
+    symlinkSync('../source.ts', record);
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true })).toThrow('independent file');
+  });
+
+  it('keeps recorded generation metadata in the source census', () => {
+    const root = archive();
+    mkdirSync(join(root, '.papercusp'));
+    const record = join(root, '.papercusp/dependency-generation-root');
+    writeFileSync(record, `${join(root, 'generations')}\n`);
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    writeFileSync(record, `${join(root, 'different')}\n`);
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true }))
+      .toThrow('changed .papercusp/dependency-generation-root');
+  });
+
   it('hashes complete multi-chunk files, empty files and symlink text with exact progress bytes', () => {
     const root = archive();
     const content = Buffer.alloc(2 * 1024 * 1024 + 37);
