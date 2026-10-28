@@ -89,6 +89,11 @@
       "import": "./src/execution-details.ts",
       "default": "./src/execution-details.ts"
     },
+    "./vitest-failure-classification": {
+      "types": "./src/vitest-failure-classification.d.mts",
+      "import": "./src/vitest-failure-classification.mjs",
+      "default": "./src/vitest-failure-classification.mjs"
+    },
     "./mutation-descriptor": {
       "types": "./src/mutation-descriptor.ts",
       "import": "./src/mutation-descriptor.ts",
