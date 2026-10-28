@@ -2277,6 +2277,15 @@ export async function insertTestCaseRowsWithSql(
  * node:test recorder (node-test-ledger.ts, EI-24836213046334894) writes rows with exactly
  * the semantics this Vitest reporter does instead of a parallel copy.
  */
+/** Only an explicitly named work item binds native results to a close. */
+export function nativeTestRunAttribution(env: NodeJS.ProcessEnv): Pick<TestRunExecutionDetails, 'attribution'> {
+  const ownerId = env.PAPERCUSP_SID?.trim();
+  const workItemId = env.PAPERCUSP_TEST_RUN_WORK_ITEM?.trim();
+  if (!ownerId || !workItemId || !/^(?:WI|EI|F)-[A-Za-z0-9._-]+$/.test(workItemId)
+    || !env.PAPERCUSP_TEST_RUN_GROUP?.trim()) return {};
+  return { attribution: { ownerId, workItemId } };
+}
+
 export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
   if (rows.length === 0) return;
   let branch: string | null = null;
@@ -2624,6 +2633,7 @@ export default class AdminTestRunsReporter implements Reporter {
       runStartedAt,
       root: resolveRecordRoot(),
       runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+      ...nativeTestRunAttribution(process.env),
       workspaceId: resolveTestRunWorkspaceId(),
       harnessSlug: resolveTestRunHarnessSlug(),
       testNamePattern: ctx?.config?.testNamePattern?.source ?? null,

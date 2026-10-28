@@ -13,6 +13,23 @@ import {
   type TestRunExecutionDetails,
 } from './execution-details.ts';
 
+describe('native execution attribution', () => {
+  it('preserves exact custody and legacy compatibility', () => {
+    const attribution = { ownerId: 'agent-a', workItemId: 'EI-123' };
+    expect(parseTestRunExecutionDetails(details({ runGroupId: 'native-group', attribution })))
+      .toMatchObject({ attribution });
+    expect(parseTestRunExecutionDetails(details())).toBeDefined();
+  });
+  it('rejects partial, expanded, invalid and groupless custody', () => {
+    for (const attribution of [{ ownerId: '', workItemId: 'EI-123' },
+      { ownerId: 'agent-a', workItemId: 'other' }, { ownerId: 'agent-a' },
+      { ownerId: 'agent-a', workItemId: 'EI-123', trusted: true }])
+      expect(parseTestRunExecutionDetails(details({ runGroupId: 'g', attribution }))).toBeUndefined();
+    expect(parseTestRunExecutionDetails(details({ runGroupId: null,
+      attribution: { ownerId: 'agent-a', workItemId: 'EI-123' } }))).toBeUndefined();
+  });
+});
+
 describe('recorded requirement realization checks', () => {
   it('roundtrips the canonical check kind without admitting unknown kinds', () => {
     const check = { id: 'R-1:done-when', rubricRef: 'conformance:repo/plan', criterionKey: 'R-1',

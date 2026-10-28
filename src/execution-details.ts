@@ -233,6 +233,8 @@ export interface TestRunExecutionDetails {
   root: string;
   filePath: string;
   runGroupId: string | null;
+  /** Explicit native execution custody; absent on legacy or unscoped runs. */
+  attribution?: { ownerId: string; workItemId: string };
   workspaceId: string | null;
   harnessSlug: string | null;
   testNamePattern: string | null;
@@ -483,7 +485,7 @@ export type RuntimeEnvironmentCaptureStatus =
   | 'error';
 
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
-  'schemaVersion', 'root', 'filePath', 'runGroupId', 'workspaceId', 'harnessSlug',
+  'schemaVersion', 'root', 'filePath', 'runGroupId', 'attribution', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'scenarioId', 'llmRunIds', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
   'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
@@ -552,6 +554,12 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || typeof value.root !== 'string' || value.root.length === 0
     || typeof value.filePath !== 'string' || value.filePath.length === 0
     || !isNullableString(value.runGroupId) || !isNullableString(value.workspaceId)
+    || (value.attribution !== undefined && (!isRecord(value.attribution)
+      || Object.keys(value.attribution).length !== 2
+      || typeof value.attribution.ownerId !== 'string' || !value.attribution.ownerId.trim()
+      || typeof value.attribution.workItemId !== 'string'
+      || !/^(?:WI|EI|F)-[A-Za-z0-9._-]+$/.test(value.attribution.workItemId)
+      || typeof value.runGroupId !== 'string' || !value.runGroupId.trim()))
     || !isNullableString(value.harnessSlug) || !isNullableString(value.testNamePattern)
     || (value.scenarioId !== undefined && (typeof value.scenarioId !== 'string' || value.scenarioId.length === 0))
     || (value.llmRunIds !== undefined && (value.testLayer !== 'llm'
