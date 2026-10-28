@@ -393,6 +393,20 @@ export function currentRecorder(): Recorder | null {
   return state.current;
 }
 
+/**
+ * Test seam: snapshot the state resetCaptureForTests clears; the returned function restores it.
+ * In an armed worker the setup file's real recorder and installation must survive unit tests
+ * that reset and install against fakes, or the file's record is lost (WI-6554700010042252).
+ */
+export function snapshotCaptureForTests(): () => void {
+  const saved = { current: state.current, installed: state.installed, repoRoot: state.repoRoot };
+  return () => {
+    state.current = saved.current;
+    state.installed = saved.installed;
+    state.repoRoot = saved.repoRoot;
+  };
+}
+
 /** Test seam: forget the installation (unit tests install against fakes). */
 export function resetCaptureForTests(): void {
   state.current = null;
