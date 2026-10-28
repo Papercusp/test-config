@@ -252,6 +252,14 @@ delete process.env.PAPERCUSP_SPAWNER_SIDECAR;
 delete process.env.PAPERCUSP_SPAWNER_SIDECAR_MODE;
 for (const key of Object.keys(process.env)) {
   if (key.startsWith('PAPERCUSP_') && key.endsWith('_SPAWN_SIDECAR')) delete process.env[key];
+  // EI-27213783324748898: a gate leg launched BY bg-host inherits its sidecar
+  // socket path (PAPERCUSP_SPAWNER_IPC_SOCKET=/tmp/papercusp-spawner-<bg-host pid>.sock).
+  // A test that then started a REAL spawner-sidecar bound THAT path, hijacking the
+  // production host's socket: every bg-host git call reached a VITEST sidecar whose
+  // admission refused real Postgres, the circuit stayed open, and git-sync could not
+  // commit or push for ~45min. A test must resolve its own pid-keyed path, never an
+  // inherited production one — strip every sidecar IPC socket override.
+  if (key.startsWith('PAPERCUSP_') && key.endsWith('_IPC_SOCKET')) delete process.env[key];
 }
 // EI-25164235306950609: a fixture host shares the test runner's pc scope.
 // Inheriting the parent agent's headless flag falsely authorizes sweeping that

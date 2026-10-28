@@ -188,6 +188,16 @@ describe('setup-hermetic-env: per-host spawner rollout is scrubbed', () => {
     expect(after.PAPERCUSP_SPAWNER_SIDECAR_MODE).toBeUndefined();
   });
 
+  // EI-27213783324748898: an inherited production socket path let a test-spawned
+  // sidecar hijack bg-host's /tmp/papercusp-spawner-<pid>.sock.
+  it.each(['PAPERCUSP_SPAWNER_IPC_SOCKET', 'PAPERCUSP_SUBSTRATE_IPC_SOCKET'])(
+    'removes inherited sidecar socket path %s so a test can never bind a production socket',
+    async (key) => {
+      const after = await runSetupOn({ [key]: '/tmp/papercusp-spawner-332540.sock' });
+      expect(after[key]).toBeUndefined();
+    },
+  );
+
   it.each([
     'PAPERCUSP_GIT_PIPELINE_SPAWN_SIDECAR',
     'PAPERCUSP_PLAN_AUDIT_SPAWN_SIDECAR',
