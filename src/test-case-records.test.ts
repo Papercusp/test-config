@@ -20,7 +20,7 @@ import {
 
 type FakeCase = {
   fullName?: string;
-  result: () => { state: string; errors?: unknown[] };
+  result: () => { state: string; errors?: unknown[]; note?: string };
   diagnostic?: () => { duration?: number } | undefined;
 };
 
@@ -28,7 +28,7 @@ const moduleOf = (cases: FakeCase[], state = 'passed') =>
   ({ state: () => state, children: { allTests: () => cases } }) as unknown as Parameters<typeof collectTestCases>[0];
 
 describe('collectTestCases', () => {
-  it('records every case in module order with its title path, status, duration and failure tail', () => {
+  it('records every case in module order with its title path, status, duration and diagnostic tail', () => {
     const cases = collectTestCases(moduleOf([
       { fullName: 'suite > passes', result: () => ({ state: 'passed' }), diagnostic: () => ({ duration: 3.6 }) },
       {
@@ -36,12 +36,19 @@ describe('collectTestCases', () => {
         result: () => ({ state: 'failed', errors: [{ message: 'expected 1 to be 2' }, { message: 'second error' }] }),
         diagnostic: () => ({ duration: 1 }),
       },
-      { fullName: 'suite > skipped', result: () => ({ state: 'skipped' }), diagnostic: () => undefined },
+      {
+        fullName: 'suite > skipped',
+        result: () => ({ state: 'skipped', note: 'provider refused TEST_FILE_NAME_FILTER_NO_MATCH testsExecuted=0' }),
+        diagnostic: () => undefined,
+      },
     ], 'failed'));
     expect(cases).toEqual<TestCaseRecord[]>([
       { caseIndex: 0, caseKey: 'suite > passes', occurrence: 1, status: 'pass', durationMs: 4, errorTail: null },
       { caseIndex: 1, caseKey: 'suite > fails', occurrence: 1, status: 'fail', durationMs: 1, errorTail: 'expected 1 to be 2' },
-      { caseIndex: 2, caseKey: 'suite > skipped', occurrence: 1, status: 'skip', durationMs: null, errorTail: null },
+      {
+        caseIndex: 2, caseKey: 'suite > skipped', occurrence: 1, status: 'skip', durationMs: null,
+        errorTail: 'provider refused TEST_FILE_NAME_FILTER_NO_MATCH testsExecuted=0',
+      },
     ]);
   });
 

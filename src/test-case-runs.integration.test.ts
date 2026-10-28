@@ -150,11 +150,11 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
       .toEqual([
         { case_index: 0, case_key: 'case ledger fixture > passes', occurrence: 1, status: 'pass' },
         { case_index: 1, case_key: 'case ledger fixture > fails with a readable message', occurrence: 1, status: 'fail' },
-        { case_index: 2, case_key: 'case ledger fixture > is skipped', occurrence: 1, status: 'skip' },
+        { case_index: 2, case_key: 'case ledger fixture > is dynamically skipped with a provider reason', occurrence: 1, status: 'skip' },
         { case_index: 3, case_key: 'case ledger fixture > nested > repeats under one name', occurrence: 1, status: 'pass' },
         { case_index: 4, case_key: 'case ledger fixture > nested > repeats under one name', occurrence: 2, status: 'pass' },
       ]);
-    // Executed cases carry a measured duration; only the failure carries an error tail.
+    // Executed cases carry a measured duration; dynamic skip notes and failures carry diagnostics.
     for (const c of cases.filter((row) => row.status !== 'skip')) {
       expect(c.duration_ms, c.case_key).not.toBeNull();
       expect(c.duration_ms!, c.case_key).toBeGreaterThanOrEqual(0);
@@ -162,7 +162,8 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
     expect(cases[1]!.error_tail).toContain('case-ledger-expected');
     expect(cases[1]!.error_tail).toContain('\\0binary-bytes');
     expect(run.output_tail).toContain('\\0binary-bytes');
-    expect(cases.filter((row) => row.status !== 'fail').every((row) => row.error_tail === null)).toBe(true);
+    expect(cases[2]!.error_tail).toContain('case-ledger-provider-refusal TEST_FILE_NAME_FILTER_NO_MATCH testsExecuted=0');
+    expect(cases.filter((row) => row.status === 'pass').every((row) => row.error_tail === null)).toBe(true);
   });
 
   it('prunes case rows with their file row (ON DELETE CASCADE)', async () => {

@@ -976,7 +976,7 @@ export interface TestCaseRecord {
   occurrence: number;
   status: 'pass' | 'fail' | 'skip';
   durationMs: number | null;
-  /** The first error of a failed case, at most TEST_CASE_ERROR_TAIL_MAX_CHARS. */
+  /** Failure text or a dynamic skip note, at most TEST_CASE_ERROR_TAIL_MAX_CHARS. */
   errorTail: string | null;
 }
 
@@ -1010,9 +1010,15 @@ export function collectTestCases(testModule: TestModule): TestCaseRecord[] | nul
         if (typeof duration === 'number' && Number.isFinite(duration) && duration >= 0) durationMs = Math.round(duration);
       } catch { /* fail-soft: duration unknown */ }
       const firstError = status === 'fail' ? result.errors?.[0] : undefined;
-      const errorTail = firstError === undefined
-        ? null
-        : formatTestCaseError(firstError).slice(0, TEST_CASE_ERROR_TAIL_MAX_CHARS) || null;
+      const resultNote = (result as { note?: unknown }).note;
+      const skipNote = status === 'skip' && typeof resultNote === 'string' && resultNote.trim()
+        ? resultNote
+        : undefined;
+      const errorTail = skipNote !== undefined
+        ? boundFailureText(skipNote, TEST_CASE_ERROR_TAIL_MAX_CHARS) || null
+        : firstError === undefined
+          ? null
+          : formatTestCaseError(firstError).slice(0, TEST_CASE_ERROR_TAIL_MAX_CHARS) || null;
       cases.push({ caseIndex: cases.length, caseKey, occurrence, status, durationMs, errorTail });
     }
     return cases;
