@@ -379,15 +379,19 @@ describe('original config load evidence', () => {
       const parentExits = readFileSync(exits, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(forks).toHaveLength(1);
       const pid = forks[0].pid;
-      expect(parentExits).toContainEqual(expect.objectContaining({ pid, code: null,
-        signal: mode === 'slow snapshot' ? 'SIGKILL' : 'SIGTERM' }));
+      // Vitest 4 tears a fork down gracefully (exit code 0, no signal); only the
+      // interrupted slow snapshot is escalated to SIGKILL by the parent.
+      const expectedExit = mode === 'slow snapshot' ? { code: null, signal: 'SIGKILL' } : { code: 0, signal: null };
+      expect(parentExits, `fork ${pid} exit not observed as expected; parent=${JSON.stringify(parentExits)}`)
+        .toContainEqual(expect.objectContaining({ pid, ...expectedExit }));
       const receipt = join(`${out}.processes`, `${pid}-0.json`);
       if (mode === 'slow snapshot') {
         expect(readFileSync(snapshotEvents, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
           .toEqual([{ pid, phase: 'started' }]);
         expect(existsSync(receipt), `interrupted snapshot lost termination receipt; parent=${JSON.stringify(parentExits)}`).toBe(true);
         expect(JSON.parse(readFileSync(receipt, 'utf8'))).toMatchObject({ pid, isMainThread: true,
-          phase: 'signal', exitCode: null, signal: 'SIGTERM', status: 'unknown', engineScripts: null,
+          // Vitest 4 tears the fork down gracefully before the parent's SIGKILL.
+          phase: 'exit', exitCode: 0, signal: null, status: 'unknown', engineScripts: null,
           reasons: expect.arrayContaining(['process-source-snapshot-incomplete', 'process-engine-snapshot-incomplete']),
         });
         const result = writeExecutedCaptureDiagnostic({ outPath: out, cgroupsPath: cgroups,
@@ -404,7 +408,7 @@ describe('original config load evidence', () => {
       }
       expect(existsSync(receipt), `missing worker receipt for ${pid}; parent=${JSON.stringify(parentExits)}`).toBe(true);
       expect(JSON.parse(readFileSync(receipt, 'utf8'))).toMatchObject({ pid, isMainThread: true,
-        phase: 'signal', exitCode: null, signal: 'SIGTERM', observedSources: expect.any(Array),
+        phase: 'exit', exitCode: 0, signal: null, observedSources: expect.any(Array),
         engineScripts: { populationStatus: 'unknown', scripts: expect.arrayContaining([
           expect.objectContaining({ execution: 'observed', sourceTextSha256: expect.stringMatching(/^[a-f0-9]{64}$/) }),
         ]) },
@@ -425,7 +429,7 @@ describe('original config load evidence', () => {
         ]),
       });
       expect(membership).toContainEqual(expect.objectContaining({ pid, vitestFork: true,
-        phase: 'signal', signal: 'SIGTERM', cgroupPath,
+        phase: 'exit', exitCode: 0, signal: null, cgroupPath,
       }));
       // The diagnostic persists the actual transformed-script association even
       // when a stopped worker leaves the diagnostic's acceptance checks invalid.
