@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,
   beginFile,
@@ -14,6 +14,7 @@ import {
   installModuleEvaluationCapture,
   repoPathOf,
   resetCaptureForTests,
+  snapshotCaptureForTests,
   type CaptureTargets,
 } from './executed-inputs-capture';
 
@@ -24,7 +25,15 @@ import {
 // live `process.cwd` property.
 
 /** True when the setup file already installed capture on the real fs in this worker. */
-const armed = Boolean(process.env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim());
+// The env var alone is not enough: vitest-config wires the setup file only when the executed
+// source map is also armed, so a partial arm (env set, setup absent) must count as unarmed.
+const armed = Boolean(process.env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim()) && currentRecorder() !== null;
+
+// Unit tests below reset and re-install capture against fakes. Restore the setup file's real
+// recorder after each one, or an armed worker loses it (and this file's inputs record).
+let restoreCapture: () => void = () => {};
+beforeEach(() => { restoreCapture = snapshotCaptureForTests(); });
+afterEach(() => restoreCapture());
 
 describe('final worker module observation', () => {
   it('retains body imports and external flags while excluding builtin and virtual IDs', () => {
