@@ -22,6 +22,11 @@ import { fileURLToPath } from 'node:url';
 import postgres from 'postgres';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createFreshTestDb, type MigratedTestDb } from './pg-migrate.ts';
+import type { TestProject } from 'vitest/node';
+import loadTimeoutHistory from './test-timeout-history-global-setup.ts';
+import { testTimingRuntimeIdentity, type TestTimeoutHistorySnapshot } from './test-timeout-runtime.ts';
+import { resolveTestRunWorkspaceId, resolveTestRunHarnessSlug } from './admin-test-runs-reporter.ts';
+import { historicalTestTimeout } from './test-timeout-history.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SQL_DIR = resolve(here, '../../papercusp/libs/db/sql');
@@ -164,6 +169,45 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
     expect(run.output_tail).toContain('\\0binary-bytes');
     expect(cases[2]!.error_tail).toContain('case-ledger-provider-refusal TEST_FILE_NAME_FILTER_NO_MATCH testsExecuted=0');
     expect(cases.filter((row) => row.status === 'pass').every((row) => row.error_tail === null)).toBe(true);
+  });
+
+  it('loads compatible clean case history from the real ledger and rejects dirty or foreign-runtime measurements', async () => {
+    const runnerIdentity = testTimingRuntimeIdentity();
+    const file = 'libs/test-config/src/history-query-fixture.test.ts';
+    const root = resolve(here, '../../..');
+    const details = { testLayer: 'unit', testTimingRuntimeIdentity: runnerIdentity };
+    for (const [duration, dirty, runtime] of [[90_000, false, runnerIdentity],
+      [90_000, false, runnerIdentity], [90_000, false, runnerIdentity],
+      [400_000, true, runnerIdentity], [400_000, false, 'foreign']] as const) {
+      const [parent] = await sql`
+        INSERT INTO harness_shared.test_runs
+          (file_path, framework, status, duration_ms, started_at, finished_at,
+           source, worktree_dirty, is_scratch_config, workspace_id, harness_slug, execution_details)
+        VALUES (${file}, 'vitest', 'pass', ${duration}, now(), now(), 'ci', ${dirty}, false,
+          ${resolveTestRunWorkspaceId()}, ${resolveTestRunHarnessSlug()},
+          ${sql.json({ ...details, testTimingRuntimeIdentity: runtime })}) RETURNING id`;
+      await sql`INSERT INTO harness_shared.test_case_runs
+        (test_run_id, case_index, case_key, occurrence, status, duration_ms)
+        VALUES (${parent!.id}, 0, 'suite > slow', 1, 'pass', ${duration})`;
+    }
+    let snapshot: TestTimeoutHistorySnapshot | undefined;
+    const saved = process.env.PAPERCUSP_TEST_RUNS_DB_URL;
+    process.env.PAPERCUSP_TEST_RUNS_DB_URL = db.url;
+    try {
+      await loadTimeoutHistory({
+        config: { root, provide: { papercuspTestLayer: 'unit' } },
+        vitest: { state: { getPaths: () => [join(root, file)] } },
+        provide: (_key: string, value: TestTimeoutHistorySnapshot) => { snapshot = value; },
+      } as unknown as TestProject);
+    } finally {
+      if (saved === undefined) delete process.env.PAPERCUSP_TEST_RUNS_DB_URL;
+      else process.env.PAPERCUSP_TEST_RUNS_DB_URL = saved;
+    }
+    expect(snapshot, JSON.stringify(snapshot)).toMatchObject({ readStatus: 'loaded' });
+    expect(snapshot?.samples).toHaveLength(3);
+    expect(historicalTestTimeout({ file, caseKey: 'suite > slow', occurrence: 1,
+      layer: 'unit', runnerIdentity }, snapshot!.samples, Date.now()))
+      .toMatchObject({ basis: 'case-history', timeoutMs: 365_000, sampleCount: 3 });
   });
 
   it('prunes case rows with their file row (ON DELETE CASCADE)', async () => {

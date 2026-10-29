@@ -55,6 +55,7 @@ import {
 } from './mutation-descriptor.ts';
 import { isRestoredCheckoutPath } from './test-run-paths.ts';
 import { redactSensitiveText } from './sensitive-text.ts';
+import { testTimingRuntimeIdentity } from './test-timeout-runtime.ts';
 
 /** sha256 of the test file a row ran (its execution_details.mutation.testFileSha256), or null. */
 export function sha256OfTestFile(absolutePath: string): string | null {
@@ -2643,6 +2644,7 @@ export default class AdminTestRunsReporter implements Reporter {
       workspaceId: resolveTestRunWorkspaceId(),
       harnessSlug: resolveTestRunHarnessSlug(),
       testNamePattern: ctx?.config?.testNamePattern?.source ?? null,
+      ...(testTimingRuntimeIdentity() ? { testTimingRuntimeIdentity: testTimingRuntimeIdentity() } : {}),
       testLayer: recordedTestLayer({ schemaVersion: 1,
         testLayer: (ctx?.config?.provide as Record<string, unknown> | undefined)?.papercuspTestLayer }),
       mutationPhase: resolveMutationProbePhase(),
