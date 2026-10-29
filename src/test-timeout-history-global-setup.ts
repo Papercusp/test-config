@@ -34,7 +34,9 @@ export default async function setup(project: TestProject): Promise<void> {
         SELECT r.file_path, r.id::text AS run_id, r.duration_ms AS file_duration_ms,
                extract(epoch FROM r.finished_at) * 1000 AS observed_at_ms,
                c.case_key, c.occurrence, c.duration_ms AS case_duration_ms
-        FROM unnest(${sql.array(files)}::text[]) AS selected(file_path)
+        -- fetch_types:false deliberately skips postgres.js's array-OID catalog.
+        -- JSONB has a built-in serializer and needs no array-type discovery.
+        FROM jsonb_array_elements_text(${sql.json(files)}) AS selected(file_path)
         CROSS JOIN LATERAL (
           SELECT * FROM harness_shared.test_runs r
           WHERE r.file_path = selected.file_path AND r.framework = 'vitest'
@@ -44,6 +46,7 @@ export default async function setup(project: TestProject): Promise<void> {
             AND r.harness_slug IS NOT DISTINCT FROM ${resolveTestRunHarnessSlug()}
             AND r.execution_details->>'testLayer' = ${String(project.config.provide.papercuspTestLayer)}
             AND r.execution_details->>'testTimingRuntimeIdentity' = ${runnerIdentity}
+            AND r.execution_details->>'testNamePattern' IS NULL
             AND r.finished_at >= now() - interval '14 days'
           ORDER BY r.finished_at DESC LIMIT 20
         ) r

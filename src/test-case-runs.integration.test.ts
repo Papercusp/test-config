@@ -176,16 +176,17 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
     const file = 'libs/test-config/src/history-query-fixture.test.ts';
     const root = resolve(here, '../../..');
     const details = { testLayer: 'unit', testTimingRuntimeIdentity: runnerIdentity };
-    for (const [duration, dirty, runtime] of [[90_000, false, runnerIdentity],
-      [90_000, false, runnerIdentity], [90_000, false, runnerIdentity],
-      [400_000, true, runnerIdentity], [400_000, false, 'foreign']] as const) {
+    for (const [duration, dirty, runtime, testNamePattern] of [[90_000, false, runnerIdentity, null],
+      [90_000, false, runnerIdentity, null], [90_000, false, runnerIdentity, null],
+      [400_000, true, runnerIdentity, null], [400_000, false, 'foreign', null],
+      [100, false, runnerIdentity, 'only one case']] as const) {
       const [parent] = await sql`
         INSERT INTO harness_shared.test_runs
           (file_path, framework, status, duration_ms, started_at, finished_at,
            source, worktree_dirty, is_scratch_config, workspace_id, harness_slug, execution_details)
         VALUES (${file}, 'vitest', 'pass', ${duration}, now(), now(), 'ci', ${dirty}, false,
           ${resolveTestRunWorkspaceId()}, ${resolveTestRunHarnessSlug()},
-          ${sql.json({ ...details, testTimingRuntimeIdentity: runtime })}) RETURNING id`;
+          ${sql.json({ ...details, testTimingRuntimeIdentity: runtime, testNamePattern })}) RETURNING id`;
       await sql`INSERT INTO harness_shared.test_case_runs
         (test_run_id, case_index, case_key, occurrence, status, duration_ms)
         VALUES (${parent!.id}, 0, 'suite > slow', 1, 'pass', ${duration})`;
