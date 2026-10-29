@@ -57,6 +57,25 @@ import { isRestoredCheckoutPath } from './test-run-paths.ts';
 import { redactSensitiveText } from './sensitive-text.ts';
 import { testTimingRuntimeIdentity } from './test-timeout-runtime.ts';
 
+/** Diagnose private proof finalization without granting deadline or verdict authority. */
+export async function observeReporterStage<T>(reporter: 'test-runs' | 'executed-source',
+  stage: 'source-snapshot' | 'write-rows' | 'onTestRunEnd' | 'onExit' | 'pg-release' | 'completion-checkpoints' | 'completion-snapshot',
+  action: () => Promise<T>): Promise<T> {
+  if (process.env.PC_ISOLATED_RUNTIME_PROOF !== '1' && !process.env.VERIFY_TAURI_SOURCE_RECEIPT) return action();
+  const startedAt = Date.now(), operationId = randomUUID();
+  const emit = (event: 'start' | 'end', outcome?: 'returned' | 'threw') => {
+    try {
+      process.stderr.write('TEST_FILE_FINALIZATION ' + JSON.stringify({ pid: process.pid,
+        phase: 'reporter-stage', reporter, stage, event, operationId,
+        elapsedMs: Date.now() - startedAt, ...(outcome ? { outcome } : {}) }) + '\n');
+    } catch { /* A diagnostic sink must never change the observed operation. */ }
+  };
+  emit('start');
+  let outcome: 'returned' | 'threw' = 'threw';
+  try { const result = await action(); outcome = 'returned'; return result; }
+  finally { emit('end', outcome); }
+}
+
 /** sha256 of the test file a row ran (its execution_details.mutation.testFileSha256), or null. */
 export function sha256OfTestFile(absolutePath: string): string | null {
   try {
@@ -2549,7 +2568,7 @@ export default class AdminTestRunsReporter implements Reporter {
     // throws and rejected promises immediately and retain dirty provenance.
     this.readWorktreeSnapshot = async (phase?: WorktreeSnapshotPhase) => {
       try {
-        return await snapshotReader(phase);
+        return await observeReporterStage('test-runs', 'source-snapshot', () => snapshotReader(phase));
       } catch (error) {
         return {
           commit: null,
@@ -2558,13 +2577,14 @@ export default class AdminTestRunsReporter implements Reporter {
         };
       }
     };
-    this.writeRows =
+    const rowsWriter =
       writeRows ??
       (writeRow
         ? async (rows) => {
             await Promise.allSettled(rows.map((row) => writeRow(row)));
           }
         : insertRows);
+    this.writeRows = rows => observeReporterStage('test-runs', 'write-rows', () => rowsWriter(rows));
     const configuredReader = typeof readWorktreeSnapshotOrOptions === 'object'
       ? readWorktreeSnapshotOrOptions?.readRuntimeEnvironment : undefined;
     this.readRuntimeEnvironment = readRuntimeEnvironment ??
@@ -2867,6 +2887,7 @@ export default class AdminTestRunsReporter implements Reporter {
     unhandledErrors: ReadonlyArray<unknown> = [],
     reason?: TestRunEndReason,
   ): Promise<void> {
+    return observeReporterStage('test-runs', 'onTestRunEnd', async () => {
     try {
       // WI-6554700010008757: Vitest can pass every assertion yet fail the
       // invocation with an unhandled async/stream error. Module counts remain
@@ -2890,18 +2911,21 @@ export default class AdminTestRunsReporter implements Reporter {
       /* swallow — D-007 */
     } finally {
       this.flushFailureDetails();
-      await (this.pgLease ?? closeSharedPgIfUnheld)();
+      await observeReporterStage('test-runs', 'pg-release', this.pgLease ?? closeSharedPgIfUnheld);
     }
+    });
   }
 
   async onExit(): Promise<void> {
+    return observeReporterStage('test-runs', 'onExit', async () => {
     try {
       await this.flushPending();
     } catch {
       /* swallow — D-007 */
     } finally {
       this.flushFailureDetails();
-      await (this.pgLease ?? closeSharedPgIfUnheld)();
+      await observeReporterStage('test-runs', 'pg-release', this.pgLease ?? closeSharedPgIfUnheld);
     }
+    });
   }
 }

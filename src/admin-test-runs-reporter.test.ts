@@ -23,6 +23,7 @@ import { MAX_RECORDED_CASE_TITLE_CHARS, MAX_RECORDED_PASSED_CASES } from './exec
 import { redactSensitiveText } from './sensitive-text.ts';
 import AdminTestRunsReporter, {
   nativeTestRunAttribution,
+  observeReporterStage,
   buildOutputTail,
   captureWorktreeSnapshot,
   collectModuleExecution,
@@ -101,6 +102,59 @@ describe('native test execution custody', () => {
       attribution: { ownerId: 'agent-native', workItemId: 'EI-123' } });
   });
 });
+describe('reporter finalization stage diagnostics', () => {
+  it('keeps a pending operation open and preserves settlement when the diagnostic sink fails', async () => {
+    vi.stubEnv('PC_ISOLATED_RUNTIME_PROOF', '1');
+    const lines: string[] = [];
+    const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
+    let release!: (value: number) => void;
+    try {
+      const pending = observeReporterStage('test-runs', 'source-snapshot', () => new Promise<number>(resolve => { release = resolve; }));
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0].slice('TEST_FILE_FINALIZATION '.length))).toMatchObject({ event: 'start', stage: 'source-snapshot' });
+      release(17);
+      await expect(pending).resolves.toBe(17);
+      const events = lines.map(line => JSON.parse(line.slice('TEST_FILE_FINALIZATION '.length)));
+      expect(events[1]).toMatchObject({ event: 'end', outcome: 'returned', operationId: events[0].operationId });
+      sink.mockImplementation(() => { throw new Error('diagnostic unavailable'); });
+      const original = new Error('original operation');
+      await expect(observeReporterStage('test-runs', 'write-rows', async () => { throw original; })).rejects.toBe(original);
+    } finally { sink.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it('distinguishes a blocked final snapshot from ledger writing and PG release through real hooks', async () => {
+    vi.stubEnv('PC_ISOLATED_RUNTIME_PROOF', '1');
+    const lines: string[] = [];
+    const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
+    let reads = 0, release!: (value: { commit: string; porcelain: string }) => void;
+    const writing = vi.fn(async () => {});
+    const reporter = new AdminTestRunsReporter(async () => ++reads === 1
+      ? { commit: 'abc', porcelain: '' } : new Promise(resolve => { release = resolve; }), undefined, writing);
+    const events = () => lines.filter(line => line.startsWith('TEST_FILE_FINALIZATION '))
+      .map(line => JSON.parse(line.slice('TEST_FILE_FINALIZATION '.length)));
+    let pending: Promise<void> | undefined;
+    try {
+      await reporter.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      reporter.onTestModuleEnd({ moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
+        state: () => 'passed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+      } as never);
+      pending = reporter.onTestRunEnd();
+      await vi.waitFor(() => expect(reads).toBe(2));
+      expect(events().filter(row => row.stage === 'source-snapshot' && row.event === 'end')).toHaveLength(1);
+      expect(events()).toContainEqual(expect.objectContaining({ stage: 'onTestRunEnd', event: 'start' }));
+      expect(writing).not.toHaveBeenCalled();
+      release({ commit: 'abc', porcelain: '' });
+      await pending;
+      expect(writing).toHaveBeenCalledTimes(1);
+      expect(events().filter(row => row.event === 'end').map(row => row.stage))
+        .toEqual(['source-snapshot', 'source-snapshot', 'write-rows', 'pg-release', 'onTestRunEnd']);
+    } finally {
+      release?.({ commit: 'abc', porcelain: '' }); await pending;
+      sink.mockRestore(); vi.unstubAllEnvs();
+    }
+  });
+});
+
 /** The resolver the reporter's onInit loads in a hive that ships verification-harness. */
 describe('framework boundary case identities', () => {
   const receipt = { boundary: 'graph:query:evidence', callId: 'dispatch-1', workspaceId: 'ws', harness: 'repo',

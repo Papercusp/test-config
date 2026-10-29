@@ -41,6 +41,7 @@ import { completionSnapshotChunks } from '../../../scripts/lib/completion-snapsh
 
 import {
   captureWorktreeSnapshot,
+  observeReporterStage,
   closeSharedPgIfUnheld,
   computeWorktreeDirty,
   collectModuleExecution,
@@ -851,11 +852,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
     writeSnapshot?: SnapshotWriter,
   ) {
     // Vitest constructs reporters with its options object; the unit suite injects seams.
-    this.readWorktreeSnapshot =
+    const snapshotReader =
       typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
+    this.readWorktreeSnapshot = () => observeReporterStage('executed-source', 'source-snapshot', snapshotReader);
     // A flush timeout releases the reporter lease, but the default writer can
     // still be between SQL chunks. Keep the whole write alive until settlement.
-    this.writeRows = writeRows ?? ((flush) => trackSharedPgOperation(writeExecutedSourceRows(flush)));
+    const rowsWriter = writeRows ?? ((flush: ExecutedSourceFlush) => trackSharedPgOperation(writeExecutedSourceRows(flush)));
+    this.writeRows = flush => observeReporterStage('executed-source', 'write-rows', () => rowsWriter(flush));
     this.resolveGitDir = resolveGitDir ?? resolveRecordedGitDir;
     this.writeSnapshot = writeSnapshot ?? writeExecutedSourceMapSnapshotAsync;
   }
@@ -1092,7 +1095,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
         recordedGitDir: this.resolveGitDir(this.repoRoot),
         worktreeDirty: before === null || computeWorktreeDirty(before, after),
       };
-      await this.writeSnapshot(armed.outPath!, checkpoint);
+      await observeReporterStage('executed-source', 'completion-snapshot', async () => {
+        await this.writeSnapshot(armed.outPath!, checkpoint);
+      });
       const completionIds = payload.nativeRun.files.map(file => file.completionId)
         .filter(completionId => !this.acknowledgedCompletionIds.has(completionId));
       for (const completionId of completionIds) this.acknowledgedCompletionIds.add(completionId);
@@ -1107,7 +1112,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private async flushPending(): Promise<void> {
     if (!this.armed || this.flushed) return;
     this.flushed = true;
-    await this.checkpointWrites;
+    await observeReporterStage('executed-source', 'completion-checkpoints', () => this.checkpointWrites);
     const rows = this.pending.splice(0);
     if (executedSourceRunnerIdentity() !== this.completionContext.runnerIdentity)
       this.completionContext.runnerIdentity = null;
@@ -1244,6 +1249,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     unhandledErrors?: ReadonlyArray<unknown>,
     reason?: TestRunEndReason,
   ): Promise<void> {
+    return observeReporterStage('executed-source', 'onTestRunEnd', async () => {
     try {
       if (this.nativeRun && !this.flushed) {
         this.nativeRun.finishedAtMs = Date.now();
@@ -1271,11 +1277,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
     } catch {
       /* swallow — D-007 */
     } finally {
-      await (this.pgLease ?? closeSharedPgIfUnheld)();
+      await observeReporterStage('executed-source', 'pg-release', this.pgLease ?? closeSharedPgIfUnheld);
     }
+    });
   }
 
   async onExit(): Promise<void> {
+    return observeReporterStage('executed-source', 'onExit', async () => {
     try {
       if (this.nativeRun && !this.flushed) {
         this.nativeRun.finishedAtMs = Date.now();
@@ -1286,8 +1294,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
     } catch {
       /* swallow — D-007 */
     } finally {
-      await (this.pgLease ?? closeSharedPgIfUnheld)();
+      await observeReporterStage('executed-source', 'pg-release', this.pgLease ?? closeSharedPgIfUnheld);
     }
+    });
   }
 }
 
