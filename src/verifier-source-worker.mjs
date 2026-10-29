@@ -4,7 +4,10 @@ import { readVerifierSourceReceiptSync } from './verifier-source.ts';
 
 try {
   parentPort.postMessage({
-    receipt: readVerifierSourceReceiptSync(workerData.root, workerData.receiptPath, { mutation: workerData.mutation }),
+    receipt: readVerifierSourceReceiptSync(workerData.root, workerData.receiptPath, {
+      mutation: workerData.mutation,
+      progress: progress => parentPort.postMessage({ progress }),
+    }),
   });
 } catch (error) {
   parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) });

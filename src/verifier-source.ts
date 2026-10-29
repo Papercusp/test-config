@@ -74,14 +74,19 @@ export function readVerifierSourceReceiptSync(root: string, receiptPath = proces
  */
 export function readVerifierSourceReceipt(root: string,
   receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT,
-  options: { mutation?: VerifierSourceMutation } = {}): Promise<VerifierSourceReceipt> {
+  options: { mutation?: VerifierSourceMutation; progress?: (record: VerifierSourceProgress) => void } = {}): Promise<VerifierSourceReceipt> {
   return new Promise((resolveReceipt, reject) => {
     const worker = new Worker(new URL('./verifier-source-worker.mjs', import.meta.url), {
       workerData: { root, receiptPath, mutation: options.mutation },
     });
     let receipt: VerifierSourceReceipt | undefined;
     let failure: Error | undefined;
-    worker.once('message', (result: { receipt?: VerifierSourceReceipt; error?: string }) => {
+    worker.on('message', (result: { receipt?: VerifierSourceReceipt; error?: string; progress?: VerifierSourceProgress }) => {
+      if (result.progress) {
+        // Diagnostics must not change the full census or its terminal verdict.
+        try { options.progress?.(result.progress); } catch { /* observer failure */ }
+        return;
+      }
       if (result.error) failure = new VerifierSourceError(result.error);
       else receipt = result.receipt;
     });

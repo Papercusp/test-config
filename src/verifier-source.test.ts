@@ -5,7 +5,7 @@ import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, symlinkS
   truncateSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { verifierSourceFiles, verifyVerifierSourceSync } from './verifier-source.ts';
+import { readVerifierSourceReceipt, verifierSourceFiles, verifyVerifierSourceSync, type VerifierSourceProgress } from './verifier-source.ts';
 
 const directories: string[] = [];
 function archive(): string {
@@ -18,6 +18,30 @@ afterEach(() => {
 });
 
 describe('full verifier source census', () => {
+  it('relays async census progress without treating it as a completed receipt', async () => {
+    const root = archive();
+    writeFileSync(join(root, 'source.ts'), 'export {};');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    const independentReceipt = join(archive(), 'receipt.json');
+    writeFileSync(independentReceipt, JSON.stringify(receipt));
+    const progress: VerifierSourceProgress[] = [];
+    await expect(readVerifierSourceReceipt(root, independentReceipt, {
+      progress: record => { progress.push(record); throw new Error('observer unavailable'); },
+    })).resolves.toEqual(receipt);
+    expect(progress[0]).toMatchObject({ step: 'source-census', event: 'start' });
+    expect(progress).toContainEqual(expect.objectContaining({ step: 'source-census', event: 'progress',
+      completedFiles: 1, totalFiles: 1, bytesRead: Buffer.byteLength('export {};') }));
+    expect(progress.at(-1)).toMatchObject({ step: 'source-census', event: 'end', status: 0 });
+    writeFileSync(join(root, 'source.ts'), 'export {changed};');
+    await expect(readVerifierSourceReceipt(root, independentReceipt, {
+      progress: record => progress.push(record),
+    })).rejects.toThrow('tampered');
+    expect(progress.at(-1)).toMatchObject({ step: 'source-census', event: 'end', status: 3 });
+  });
+
   it('admits only independent maintained generation-root metadata in runtime mode', () => {
     const root = archive();
     writeFileSync(join(root, 'source.ts'), 'export {};');
