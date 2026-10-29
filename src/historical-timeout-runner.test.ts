@@ -20,8 +20,13 @@ describe('history-derived native Vitest execution', () => {
       expect(defineVitestConfig({ layer: 'unit' }).test?.runner).toBe(runner);
       expect(defineVitestConfig({ layer: 'integration' }).test?.runner).toBe(runner);
       expect(gateParticipationConfig().runner).toBe(runner);
+      expect(defineVitestConfig({ layer: 'unit' }).test?.pool).toMatchObject({ name: 'forks', createPoolWorker: expect.any(Function) });
+      expect(gateParticipationConfig().pool).toMatchObject({ name: 'forks', createPoolWorker: expect.any(Function) });
+      expect(gateParticipationConfig().reporters.some(path => path.endsWith('worker-progress-pool.ts'))).toBe(true);
       expect(defineVitestConfig({ layer: 'browser' }).test?.runner).toBeUndefined();
+      expect(defineVitestConfig({ layer: 'browser' }).test?.pool).toBe('threads');
       expect(gateParticipationConfig({}, {}).runner).toBeUndefined();
+      expect(gateParticipationConfig({}, {}).pool).toBeUndefined();
     } finally {
       if (saved === undefined) delete process.env.GREEN_CHECKPOINT;
       else process.env.GREEN_CHECKPOINT = saved;
@@ -62,7 +67,7 @@ describe('history-derived native Vitest execution', () => {
       } };`);
       // The 1ms uniform default is intentionally too small. The runner must
       // replace it BEFORE collection; simply mutating task.timeout would fail.
-      await run(process.execPath, [cli, 'run', '--config', join(root, 'vitest.config.mjs')], {
+      await run(process.execPath, [cli, 'run', '--configLoader', 'native', '--config', join(root, 'vitest.config.mjs')], {
         cwd: root, env: { ...process.env, GREEN_CHECKPOINT: '0' }, maxBuffer: 200_000,
       });
       const result = JSON.parse(readFileSync(outputFile, 'utf8'));

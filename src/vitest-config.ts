@@ -20,6 +20,8 @@ import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
 // gate-file-level-test-reuse-2026-09-27 P-008: per-file pass reuse (PC_TEST_REUSE_SKIP_LIST).
 import { resolvePartialResumeSkipExclude, resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
 import type { RecordedRuntimeEnvironment } from './execution-details.ts';
+import { createProgressForksPool } from './worker-progress-pool.ts';
+import type { PoolRunnerInitializer } from 'vitest/node';
 import {
   EXECUTED_INPUTS_CAPTURE_SETUP,
   FAIL_ON_CONSOLE_SETUP,
@@ -276,6 +278,7 @@ export function armExecutedInputsCapture(env: NodeJS.ProcessEnv = process.env): 
 // new gate-owned piece reaches every enrolled config at once instead of drifting.
 interface GateOwnedParts {
   runner?: string;
+  pool?: PoolRunnerInitializer;
   plugins: Plugin[];
   /** Gate-owned reporters only — never 'default' / 'junit', which each config chooses. */
   reporters: string[];
@@ -297,12 +300,14 @@ function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedPart
   const executedSourceMap = executedSourceMapConfig(env);
   const coverageRequested = process.argv.some(arg => /^--coverage(?:$|\.(?:enabled|provider)(?:=|$)|=true$)/.test(arg));
   return {
-    ...(env.GREEN_CHECKPOINT === '1' && layer !== 'browser' ? { runner: HISTORICAL_TIMEOUT_RUNNER } : {}),
+    ...(env.GREEN_CHECKPOINT === '1' && layer !== 'browser'
+      ? { runner: HISTORICAL_TIMEOUT_RUNNER, pool: createProgressForksPool() } : {}),
     plugins: [...(executedSourceMap.plugins ?? []),
       ...(coverageRequested && !executedSourceMap.plugins?.some(p => p.name === 'papercusp-executed-source-originals')
         ? [executedSourceOriginalsPlugin()] : [])],
     reporters: [
       ...(env.PAPERCUSP_DISABLE_TEST_RUNS_REPORTER === '1' ? [] : [ADMIN_TEST_RUNS_REPORTER]),
+      ...(env.GREEN_CHECKPOINT === '1' && layer !== 'browser' ? [resolve(__dirname, 'worker-progress-pool.ts')] : []),
       ...executedSourceMap.reporters,
     ],
     // The capture patches node:fs, so never in a real browser.
@@ -331,6 +336,7 @@ export interface GateParticipationOptions {
 
 export interface GateParticipationFragment {
   runner?: string;
+  pool?: PoolRunnerInitializer;
   provide: { papercuspTestLayer: 'unit' };
   reporters: string[];
   setupFiles: string[];
@@ -357,6 +363,7 @@ export function gateParticipationConfig(
   const gate = gateOwnedParts('unit', env);
   return {
     ...(gate.runner ? { runner: gate.runner } : {}),
+    ...(gate.pool ? { pool: gate.pool } : {}),
     provide: { papercuspTestLayer: 'unit' },
     reporters: ['default', ...gate.reporters],
     setupFiles: [...gate.leadingSetupFiles, ...(opts.setupFiles ?? [])],
@@ -827,7 +834,7 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
       // depends on which Node the runner's PATH happens to resolve. Browser
       // mode keeps its own pool semantics. See
       // docs/plans/test-affected-coredump-investigation-2026-06-01.md.
-      pool: layer === 'browser' ? 'threads' : 'forks',
+      pool: gate.pool ?? (layer === 'browser' ? 'threads' : 'forks'),
       // Integration tests share real PG schemas (e.g. harness_shared) — running
       // files in parallel races their `DROP SCHEMA CASCADE` teardown. Serialise.
       // e2e files drive one shared live system (serving operator + real DB), so they serialise too.
