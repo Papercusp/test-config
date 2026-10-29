@@ -34,8 +34,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { open, rename, rm } from 'node:fs/promises';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
-import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, isAbsolute, resolve } from 'node:path';
+import { classifyReadPaths, normalizeExecutedKey } from './executed-read-paths';
+export { classifyReadPaths, normalizeExecutedKey } from './executed-read-paths';
 import * as runtimeProof from './runtime-proof.ts';
 import { completionSnapshotChunks } from '../../../scripts/lib/completion-snapshot.mjs';
 
@@ -96,37 +97,6 @@ export interface ExecutedSourceFlush {
 // recorded and the value compared can never drift apart (D-004 rules 1 and 6).
 import { executedSourceRunContext, executedSourceRunnerIdentity, REUSE_PROOF_FORMAT } from './test-pass-reuse-skip';
 export { executedSourceRunContext, executedSourceRunnerIdentity };
-
-/** Cap on how many untracked read paths an opaque reason names (the rest are counted). */
-const UNTRACKED_REASON_CAP = 5;
-
-/**
- * Classify a file's runtime reads against the tracked tree. PURE over its seams — exported for
- * the unit test. A read of a TRACKED file or directory is an input a git diff can see. A read of
- * a path that does not exist is an absence input (creating it later shows up in the diff). A read
- * of an existing UNTRACKED path (generated output, a gitignored cache) has content no diff can
- * describe, so it makes the pass opaque.
- */
-export function classifyReadPaths(
-  reads: string[],
-  o: { repoRoot: string; isTracked: (rel: string) => boolean; exists: (abs: string) => boolean },
-): { readPaths: string[]; opaqueReasons: string[] } {
-  const readPaths = new Set<string>();
-  const untracked: string[] = [];
-  for (const abs of reads) {
-    const rel = normalizeExecutedKey(abs, o.repoRoot);
-    if (!rel) continue;
-    if (o.isTracked(rel) || !o.exists(abs)) readPaths.add(rel);
-    else untracked.push(rel);
-  }
-  const opaqueReasons: string[] = [];
-  untracked.sort();
-  for (const rel of untracked.slice(0, UNTRACKED_REASON_CAP)) opaqueReasons.push(`untracked-read:${rel}`);
-  if (untracked.length > UNTRACKED_REASON_CAP) {
-    opaqueReasons.push(`untracked-read:+${untracked.length - UNTRACKED_REASON_CAP} more`);
-  }
-  return { readPaths: [...readPaths].sort(), opaqueReasons };
-}
 
 interface ConfigDepsSource {
   vite?: { config?: { configFileDependencies?: unknown; configFile?: unknown } };
@@ -279,32 +249,6 @@ export function completeWorkerRuntime(inputs: InputsRecord | null, reporterIdent
   if (`${REUSE_PROOF_FORMAT} ${before}` !== reporterIdentity ||
       `${REUSE_PROOF_FORMAT} ${after}` !== reporterIdentity) reasons.push('worker-runtime-mismatch');
   return reasons;
-}
-
-/**
- * Normalise one `importDurations` key to a repo-root-relative POSIX path, or `null` when it
- * is not a repo-internal source module. Keys are absolute file paths as vitest's module
- * runner saw them — occasionally a `file://` URL, occasionally carrying a `?v=…` / `?import`
- * query — and node_modules entries are marked `external` but also dropped by path, so an
- * unflagged externalised copy cannot slip in.
- */
-export function normalizeExecutedKey(key: string, repoRoot: string): string | null {
-  let p = key;
-  if (p.startsWith('file://')) {
-    try {
-      p = fileURLToPath(p);
-    } catch {
-      return null;
-    }
-  }
-  const q = p.indexOf('?');
-  if (q >= 0) p = p.slice(0, q);
-  if (p.startsWith('/@fs/')) p = p.slice('/@fs'.length);
-  if (!isAbsolute(p)) return null;
-  const rel = relative(repoRoot, p).split(/[/\\]/).join(posix.sep);
-  if (rel.length === 0 || rel.startsWith('..')) return null;
-  if (rel.split('/').includes('node_modules')) return null;
-  return rel;
 }
 
 /**
