@@ -34,7 +34,7 @@ export default async function setup(project: TestProject): Promise<void> {
         SELECT r.file_path, r.id::text AS run_id, r.duration_ms AS file_duration_ms,
                extract(epoch FROM r.finished_at) * 1000 AS observed_at_ms,
                c.case_key, c.occurrence, c.duration_ms AS case_duration_ms
-        FROM unnest(${files}::text[]) AS selected(file_path)
+        FROM unnest(${sql.array(files)}::text[]) AS selected(file_path)
         CROSS JOIN LATERAL (
           SELECT * FROM harness_shared.test_runs r
           WHERE r.file_path = selected.file_path AND r.framework = 'vitest'
