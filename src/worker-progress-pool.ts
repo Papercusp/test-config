@@ -56,7 +56,8 @@ function fileBudget(project: TestProject, file: string): number {
  * escalation. No private worker fields, custom IPC, or run-duration cap. */
 export function createProgressForksPool({ idleTimeoutMs }: { idleTimeoutMs?: number } = {}): PoolRunnerInitializer {
   return {
-    name: 'forks',
+    // Vitest dispatches built-in names before consulting a custom initializer.
+    name: 'papercusp-progress-forks',
     createPoolWorker(options: PoolOptions): PoolWorker {
       const delegate = new ForksPoolWorker(options);
       let stopping: Promise<void> | undefined;

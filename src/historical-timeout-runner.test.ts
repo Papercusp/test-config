@@ -20,8 +20,8 @@ describe('history-derived native Vitest execution', () => {
       expect(defineVitestConfig({ layer: 'unit' }).test?.runner).toBe(runner);
       expect(defineVitestConfig({ layer: 'integration' }).test?.runner).toBe(runner);
       expect(gateParticipationConfig().runner).toBe(runner);
-      expect(defineVitestConfig({ layer: 'unit' }).test?.pool).toMatchObject({ name: 'forks', createPoolWorker: expect.any(Function) });
-      expect(gateParticipationConfig().pool).toMatchObject({ name: 'forks', createPoolWorker: expect.any(Function) });
+      expect(defineVitestConfig({ layer: 'unit' }).test?.pool).toMatchObject({ name: 'papercusp-progress-forks', createPoolWorker: expect.any(Function) });
+      expect(gateParticipationConfig().pool).toMatchObject({ name: 'papercusp-progress-forks', createPoolWorker: expect.any(Function) });
       expect(gateParticipationConfig().reporters.some(path => path.endsWith('worker-progress-pool.ts'))).toBe(true);
       expect(defineVitestConfig({ layer: 'browser' }).test?.runner).toBeUndefined();
       expect(defineVitestConfig({ layer: 'browser' }).test?.pool).toBe('threads');

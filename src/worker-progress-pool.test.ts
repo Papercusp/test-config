@@ -63,11 +63,11 @@ describe('parent worker inactivity recovery', () => {
           cwd: root, env: { ...process.env, GREEN_CHECKPOINT: '0' }, timeout: 45_000, maxBuffer: 200_000,
         });
       } catch (error) { failed = error as typeof failed; }
-      expect(failed?.code).toBe(1);
-      expect(failed?.killed).not.toBe(true);
       if (!`${failed?.stdout}\n${failed?.stderr}`.includes('Vitest worker made no test progress:')) {
         throw new Error(`Native worker fixture did not reach recovery:\n${failed?.stdout}\n${failed?.stderr}`);
       }
+      expect(failed?.code).toBe(1);
+      expect(failed?.killed).not.toBe(true);
       expect(`${failed?.stdout}\n${failed?.stderr}`).toContain('Vitest worker made no test progress:');
       expect(`${failed?.stdout}\n${failed?.stderr}`).toContain('blocked.test.ts');
       const result = JSON.parse(readFileSync(outputFile, 'utf8'));
