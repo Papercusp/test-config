@@ -14,6 +14,14 @@ import {
 } from './execution-details.ts';
 
 describe('native execution attribution', () => {
+  it('roundtrips timing runtime identity while keeping old rows valid and rejecting malformed identities', () => {
+    const testTimingRuntimeIdentity = 'node:25.9.0 linux/x64 vitest:4.1.8';
+    expect(parseTestRunExecutionDetails(details({ testTimingRuntimeIdentity })))
+      .toMatchObject({ testTimingRuntimeIdentity });
+    expect(parseTestRunExecutionDetails(details())).toBeDefined();
+    for (const invalid of ['', ' ', 7, 'x'.repeat(301)])
+      expect(parseTestRunExecutionDetails(details({ testTimingRuntimeIdentity: invalid }))).toBeUndefined();
+  });
   it('preserves exact custody and legacy compatibility', () => {
     const attribution = { ownerId: 'agent-a', workItemId: 'EI-123' };
     expect(parseTestRunExecutionDetails(details({ runGroupId: 'native-group', attribution })))

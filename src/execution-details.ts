@@ -240,6 +240,8 @@ export interface TestRunExecutionDetails {
   testNamePattern: string | null;
   /** Observed from the executing project's registered config; absent on older rows. */
   testLayer?: RecordedTestLayer;
+  /** Node/platform/Vitest identity for compatible per-case timing history. */
+  testTimingRuntimeIdentity?: string;
   /** Identity of an individual live LLM scenario case; absent on other and older rows. */
   scenarioId?: string;
   /** Exact rich reports emitted by this native LLM execution. */
@@ -487,7 +489,7 @@ export type RuntimeEnvironmentCaptureStatus =
 const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'schemaVersion', 'root', 'filePath', 'runGroupId', 'attribution', 'workspaceId', 'harnessSlug',
   'testNamePattern', 'scenarioId', 'llmRunIds', 'passed', 'failed', 'skipped', 'collectionFailed', 'mutationPhase',
-  'commitSha', 'worktreeDirty', 'testLayer', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
+  'commitSha', 'worktreeDirty', 'testLayer', 'testTimingRuntimeIdentity', 'worktreeDirtyReason', 'runStartedAt', 'failedCaseTitles',
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
@@ -551,6 +553,8 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
   }
   if (value.schemaVersion !== TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION
     || (value.testLayer !== undefined && recordedTestLayer(value) === undefined)
+    || (value.testTimingRuntimeIdentity !== undefined && (typeof value.testTimingRuntimeIdentity !== 'string'
+      || !value.testTimingRuntimeIdentity.trim() || value.testTimingRuntimeIdentity.length > 300))
     || typeof value.root !== 'string' || value.root.length === 0
     || typeof value.filePath !== 'string' || value.filePath.length === 0
     || !isNullableString(value.runGroupId) || !isNullableString(value.workspaceId)

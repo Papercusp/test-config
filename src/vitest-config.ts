@@ -122,6 +122,8 @@ ensurePapercuspTmpdir();
 const ADMIN_TEST_RUNS_REPORTER = resolve(__dirname, 'admin-test-runs-reporter.ts');
 /** The host repository's "may this run start?" veto — see host-preflight-global-setup.ts. */
 export const HOST_PREFLIGHT_GLOBAL_SETUP = resolve(__dirname, 'host-preflight-global-setup.ts');
+const TEST_TIMEOUT_HISTORY_GLOBAL_SETUP = resolve(__dirname, 'test-timeout-history-global-setup.ts');
+const HISTORICAL_TIMEOUT_RUNNER = resolve(__dirname, 'historical-timeout-runner.ts');
 
 // ── EXECUTED-SOURCE MAP (gate-latency-selection-and-retry-policy-2026-09-06, P-002) ──────
 // A second reporter that records, per test FILE, the modules vitest actually executed, into
@@ -273,6 +275,7 @@ export function armExecutedInputsCapture(env: NodeJS.ProcessEnv = process.env): 
 // of 73 tasks). defineVitestConfig and gateParticipationConfig now both read THIS function, so a
 // new gate-owned piece reaches every enrolled config at once instead of drifting.
 interface GateOwnedParts {
+  runner?: string;
   plugins: Plugin[];
   /** Gate-owned reporters only — never 'default' / 'junit', which each config chooses. */
   reporters: string[];
@@ -294,6 +297,7 @@ function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedPart
   const executedSourceMap = executedSourceMapConfig(env);
   const coverageRequested = process.argv.some(arg => /^--coverage(?:$|\.(?:enabled|provider)(?:=|$)|=true$)/.test(arg));
   return {
+    ...(env.GREEN_CHECKPOINT === '1' && layer !== 'browser' ? { runner: HISTORICAL_TIMEOUT_RUNNER } : {}),
     plugins: [...(executedSourceMap.plugins ?? []),
       ...(coverageRequested && !executedSourceMap.plugins?.some(p => p.name === 'papercusp-executed-source-originals')
         ? [executedSourceOriginalsPlugin()] : [])],
@@ -304,7 +308,8 @@ function gateOwnedParts(layer: TestLayer, env: NodeJS.ProcessEnv): GateOwnedPart
     // The capture patches node:fs, so never in a real browser.
     leadingSetupFiles: layer === 'browser' ? [] : executedSourceMap.setupFiles,
     // Every layer: globalSetup runs in vitest's node main process even for a browser run.
-    leadingGlobalSetup: [HOST_PREFLIGHT_GLOBAL_SETUP],
+    leadingGlobalSetup: [HOST_PREFLIGHT_GLOBAL_SETUP,
+      ...(env.GREEN_CHECKPOINT === '1' && layer !== 'browser' ? [TEST_TIMEOUT_HISTORY_GLOBAL_SETUP] : [])],
     // affected-tests arms the skip channel for unit vitest tasks alone, and the reader re-checks
     // run context + runner identity (a declined list means every file runs).
     reuseSkipExclude: layer === 'unit' ? resolveReuseSkipExclude(env) : [],
@@ -325,6 +330,7 @@ export interface GateParticipationOptions {
 }
 
 export interface GateParticipationFragment {
+  runner?: string;
   provide: { papercuspTestLayer: 'unit' };
   reporters: string[];
   setupFiles: string[];
@@ -350,6 +356,7 @@ export function gateParticipationConfig(
 ): GateParticipationFragment {
   const gate = gateOwnedParts('unit', env);
   return {
+    ...(gate.runner ? { runner: gate.runner } : {}),
     provide: { papercuspTestLayer: 'unit' },
     reporters: ['default', ...gate.reporters],
     setupFiles: [...gate.leadingSetupFiles, ...(opts.setupFiles ?? [])],
@@ -785,6 +792,7 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
     // hand-rolled configs through gateParticipationServerConfig() (WI-10003808).
     server: gateParticipationServerConfig(),
     test: {
+      ...(gate.runner ? { runner: gate.runner } : {}),
       // The reporter reads the executing project's config, including when CLI
       // reporter overrides are used. This is runtime evidence, not a caller label.
       provide: { papercuspTestLayer: layer },
