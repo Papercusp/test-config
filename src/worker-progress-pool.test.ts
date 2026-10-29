@@ -55,7 +55,7 @@ describe('parent worker inactivity recovery', () => {
         import { createProgressForksPool } from ${JSON.stringify(source)};
         export default { test: { root: ${JSON.stringify(root)}, include: ['*.test.ts'],
           pool: createProgressForksPool({ idleTimeoutMs: 5000 }), maxWorkers: 2,
-          testTimeout: 20000, reporters: ['json', ${JSON.stringify(source)}],
+          testTimeout: 20000, reporters: ['default', 'json', ${JSON.stringify(source)}],
           outputFile: ${JSON.stringify(outputFile)} } };`);
       let failed: { code?: number; killed?: boolean; stdout?: string; stderr?: string } | undefined;
       try {
@@ -70,6 +70,7 @@ describe('parent worker inactivity recovery', () => {
       expect(failed?.killed).not.toBe(true);
       expect(`${failed?.stdout}\n${failed?.stderr}`).toContain('Vitest worker made no test progress:');
       expect(`${failed?.stdout}\n${failed?.stderr}`).toContain('blocked.test.ts');
+      expect(`${failed?.stdout}\n${failed?.stderr}`).not.toMatch(/Failed to terminate|Timeout terminating|torn down or never initialized/);
       const result = JSON.parse(readFileSync(outputFile, 'utf8'));
       const healthy = result.testResults.find((file: { name: string }) => file.name.endsWith('healthy.test.ts'));
       expect(healthy.assertionResults).toHaveLength(14);

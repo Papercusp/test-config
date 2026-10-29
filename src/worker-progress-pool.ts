@@ -1,4 +1,5 @@
 import { relative } from 'node:path';
+import { EventEmitter } from 'node:events';
 import { ForksPoolWorker, type PoolOptions, type PoolRunnerInitializer, type PoolWorker,
   type Reporter, type TestCase, type TestModule, type TestProject } from 'vitest/node';
 import { historicalTestTimeout } from './test-timeout-history.ts';
@@ -60,11 +61,14 @@ export function createProgressForksPool({ idleTimeoutMs }: { idleTimeoutMs?: num
     name: 'papercusp-progress-forks',
     createPoolWorker(options: PoolOptions): PoolWorker {
       const delegate = new ForksPoolWorker(options);
+      const events = new EventEmitter();
       let stopping: Promise<void> | undefined;
       const lease = createWorkerProgressLease(() => {
         const error = new Error(`Vitest worker made no test progress: ${[...progress.files].join(', ')}`);
         options.project.vitest.state.catchError(error, 'Worker no-progress');
-        void stop().catch(error => options.project.vitest.state.catchError(error, 'Worker cleanup'));
+        // Reject the active task through the public worker protocol. Vitest then
+        // forces shutdown itself, detaching its listeners BEFORE delegate.stop().
+        events.emit('error', error);
       });
       const progress: WorkerProgress = {
         files: new Set(),
@@ -78,15 +82,20 @@ export function createProgressForksPool({ idleTimeoutMs }: { idleTimeoutMs?: num
       })();
       return {
         name: delegate.name, cacheFs: delegate.cacheFs,
-        on: (event, callback) => delegate.on(event, callback),
-        off: (event, callback) => delegate.off(event, callback),
+        on: (event, callback) => { events.on(event, callback); },
+        off: (event, callback) => { events.off(event, callback); },
         deserialize: data => delegate.deserialize(data),
         async start() {
           stopping = undefined;
           await delegate.start();
-          delegate.on('exit', () => { lease.stop(); workers(options.project).delete(progress); });
+          delegate.on('error', error => events.emit('error', error));
+          delegate.on('exit', code => {
+            lease.stop(); workers(options.project).delete(progress);
+            events.emit('exit', code);
+          });
           delegate.on('message', message => {
             if (message?.__vitest_worker_response__ && message.type === 'testfileFinished') lease.stop();
+            events.emit('message', message);
           });
         },
         send(message) {
