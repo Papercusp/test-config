@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, symlinkSync,
@@ -14,6 +14,7 @@ function archive(): string {
   return root;
 }
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const root of directories.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -24,6 +25,7 @@ describe('full verifier source census', () => {
     const files = verifierSourceFiles(root);
     const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
       testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    vi.stubEnv('VERIFY_TAURI_SOURCE_REF', receipt.sourceCommit);
     writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
     const independentReceipt = join(archive(), 'receipt.json');
     writeFileSync(independentReceipt, JSON.stringify(receipt));
