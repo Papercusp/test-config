@@ -17,7 +17,7 @@ const vitest = join(dirname(createRequire(import.meta.url).resolve('vitest/packa
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
 describe('P016 native V8 per-file collector', () => {
-  it.each(['gate', 'reporter'] as const)('ingests child execution into its %s scope and rejects source drift without changing LCOV', async mode => {
+  it.each(['gate', 'reporter', 'docs-engine'] as const)('ingests child execution into its %s scope and rejects source drift without changing LCOV', async mode => {
     const pg = await startDedicatedNativePg();
     const sql = postgres(pg.getConnectionUri(), { max: 2, onnotice: () => {} });
     try {
@@ -32,11 +32,20 @@ describe('P016 native V8 per-file collector', () => {
         await writeFile(join(root, 'subject.ts'), source);
         await writeFile(join(root, 'subject.test.ts'), test);
       }
-      await writeFile(join(dir, 'vitest.config.ts'), `import { defineConfig } from ${JSON.stringify(join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'dist/config.js'))};
+      // Exercise the consumer's real configuration: overriding report paths must retain its
+      // execution receipts and per-file provider, rather than silently falling back to V8 alone.
+      const config = mode === 'docs-engine'
+        ? `import { mergeConfig } from ${JSON.stringify(join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'dist/config.js'))};
+import docsConfig from ${JSON.stringify(resolve(here, '../../../packages/docs-engine/vitest.config.ts'))};
+export default mergeConfig(docsConfig, { test: { include: ['subject.test.ts'], maxWorkers: 1,
+coverage: { include: ['subject.ts'], reporter: ['json','lcov'], reportsDirectory: './reports' } } });
+`
+        : `import { defineConfig } from ${JSON.stringify(join(dirname(createRequire(import.meta.url).resolve('vitest/package.json')), 'dist/config.js'))};
 import { executedSourceOriginalsPlugin } from ${JSON.stringify(join(here, 'vitest-config.ts'))};
 export default defineConfig({ plugins: [executedSourceOriginalsPlugin()], test: { include: ['subject.test.ts'], maxWorkers: 1,
 coverage: { provider: 'custom', customProviderModule: ${JSON.stringify(join(here, 'test-coverage-provider.ts'))}, include: ['subject.ts'], reporter: ['json','lcov'], reportsDirectory: './reports' } } });
-`);
+`;
+      await writeFile(join(dir, 'vitest.config.ts'), config);
       const scope = { workspaceId: 'coverage-workspace', harnessSlug: 'coverage-harness',
         executionRoot: dir, repositoryRoot: mode === 'gate' ? canonical : dir, candidate: 'a'.repeat(40) };
       const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
