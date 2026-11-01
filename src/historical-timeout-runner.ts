@@ -75,7 +75,9 @@ export default class HistoricalTimeoutRunner extends VitestTestRunner {
 
   async runTask(test: RunnerTestCase): Promise<void> {
     const budget = this.budgets.get(test) ?? { timeoutMs: 180_000, basis: 'fallback' };
-    const timeoutMs = Math.min(test.timeout || budget.timeoutMs, budget.timeoutMs);
+    // onCollected fills only missing limits. A truthy timeout here may be an
+    // explicit author limit, so history must not silently shorten it.
+    const timeoutMs = test.timeout || budget.timeoutMs;
     const controller = this.controllers.get(test)!;
     const started = performance.now();
     const timeout = () => controller.abort(new Error(
