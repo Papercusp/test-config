@@ -69,7 +69,7 @@ describe('history-derived native Vitest execution', () => {
         testTimeout: 1, hookTimeout: 1000,
         provide: { papercuspTestLayer: 'unit', papercuspTestTimeoutHistory: ${JSON.stringify({
           schema: 1, root, runnerIdentity: runtime, observedAtMs: now, samples,
-        })} }, reporters: ['json'], outputFile: ${JSON.stringify(outputFile)}
+        })} }, reporters: ['default', 'json'], outputFile: ${JSON.stringify(outputFile)}
       } };`);
       // The 1ms uniform default is intentionally too small. The runner must
       // replace it BEFORE collection; simply mutating task.timeout would fail.
