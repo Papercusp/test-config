@@ -3059,6 +3059,66 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     }
   });
 
+  it('a prepared-root receipt cannot hide an after-run Git deadline failure (EI-27287737272256622)', async () => {
+    const fixture = preparedRootReceiptFixture();
+    const { run, calls } = fakeGit({
+      'git rev-parse HEAD': [fixture.sourceCommit, fixture.sourceCommit],
+      [STATUS]: WORKTREE_SNAPSHOT_GIT_BUDGETS_MS.map(() => null),
+    });
+    try {
+      const before = await captureWorktreeSnapshot(run, 'before');
+      expect(before).toEqual({ commit: fixture.sourceCommit, porcelain: '' });
+      expect(existsSync(fixture.receiptPath)).toBe(false);
+
+      const after = await captureWorktreeSnapshot(run, 'after');
+      expect(after.commit).toBe(fixture.sourceCommit);
+      expect(after.porcelain).toBeNull();
+      expect(calls.filter(call => call.cmd === STATUS).map(call => call.timeoutMs))
+        .toEqual([...WORKTREE_SNAPSHOT_GIT_BUDGETS_MS]);
+      expect(computeWorktreeDirty(before, after)).toBe(true);
+      expect(describeWorktreeDirt(before, after)).toBe('git status unreadable after the run');
+    } finally {
+      setRunRoot(null);
+      vi.unstubAllEnvs();
+      rmSync(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('verified-source snapshots avoid Git deadlines and reject post-run source tampering (EI-27287737272256622)', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'reporter-verified-source-'));
+    const root = join(parent, 'source');
+    mkdirSync(root);
+    writeFileSync(join(root, 'subject.ts'), 'export const value = 1;');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    const receiptPath = join(parent, 'receipt.json');
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', receiptPath);
+    vi.stubEnv('VERIFY_TAURI_SOURCE_REF', receipt.sourceCommit);
+    setRunRoot(root);
+    const run = vi.fn(async () => null);
+    try {
+      const before = await captureWorktreeSnapshot(run, 'before');
+      const unchanged = await captureWorktreeSnapshot(run, 'after');
+      expect(before).toEqual({ commit: receipt.sourceCommit, porcelain: '' });
+      expect(computeWorktreeDirty(before, unchanged)).toBe(false);
+      expect(run).not.toHaveBeenCalled();
+
+      writeFileSync(join(root, 'subject.ts'), 'export const value = 2;');
+      const changed = await captureWorktreeSnapshot(run, 'after');
+      expect(changed).toMatchObject({ commit: null, porcelain: null });
+      expect(changed.provenanceError).toContain('tampered');
+      expect(computeWorktreeDirty(before, changed)).toBe(true);
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      setRunRoot(null);
+      vi.unstubAllEnvs();
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a receipt with the wrong owner-marker digest and falls back to Git status', async () => {
     const fixture = preparedRootReceiptFixture();
     const receipt = JSON.parse(readFileSync(fixture.receiptPath, 'utf8'));
