@@ -33,13 +33,14 @@ describe('history-derived native Vitest execution', () => {
     }
   });
 
-  it('uses different case budgets, aborts a hung callback, cleans up, and runs the next case', async () => {
+  it('uses historical defaults, preserves explicit deadlines, aborts a hung callback, and cleans up', async () => {
     const root = mkdtempSync(join(tmpdir(), 'historical-vitest-'));
     const now = Date.now();
     const runtime = testTimingRuntimeIdentity();
     const samples = ['a', 'b', 'c'].flatMap(runId => [
       { caseKey: 'slow', caseDurationMs: 90_000 },
       { caseKey: 'hung', caseDurationMs: 100 },
+      { caseKey: 'explicit limit', caseDurationMs: 100 },
     ].map(test => ({ ...test, runId, file: 'fixture.test.ts', occurrence: 1, layer: 'unit',
       runnerIdentity: runtime, observedAtMs: now - 1_000, status: 'pass', clean: true, fileDurationMs: 100_000 })));
     try {
@@ -49,6 +50,11 @@ describe('history-derived native Vitest execution', () => {
         let cleaned = false;
         afterEach(() => { if (aborted) cleaned = true; });
         it('slow', ({ task }) => { expect(task.timeout).toBe(365000); });
+        it('explicit limit', async ({ task }) => {
+          expect(task.timeout).toBe(20000);
+          // Its 15s historical default must not replace the author's 20s limit.
+          await new Promise(resolve => setTimeout(resolve, 15500));
+        }, 20000);
         it.fails('hung', async ({ signal, task }) => {
           expect(task.timeout).toBe(15000);
           signal.addEventListener('abort', () => { aborted = true; });
@@ -71,7 +77,7 @@ describe('history-derived native Vitest execution', () => {
         cwd: root, env: { ...process.env, GREEN_CHECKPOINT: '0' }, maxBuffer: 200_000,
       });
       const result = JSON.parse(readFileSync(outputFile, 'utf8'));
-      expect(result.numPassedTests).toBe(3);
+      expect(result.numPassedTests).toBe(4);
       expect(result.numFailedTests).toBe(0);
       const hung = result.testResults[0].assertionResults.find((test: { title: string }) => test.title === 'hung');
       // Expected-failure status alone is insufficient: an import/assertion error
