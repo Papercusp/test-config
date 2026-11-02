@@ -966,6 +966,8 @@ async function runGitWithRetry(
 
 export interface TestRunRow {
   filePath: string; // workspace-relative POSIX
+  /** The owning runner; Vitest is the legacy default for existing callers. */
+  framework?: 'vitest' | 'node';
   status: 'pass' | 'fail' | 'skip' | 'cancelled' | 'error';
   durationMs: number;
   startedAt: Date;
@@ -2042,7 +2044,7 @@ export async function insertTestRunRowsWithSql(
   const insertBatch = (sourceRows: readonly ReceiptIdentifiedTestRunRow[]) => sourceRows
     .map((row) => escapeLedgerNul({
       file_path: row.filePath,
-      framework: 'vitest',
+      framework: row.framework ?? 'vitest',
       status: row.status,
       duration_ms: row.durationMs,
       // postgres-js's multi-row helper rejects Date objects. ISO strings retain

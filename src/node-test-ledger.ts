@@ -163,6 +163,7 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
       : undefined;
     if (mutation) executionDetails.mutation = mutation;
     rows.push({
+      framework: 'node',
       filePath,
       status,
       durationMs,

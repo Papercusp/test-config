@@ -185,7 +185,7 @@ describe('buildNodeTestRunRows', () => {
   it('writes a repo-relative row whose execution details satisfy the stored contract', () => {
     const [row] = buildNodeTestRunRows(summary([result({ passed: 7, passedCaseTitles: ['guard > passed'] })]), ctx());
     expect(row).toMatchObject({
-      filePath: 'papercusp-desktop/test/guard.test.js', status: 'pass', durationMs: 40,
+      filePath: 'papercusp-desktop/test/guard.test.js', framework: 'node', status: 'pass', durationMs: 40,
       outputTail: null, worktreeDirty: false, commitSha: 'c0ffee1234567890', isScratchConfig: false,
     });
     expect(row.startedAt.toISOString()).toBe('2026-10-06T16:59:59.960Z');

@@ -1337,6 +1337,28 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         { end: async () => undefined },
       ) as unknown as PgSql;
 
+    it('uses a row framework override and keeps Vitest as the compatibility default', async () => {
+      const insertedRows: Record<string, unknown>[] = [];
+      const sql = Object.assign(
+        (first: unknown) => {
+          if (Array.isArray(first) && !('raw' in (first as object))) {
+            insertedRows.push(...(first as Record<string, unknown>[]));
+            return {};
+          }
+          return Promise.resolve([
+            { id: '901', file_path: 'node.test.js' },
+            { id: '902', file_path: 'vitest.test.ts' },
+          ]);
+        },
+        { end: async () => undefined },
+      ) as unknown as PgSql;
+      await insertTestRunRowsWithSql(sql, [
+        { ...row('node.test.js', 'pass'), framework: 'node' },
+        row('vitest.test.ts', 'pass'),
+      ], context);
+      expect(insertedRows.map((inserted) => inserted.framework)).toEqual(['node', 'vitest']);
+    });
+
     it('pairs RETURNING ids to rows by file path, not by position', async () => {
       const sql = fakeSql(async () => [
         { id: '902', file_path: 'b.test.ts' },
