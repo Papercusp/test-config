@@ -12,8 +12,18 @@ export function isVitestAssertionFailure(failureMessages) {
     return header === 'AssertionError'
       || header.startsWith('AssertionError:')
       || header.startsWith('AssertionError [')
-      || isPromiseSettlementAssertion(header, origin);
+      || isPromiseSettlementAssertion(header, origin)
+      || isTestingLibraryQueryAssertion(header, message);
   });
+}
+
+function isTestingLibraryQueryAssertion(header, message) {
+  if (!/^TestingLibraryElementError: (Unable to find |Found multiple elements)/.test(header)) return false;
+  // DOM query errors include a pretty-printed document before the stack.
+  // Require the first stack frame to identify the library's query assertion,
+  // rather than accepting arbitrary runtime errors with a matching message.
+  const origin = message.split(/\r?\n/).find((line) => /^\s*at /.test(line));
+  return /^\s*at (?:Object\.)?getElementError \((?:file:\/\/)?[^\r\n]*[/\\]node_modules[/\\]@testing-library[/\\]dom[/\\]dist[/\\]config\.js:\d+:\d+\)$/.test(origin ?? '');
 }
 
 function isPromiseSettlementAssertion(header, origin) {

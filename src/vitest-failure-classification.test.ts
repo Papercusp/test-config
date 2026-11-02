@@ -60,4 +60,25 @@ describe('isVitestAssertionFailure', () => {
       'TypeError: teardown failed',
     ])).toBe(false);
   });
+
+  it.each(['Unable to find an element with the text: Authorized document.', 'Found multiple elements with the text: Authorized document.'])(
+    'recognizes a Testing Library query assertion: %s', (message) => {
+      // The serialized DOM query failure includes the pretty DOM before its stack.
+      const serialized = `TestingLibraryElementError: ${message}\n\nIgnored nodes: comments, script, style\n<body><p>This result is unavailable.</p></body>\n    at Object.getElementError (/repo/node_modules/@testing-library/dom/dist/config.js:37:19)\n    at /repo/node_modules/@testing-library/dom/dist/query-helpers.js:76:38\n    at guard.integration.test.tsx:240:19`;
+      expect(isVitestAssertionFailure([serialized])).toBe(true);
+    },
+  );
+
+  it('requires Testing Library query failure identity and its immediate library origin', () => {
+    const header = 'TestingLibraryElementError: Unable to find an element with the text: Authorized document.';
+    const origin = '    at Object.getElementError (/repo/node_modules/@testing-library/dom/dist/config.js:37:19)';
+    for (const message of [
+      header,
+      `${header}\n    at beforeAll (/repo/hooks.ts:4:3)\n${origin}`,
+      `${header}\n    at Object.getElementError (/repo/domain.ts:37:19)`,
+      `TypeError: Unable to find an element with the text: Authorized document.\n${origin}`,
+      `TestingLibraryElementError: setup failed\n${origin}`,
+    ]) expect(isVitestAssertionFailure([message]), message).toBe(false);
+    expect(isVitestAssertionFailure([`${header}\n${origin}`, 'Error: afterAll failed'])).toBe(false);
+  });
 });
