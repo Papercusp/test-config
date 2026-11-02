@@ -7,7 +7,7 @@
  * drives it, so a change in node:test's event stream fails here rather than silently
  * dropping ledger rows again.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
