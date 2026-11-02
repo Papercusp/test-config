@@ -564,15 +564,26 @@ describe('the before-snapshot survives a caller that blocks the event loop (EI-2
     }
   });
 
-  it('runGit reports a timed-out child as unreadable (null), never as empty output', async () => {
+  it('runGit preserves fast output across a caller-loop stall and times out a slow child', async () => {
     const failures: string[] = [];
     // Control: an unblocked loop reads the real output.
     expect(await runGit('git --version', process.cwd(), 5_000)).toMatch(/^git version /);
-    // POSIX runs the reader in a worker, so blocking Vitest's loop no longer makes a fast
-    // command time out. Use a genuinely slow child to exercise the worker-owned deadline.
-    const pending = runGit('sleep 0.5', process.cwd(), 100, detail => failures.push(detail));
-    expect(await pending).toBeNull();
-    expect(failures).toHaveLength(1);
-    expect(JSON.parse(failures[0])).toMatchObject({ command: 'sleep 0.5', timeoutMs: 100, killed: true });
+    // The POSIX reader owns its deadline and pipe in a worker. A completed fast child must
+    // remain readable even when the caller loop is blocked beyond its timeout.
+    const pending = await new Promise<Promise<string | null>>((resolve) => {
+      setImmediate(() => {
+        const read = runGit('git --version', process.cwd(), 250, detail => failures.push(detail));
+        spawnSync('sleep', ['0.5']);
+        resolve(read);
+      });
+    });
+    expect(await pending).toMatch(/^git version /);
+    expect(failures).toHaveLength(0);
+
+    // A genuinely slow child still hits the worker-owned deadline and is unreadable, not empty.
+    const timeoutFailures: string[] = [];
+    expect(await runGit('sleep 0.75', process.cwd(), 100, detail => timeoutFailures.push(detail))).toBeNull();
+    expect(timeoutFailures).toHaveLength(1);
+    expect(JSON.parse(timeoutFailures[0])).toMatchObject({ command: 'sleep 0.75', timeoutMs: 100, killed: true });
   });
 });
