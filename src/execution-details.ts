@@ -62,6 +62,13 @@ export function isRecordedTestLayer(value: unknown): value is RecordedTestLayer 
  */
 export const REGISTERED_VITEST_FILE_PROJECTS = [
   {
+    root: 'apps/operator',
+    name: 'pty-process-integration',
+    layer: 'integration',
+    config: 'vitest.pty-process.integration.config.ts',
+    files: ['lib/psu-pty-host-assume-fence.integration.test.ts'],
+  },
+  {
     root: 'apps/operator-public',
     name: 'artifact-storage-integration',
     layer: 'integration',

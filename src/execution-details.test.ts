@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MAX_RECORDED_PASSED_CASES,
+  REGISTERED_VITEST_FILE_PROJECTS,
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
   parseTestRunExecutionDetails,
   parseRecordedMeasurementProvenance,
@@ -9,9 +10,25 @@ import {
   parseExecutionBoundaryReceipt,
   parseTestBoundaryObservations,
   passedCaseTitlesIncomplete,
+  registeredVitestFileLayer,
   stableRecordedRuntimeEnvironment,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
+
+describe('registered per-file Vitest projects', () => {
+  it('keeps the DB-free PTY process fixture classified as integration', () => {
+    const path = 'apps/operator/lib/psu-pty-host-assume-fence.integration.test.ts';
+    expect(REGISTERED_VITEST_FILE_PROJECTS.find(project => project.files.includes(
+      'lib/psu-pty-host-assume-fence.integration.test.ts',
+    ))).toMatchObject({
+      root: 'apps/operator',
+      name: 'pty-process-integration',
+      layer: 'integration',
+      config: 'vitest.pty-process.integration.config.ts',
+    });
+    expect(registeredVitestFileLayer(path)).toBe('integration');
+  });
+});
 
 describe('native execution attribution', () => {
   it('roundtrips timing runtime identity while keeping old rows valid and rejecting malformed identities', () => {
