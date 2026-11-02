@@ -42,8 +42,10 @@ import AdminTestRunsReporter, {
   isDefinitePreSubmitFailure,
   isMissingConfigurationSnapshotColumn,
   missingTestRunReceiptPaths,
+  recoverTimedOutTestRunReceipts,
   readRunConfigRoot,
   setRunRoot,
+  testRunReceiptBaseFor,
   toWorkspaceRel,
   formatTestCaseError,
   isScratchConfigFile,
@@ -67,6 +69,7 @@ import AdminTestRunsReporter, {
   MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS,
   type PgSql,
   type TestRunReceipt,
+  type TestRunReceiptReadbackCandidate,
   type TestRunRow,
   type WorktreeGitRunner,
 } from './admin-test-runs-reporter';
@@ -1387,6 +1390,109 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         { filePath: 'a.test.ts', status: 'fail', outcome: 'inserted', id: '901' },
         { filePath: 'b.test.ts', status: 'pass', outcome: 'inserted', id: '902' },
       ]);
+    });
+
+    describe('exact timed-out receipt readback', () => {
+      const details = {
+        schemaVersion: 1,
+        root: '/workspace/packages/operator-core',
+        filePath: 'a.test.ts',
+        runGroupId: 'group-a',
+        workspaceId: 'workspace-a',
+        harnessSlug: 'papercusp',
+        testNamePattern: null,
+        passed: 1,
+        failed: 0,
+        skipped: 0,
+        collectionFailed: false,
+        mutationPhase: null,
+        commitSha: 'abc123',
+        worktreeDirty: false,
+      } as NonNullable<TestRunRow['executionDetails']>;
+      const base = testRunReceiptBaseFor({ ...row('a.test.ts', 'pass'), executionDetails: details });
+      const receipt: TestRunReceipt = {
+        ...base, outcome: 'timeout', reason: 'pg_insert_timeout_2000ms', replayable: false,
+      };
+      const candidate: TestRunReceiptReadbackCandidate = {
+        id: '901',
+        runGroupId: 'group-a',
+        filePath: 'a.test.ts',
+        framework: 'vitest',
+        status: 'pass',
+        durationMs: 1,
+        startedAt: at,
+        finishedAt: at,
+        commitSha: 'abc123',
+        harnessSlug: 'papercusp',
+        workspaceId: 'workspace-a',
+        isScratchConfig: false,
+        worktreeDirty: false,
+        root: details.root,
+        detailsRunGroupId: 'group-a',
+        detailsFilePath: 'a.test.ts',
+        detailsCommitSha: 'abc123',
+        detailsHarnessSlug: 'papercusp',
+        detailsWorkspaceId: 'workspace-a',
+      };
+
+      it('restores the original ledger id from one exact same-run row', () => {
+        expect(recoverTimedOutTestRunReceipts([receipt], [candidate], 'group-a')).toEqual([{
+          ...base, outcome: 'inserted', id: '901',
+        }]);
+      });
+
+      it.each([
+        ['the group', { runGroupId: 'group-b' }],
+        ['the details group', { detailsRunGroupId: 'group-b' }],
+        ['the file', { filePath: 'b.test.ts' }],
+        ['the details file', { detailsFilePath: 'b.test.ts' }],
+        ['the status', { status: 'fail' }],
+        ['the duration', { durationMs: 2 }],
+        ['the start time', { startedAt: new Date('2026-10-06T01:15:01.000Z') }],
+        ['the finish time', { finishedAt: new Date('2026-10-06T01:15:01.000Z') }],
+        ['the commit', { commitSha: 'other' }],
+        ['the details commit', { detailsCommitSha: 'other' }],
+        ['the recorded root', { root: '/workspace/other' }],
+        ['the harness scope', { harnessSlug: 'other' }],
+        ['the details harness scope', { detailsHarnessSlug: 'other' }],
+        ['the workspace scope', { workspaceId: 'other' }],
+        ['the details workspace scope', { detailsWorkspaceId: 'other' }],
+        ['the framework', { framework: 'node' }],
+      ] as Array<[string, Partial<TestRunReceiptReadbackCandidate>]>)(
+        'keeps the timeout when %s differs',
+        (_field, mismatch) => {
+          expect(recoverTimedOutTestRunReceipts(
+            [receipt], [{ ...candidate, ...mismatch }], 'group-a',
+          )).toEqual([]);
+        },
+      );
+
+      it('keeps the timeout for invalid timestamps, ambiguous rows, or a truncated read', () => {
+        expect(recoverTimedOutTestRunReceipts([receipt], [
+          { ...candidate, startedAt: 'not-a-timestamp' },
+        ], 'group-a')).toEqual([]);
+        expect(recoverTimedOutTestRunReceipts([receipt], [
+          candidate, { ...candidate, id: '902' },
+        ], 'group-a')).toEqual([]);
+        expect(recoverTimedOutTestRunReceipts([receipt], [candidate], 'group-a', true)).toEqual([]);
+      });
+
+      it('does not let one ledger row satisfy multiple receipts or a failed receipt', () => {
+        const secondReceipt: TestRunReceipt = {
+          ...receipt,
+          receiptId: 'receipt-b',
+          row: { ...receipt.row, receiptId: 'receipt-b' },
+        };
+        const failedReceipt: TestRunReceipt = {
+          ...receipt, outcome: 'failed', reason: 'connect timeout', replayable: false,
+        };
+        expect(recoverTimedOutTestRunReceipts(
+          [receipt, secondReceipt], [candidate], 'group-a',
+        )).toEqual([]);
+        expect(recoverTimedOutTestRunReceipts(
+          [failedReceipt], [candidate], 'group-a',
+        )).toEqual([]);
+      });
     });
 
     it('records client timing and only the backend pid from the postgres result', async () => {

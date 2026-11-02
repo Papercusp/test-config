@@ -1923,18 +1923,23 @@ function matchesTestRunReceiptReadback(
   if (receipt.outcome !== 'timeout' || typeof candidate.id !== 'string' || candidate.id.length === 0) return false;
   const row = receipt.row;
   const details = row.executionDetails as unknown as Record<string, unknown> | null | undefined;
+  const startedAt = receiptTimestamp(row.startedAt);
+  const finishedAt = receiptTimestamp(row.finishedAt);
   if (!details || receipt.filePath !== row.filePath || receipt.status !== row.status
     || details.runGroupId !== runGroupId || details.filePath !== row.filePath
     || typeof details.root !== 'string' || !isAbsolute(details.root)
     || (details.workspaceId !== null && typeof details.workspaceId !== 'string')
     || (details.harnessSlug !== null && typeof details.harnessSlug !== 'string')
     || (details.commitSha !== null && typeof details.commitSha !== 'string')
+    || details.commitSha !== row.commitSha
+    || !Number.isSafeInteger(row.durationMs) || row.durationMs < 0
+    || startedAt === null || finishedAt === null
     || candidate.runGroupId !== runGroupId || candidate.detailsRunGroupId !== runGroupId
     || candidate.filePath !== row.filePath || candidate.detailsFilePath !== row.filePath
     || candidate.framework !== (row.framework ?? 'vitest') || candidate.status !== row.status
     || candidate.durationMs !== row.durationMs
-    || receiptTimestamp(candidate.startedAt) !== receiptTimestamp(row.startedAt)
-    || receiptTimestamp(candidate.finishedAt) !== receiptTimestamp(row.finishedAt)
+    || receiptTimestamp(candidate.startedAt) !== startedAt
+    || receiptTimestamp(candidate.finishedAt) !== finishedAt
     || candidate.commitSha !== row.commitSha || candidate.detailsCommitSha !== row.commitSha
     || candidate.root !== details.root
     || candidate.harnessSlug !== details.harnessSlug || candidate.detailsHarnessSlug !== details.harnessSlug
