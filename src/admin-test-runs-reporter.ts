@@ -1430,6 +1430,7 @@ function isInterimFlushStatus(status: TestRunRow['status']): boolean {
 export type PgSql = {
   (strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown>;
   (rows: readonly Record<string, unknown>[], ...columns: string[]): unknown;
+  array(values: readonly string[]): unknown;
   end(opts?: { timeout?: number }): Promise<unknown>;
 };
 export type PgHandle = { sql: PgSql } | null;
@@ -1838,14 +1839,7 @@ function isTestRunReceipt(value: unknown): value is TestRunReceipt {
     typeof receipt.reason === 'string' && typeof receipt.replayable === 'boolean';
 }
 
-/**
- * Return paths without a canonical inserted receipt; inserted acknowledgements dominate timeouts.
- * When expectedRoot is supplied, compare file identities in that checkout using each row's recorded
- * root. Object-sourced submodules may be independent repos and therefore record shorter paths.
- */
-export function missingTestRunReceiptPaths(
-  receiptLog: string, expectedPaths: readonly string[], expectedRoot?: string,
-): string[] {
+function latestTestRunReceipts(receiptLog: string): TestRunReceipt[] {
   const latest = new Map<string, TestRunReceipt>();
   for (const line of receiptLog.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -1856,22 +1850,211 @@ export function missingTestRunReceiptPaths(
     if (prior?.outcome === 'inserted') continue;
     if (parsed.outcome === 'inserted' || !prior || parsed.attempt >= prior.attempt) latest.set(parsed.receiptId, parsed);
   }
-  const inserted = new Set([...latest.values()]
+  return [...latest.values()];
+}
+
+function testRunReceiptPathForRoot(receipt: TestRunReceipt, expectedRoot?: string): string | null {
+  const path = receipt.filePath.replaceAll('\\', '/');
+  if (expectedRoot === undefined) return path;
+  const recordRoot = receipt.row.executionDetails?.root;
+  if (typeof recordRoot !== 'string' || !isAbsolute(recordRoot) || isAbsolute(path)
+    || receipt.row.filePath.replaceAll('\\', '/') !== path) return null;
+  const outside = (candidate: string) => candidate === '..' || candidate.startsWith(`..${posix.sep}`) || isAbsolute(candidate);
+  const root = resolve(expectedRoot);
+  if (outside(relative(root, recordRoot).replaceAll('\\', '/'))) return null;
+  const absolute = resolve(recordRoot, path);
+  if (outside(relative(recordRoot, absolute).replaceAll('\\', '/'))) return null;
+  return relative(root, absolute).replaceAll('\\', '/');
+}
+
+/**
+ * Return paths without a canonical inserted receipt; inserted acknowledgements dominate timeouts.
+ * When expectedRoot is supplied, compare file identities in that checkout using each row's recorded
+ * root. Object-sourced submodules may be independent repos and therefore record shorter paths.
+ */
+export function missingTestRunReceiptPaths(
+  receiptLog: string, expectedPaths: readonly string[], expectedRoot?: string,
+): string[] {
+  const inserted = new Set(latestTestRunReceipts(receiptLog)
     .filter((receipt): receipt is Extract<TestRunReceipt, { outcome: 'inserted' }> => receipt.outcome === 'inserted')
     .flatMap(receipt => {
-      const path = receipt.filePath.replaceAll('\\', '/');
-      if (expectedRoot === undefined) return [path];
-      const recordRoot = receipt.row.executionDetails?.root;
-      if (typeof recordRoot !== 'string' || !isAbsolute(recordRoot) || isAbsolute(path)
-        || receipt.row.filePath.replaceAll('\\', '/') !== path) return [];
-      const outside = (path: string) => path === '..' || path.startsWith(`..${posix.sep}`) || isAbsolute(path);
-      const root = resolve(expectedRoot);
-      if (outside(relative(root, recordRoot).replaceAll('\\', '/'))) return [];
-      const absolute = resolve(recordRoot, path);
-      if (outside(relative(recordRoot, absolute).replaceAll('\\', '/'))) return [];
-      return [relative(root, absolute).replaceAll('\\', '/')];
+      const path = testRunReceiptPathForRoot(receipt, expectedRoot);
+      return path === null ? [] : [path];
     }));
   return [...new Set(expectedPaths.map(path => path.replaceAll('\\', '/')))].filter(path => !inserted.has(path));
+}
+
+export type TestRunReceiptReadbackCandidate = {
+  id: string;
+  runGroupId: string | null;
+  filePath: string;
+  framework: string;
+  status: string;
+  durationMs: number;
+  startedAt: Date | string;
+  finishedAt: Date | string;
+  commitSha: string | null;
+  harnessSlug: string | null;
+  workspaceId: string | null;
+  isScratchConfig: boolean;
+  worktreeDirty: boolean;
+  root: string | null;
+  detailsRunGroupId: string | null;
+  detailsFilePath: string | null;
+  detailsCommitSha: string | null;
+  detailsHarnessSlug: string | null;
+  detailsWorkspaceId: string | null;
+};
+
+const TEST_RUN_RECEIPT_READBACK_MAX_RECEIPTS = TEST_RUN_INSERT_BATCH_SIZE;
+const TEST_RUN_RECEIPT_READBACK_MAX_ROWS = TEST_RUN_INSERT_BATCH_SIZE * 2 + 1;
+const TEST_RUN_RECEIPT_READBACK_TIMEOUT_MS = 2_000;
+
+function receiptTimestamp(value: unknown): string | null {
+  const date = value instanceof Date ? value : typeof value === 'string' ? new Date(value) : null;
+  return date && Number.isFinite(date.valueOf()) ? date.toISOString() : null;
+}
+
+function matchesTestRunReceiptReadback(
+  receipt: TestRunReceipt,
+  candidate: TestRunReceiptReadbackCandidate,
+  runGroupId: string,
+): boolean {
+  if (receipt.outcome !== 'timeout' || typeof candidate.id !== 'string' || candidate.id.length === 0) return false;
+  const row = receipt.row;
+  const details = row.executionDetails as unknown as Record<string, unknown> | null | undefined;
+  if (!details || receipt.filePath !== row.filePath || receipt.status !== row.status
+    || details.runGroupId !== runGroupId || details.filePath !== row.filePath
+    || typeof details.root !== 'string' || !isAbsolute(details.root)
+    || (details.workspaceId !== null && typeof details.workspaceId !== 'string')
+    || (details.harnessSlug !== null && typeof details.harnessSlug !== 'string')
+    || (details.commitSha !== null && typeof details.commitSha !== 'string')
+    || candidate.runGroupId !== runGroupId || candidate.detailsRunGroupId !== runGroupId
+    || candidate.filePath !== row.filePath || candidate.detailsFilePath !== row.filePath
+    || candidate.framework !== (row.framework ?? 'vitest') || candidate.status !== row.status
+    || candidate.durationMs !== row.durationMs
+    || receiptTimestamp(candidate.startedAt) !== receiptTimestamp(row.startedAt)
+    || receiptTimestamp(candidate.finishedAt) !== receiptTimestamp(row.finishedAt)
+    || candidate.commitSha !== row.commitSha || candidate.detailsCommitSha !== row.commitSha
+    || candidate.root !== details.root
+    || candidate.harnessSlug !== details.harnessSlug || candidate.detailsHarnessSlug !== details.harnessSlug
+    || candidate.workspaceId !== details.workspaceId || candidate.detailsWorkspaceId !== details.workspaceId
+    || candidate.isScratchConfig !== row.isScratchConfig || candidate.worktreeDirty !== row.worktreeDirty) return false;
+  return true;
+}
+
+/**
+ * Recover only a timeout whose full run identity selects one and only one canonical row.
+ * One ledger row cannot satisfy two receipts, and an ambiguous/truncated read stays unmeasured.
+ */
+export function recoverTimedOutTestRunReceipts(
+  receipts: readonly TestRunReceipt[],
+  candidates: readonly TestRunReceiptReadbackCandidate[],
+  runGroupId: string,
+  truncated = false,
+): Extract<TestRunReceipt, { outcome: 'inserted' }>[] {
+  if (!runGroupId || truncated || receipts.length > TEST_RUN_RECEIPT_READBACK_MAX_RECEIPTS) return [];
+  const matches = receipts.flatMap(receipt => receipt.outcome === 'timeout'
+    ? [{ receipt, candidates: candidates.filter(candidate =>
+        matchesTestRunReceiptReadback(receipt, candidate, runGroupId)) }]
+    : []);
+  const useCount = new Map<string, number>();
+  for (const match of matches) {
+    for (const candidate of match.candidates) useCount.set(candidate.id, (useCount.get(candidate.id) ?? 0) + 1);
+  }
+  return matches.flatMap(({ receipt, candidates: matchesForReceipt }) => {
+    if (matchesForReceipt.length !== 1) return [];
+    const candidate = matchesForReceipt[0]!;
+    if (useCount.get(candidate.id) !== 1) return [];
+    const { outcome: _outcome, reason: _reason, errorCode: _errorCode,
+      pgSetupFailure: _pgSetupFailure, replayable: _replayable, ...base } = receipt;
+    return [{ ...base, outcome: 'inserted' as const, id: candidate.id }];
+  });
+}
+
+/**
+ * After the receipt-file wait, read the existing run group once and append an inserted receipt
+ * only for exact, unique rows. The query and row count are bounded; failure remains fail-soft.
+ */
+export async function reconcileTimedOutTestRunReceipts(
+  receiptLog: string,
+  options: {
+    expectedPaths: readonly string[];
+    expectedRoot: string;
+    runGroupId: string | null | undefined;
+    env?: Readonly<Record<string, string | undefined>>;
+    timeoutMs?: number;
+  },
+): Promise<Extract<TestRunReceipt, { outcome: 'inserted' }>[]> {
+  const runGroupId = options.runGroupId?.trim();
+  if (!runGroupId || !isAbsolute(options.expectedRoot) || options.expectedPaths.length === 0) return [];
+  const missingPaths = new Set(options.expectedPaths.map(path => path.replaceAll('\\', '/')));
+  const timedOutReceipts = latestTestRunReceipts(receiptLog).filter(receipt => {
+    if (receipt.outcome !== 'timeout'
+      || receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
+    const expectedPath = testRunReceiptPathForRoot(receipt, options.expectedRoot);
+    return expectedPath !== null && missingPaths.has(expectedPath);
+  });
+  if (timedOutReceipts.length === 0
+    || timedOutReceipts.length > TEST_RUN_RECEIPT_READBACK_MAX_RECEIPTS) return [];
+
+  const pg = await tryGetPg();
+  if (!pg) return [];
+  try {
+    if (typeof pg.sql.array !== 'function') return [];
+    const filePaths = [...new Set(timedOutReceipts.map(receipt => receipt.row.filePath))];
+    const maxRows = Math.min(TEST_RUN_RECEIPT_READBACK_MAX_ROWS, timedOutReceipts.length * 2 + 1);
+    let readbacks: unknown = [];
+    const query = trackSharedPgOperation(Promise.resolve().then(async () => {
+      readbacks = await pg.sql`
+        SELECT id::text AS id,
+          run_group_id AS "runGroupId",
+          file_path AS "filePath",
+          framework,
+          status,
+          duration_ms AS "durationMs",
+          started_at AS "startedAt",
+          finished_at AS "finishedAt",
+          commit_sha AS "commitSha",
+          harness_slug AS "harnessSlug",
+          workspace_id AS "workspaceId",
+          is_scratch_config AS "isScratchConfig",
+          worktree_dirty AS "worktreeDirty",
+          execution_details->>'root' AS root,
+          execution_details->>'runGroupId' AS "detailsRunGroupId",
+          execution_details->>'filePath' AS "detailsFilePath",
+          execution_details->>'commitSha' AS "detailsCommitSha",
+          execution_details->>'harnessSlug' AS "detailsHarnessSlug",
+          execution_details->>'workspaceId' AS "detailsWorkspaceId"
+        FROM harness_shared.test_runs
+        WHERE run_group_id = ANY(${pg.sql.array([runGroupId])})
+          AND file_path = ANY(${pg.sql.array(filePaths)})
+        ORDER BY id
+        LIMIT ${maxRows}
+      `;
+    }).catch(() => { readbacks = []; }));
+    const requestedTimeout = options.timeoutMs;
+    const timeoutMs = Number.isSafeInteger(requestedTimeout) && requestedTimeout! > 0
+      ? Math.min(5_000, requestedTimeout!)
+      : TEST_RUN_RECEIPT_READBACK_TIMEOUT_MS;
+    if (!await settleWithin(query, timeoutMs)) return [];
+    const candidates = Array.isArray(readbacks)
+      ? readbacks.filter((row): row is TestRunReceiptReadbackCandidate =>
+          Boolean(row && typeof row === 'object'))
+      : [];
+    const recovered = recoverTimedOutTestRunReceipts(
+      timedOutReceipts,
+      candidates,
+      runGroupId,
+      candidates.length >= maxRows,
+    );
+    appendTestRunReceipts(options.env ?? process.env, recovered);
+    return recovered;
+  } catch {
+    return [];
+  } finally {
+    await closeSharedPgIfUnheld();
+  }
 }
 
 export function appendTestRunReceipts(
