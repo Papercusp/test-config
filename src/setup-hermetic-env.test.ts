@@ -85,6 +85,17 @@ async function runSetupOn(values: Record<string, string>): Promise<Record<string
   }
 }
 
+describe('setup-hermetic-env: Vitest mode is pinned', () => {
+  it('runs this worker in test mode', () => {
+    expect(process.env.NODE_ENV).toBe('test');
+  });
+
+  it('overrides an inherited production mode when setup runs', async () => {
+    const result = await runSetupOn({ NODE_ENV: 'production' });
+    expect(result.NODE_ENV).toBe('test');
+  });
+});
+
 describe('setup-hermetic-env: original ledger workspace survives runtime isolation', () => {
   it.each(['PAPERCUSP_WORKSPACE_ID', 'PAPERCUSP_WORKSPACE'])(
     'preserves %s for proof attribution before scrubbing the runtime pin', async key => {

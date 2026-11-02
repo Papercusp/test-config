@@ -163,6 +163,10 @@ try {
 // skips setupFiles (the known false-green trap, EI-14190) still gets them.
 process.env.MEM0_TELEMETRY = 'false';
 
+// Direct Vitest invocations can inherit NODE_ENV=production from the operator service.
+// Set test mode before test files import React or application modules.
+process.env.NODE_ENV = 'test';
+
 process.env.PAPERCUSP_PGBOUNCER = '0';
 // Same rule as the voice-ipc redirect below — a unit test must never read the real
 // ~/.papercusp. embedded-pg.json is the discovery file for a LIVE Postgres, so once the
