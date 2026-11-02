@@ -18,8 +18,8 @@
  * wrapper calls straight through and records in a try/catch.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
@@ -295,9 +295,20 @@ function retainEvaluationCode(code: string, recorder: Recorder, observation: Mod
     try {
       mkdirSync(root, { recursive: true });
       if (!lstatSync(root).isDirectory() || lstatSync(root).isSymbolicLink()) throw new Error('invalid artifact root');
-      const path = join(realpathSync(root), `${sha256}.js`);
-      try { writeFileSync(path, code, { flag: 'wx', mode: 0o600 }); } catch (error) {
-        if ((error as { code?: string }).code !== 'EEXIST') throw error;
+      const directory = realpathSync(root);
+      const path = join(directory, `${sha256}.js`);
+      // Workers share this content-addressed directory. A direct wx write makes
+      // partial bytes visible to an EEXIST reader. Reuse the native tracer's
+      // completed-write/no-replace publication pattern; staging stays outside
+      // the trusted inventory even if the worker is killed before cleanup.
+      const temporary = `${directory}.pending-${process.pid}-${randomUUID()}`;
+      try {
+        writeFileSync(temporary, code, { flag: 'wx', mode: 0o600 });
+        try { linkSync(temporary, path); } catch (error) {
+          if ((error as { code?: string }).code !== 'EEXIST') throw error;
+        }
+      } finally {
+        try { unlinkSync(temporary); } catch { /* An interrupted worker may leave staging evidence. */ }
       }
       if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink() ||
           createHash('sha256').update(readFileSync(path)).digest('hex') !== sha256) throw new Error('evaluator artifact differs');

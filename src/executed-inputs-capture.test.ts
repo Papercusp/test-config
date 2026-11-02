@@ -1,6 +1,8 @@
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -201,6 +203,81 @@ describe('prospective evaluator inputs', () => {
       expect(capture()?.reasons).toContain('code-bytes-not-retained');
       expect(fs.lstatSync(path).isSymbolicLink()).toBe(true);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains both evaluator references when another writer arrives during an archive write', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-evaluator-overlap-'));
+    const code = 'export const shared = "complete bytes";';
+    const path = join(root, `${createHash('sha256').update(code).digest('hex')}.js`);
+    const evaluator = { runInlinedModule(..._args: unknown[]) { return 'executed'; } };
+    const originalWrite = nativeFs.writeFileSync;
+    let overlapped = false;
+    beginFile();
+    installModuleEvaluationCapture({ moduleRunner: { evaluator } }, root, {});
+    // Deterministically interleave a second worker's publication after the first
+    // file is created but before its write completes. No timing or large files.
+    nativeFs.writeFileSync = ((target, data, options) => {
+      if (!overlapped && data === code && typeof target !== 'number') {
+        overlapped = true;
+        const fd = nativeFs.openSync(target, 'wx', 0o600);
+        try {
+          nativeFs.writeSync(fd, code.slice(0, 5));
+          expect(evaluator.runInlinedModule({}, code, { id: '/repo/second.ts' })).toBe('executed');
+          nativeFs.writeSync(fd, code.slice(5));
+        } finally { nativeFs.closeSync(fd); }
+        return;
+      }
+      return originalWrite(target, data, options);
+    }) as typeof nativeFs.writeFileSync;
+    syncBuiltinESMExports();
+    try {
+      expect(evaluator.runInlinedModule({}, code, { id: '/repo/first.ts' })).toBe('executed');
+      const observation = endFile('/repo/test.ts')?.moduleEvaluations;
+      expect(overlapped).toBe(true);
+      expect(observation?.entries).toHaveLength(2);
+      expect(observation?.entries.map(entry => entry.codeRef)).toEqual([path, path]);
+      expect(observation?.reasons).not.toContain('evaluator-code-archive-unavailable');
+      expect(nativeFs.readFileSync(path, 'utf8')).toBe(code);
+      expect(nativeFs.readdirSync(root)).toEqual([path.slice(root.length + 1)]);
+    } finally {
+      nativeFs.writeFileSync = originalWrite;
+      syncBuiltinESMExports();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not publish partial evaluator bytes when a write is interrupted', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-evaluator-interrupted-'));
+    const code = 'export const interrupted = true;';
+    const path = join(root, `${createHash('sha256').update(code).digest('hex')}.js`);
+    const evaluator = { runInlinedModule(..._args: unknown[]) { return 'executed'; } };
+    const originalWrite = nativeFs.writeFileSync;
+    beginFile();
+    installModuleEvaluationCapture({ moduleRunner: { evaluator } }, root, {});
+    nativeFs.writeFileSync = ((target, data, options) => {
+      if (data !== code) return originalWrite(target, data, options);
+      originalWrite(target, code.slice(0, 5), options);
+      throw new Error('interrupted archive write');
+    }) as typeof nativeFs.writeFileSync;
+    syncBuiltinESMExports();
+    try {
+      expect(evaluator.runInlinedModule({}, code, { id: '/repo/first.ts' })).toBe('executed');
+      const observation = endFile('/repo/test.ts')?.moduleEvaluations;
+      expect(observation?.reasons).toContain('evaluator-code-archive-unavailable');
+      expect(observation?.entries[0]?.codeRef).toBeUndefined();
+      expect(nativeFs.existsSync(path)).toBe(false);
+      expect(nativeFs.readdirSync(root)).toEqual([]);
+      nativeFs.writeFileSync = originalWrite;
+      syncBuiltinESMExports();
+      beginFile();
+      installModuleEvaluationCapture({ moduleRunner: { evaluator } }, root, {});
+      evaluator.runInlinedModule({}, code, { id: '/repo/recovery.ts' });
+      expect(endFile('/repo/test.ts')?.moduleEvaluations?.entries[0]?.codeRef).toBe(path);
+    } finally {
+      nativeFs.writeFileSync = originalWrite;
+      syncBuiltinESMExports();
       rmSync(root, { recursive: true, force: true });
     }
   });
