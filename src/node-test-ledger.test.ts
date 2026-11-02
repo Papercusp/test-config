@@ -7,7 +7,7 @@
  * drives it, so a change in node:test's event stream fails here rather than silently
  * dropping ledger rows again.
  */
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -564,24 +564,15 @@ describe('the before-snapshot survives a caller that blocks the event loop (EI-2
     }
   });
 
-  it('runGit reports a git child killed by its timeout as unreadable (null), never as empty output', async () => {
+  it('runGit reports a timed-out child as unreadable (null), never as empty output', async () => {
     const failures: string[] = [];
     // Control: an unblocked loop reads the real output.
     expect(await runGit('git --version', process.cwd(), 5_000)).toMatch(/^git version /);
-    // Block the loop past the timeout while the child is in flight: exec's timeout handler then
-    // destroys the unread stdout of a child that already exited 0, so the callback sees
-    // err=null and stdout ''. That must surface as unreadable, never as a (false-clean) ''.
-    // Blocking from a setImmediate (check phase) makes the order deterministic: the next loop
-    // iteration runs the expired timeout (timers phase) before it reads the pipe (poll phase).
-    const pending = await new Promise<Promise<string | null>>((resolve) => {
-      setImmediate(() => {
-        const read = runGit('git --version', process.cwd(), 100, detail => failures.push(detail));
-        spawnSync('sleep', ['0.5']);
-        resolve(read);
-      });
-    });
+    // POSIX runs the reader in a worker, so blocking Vitest's loop no longer makes a fast
+    // command time out. Use a genuinely slow child to exercise the worker-owned deadline.
+    const pending = runGit('sleep 0.5', process.cwd(), 100, detail => failures.push(detail));
     expect(await pending).toBeNull();
     expect(failures).toHaveLength(1);
-    expect(JSON.parse(failures[0])).toMatchObject({ command: 'git --version', timeoutMs: 100, killed: true });
+    expect(JSON.parse(failures[0])).toMatchObject({ command: 'sleep 0.5', timeoutMs: 100, killed: true });
   });
 });
