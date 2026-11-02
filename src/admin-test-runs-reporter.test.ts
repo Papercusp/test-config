@@ -103,6 +103,24 @@ describe('native test execution custody', () => {
   });
 });
 describe('reporter finalization stage diagnostics', () => {
+  it('emits reporter-stage spans only when the per-run diagnostic flag is enabled', async () => {
+    vi.stubEnv('PC_ISOLATED_RUNTIME_PROOF', '');
+    vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', '');
+    vi.stubEnv('PAPERCUSP_TEST_REPORTER_STAGE_TRACE', '');
+    const lines: string[] = [];
+    const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
+    try {
+      await expect(observeReporterStage('test-runs', 'onExit', async () => 'ordinary')).resolves.toBe('ordinary');
+      expect(lines).toHaveLength(0);
+      vi.stubEnv('PAPERCUSP_TEST_REPORTER_STAGE_TRACE', '1');
+      await expect(observeReporterStage('test-runs', 'onExit', async () => 'traced')).resolves.toBe('traced');
+      const events = lines.map(line => JSON.parse(line.slice('TEST_FILE_FINALIZATION '.length)));
+      expect(events).toHaveLength(2);
+      expect(events[0]).toMatchObject({ phase: 'reporter-stage', reporter: 'test-runs', stage: 'onExit', event: 'start' });
+      expect(events[1]).toMatchObject({ event: 'end', outcome: 'returned', operationId: events[0].operationId });
+    } finally { sink.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
   it('keeps a pending operation open and preserves settlement when the diagnostic sink fails', async () => {
     vi.stubEnv('PC_ISOLATED_RUNTIME_PROOF', '1');
     const lines: string[] = [];

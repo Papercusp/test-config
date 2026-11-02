@@ -61,7 +61,8 @@ import { testTimingRuntimeIdentity } from './test-timeout-runtime.ts';
 export async function observeReporterStage<T>(reporter: 'test-runs' | 'executed-source',
   stage: 'source-snapshot' | 'write-rows' | 'onTestRunEnd' | 'onExit' | 'pg-release' | 'completion-checkpoints' | 'completion-snapshot',
   action: () => Promise<T>): Promise<T> {
-  if (process.env.PC_ISOLATED_RUNTIME_PROOF !== '1' && !process.env.VERIFY_TAURI_SOURCE_RECEIPT) return action();
+  if (process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE !== '1'
+    && process.env.PC_ISOLATED_RUNTIME_PROOF !== '1' && !process.env.VERIFY_TAURI_SOURCE_RECEIPT) return action();
   const startedAt = Date.now(), operationId = randomUUID();
   const emit = (event: 'start' | 'end', outcome?: 'returned' | 'threw') => {
     try {
