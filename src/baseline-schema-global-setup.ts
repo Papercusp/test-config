@@ -68,7 +68,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from './testcontainer-start-lock.ts';
 import { assertSharedTestPgStorageHeadroom, CappedLogPostgreSqlContainer, NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
-import { probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
+import { assertPgReachable, probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 import { dropDatabaseWithLock, type DropDatabaseWithLockOptions } from './pg-migrate.ts';
 
 /** Keep escape-hatch teardown on the same bounded cleanup lane as test fixtures. */
@@ -230,6 +230,8 @@ export interface ReusedMigrationRecoveryDeps<T> {
   root?: string;
   withStartLock: <R>(action: () => Promise<R>) => Promise<R>;
   start: (generation: number) => Promise<T>;
+  /** Wait until the candidate accepts a bounded SELECT 1 before inspecting its migration ledger. */
+  awaitReady: (candidate: T) => Promise<void>;
   /** True when the container holds no migration ledger yet, i.e. nobody has replayed into it. */
   isEmpty: (candidate: T) => Promise<boolean>;
   apply: (candidate: T) => Promise<void>;
@@ -251,6 +253,9 @@ export async function recoverFromReusedMigrationFailure<T>(
     if (decision.kind === 'rethrow') return decision;
     const generation = decision.kind === 'adopt' ? decision.generation : await rotateBaselineReuseGeneration(root);
     const candidate = await deps.start(generation);
+    // A started container can still report PostgreSQL 57P03 until recovery finishes. Do not
+    // let the one-shot ledger probe turn that normal startup window into a failed recovery.
+    await deps.awaitReady(candidate);
     // Probed under the start lock: no peer can select this generation's container before
     // the lock is released, so an empty ledger here proves the replay below starts from empty.
     const empty = await deps.isEmpty(candidate);
@@ -958,6 +963,9 @@ export default async function setup({ provide }: TestProject) {
         runBaselineSetupStage('container-reprovision-after-migration-failure', () =>
           withTestcontainerStartLock(BASELINE_SCHEMA_CONTAINER_START_LOCK, action)),
       start: (generation) => runBaselineSetupStage('container-start', () => start(generation)),
+      awaitReady: (candidate) =>
+        runBaselineSetupStage('container-recovery-readiness', () =>
+          assertPgReachable(candidate.getConnectionUri(), 'baseline-schema recovery candidate')),
       isEmpty: (candidate) => runBaselineSetupStage('container-empty-probe', () => isBaselineDatabaseEmpty(candidate.getConnectionUri())),
       apply: async (candidate) => {
         await runBaselineSetupStage('postgres-storage-headroom', () => assertSharedTestPgStorageHeadroom(candidate));

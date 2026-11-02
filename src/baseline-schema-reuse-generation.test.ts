@@ -153,6 +153,7 @@ describe('baseline migration failure on a reused container', () => {
         started.push(generation);
         return { generation, empty: !(opts.nonEmpty ?? []).includes(generation), stop: vi.fn() };
       },
+      awaitReady: async () => {},
       isEmpty: async (candidate) => candidate.empty,
       apply: async (candidate) => {
         applied.push(candidate.generation);
@@ -164,6 +165,43 @@ describe('baseline migration failure on a reused container', () => {
   }
 
   const firstFailure = new BaselineMigrationApplyError('1444: 1 same-workspace work-item twin set(s) remain (e.g. default/WI-zzz-iv-impl)');
+
+  it('waits for replacement PostgreSQL readiness before probing the migration ledger', async () => {
+    const root = await freshRoot();
+    const { deps } = harness(root);
+    const order: string[] = [];
+    const apply = deps.apply;
+    deps.awaitReady = async (candidate) => {
+      order.push(`ready:${candidate.generation}`);
+    };
+    deps.isEmpty = async (candidate) => {
+      order.push(`empty:${candidate.generation}`);
+      return candidate.empty;
+    };
+    deps.apply = async (candidate) => {
+      order.push(`apply:${candidate.generation}`);
+      await apply(candidate);
+    };
+
+    await expect(recoverFromReusedMigrationFailure(firstFailure, deps)).resolves.toMatchObject({ generation: 1 });
+    expect(order).toEqual(['ready:1', 'empty:1', 'apply:1']);
+  });
+
+  it('does not probe or classify a candidate as empty while readiness is failing', async () => {
+    const root = await freshRoot();
+    const { deps, applied } = harness(root);
+    const startupError = new Error('database system is starting up');
+    const isEmpty = vi.fn(deps.isEmpty);
+    deps.awaitReady = async () => {
+      throw startupError;
+    };
+    deps.isEmpty = isEmpty;
+
+    await expect(recoverFromReusedMigrationFailure(firstFailure, deps)).rejects.toBe(startupError);
+    expect(isEmpty).not.toHaveBeenCalled();
+    expect(applied).toEqual([]);
+    await expect(readBaselineFreshMigrationFailure(root)).resolves.toBeNull();
+  });
 
   it('rotates to a fresh container and continues when leftover data caused the failure', async () => {
     const root = await freshRoot();
