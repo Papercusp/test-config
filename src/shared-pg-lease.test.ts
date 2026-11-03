@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TestModule } from 'vitest/node';
 
-import AdminTestRunsReporter, { closeSharedPg, closeSharedPgIfUnheld, insertRows, insertTestRunRowsWithSql, preflightTestRunLedger, retainSharedPg, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
+import AdminTestRunsReporter, { closeSharedPg, closeSharedPgIfUnheld, insertRows, insertTestRunRowsWithSql, preflightTestRunLedger, retainSharedPg, trackSharedPgOperation, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
 import ExecutedSourceMapReporter, { EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS } from './executed-source-map-reporter.ts';
 
 const shared = pinModuleState('@papercusp/test-config.shared-pg', () => ({
@@ -260,6 +260,51 @@ describe('same-process evidence ledger preflight', () => {
 });
 
 describe('shared PG lease (WI-10003715)', () => {
+  it('reports a deferred query at process timeout without closing it or changing its settlement', async () => {
+    const { end } = installFakeClient();
+    const release = retainSharedPg();
+    let settle!: (value: number) => void;
+    const operation = trackSharedPgOperation(new Promise<number>(resolve => { settle = resolve; }));
+    const reporter = new AdminTestRunsReporter();
+    const lines: string[] = [];
+    const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
+    try {
+      await release();
+      reporter.onProcessTimeout();
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0].slice('TEST_FILE_FINALIZATION '.length))).toMatchObject({
+        phase: 'reporter-pg-timeout', reporter: 'test-runs', holders: 0, inFlight: 1,
+        closeRequested: true, clientRequested: true, closing: false,
+      });
+      expect(end).not.toHaveBeenCalled();
+      sink.mockImplementation(() => { throw new Error('diagnostic sink unavailable'); });
+      expect(() => reporter.onProcessTimeout()).not.toThrow();
+      expect(end).not.toHaveBeenCalled();
+      settle(73);
+      await expect(operation).resolves.toBe(73);
+      expect(end).toHaveBeenCalledOnce();
+    } finally {
+      sink.mockRestore();
+      settle(73);
+      await operation;
+      await release();
+    }
+  });
+
+  it('distinguishes a retained idle client from a pending operation at process timeout', async () => {
+    const { end } = installFakeClient();
+    const release = retainSharedPg();
+    const lines: string[] = [];
+    const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
+    try {
+      new AdminTestRunsReporter().onProcessTimeout();
+      expect(JSON.parse(lines[0].slice('TEST_FILE_FINALIZATION '.length))).toMatchObject({
+        holders: 1, inFlight: 0, closeRequested: false, clientRequested: true, closing: false,
+      });
+      expect(end).not.toHaveBeenCalled();
+    } finally { sink.mockRestore(); await release(); }
+  });
+
   it.each(['resolve', 'reject'] as const)('keeps a source-map flush alive after its timeout until the writer %ss', async settlement => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const envKeys = ['PC_EXECUTED_SOURCE_MAP_WORKSPACE', 'PC_EXECUTED_SOURCE_MAP_OUT',

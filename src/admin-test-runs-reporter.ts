@@ -2775,6 +2775,8 @@ export default class AdminTestRunsReporter implements Reporter {
             await Promise.allSettled(rows.map((row) => writeRow(row)));
           }
         : insertRows);
+    // Preserve the selected writer's identity before diagnostic wrapping.
+    this.usesDefaultRowsWriter = rowsWriter === insertRows;
     this.writeRows = rows => observeReporterStage('test-runs', 'write-rows', () => rowsWriter(rows));
     const configuredReader = typeof readWorktreeSnapshotOrOptions === 'object'
       ? readWorktreeSnapshotOrOptions?.readRuntimeEnvironment : undefined;
@@ -2790,6 +2792,7 @@ export default class AdminTestRunsReporter implements Reporter {
 
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: TestRunRowsWriter;
+  private readonly usesDefaultRowsWriter: boolean;
   private readonly readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>;
   private readonly runtimeEnvironmentCaptureTimeoutMs: number;
 
@@ -2829,7 +2832,7 @@ export default class AdminTestRunsReporter implements Reporter {
     // Evidence consumers must fail before importing expensive test modules.
     // Ordinary reporter runs retain D-007's fail-soft behavior. This executes in
     // the same Vitest process/module cache that will later persist the results.
-    if (this.writeRows === insertRows && process.env[TEST_RUN_RECEIPT_ENV]?.trim()) {
+    if (this.usesDefaultRowsWriter && process.env[TEST_RUN_RECEIPT_ENV]?.trim()) {
       const preflight = await preflightTestRunLedger();
       if (!preflight.ok) {
         const release = this.pgLease;
@@ -3071,6 +3074,19 @@ export default class AdminTestRunsReporter implements Reporter {
     this.failureDetailsFlushed = true;
     const details = this.failureDetails.splice(0);
     writeFailureDetails(details);
+  }
+
+  /** A force-exit warning alone cannot distinguish a deferred ledger query from
+   *  another parent resource. Record only lifecycle state, never SQL or URLs. */
+  onProcessTimeout(): void {
+    try {
+      process.stderr.write('TEST_FILE_FINALIZATION ' + JSON.stringify({
+        pid: process.pid, phase: 'reporter-pg-timeout', reporter: 'test-runs',
+        holders: sharedPg.holders, inFlight: sharedPg.inFlight,
+        closeRequested: sharedPg.closeRequested,
+        clientRequested: Boolean(sharedPg.promise), closing: Boolean(sharedPg.closePromise),
+      }) + '\n');
+    } catch { /* Diagnostics must not change the runner's timeout or exit. */ }
   }
 
   async onTestRunEnd(
