@@ -17,6 +17,55 @@ const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=d
   Buffer.from(JSON.stringify(map)).toString('base64');
 
 describe('engine script execution observations', () => {
+  it('admits only independently pinned external engine text and keeps compilation distinct from execution', () => {
+    const root = mkdtempSync(join(tmpdir(), 'engine-external-pin-'));
+    const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;
+    const path = join(root, 'private-bundle.mjs'), url = pathToFileURL(path).href;
+    const source = 'globalThis.__pinnedMarker = "🌱"; function untouched() { return 7; }';
+    try {
+      writeFileSync(path, 'disk bytes cannot attest engine execution');
+      const script = `import { Session } from 'node:inspector';
+        const { observeEngineScriptExecution } = await import(${JSON.stringify(capture)});
+        const source = ${JSON.stringify(source)}, path = ${JSON.stringify(path)}, url = ${JSON.stringify(url)};
+        const runtime = new Session(); runtime.connect();
+        const post = (method, params) => { let value, error;
+          runtime.post(method, params, (e, r) => { error = e; value = r; });
+          if (error) throw error; return value; };
+        post('Runtime.enable');
+        const results = [];
+        for (const pin of [null, { path, sha256: ${JSON.stringify(digest(source))}, byteLength: Buffer.byteLength(source) },
+          { path, sha256: '0'.repeat(64), byteLength: Buffer.byteLength(source) },
+          { path, sha256: ${JSON.stringify(digest(source))}, byteLength: Buffer.byteLength(source) + 1 }]) {
+          const observer = observeEngineScriptExecution('/unrelated-source-root', {
+            repositorySources: false, pinnedSources: pin ? [pin] : [] });
+          const { scriptId } = post('Runtime.compileScript', { expression: source, sourceURL: url, persistScript: true });
+          const before = observer.snapshot(); post('Runtime.runScript', { scriptId });
+          results.push({ scriptId, before, after: observer.snapshot() }); observer.disconnect();
+        }
+        runtime.disconnect(); console.log(JSON.stringify(results));`;
+      const env = { ...process.env }; delete env.NODE_OPTIONS;
+      for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
+      const results = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+        env, encoding: 'utf8', timeout: 10000,
+      }));
+      expect(results[0].after.scripts).toEqual([]);
+      const matched = results[1];
+      expect(matched.before.scripts).toContainEqual(expect.objectContaining({ scriptId: matched.scriptId,
+        path, sourceTextSha256: digest(source), execution: 'unknown', coverageRanges: [] }));
+      expect(matched.after.scripts).toContainEqual(expect.objectContaining({ scriptId: matched.scriptId,
+        sourceTextSha256: digest(source), execution: 'observed', independentPin: {
+          path, sha256: digest(source), byteLength: Buffer.byteLength(source) } }));
+      const observed = matched.after.scripts.find((row: { scriptId: string }) => row.scriptId === matched.scriptId);
+      expect(observed.coverageRanges).toContainEqual(expect.objectContaining({ functionName: 'untouched', count: 0 }));
+      for (const mismatch of results.slice(2)) {
+        expect(mismatch.after.scripts.find((row: { scriptId: string }) => row.scriptId === mismatch.scriptId))
+          .toMatchObject({ sourceTextSha256: null, execution: 'unknown', coverageRanges: [] });
+        expect(mismatch.after.reasons).toContain('engine-pinned-source-mismatch');
+      }
+      expect(matched.after.populationStatus).toBe('unknown');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('ties coverage to exact transformed script ids while compilation alone stays unknown', () => {
     const root = mkdtempSync(join(tmpdir(), 'engine-script-observation-'));
     const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;

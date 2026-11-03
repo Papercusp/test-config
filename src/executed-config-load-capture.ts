@@ -23,16 +23,36 @@ const shared = pinModuleState<{ capture: Capture | null }>(
   '@papercusp/test-config.original-config-loads', () => ({ capture: null }));
 const hash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 
+export const nativeSourceRetentionLimits = Object.freeze({ sourceBytes: 16 * 1024 ** 2,
+  processBytes: 64 * 1024 ** 2, pinnedSourceBytes: 128 * 1024 ** 2,
+  pinnedProcessBytes: 256 * 1024 ** 2, pins: 4 });
+interface SourcePin { path: string; sha256: string; byteLength: number }
+export function validateSourcePins(pins: unknown): SourcePin[] {
+  if (!Array.isArray(pins) || pins.length > nativeSourceRetentionLimits.pins ||
+      new Set(pins.map(pin => pin?.path)).size !== pins.length || pins.some(pin =>
+        typeof pin?.path !== 'string' || !isAbsolute(pin.path) || pin.path.length > 1024 ||
+        !/^[a-f0-9]{64}$/.test(pin.sha256) || !Number.isSafeInteger(pin.byteLength) ||
+        pin.byteLength < 0 || pin.byteLength > nativeSourceRetentionLimits.pinnedSourceBytes) ||
+      pins.reduce((total, pin) => total + pin.byteLength, 0) > nativeSourceRetentionLimits.pinnedProcessBytes)
+    throw new Error('Invalid bounded native loader source pins');
+  return pins.map(pin => ({ ...pin }));
+}
+
 /** Engine source text and execution ranges share a V8 script id. Neither a
  * scriptParsed event nor getScriptSource alone establishes execution. Best
  * effort coverage supplies positive observations only: GC can erase counters,
  * so an absent/zero count stays unknown. No precise coverage, pauses or code
  * rewriting are used, and this diagnostic never authorizes reusable passes. */
-export function observeEngineScriptExecution(repoRoot: string) {
+export function observeEngineScriptExecution(repoRoot: string,
+  options: { pinnedSources?: SourcePin[]; repositorySources?: boolean } = {}) {
+  const pins = validateSourcePins(options.pinnedSources ?? []);
+  const pinnedOnly = options.repositorySources === false;
   const session = new Session();
   const reasons = new Set<string>();
   const scripts = new Map<string, { scriptId: string; url: string; path: string;
-    sourceTextSha256: string | null; sourceTextLength: number | null }>();
+    sourceTextSha256: string | null; sourceTextLength: number | null;
+    independentPin?: SourcePin }>();
+  let pinnedBytes = 0;
   let connected = false;
   const post = <T>(method: string, params: Record<string, unknown> = {}): T => {
     let done = false;
@@ -49,18 +69,32 @@ export function observeEngineScriptExecution(repoRoot: string) {
     try {
       const absolute = params.url.startsWith('file:') ? fileURLToPath(params.url) : params.url;
       if (!isAbsolute(absolute)) return;
-      const path = relative(repoRoot, absolute).split(/[\\/]/).join('/');
-      if (!path || isAbsolute(path) || path === '..' || path.startsWith('../') ||
-          path.split('/').includes('node_modules')) return;
+      const pin = pins.find(pin => pathToFileURL(pin.path).href === params.url);
+      const rel = relative(repoRoot, absolute).split(/[\\/]/).join('/');
+      if (!pin && (pinnedOnly || !rel || isAbsolute(rel) || rel === '..' || rel.startsWith('../') ||
+          rel.split('/').includes('node_modules'))) return;
+      const path = pin ? pin.path : rel;
+      if (pinnedOnly && !scripts.has(params.scriptId) && scripts.size >= nativeSourceRetentionLimits.pins) {
+        reasons.add('engine-script-population-limit'); return;
+      }
+      if (pin && (!Number.isSafeInteger(params.length) || params.length > pin.byteLength ||
+          pin.byteLength > nativeSourceRetentionLimits.pinnedProcessBytes - pinnedBytes)) {
+        reasons.add('engine-pinned-source-limit'); return;
+      }
       const { scriptSource } = post<{ scriptSource: string }>('Debugger.getScriptSource', { scriptId: params.scriptId });
       if (typeof scriptSource !== 'string') throw new Error('engine source text unavailable');
+      if (pin) pinnedBytes += pin.byteLength; // Failed matches consume the budget too.
       const sourceTextSha256 = hash(scriptSource);
+      const pinMatches = !pin || scriptSource.length <= pin.byteLength &&
+        Buffer.byteLength(scriptSource) === pin.byteLength && sourceTextSha256 === pin.sha256;
+      if (!pinMatches) reasons.add('engine-pinned-source-mismatch');
       const prior = scripts.get(params.scriptId);
       const changed = params.isLiveEdit || (prior && prior.sourceTextSha256 !== sourceTextSha256);
       if (changed) reasons.add('engine-script-source-changed');
       scripts.set(params.scriptId, { scriptId: params.scriptId, url: params.url, path,
-        sourceTextSha256: changed ? null : sourceTextSha256,
-        sourceTextLength: changed ? null : scriptSource.length });
+        sourceTextSha256: changed || !pinMatches ? null : sourceTextSha256,
+        sourceTextLength: changed || !pinMatches ? null : scriptSource.length,
+        ...(pin ? { independentPin: { ...pin } } : {}) });
     } catch { reasons.add('engine-script-source-unavailable'); }
   });
   try {
@@ -84,19 +118,26 @@ export function observeEngineScriptExecution(repoRoot: string) {
             hash(scriptSource) === script.sourceTextSha256;
           if (!sourceMatches) reasons.add('engine-script-source-changed');
         } catch { reasons.add('engine-script-source-unavailable'); }
-        const ranges = sourceMatches && row?.url === script.url ? row.functions.flatMap(fn =>
-          fn.ranges.filter(range => Number.isSafeInteger(range.count) && range.count >= 0 &&
-            Number.isSafeInteger(range.startOffset) && Number.isSafeInteger(range.endOffset) &&
-            range.startOffset >= 0 && range.endOffset > range.startOffset &&
-            range.endOffset <= script.sourceTextLength!).map(range => ({ functionName: fn.functionName, ...range }))) : [];
+        const retained: Array<{ functionName: string; startOffset: number; endOffset: number; count: number }> = [];
+        let coverageRangesComplete = true;
+        if (sourceMatches && row?.url === script.url) for (const fn of row.functions) for (const range of fn.ranges) {
+          if (!Number.isSafeInteger(range.count) || range.count < 0 ||
+              !Number.isSafeInteger(range.startOffset) || !Number.isSafeInteger(range.endOffset) ||
+              range.startOffset < 0 || range.endOffset <= range.startOffset ||
+              range.endOffset > script.sourceTextLength!) continue;
+          if (pinnedOnly && retained.length >= 128) { coverageRangesComplete = false; continue; }
+          retained.push({ functionName: pinnedOnly ? fn.functionName.slice(0, 256) : fn.functionName, ...range });
+        }
+        if (!coverageRangesComplete) reasons.add('engine-execution-range-limit');
         return { ...script, sourceTextSha256: sourceMatches ? script.sourceTextSha256 : null,
-          execution: ranges.some(range => range.count > 0) ? 'observed' as const : 'unknown' as const,
+          execution: retained.some(range => range.count > 0) ? 'observed' as const : 'unknown' as const,
           // Offsets address engine UTF-16 source text. A positive outer range
           // does not establish execution of a nested function or every byte.
-          coverageRanges: ranges };
+          coverageRanges: retained, coverageRangesComplete };
       });
       return { schemaVersion: 'node-engine-script-observations-v1', basis: 'v8-script-id-source-and-best-effort-coverage',
-        scope: 'observed-repository-engine-scripts', sourceEncoding: 'utf8-of-engine-source-text',
+        scope: pinnedOnly ? 'observed-independently-pinned-engine-scripts' : 'observed-repository-engine-scripts',
+        sourceEncoding: 'utf8-of-engine-source-text',
         offsetUnits: 'utf16-code-units', populationStatus: 'unknown', scripts: observedScripts,
         reasons: [...reasons].sort(), unresolved: ['engine-bootstrap-observation-window-unmeasured',
           'engine-script-population-unmeasured', 'engine-best-effort-coverage-may-lose-gc-data',
