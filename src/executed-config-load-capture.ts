@@ -77,7 +77,9 @@ export function observeEngineScriptExecution(repoRoot: string,
       if (pinnedOnly && !scripts.has(params.scriptId) && scripts.size >= nativeSourceRetentionLimits.pins) {
         reasons.add('engine-script-population-limit'); return;
       }
-      if (pin && (!Number.isSafeInteger(params.length) || params.length > pin.byteLength ||
+      const scriptLength = params.length;
+      if (pin && (typeof scriptLength !== 'number' || !Number.isSafeInteger(scriptLength) ||
+          scriptLength > pin.byteLength ||
           pin.byteLength > nativeSourceRetentionLimits.pinnedProcessBytes - pinnedBytes)) {
         reasons.add('engine-pinned-source-limit'); return;
       }
