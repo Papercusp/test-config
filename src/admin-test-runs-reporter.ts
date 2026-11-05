@@ -1614,6 +1614,7 @@ export async function closeSharedPg(): Promise<void> {
     sharedPg.closeRequested = false;
     return;
   }
+  const startedUnheld = sharedPg.holders === 0;
   const closing = (async () => {
     try {
       if (sharedPg.inFlight > 0) {
@@ -1629,7 +1630,7 @@ export async function closeSharedPg(): Promise<void> {
       }
       // A new run can retain the shared client while the old run drains.
       // Its live lease wins over the old shutdown request.
-      if (sharedPg.holders > 0) return;
+      if (startedUnheld && sharedPg.holders > 0) return;
       sharedPg.promise = undefined;
       sharedPg.setupFailure = undefined;
       const handle = await p;

@@ -357,7 +357,7 @@ describe('shared PG lease (WI-10003715)', () => {
     } finally { sink.mockRestore(); await release(); }
   });
 
-  it.each(['resolve', 'reject'] as const)('keeps a source-map flush alive after its timeout until the writer %ss', async settlement => {
+  it.each(['resolve', 'reject'] as const)('keeps a source-map flush alive during the bounded final drain until the writer %ss', async settlement => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const envKeys = ['PC_EXECUTED_SOURCE_MAP_WORKSPACE', 'PC_EXECUTED_SOURCE_MAP_OUT',
       'PC_EXECUTED_SOURCE_MAP_RESULT', 'PC_EXECUTED_SOURCE_MAP_NO_PERSIST', 'PC_EXECUTED_INPUTS_DIR'];
@@ -398,12 +398,12 @@ describe('shared PG lease (WI-10003715)', () => {
       await entered;
       await sibling();
       await vi.advanceTimersByTimeAsync(EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS);
-      await done;
-      await reporter.onExit();
       expect(statement).toHaveBeenCalledTimes(1);
       expect(end).not.toHaveBeenCalled();
       if (settlement === 'resolve') resolveStatement();
       else rejectStatement(new Error('source-map insert rejected'));
+      await done;
+      await reporter.onExit();
       await vi.waitFor(() => expect(end).toHaveBeenCalledTimes(1));
       expect(statement).toHaveBeenCalledTimes(settlement === 'resolve' ? 3 : 1);
     } finally {
