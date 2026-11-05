@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TestModule } from 'vitest/node';
 
-import AdminTestRunsReporter, { closeSharedPg, closeSharedPgIfUnheld, insertRows, insertTestRunRowsWithSql, preflightTestRunLedger, retainSharedPg, trackSharedPgOperation, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
+import AdminTestRunsReporter, { closeSharedPg, closeSharedPgIfUnheld, insertRows, insertTestRunRowsWithSql, preflightTestRunLedger, retainSharedPg, SHARED_PG_DRAIN_TIMEOUT_MS, trackSharedPgOperation, tryGetPg, type PgHandle, type PgSql, type TestRunRow } from './admin-test-runs-reporter.ts';
 import ExecutedSourceMapReporter, { EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS } from './executed-source-map-reporter.ts';
 
 const shared = pinModuleState('@papercusp/test-config.shared-pg', () => ({
@@ -260,7 +260,7 @@ describe('same-process evidence ledger preflight', () => {
 });
 
 describe('shared PG lease (WI-10003715)', () => {
-  it('reports a deferred query at process timeout without closing it or changing its settlement', async () => {
+  it('reports a pending bounded drain and preserves a query that settles during it', async () => {
     const { end } = installFakeClient();
     const release = retainSharedPg();
     let settle!: (value: number) => void;
@@ -269,12 +269,12 @@ describe('shared PG lease (WI-10003715)', () => {
     const lines: string[] = [];
     const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
     try {
-      await release();
+      const releasing = release();
       reporter.onProcessTimeout();
       expect(lines).toHaveLength(1);
       expect(JSON.parse(lines[0].slice('TEST_FILE_FINALIZATION '.length))).toMatchObject({
         phase: 'reporter-pg-timeout', reporter: 'test-runs', holders: 0, inFlight: 1,
-        closeRequested: true, clientRequested: true, closing: false,
+        closeRequested: true, clientRequested: true, closing: true,
       });
       expect(end).not.toHaveBeenCalled();
       sink.mockImplementation(() => { throw new Error('diagnostic sink unavailable'); });
@@ -282,6 +282,7 @@ describe('shared PG lease (WI-10003715)', () => {
       expect(end).not.toHaveBeenCalled();
       settle(73);
       await expect(operation).resolves.toBe(73);
+      await releasing;
       expect(end).toHaveBeenCalledOnce();
     } finally {
       sink.mockRestore();
@@ -289,6 +290,57 @@ describe('shared PG lease (WI-10003715)', () => {
       await operation;
       await release();
     }
+  });
+
+  it('destroys a query that never settles after the final lease exhausts its drain budget', async () => {
+    vi.useFakeTimers();
+    let rejectQuery!: (error: Error) => void;
+    const query = new Promise<unknown>((_, reject) => { rejectQuery = reject; });
+    const end = vi.fn(async () => { rejectQuery(new Error('CONNECTION_DESTROYED')); });
+    const sql = Object.assign(vi.fn(() => query), { end }) as unknown as PgSql;
+    shared.promise = Promise.resolve({ sql });
+    const release = retainSharedPg();
+    const outcome = trackSharedPgOperation(query).catch(error => error.message);
+    const closing = release();
+    try {
+      await vi.advanceTimersByTimeAsync(SHARED_PG_DRAIN_TIMEOUT_MS - 1);
+      expect(end).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await closing;
+      expect(end).toHaveBeenCalledExactlyOnceWith({ timeout: 0 });
+      await expect(outcome).resolves.toBe('CONNECTION_DESTROYED');
+      expect(shared.promise).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      rejectQuery(new Error('test cleanup'));
+      await closing;
+      await outcome;
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not destroy a client retained by a new sibling during the final drain', async () => {
+    vi.useFakeTimers();
+    const { end } = installFakeClient();
+    const release = retainSharedPg();
+    let settle!: () => void;
+    const query = trackSharedPgOperation(new Promise<void>(resolve => { settle = resolve; }));
+    const closing = release();
+    const sibling = retainSharedPg();
+    try {
+      await vi.advanceTimersByTimeAsync(SHARED_PG_DRAIN_TIMEOUT_MS);
+      await closing;
+      expect(end).not.toHaveBeenCalled();
+      settle();
+      await query;
+      expect(end).not.toHaveBeenCalled();
+    } finally {
+      settle();
+      await query;
+      await sibling();
+      vi.useRealTimers();
+    }
+    expect(end).toHaveBeenCalledOnce();
   });
 
   it('distinguishes a retained idle client from a pending operation at process timeout', async () => {
@@ -480,21 +532,23 @@ describe('shared PG lease (WI-10003715)', () => {
       startedAt: at, finishedAt: at, outputTail: null,
       isScratchConfig: false, worktreeDirty: false, commitSha: 'abc123', executionDetails: null,
     };
-    const write = insertTestRunRowsWithSql(sql, [row], {
+    const insertion = insertTestRunRowsWithSql(sql, [row], {
       branch: 'staging', inferredCommit: null, declaredSource: 'mutation-probe', runGroupId: null,
       harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null,
-    }, { insertTimeoutMs: 20, totalInsertMs: 100 }).then(async receipts => {
+    }, { insertTimeoutMs: 20, totalInsertMs: 100 });
+    const write = insertion.then(async receipts => {
       await lease();
       return receipts;
     });
     try {
       await vi.advanceTimersByTimeAsync(101);
-      await expect(write).resolves.toMatchObject([
+      await expect(insertion).resolves.toMatchObject([
         { outcome: 'timeout', reason: 'pg_insert_timeout_100ms' },
       ]);
       expect(end).not.toHaveBeenCalled();
 
       resolveInsert([{ id: '902', file_path: row.filePath }]);
+      await write;
       await vi.waitFor(() => expect(end).toHaveBeenCalledTimes(1));
     } finally {
       resolveInsert([]);

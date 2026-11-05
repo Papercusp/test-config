@@ -1,6 +1,6 @@
-/** EI-27702384737902667: distinguish a reporter's pending PG operation from worker shutdown.
- * The blocker lives outside the Vitest child, so only the leased client can keep that
- * parent alive. Both controls execute the same query against an owned PG cluster.
+/** EI-27982872070632258: a pending PG operation must not outlive reporter shutdown.
+ * Both controls execute the same query against an owned PG cluster. A late success
+ * is preserved; an indefinitely blocked query is destroyed after the bounded drain.
  */
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
@@ -21,7 +21,7 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(async () => { await pg?.stop(); }, 30_000);
 
-it('reproduces the parent close warning only while a leased real PG query is pending', async () => {
+it('closes the parent cleanly after either draining or destroying a leased real PG query', async () => {
   const root = mkdtempSync(join(tmpdir(), 'shared-pg-parent-close-'));
   const require = createRequire(import.meta.url);
   const probe = join(root, 'probe.mjs');
@@ -66,11 +66,13 @@ it('reproduces the parent close warning only while a leased real PG query is pen
           const rows = await query;
           if (rows[0].proof !== 73) throw new Error('query did not complete');
           event('query-settled');
-        } else {
-          void query.catch(error => { event('query-rejected'); process.exitCode = 1; });
         }
         await release();
-        event('lease-released');
+        if (mode === 'pending') await query.then(
+          () => { throw new Error('blocked query unexpectedly completed'); },
+          error => event('query-cancelled', { code: error.code }),
+        );
+        event('lease-released', { operationPending });
       } }],
     }, undefined, { stdout: stream, stderr: stream });
     await runner.start();
@@ -102,21 +104,18 @@ it('reproduces the parent close warning only while a leased real PG query is pen
         const records = result.stdout.trim().split('\n').map(line => JSON.parse(line));
         const events = records.map(record => record.kind);
         expect(events, JSON.stringify(result)).toEqual(mode === 'pending'
-          ? ['test-passed', 'query-pending', 'lease-released', 'runner-closed', 'process-timeout']
+          ? ['test-passed', 'query-pending', 'query-cancelled', 'lease-released', 'runner-closed']
           : ['test-passed', 'query-pending', 'query-settled', 'lease-released', 'runner-closed']);
-        expect(result.stderr.includes('close timed out after 500ms'), JSON.stringify(result)).toBe(mode === 'pending');
+        expect(result.stderr, JSON.stringify(result)).not.toContain('close timed out');
         expect(result.stderr).not.toMatch(/Timeout terminating .*worker|Failed to terminate .*worker/);
         if (mode === 'pending') {
-          const timeout = records.find(record => record.kind === 'process-timeout');
-          expect(timeout).toMatchObject({ operationPending: true, poolClosed: true });
-          expect(timeout.sockets).toContainEqual({ destroyed: false, referenced: true });
+          expect(records.find(record => record.kind === 'query-cancelled'))
+            .toMatchObject({ code: 'CONNECTION_DESTROYED' });
         }
+        expect(records.find(record => record.kind === 'lease-released')).toMatchObject({ operationPending: false });
         const lifecycle = result.stderr.split('\n').filter(line => line.startsWith('TEST_FILE_FINALIZATION '))
           .map(line => JSON.parse(line.slice('TEST_FILE_FINALIZATION '.length)));
-        expect(lifecycle).toEqual(mode === 'pending' ? [expect.objectContaining({
-          phase: 'reporter-pg-timeout', holders: 0, inFlight: 1, closeRequested: true,
-          clientRequested: true, closing: false,
-        })] : []);
+        expect(lifecycle).toEqual([]);
       } finally {
         await blocker.unsafe('SELECT pg_advisory_unlock_all()');
         await blocker.end({ timeout: 2 });

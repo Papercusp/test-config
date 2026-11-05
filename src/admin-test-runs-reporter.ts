@@ -1492,7 +1492,12 @@ const sharedPg = pinModuleState('@papercusp/test-config.shared-pg', () => ({
   /** A lease release requests shutdown; the last query completion performs it. */
   closeRequested: false,
   closePromise: undefined as Promise<void> | undefined,
+  drainWaiters: new Set<() => void>(),
 }));
+
+// Reuse the client's existing two-second shutdown boundary for deferred work.
+// A foreground write timeout must not turn into an unlimited socket lifetime.
+export const SHARED_PG_DRAIN_TIMEOUT_MS = 2_000;
 
 export function resolveTestRunsPgUrl(env: NodeJS.ProcessEnv = process.env): string {
   return env.PAPERCUSP_TEST_RUNS_DB_URL?.trim()
@@ -1583,6 +1588,9 @@ export function trackSharedPgOperation<T>(operation: Promise<T>): Promise<T> {
   sharedPg.inFlight += 1;
   return operation.finally(async () => {
     sharedPg.inFlight = Math.max(0, sharedPg.inFlight - 1);
+    if (sharedPg.inFlight === 0) {
+      for (const drained of sharedPg.drainWaiters) drained();
+    }
     if (sharedPg.inFlight === 0 && sharedPg.closeRequested) await closeSharedPg();
   });
 }
@@ -1601,19 +1609,34 @@ export async function closeSharedPg(): Promise<void> {
     return;
   }
   sharedPg.closeRequested = true;
-  if (sharedPg.inFlight > 0) return;
   const p = sharedPg.promise;
   if (!p) {
     sharedPg.closeRequested = false;
     return;
   }
-  sharedPg.promise = undefined;
-  sharedPg.setupFailure = undefined;
-  sharedPg.closeRequested = false;
   const closing = (async () => {
     try {
+      if (sharedPg.inFlight > 0) {
+        await new Promise<void>(resolve => {
+          const drained = () => {
+            clearTimeout(timer);
+            sharedPg.drainWaiters.delete(drained);
+            resolve();
+          };
+          const timer = setTimeout(drained, SHARED_PG_DRAIN_TIMEOUT_MS);
+          sharedPg.drainWaiters.add(drained);
+        });
+      }
+      // A new run can retain the shared client while the old run drains.
+      // Its live lease wins over the old shutdown request.
+      if (sharedPg.holders > 0) return;
+      sharedPg.promise = undefined;
+      sharedPg.setupFailure = undefined;
       const handle = await p;
-      if (handle?.sql) await handle.sql.end({ timeout: 2 });
+      // Preserve acknowledgements that settle during the drain. A query still
+      // pending at its end has exhausted shutdown's budget: destroy the client
+      // so its observed promise rejects and cannot keep Vitest alive forever.
+      if (handle?.sql) await handle.sql.end({ timeout: sharedPg.inFlight > 0 ? 0 : 2 });
     } catch {
       /* swallow — D-007 */
     }
@@ -1622,7 +1645,10 @@ export async function closeSharedPg(): Promise<void> {
   try {
     await closing;
   } finally {
-    if (sharedPg.closePromise === closing) sharedPg.closePromise = undefined;
+    if (sharedPg.closePromise === closing) {
+      sharedPg.closePromise = undefined;
+      sharedPg.closeRequested = false;
+    }
   }
 }
 
