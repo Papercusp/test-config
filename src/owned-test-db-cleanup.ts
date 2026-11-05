@@ -1,5 +1,5 @@
 /** Durable ownership for the maintained runner's test databases. No PG is started here. */
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DropDatabaseWithLockOptions, TestDbDropResult } from './pg-migrate.ts';
@@ -29,6 +29,16 @@ function directory(env: NodeJS.ProcessEnv): string | undefined {
   if (dir && !isAbsolute(dir)) throw new Error('owned test database directory must be absolute');
   return dir;
 }
+
+/** A nested private cluster must never reap or validate its parent's receipts.
+ * Keep its own registry under the retained evidence root, outside private HOME. */
+export function createOwnedTestDatabaseScope(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const parent = directory(env);
+  if (!parent) return undefined;
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  return mkdtempSync(join(parent, 'private-pg-'));
+}
+
 function registryPath(dir: string, name: string): string {
   assertOwnedTestDatabaseName(name);
   return join(dir, `${name}.json`);

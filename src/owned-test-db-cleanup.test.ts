@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, statSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { cleanupOwnedTestDatabases, registerOwnedTestDatabase } from './owned-test-db-cleanup';
+import { cleanupOwnedTestDatabases, createOwnedTestDatabaseScope, registerOwnedTestDatabase } from './owned-test-db-cleanup';
 
 const dirs: string[] = [];
 function fixture() {
@@ -13,6 +13,32 @@ function fixture() {
 afterEach(() => { vi.useRealTimers(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('maintained owned database cleanup', () => {
+  it('isolates nested cluster receipts without dropping or rejecting the parent database', async () => {
+    const { dir, env } = fixture();
+    const parentUri = 'postgres://private@localhost:41235/postgres';
+    const childUri = 'postgres://private@localhost:41236/postgres';
+    registerOwnedTestDatabase('org_0123456789ab', parentUri, env);
+    const childDir = createOwnedTestDatabaseScope(env)!;
+    const childEnv = { ...env, PAPERCUSP_TEST_OWNED_DB_DIR: childDir };
+    registerOwnedTestDatabase('org_abcdef012345', childUri, childEnv);
+    const siblingDir = createOwnedTestDatabaseScope(env)!;
+    expect(siblingDir).not.toBe(childDir);
+    expect(statSync(childDir).mode & 0o777).toBe(0o700);
+    const drop = vi.fn(async (_uri: string, _name: string) => 'dropped' as const);
+    const child = await cleanupOwnedTestDatabases({ dir: childDir, runId: 'run-a',
+      adminUri: childUri, deadlineAtMs: Date.now() + 1000, drop });
+    expect(child).toEqual({ complete: true, databases: [{ name: 'org_abcdef012345', outcome: 'dropped' }], errors: [] });
+    expect(drop).toHaveBeenCalledOnce();
+    expect(drop.mock.calls[0]?.slice(0, 2)).toEqual([childUri, 'org_abcdef012345']);
+    expect(JSON.parse(readFileSync(join(dir, 'org_0123456789ab.json'), 'utf8')).outcome).toBe('owned');
+    const parent = await cleanupOwnedTestDatabases({ dir, runId: 'run-a',
+      adminUri: parentUri, deadlineAtMs: Date.now() + 1000, drop });
+    expect(parent).toEqual({ complete: true, databases: [{ name: 'org_0123456789ab', outcome: 'dropped' }], errors: [] });
+    expect(createOwnedTestDatabaseScope({})).toBeUndefined();
+    expect(() => createOwnedTestDatabaseScope({ PAPERCUSP_TEST_OWNED_DB_DIR: 'relative' }))
+      .toThrow('owned test database directory must be absolute');
+  });
+
   it.each(['org', 'admission-recovery', 'mixed_prefix-2', 'a'.repeat(50)])(
     'registers and cleans the exact generated name for safe prefix %s', async prefix => {
       const { dir, env } = fixture();
