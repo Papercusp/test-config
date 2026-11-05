@@ -93,7 +93,7 @@ describe('generated verifier copies stay outside test discovery', () => {
       const exclude = kind === 'workspace'
         ? defineVitestConfig({ layer: 'unit' }).test!.exclude
         : gateParticipationConfig().exclude;
-      const vitest = await createVitest('test', { root, configFile: false, watch: false,
+      const vitest = await createVitest('test', { root, config: false, watch: false,
         include: ['**/*.test.ts'], exclude, reporters: [] });
       try {
         const files = await vitest.globTestSpecifications(['lib/fixture.test.ts']);
