@@ -580,7 +580,7 @@ const sleepMs = (ms: number) => new Promise<void>((resolve) => setTimeout(resolv
 
 describe('test database janitor (WI-6554700010008843)', () => {
   it('collects an idle superseded template, keeps the newest and a recently cloned one, and never races its build lock', async () => {
-    const family = `gcfam${randomBytes(3).toString('hex').replace(/[0-9]/g, 'q')}`;
+    const family = `gcfam${randomBytes(12).toString('hex').replace(/[0-9]/g, 'q')}`;
     // Reverse lexical order relative to creation: names must not accidentally
     // stand in for the true newest database when directory mtimes tie.
     const keys = [
