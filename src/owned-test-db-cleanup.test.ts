@@ -59,6 +59,21 @@ describe('maintained owned database cleanup', () => {
     expect(readFileSync(join(dir, 'cleanup.jsonl'), 'utf8')).not.toContain('postgres://');
   });
 
+  it('refuses a foreign server before connecting and cleans only the pinned private server', async () => {
+    const { dir, env } = fixture();
+    registerOwnedTestDatabase('org_0123456789ab', 'postgres://private@localhost:41235/postgres', env);
+    const drop = vi.fn(async () => 'dropped' as const);
+    const foreign = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000,
+      adminUri: 'postgres://private@localhost:5432/papercusp', drop });
+    expect(foreign.complete).toBe(false);
+    expect(foreign.errors).toEqual(['org_0123456789ab.json: database endpoint does not match the owned server']);
+    expect(drop).not.toHaveBeenCalled();
+    const owned = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000,
+      adminUri: 'postgres://private@localhost:41235/papercusp', drop });
+    expect(owned.complete).toBe(true);
+    expect(drop).toHaveBeenCalledOnce();
+  });
+
   it.each(['dropped', 'deferred', 'detached'] as const)('reaps a forced-exit registration without relabeling %s', async outcome => {
     const { dir, env } = fixture();
     registerOwnedTestDatabase('org_0123456789ab', 'postgres://private@localhost/test', env);

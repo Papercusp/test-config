@@ -78,6 +78,8 @@ export interface OwnedTestDbCleanupResult {
  * observed and updates the same retained receipt. */
 export async function cleanupOwnedTestDatabases(options: {
   dir: string; runId: string; deadlineAtMs: number; drop: Drop;
+  /** When the owning cluster stops next, refuse records for any other server. */
+  adminUri?: string;
 }): Promise<OwnedTestDbCleanupResult> {
   const result: OwnedTestDbCleanupResult = { complete: true, databases: [], errors: [] };
   const env = { [OWNED_TEST_DB_DIR_ENV]: options.dir, PAPERCUSP_TEST_RUN_GROUP: options.runId };
@@ -97,6 +99,14 @@ export async function cleanupOwnedTestDatabases(options: {
         throw new Error('database ownership does not match this run');
       }
       if (typeof record.adminUri !== 'string') throw new Error('missing private database endpoint');
+      if (options.adminUri) {
+        const expected = new URL(options.adminUri);
+        const actual = new URL(record.adminUri);
+        if (actual.protocol !== expected.protocol || actual.hostname !== expected.hostname ||
+            (actual.port || '5432') !== (expected.port || '5432') || actual.username !== expected.username) {
+          throw new Error('database endpoint does not match the owned server');
+        }
+      }
     } catch (cause) {
       result.errors.push(`${file}: ${cause instanceof Error ? cause.message : String(cause)}`);
       continue;
