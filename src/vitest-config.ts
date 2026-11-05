@@ -83,7 +83,7 @@ export interface DefineVitestConfigOptions {
 // fixture files left under `.papercusp` and archived tests under `_retired`,
 // recording false red rows unrelated to the package actually under test.
 // Exclude both trees so ANY package's default run is immune.
-const baseExclude = ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.papercusp/**', '**/_retired/**'];
+const baseExclude = ['**/node_modules/**', '**/dist/**', '**/dist-verify/**', '**/.next/**', '**/.papercusp/**', '**/_retired/**'];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The worker setup files (and why each exists) live in worker-setup-files.ts, so the reuse rule's
@@ -368,7 +368,7 @@ export function gateParticipationConfig(
     reporters: ['default', ...gate.reporters],
     setupFiles: [...gate.leadingSetupFiles, ...(opts.setupFiles ?? [])],
     globalSetup: [...gate.leadingGlobalSetup, ...(opts.globalSetup ?? [])],
-    exclude: [...configDefaults.exclude, ...(opts.exclude ?? []), ...gate.reuseSkipExclude],
+    exclude: [...configDefaults.exclude, ...baseExclude, ...(opts.exclude ?? []), ...gate.reuseSkipExclude],
     ...(gate.experimental ? { experimental: gate.experimental } : {}),
   };
 }
@@ -784,7 +784,7 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
     // workspace crawl. Apply the same artifact boundaries there so temporary
     // and archived checkouts cannot add resolvers or delay every focused run.
     plugins: [tsconfigPaths({ ignoreConfigErrors: true,
-      skip: dir => ['.papercusp', '_retired', 'dist', '.next'].includes(dir),
+      skip: dir => ['.papercusp', '_retired', 'dist', 'dist-verify', '.next'].includes(dir),
     }), ...gate.plugins],
     // Use a project-local Vite cache dir instead of os.tmpdir() (which is
     // TMPDIR=/tmp/claude on this dev box — a read-only path that doesn't

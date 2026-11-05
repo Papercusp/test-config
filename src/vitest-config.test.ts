@@ -21,7 +21,7 @@ import { availableParallelism } from 'node:os';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defineVitestConfig, isWritableDir } from './vitest-config.ts';
+import { defineVitestConfig, gateParticipationConfig, isWritableDir } from './vitest-config.ts';
 import { recordedTestLayer } from './execution-details.ts';
 import { createServer, type Plugin } from 'vite';
 
@@ -39,7 +39,7 @@ function withArgv(...tokens: string[]): void {
 }
 
 describe('tsconfig discovery excludes archived and generated checkouts', () => {
-  it.each(['.papercusp', '_retired', 'dist', '.next'])(
+  it.each(['.papercusp', '_retired', 'dist', 'dist-verify', '.next'])(
     'keeps live workspace aliases without discovering %s aliases', async excluded => {
       withArgv();
       const root = mkdtempSync(join(tmpdir(), 'vitest-config-discovery-'));
@@ -72,6 +72,34 @@ describe('tsconfig discovery excludes archived and generated checkouts', () => {
           .toBeNull();
       } finally {
         await server?.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe('generated verifier copies stay outside test discovery', () => {
+  it.each(['workspace', 'gate-fragment'] as const)(
+    'collects only the canonical exact-file match through the %s config', async kind => {
+      withArgv();
+      const root = mkdtempSync(join(tmpdir(), 'vitest-config-collection-'));
+      const canonical = join(root, 'lib', 'fixture.test.ts');
+      const mirror = join(root, 'dist-verify', 'build', 'apps', 'operator', 'lib', 'fixture.test.ts');
+      for (const file of [canonical, mirror]) {
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(file, "import { it } from 'vitest'; it('fixture', () => {});\n");
+      }
+      const { createVitest } = await import('vitest/node');
+      const exclude = kind === 'workspace'
+        ? defineVitestConfig({ layer: 'unit' }).test!.exclude
+        : gateParticipationConfig().exclude;
+      const vitest = await createVitest('test', { root, configFile: false, watch: false,
+        include: ['**/*.test.ts'], exclude, reporters: [] });
+      try {
+        const files = await vitest.globTestSpecifications(['lib/fixture.test.ts']);
+        expect(files.map(file => file.moduleId)).toEqual([canonical]);
+      } finally {
+        await vitest.close();
         rmSync(root, { recursive: true, force: true });
       }
     },
