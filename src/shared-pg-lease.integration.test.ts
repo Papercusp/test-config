@@ -21,15 +21,26 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(async () => { await pg?.stop(); }, 30_000);
 
-it('closes the parent cleanly after either draining or destroying a leased real PG query', async () => {
+it.each(['pending', 'drained'] as const)('closes the parent cleanly with a %s leased real PG query', async mode => {
   const root = mkdtempSync(join(tmpdir(), 'shared-pg-parent-close-'));
   const require = createRequire(import.meta.url);
   const probe = join(root, 'probe.mjs');
+  // Share the installed-driver regression's isolated candidate seam. The default
+  // still exercises the installed package; candidate runs identify their source.
+  const driverEntry = process.env.PAPERCUSP_POSTGRES_SHUTDOWN_TEST_ENTRY
+    ?? pathToFileURL(require.resolve('postgres')).href;
   writeFileSync(join(root, 'probe.test.ts'), 'test("clean worker", () => expect(true).toBe(true));\n');
   writeFileSync(probe, `
     import { Writable } from 'node:stream';
+    import { registerHooks } from 'node:module';
+    const driverEntry = ${JSON.stringify(driverEntry)};
+    registerHooks({ resolve(specifier, context, next) {
+      return specifier === 'postgres' ? { url: driverEntry, shortCircuit: true } : next(specifier, context);
+    } });
     const { createVitest } = await import(${JSON.stringify(pathToFileURL(require.resolve('vitest/node')).href)});
-    const { default: AdminTestRunsReporter, retainSharedPg, tryGetPg, trackSharedPgOperation } = await import(${JSON.stringify(new URL('./admin-test-runs-reporter.ts', import.meta.url).href)});
+    const { default: AdminTestRunsReporter, retainSharedPg, tryGetPg, trackSharedPgOperation, SHARED_PG_DRAIN_TIMEOUT_MS } = await import(${JSON.stringify(new URL('./admin-test-runs-reporter.ts', import.meta.url).href)});
+    if (SHARED_PG_DRAIN_TIMEOUT_MS !== 2000) throw new Error('reporter bounded-drain contract not loaded');
+    process.stderr.write('PG_SHUTDOWN_SOURCE ' + JSON.stringify({ driverEntry, drainTimeoutMs: SHARED_PG_DRAIN_TIMEOUT_MS }) + '\\n');
     const [root, mode] = process.argv.slice(2);
     let operationPending = false;
     const event = (kind, detail = {}) => console.log(JSON.stringify({ kind, mode, ...detail }));
@@ -80,7 +91,6 @@ it('closes the parent cleanly after either draining or destroying a leased real 
     event('runner-closed');
   `);
   try {
-    for (const mode of ['pending', 'drained']) {
       const blocker = postgres(pg.getConnectionUri(), { max: 1, fetch_types: false, onnotice: () => {} });
       try {
         await blocker.unsafe('SELECT pg_advisory_lock(277023)');
@@ -90,7 +100,8 @@ it('closes the parent cleanly after either draining or destroying a leased real 
           const child = execFile(process.execPath,
             ['--import', require.resolve('tsx'), probe, root, mode],
             { timeout: 45_000, maxBuffer: 1024 * 1024,
-              env: { ...process.env, PAPERCUSP_TEST_RUNS_DB_URL: pg.getConnectionUri() } },
+              env: { ...process.env, PAPERCUSP_TEST_STARTUP_TRACE: '1',
+                PAPERCUSP_TEST_RUNS_DB_URL: pg.getConnectionUri() } },
             (error, stdout, stderr) => error ? reject(Object.assign(error, { stdout, stderr })) : resolve({ stdout, stderr }));
           child.stdout!.on('data', chunk => {
             output += String(chunk);
@@ -107,7 +118,12 @@ it('closes the parent cleanly after either draining or destroying a leased real 
           ? ['test-passed', 'query-pending', 'query-cancelled', 'lease-released', 'runner-closed']
           : ['test-passed', 'query-pending', 'query-settled', 'lease-released', 'runner-closed']);
         expect(result.stderr, JSON.stringify(result)).not.toContain('close timed out');
-        expect(result.stderr).not.toMatch(/Timeout terminating .*worker|Failed to terminate .*worker/);
+        const source = result.stderr.split('\n').find(line => line.startsWith('PG_SHUTDOWN_SOURCE '));
+        expect(source).toBeDefined();
+        expect(JSON.parse(source!.slice('PG_SHUTDOWN_SOURCE '.length)))
+          .toEqual({ driverEntry, drainTimeoutMs: 2000 });
+        expect(result.stderr, JSON.stringify({ mode, ...result }))
+          .not.toMatch(/Timeout terminating .*worker|Failed to terminate .*worker/);
         if (mode === 'pending') {
           expect(records.find(record => record.kind === 'query-cancelled'))
             .toMatchObject({ code: 'CONNECTION_DESTROYED' });
@@ -120,6 +136,5 @@ it('closes the parent cleanly after either draining or destroying a leased real 
         await blocker.unsafe('SELECT pg_advisory_unlock_all()');
         await blocker.end({ timeout: 2 });
       }
-    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 120_000);
