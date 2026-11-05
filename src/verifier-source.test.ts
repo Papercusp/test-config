@@ -154,3 +154,25 @@ describe('full verifier source census', () => {
     expect(result.peakGrowthKiB).toBeLessThan(32 * 1024);
   });
 });
+
+describe('test:file frozen-source provenance labels', () => {
+  it('surfaces a missing receipt without describing it as a Git read failure', async () => {
+    const root = archive();
+    const subject = join(root, 'source.ts');
+    writeFileSync(join(root, '.verifier-source.json'), '{}');
+    writeFileSync(subject, 'export {};');
+    vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', '');
+
+    // @ts-expect-error the executable Node router intentionally has no declaration file
+    const { formatProvenanceBanner, snapshotProvenance } = await import('../../../scripts/test-files.mjs');
+    const snapshot = snapshotProvenance([subject], root);
+    expect(snapshot.provenanceError).toContain('missing independent verifier source receipt');
+    expect(snapshot.entries).toEqual([expect.objectContaining({ path: 'source.ts', state: 'unknown' })]);
+
+    const banner = formatProvenanceBanner(snapshot, 'pre-run');
+    expect(banner).toContain('provenanceError:');
+    expect(banner).toContain('missing independent verifier source receipt');
+    expect(banner).toContain('[state UNKNOWN — provenance could not be determined]');
+    expect(banner).not.toMatch(/git could not be read/i);
+  });
+});
