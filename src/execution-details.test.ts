@@ -18,7 +18,7 @@ import {
 describe('registered per-file Vitest projects', () => {
   it('keeps the DB-free PTY process fixture classified as integration', () => {
     const path = 'apps/operator/lib/psu-pty-host-assume-fence.integration.test.ts';
-    expect(REGISTERED_VITEST_FILE_PROJECTS.find(project => project.files.includes(
+    expect(REGISTERED_VITEST_FILE_PROJECTS.find(project => project.files.some(file => file ===
       'lib/psu-pty-host-assume-fence.integration.test.ts',
     ))).toMatchObject({
       root: 'apps/operator',
@@ -136,6 +136,19 @@ describe('bounded historical measurement contract', () => {
       expect(parseRecordedRubricCheck(check)).toEqual(check);
       expect(parseRecordedRubricCheck({ ...check, provenance: provenance() }))
         .toEqual({ ...check, provenance: provenance() });
+    }
+  });
+  it('roundtrips a scoped scalar without erasing contextual gaps and rejects expanded inputs', () => {
+    for (const value of [7, '9007199254740993', false, null]) {
+      const p = { ...provenance(), truncated: true, gaps: ['diagnostics-truncated'],
+        predicateInput: { path: '$["rows"]["0"]["sample_count"]', value } };
+      const check = { id: 'c:0', rubricRef: 'r', criterionKey: 'c', kind: 'probe', value, unit: null, provenance: p };
+      expect(parseRecordedRubricCheck(check)).toEqual(check);
+      for (const input of [{ path: '$', value: {} }, { path: '$', value: Infinity },
+        { path: '$', value: 'x'.repeat(257) }, { path: '$', value: 7, complete: true },
+        { path: '', value: 7 }, { path: '$' }]) {
+        expect(parseRecordedMeasurementProvenance({ ...p, predicateInput: input })).toBeUndefined();
+      }
     }
   });
   it('rejects malformed, nested, nonfinite, inconsistent and UTF8-over-budget provenance', () => {
