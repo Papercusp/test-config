@@ -387,6 +387,9 @@ export interface RecordedMeasurementProvenance {
   /** Snapshot is sanitized canonical JSON, never an executable replay instruction. */
   procedure: { sha256: string; snapshot: string };
   diagnostics: Array<{ path: string; value: number | string | boolean | null }>;
+  /** Complete, independently scrubbed scalar input; surrounding diagnostics may be partial.
+   * Supports predicate evaluation only, never reconstruction of query/source inputs. */
+  predicateInput?: { path: string; value: number | string | boolean | null };
   truncated: boolean;
   redacted: boolean;
   gaps: Array<typeof MEASUREMENT_PROVENANCE_GAPS[number]>;
@@ -402,7 +405,7 @@ export function measurementJsonBytes(value: unknown): number {
 
 export function parseRecordedMeasurementProvenance(value: unknown): RecordedMeasurementProvenance | undefined {
   if (!isRecord(value) || Object.keys(value).some(key => ![
-    'schemaVersion', 'startedAt', 'finishedAt', 'transactionAt', 'procedure', 'diagnostics', 'truncated', 'redacted', 'gaps',
+    'schemaVersion', 'startedAt', 'finishedAt', 'transactionAt', 'procedure', 'diagnostics', 'predicateInput', 'truncated', 'redacted', 'gaps',
   ].includes(key)) || value.schemaVersion !== 1
     || !isRecordedInstant(value.startedAt) || !isRecordedInstant(value.finishedAt)
     || Date.parse(value.startedAt) > Date.parse(value.finishedAt)
@@ -421,6 +424,15 @@ export function parseRecordedMeasurementProvenance(value: unknown): RecordedMeas
     || !Array.isArray(value.diagnostics) || value.diagnostics.length > 64
     || measurementJsonBytes(value) > MAX_MEASUREMENT_PROVENANCE_BYTES) return undefined;
   try { JSON.parse(value.procedure.snapshot); } catch { return undefined; }
+  if (value.predicateInput !== undefined) {
+    const input = value.predicateInput;
+    if (!isRecord(input) || Object.keys(input).length !== 2
+      || Object.keys(input).some(key => key !== 'path' && key !== 'value')
+      || typeof input.path !== 'string' || !input.path.length || input.path.length > 256
+      || !(input.value === null || typeof input.value === 'boolean'
+        || (typeof input.value === 'number' && Number.isFinite(input.value))
+        || (typeof input.value === 'string' && input.value.length <= 256))) return undefined;
+  }
   const paths = new Set<string>();
   for (const entry of value.diagnostics) {
     if (!isRecord(entry) || Object.keys(entry).length !== 2
