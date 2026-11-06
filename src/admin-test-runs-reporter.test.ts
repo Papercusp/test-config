@@ -12,7 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -3487,6 +3487,37 @@ describe('oversized Git status provenance (EI-26835807023614872)', () => {
 });
 
 describe('runGit failure diagnostics (EI-25879692352233544)', () => {
+  it.skipIf(process.platform === 'win32')('observes Git dirt without refreshing the index even when the caller enables optional locks', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-read-only-git-'));
+    const source = join(root, 'source.ts');
+    vi.stubEnv('GIT_OPTIONAL_LOCKS', '1');
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      writeFileSync(source, 'export const value = 1;\n');
+      execFileSync('git', ['add', 'source.ts'], { cwd: root });
+      execFileSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid',
+        'commit', '-qm', 'initial source'], { cwd: root });
+      const index = join(root, '.git/index');
+      const originalIndex = readFileSync(index);
+      // Change only the cached stat data. Ordinary status refreshes the index;
+      // a provenance observer must leave it untouched while checking the bytes.
+      const changedTime = new Date(Date.now() + 2_000);
+      utimesSync(source, changedTime, changedTime);
+      expect(await runGit('git status --porcelain --untracked-files=all', root, 5_000)).toBe('');
+      expect(readFileSync(index)).toEqual(originalIndex);
+
+      writeFileSync(source, 'export const value = 2;\n');
+      writeFileSync(join(root, 'untracked.ts'), 'new source\n');
+      const output = await runGit('git status --porcelain --untracked-files=all', root, 5_000);
+      expect(output).toContain('M source.ts');
+      expect(output).toContain('?? untracked.ts');
+      expect(readFileSync(index)).toEqual(originalIndex);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(process.platform === 'win32').each(['stdout', 'stderr'] as const)(
     'bounds %s while terminating the command without throwing (EI-26096532443968552)', async stream => {
       const failures: string[] = [];

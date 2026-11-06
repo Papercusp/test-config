@@ -144,7 +144,9 @@ function stop(reason) {
 try {
   child = spawn(cmd, { cwd, shell: true, detached: true,
     stdio: traceGit ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
-    ...(traceGit ? { env: { ...process.env, GIT_TRACE2_EVENT: '3' } } : {}),
+    // Provenance reads must not refresh indexes in the root or its submodules.
+    // Their deadline can SIGKILL Git while an optional index lock is held.
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', ...(traceGit ? { GIT_TRACE2_EVENT: '3' } : {}) },
   });
   if (child.pid) parentPort.postMessage({ type: 'spawned', pid: child.pid });
   if (traceGit) {
