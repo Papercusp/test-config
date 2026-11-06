@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, symlinkSync,
   truncateSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { readVerifierSourceReceipt, verifierSourceFiles, verifyVerifierSourceSync, type VerifierSourceProgress } from './verifier-source.ts';
 
 const directories: string[] = [];
@@ -19,6 +19,54 @@ afterEach(() => {
 });
 
 describe('full verifier source census', () => {
+  it.each([
+    'papercusp-desktop/src-tauri/resources/workbench@papercusp.ai.shell-extension.zip',
+    'papercusp-desktop/src-tauri/resources/workbench-install.js',
+  ])('admits only independent unrecorded Workbench build output: %s', artifact => {
+    const root = archive();
+    writeFileSync(join(root, 'source.ts'), 'export {};');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    const output = join(root, artifact);
+    mkdirSync(dirname(output), { recursive: true });
+    writeFileSync(output, 'generated Workbench resource');
+    expect(() => verifyVerifierSourceSync(root, receipt)).toThrow(`added ${artifact}`);
+    expect(verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true })).toEqual(receipt);
+    rmSync(output);
+    symlinkSync(join(root, 'source.ts'), output);
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true }))
+      .toThrow('runtime artifact is not an independent file');
+    rmSync(output);
+    writeFileSync(output, 'rebuilt Workbench resource');
+    const unexpected = artifact + '.unexpected';
+    writeFileSync(join(root, unexpected), 'unexpected source');
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true }))
+      .toThrow(`added ${unexpected}`);
+    rmSync(join(root, unexpected));
+    writeFileSync(join(root, 'source.ts'), 'changed source');
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true }))
+      .toThrow('changed source.ts');
+  });
+
+  it.each([
+    'papercusp-desktop/src-tauri/resources/workbench@papercusp.ai.shell-extension.zip',
+    'papercusp-desktop/src-tauri/resources/workbench-install.js',
+  ])('keeps previously recorded Workbench resources immutable: %s', artifact => {
+    const root = archive();
+    const output = join(root, artifact);
+    mkdirSync(dirname(output), { recursive: true });
+    writeFileSync(output, 'recorded resource');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    writeFileSync(output, 'changed recorded resource');
+    expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true }))
+      .toThrow(`changed ${artifact}`);
+  });
+
   it('relays async census progress without treating it as a completed receipt', async () => {
     const root = archive();
     writeFileSync(join(root, 'source.ts'), 'export {};');

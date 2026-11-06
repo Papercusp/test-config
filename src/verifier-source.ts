@@ -220,6 +220,11 @@ export function verifierSourceFiles(root: string, {
         'apps/operator/public/vad.worklet.bundle.min.js',
         // Native build wrappers create this exact regular flock file.
         'papercusp-desktop/src-tauri/sidecar.lock',
+        // build.rs stages these exact resources from native/gnome and
+        // native/linux. Exporters strip stale generated copies before sealing
+        // an archive; an already recorded resource must still stay immutable.
+        'papercusp-desktop/src-tauri/resources/workbench@papercusp.ai.shell-extension.zip',
+        'papercusp-desktop/src-tauri/resources/workbench-install.js',
         // build.rs creates these exact placeholders on a clean native build.
         'papercusp-desktop/src-tauri/sidecar/PLACEHOLDER-README.txt',
         'papercusp-desktop/src-tauri/sidecar/db-sql/PLACEHOLDER-README.txt',
