@@ -23,13 +23,14 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import postgres from 'postgres';
 import { cleanupOwnedTestDatabases } from './owned-test-db-cleanup.ts';
 import {
   createFreshTestDb,
+  dropDatabaseOnDedicatedConnection,
   dropDatabaseWithLock,
   getOrBuildTemplate,
   TEST_DB_DROP_LOCK_KEY,
@@ -86,6 +87,45 @@ async function adminClient(): Promise<postgres.Sql> {
   cleanupClients.push(sql);
   return sql;
 }
+
+it('retains the receipt filesystem error and confirms cleanup after registration fails', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pg-receipt-error-'));
+  const blocked = join(dir, 'not-a-directory');
+  writeFileSync(blocked, 'occupied');
+  const previousDir = process.env.PAPERCUSP_TEST_OWNED_DB_DIR;
+  const previousRun = process.env.PAPERCUSP_TEST_RUN_GROUP;
+  const registry = join(dir, 'registry');
+  vi.stubEnv('PAPERCUSP_TEST_OWNED_DB_DIR', registry);
+  vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'receipt-write-error');
+  let name = '';
+  try {
+    const failed = createFreshTestDb({ prefix: 'receipt', provision: async url => {
+      name = new URL(url).pathname.slice(1);
+      // Initial ownership registration and CREATE succeeded. Only the second
+      // receipt write fails, matching the production fixture failure boundary.
+      vi.stubEnv('PAPERCUSP_TEST_OWNED_DB_DIR', blocked);
+    } });
+    await expect(failed).rejects.toMatchObject({
+      message: expect.stringMatching(/ownership receipt failed; cleanup=dropped; EEXIST: .*file already exists/),
+      cause: expect.objectContaining({ code: 'EEXIST' }),
+    });
+    const sql = await adminClient();
+    expect(await sql`SELECT datname FROM pg_database WHERE datname=${name}`).toEqual([]);
+  } finally {
+    try {
+      // Settle the retained first registration while its actual endpoint is
+      // still alive; the outer private cluster must not inherit this receipt.
+      vi.stubEnv('PAPERCUSP_TEST_OWNED_DB_DIR', registry);
+      const cleanup = await cleanupOwnedTestDatabases({ dir: registry, runId: 'receipt-write-error',
+        deadlineAtMs: Date.now() + 10_000, drop: dropDatabaseOnDedicatedConnection });
+      expect(cleanup.complete).toBe(true);
+    } finally {
+      vi.stubEnv('PAPERCUSP_TEST_OWNED_DB_DIR', previousDir);
+      vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', previousRun);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
 
 afterAll(async () => {
   try {

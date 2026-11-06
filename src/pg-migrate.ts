@@ -30,6 +30,7 @@ import path from 'node:path';
 import postgres from 'postgres';
 import { getTestPg } from './pg-container.ts';
 import { assertOwnedTestDatabaseName, GENERATED_TEST_DB_NAME_PATTERN, registerOwnedTestDatabase } from './owned-test-db-cleanup.ts';
+import { redactSensitiveText } from './sensitive-text.ts';
 
 export interface MigratedTestDb {
   /** Connection URL for the freshly-provisioned database. Open your own client against it. */
@@ -1148,7 +1149,11 @@ async function recordedFreshTestDb(url: string, name: string, adminUri: string):
     record = registerOwnedTestDatabase(name, adminUri);
   } catch (cause) {
     const outcome = await dropDatabaseOnDedicatedConnection(adminUri, name);
-    throw new Error(`test database ownership receipt failed; cleanup=${outcome}`, { cause });
+    // Suite-collection reporters retain the message but can discard Error.cause.
+    // Keep the filesystem diagnostic visible without leaking private endpoints.
+    const code = (cause as NodeJS.ErrnoException | null)?.code;
+    const detail = redactSensitiveText(cause instanceof Error ? cause.message : String(cause));
+    throw new Error(`test database ownership receipt failed; cleanup=${outcome}; ${code ? `${code}: ` : ''}${detail}`, { cause });
   }
   const dropWithResult = async (options?: DropDatabaseWithLockOptions): Promise<TestDbDropResult> => {
     try {
