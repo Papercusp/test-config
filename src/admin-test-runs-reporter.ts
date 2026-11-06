@@ -1877,7 +1877,7 @@ function isTestRunReceipt(value: unknown): value is TestRunReceipt {
     typeof receipt.reason === 'string' && typeof receipt.replayable === 'boolean';
 }
 
-function latestTestRunReceipts(receiptLog: string): TestRunReceipt[] {
+export function latestTestRunReceipts(receiptLog: string, forReadback = false): TestRunReceipt[] {
   const latest = new Map<string, TestRunReceipt>();
   for (const line of receiptLog.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -1886,6 +1886,13 @@ function latestTestRunReceipts(receiptLog: string): TestRunReceipt[] {
     if (!isTestRunReceipt(parsed)) continue;
     const prior = latest.get(parsed.receiptId);
     if (prior?.outcome === 'inserted') continue;
+    // Destroying a connection after its waiter timed out does not prove that
+    // PostgreSQL rolled the INSERT back. Preserve that same attempt's timeout
+    // only for exact canonical readback; ordinary receipt readers still report
+    // the latest failure until a unique matching ledger row is observed.
+    if (forReadback && prior?.outcome === 'timeout' && parsed.outcome === 'failed'
+      && parsed.attempt === prior.attempt && parsed.errorCode === 'CONNECTION_DESTROYED'
+      && !parsed.replayable) continue;
     if (parsed.outcome === 'inserted' || !prior || parsed.attempt >= prior.attempt) latest.set(parsed.receiptId, parsed);
   }
   return [...latest.values()];
@@ -2032,7 +2039,7 @@ export async function reconcileTimedOutTestRunReceipts(
   const runGroupId = options.runGroupId?.trim();
   if (!runGroupId || !isAbsolute(options.expectedRoot) || options.expectedPaths.length === 0) return [];
   const missingPaths = new Set(options.expectedPaths.map(path => path.replaceAll('\\', '/')));
-  const timedOutReceipts = latestTestRunReceipts(receiptLog).filter(receipt => {
+  const timedOutReceipts = latestTestRunReceipts(receiptLog, true).filter(receipt => {
     if (receipt.outcome !== 'timeout'
       || receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
     const expectedPath = testRunReceiptPathForRoot(receipt, options.expectedRoot);

@@ -42,6 +42,7 @@ import AdminTestRunsReporter, {
   isDefinitePreSubmitFailure,
   isMissingConfigurationSnapshotColumn,
   missingTestRunReceiptPaths,
+  latestTestRunReceipts,
   recoverTimedOutTestRunReceipts,
   readRunConfigRoot,
   setRunRoot,
@@ -1439,6 +1440,49 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         expect(recoverTimedOutTestRunReceipts([receipt], [candidate], 'group-a')).toEqual([{
           ...base, outcome: 'inserted', id: '901',
         }]);
+      });
+
+      it('recovers a committed row after the same timed-out connection was destroyed', () => {
+        const failed: TestRunReceipt = { ...receipt, outcome: 'failed',
+          reason: 'write CONNECTION_DESTROYED localhost:5432',
+          errorCode: 'CONNECTION_DESTROYED', replayable: false };
+        const log = [receipt, failed].map(value => JSON.stringify(value)).join('\n');
+        expect(missingTestRunReceiptPaths(log, ['a.test.ts'], details.root)).toEqual(['a.test.ts']);
+        const eligible = latestTestRunReceipts(log, true);
+        expect(recoverTimedOutTestRunReceipts(eligible, [candidate], 'group-a')).toEqual([
+          { ...base, outcome: 'inserted', id: '901' },
+        ]);
+        expect(recoverTimedOutTestRunReceipts(eligible, [
+          { ...candidate, commitSha: 'other' },
+        ], 'group-a')).toEqual([]);
+        expect(recoverTimedOutTestRunReceipts(eligible, [
+          candidate, { ...candidate, id: '902' },
+        ], 'group-a')).toEqual([]);
+      });
+
+      it.each([
+        ['a definite pre-submit failure', { errorCode: 'CONNECT_TIMEOUT', replayable: true }],
+        ['a database rejection', { errorCode: '23514', replayable: false }],
+        ['a newer attempt', { errorCode: 'CONNECTION_DESTROYED', replayable: false, attempt: 1 }],
+      ])('does not recover the older timeout after %s', (_label, change) => {
+        const failed: TestRunReceipt = { ...receipt, outcome: 'failed', reason: 'write failed',
+          ...change };
+        const log = [receipt, failed].map(value => JSON.stringify(value)).join('\n');
+        expect(recoverTimedOutTestRunReceipts(
+          latestTestRunReceipts(log, true), [candidate], 'group-a',
+        )).toEqual([]);
+      });
+
+      it('never revives a failed-only or already inserted receipt for readback', () => {
+        const failed: TestRunReceipt = { ...receipt, outcome: 'failed', reason: 'connection destroyed',
+          errorCode: 'CONNECTION_DESTROYED', replayable: false };
+        const inserted: TestRunReceipt = { ...base, outcome: 'inserted', id: '901' };
+        for (const history of [[failed], [receipt, inserted, failed]]) {
+          expect(recoverTimedOutTestRunReceipts(
+            latestTestRunReceipts(history.map(value => JSON.stringify(value)).join('\n'), true),
+            [candidate], 'group-a',
+          )).toEqual([]);
+        }
       });
 
       it.each([
