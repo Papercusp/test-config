@@ -1429,6 +1429,7 @@ function isInterimFlushStatus(status: TestRunRow['status']): boolean {
 // standalone tsc across the 22 workspaces that inherit this reporter).
 export type PgSql = {
   (strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown>;
+  (values: readonly string[]): unknown;
   (rows: readonly Record<string, unknown>[], ...columns: string[]): unknown;
   array(values: readonly string[]): unknown;
   end(opts?: { timeout?: number }): Promise<unknown>;
@@ -1935,7 +1936,7 @@ export type TestRunReceiptReadbackCandidate = {
   filePath: string;
   framework: string;
   status: string;
-  durationMs: number;
+  durationMs: number | string;
   startedAt: Date | string;
   finishedAt: Date | string;
   commitSha: string | null;
@@ -1970,6 +1971,10 @@ function matchesTestRunReceiptReadback(
   const details = row.executionDetails as unknown as Record<string, unknown> | null | undefined;
   const startedAt = receiptTimestamp(row.startedAt);
   const finishedAt = receiptTimestamp(row.finishedAt);
+  // postgres.js returns duration_ms (bigint) as text; preserve exact integer identity.
+  const durationMs = typeof candidate.durationMs === 'string'
+    ? /^(0|[1-9]\d*)$/.test(candidate.durationMs) ? Number(candidate.durationMs) : NaN
+    : candidate.durationMs;
   if (!details || receipt.filePath !== row.filePath || receipt.status !== row.status
     || details.runGroupId !== runGroupId || details.filePath !== row.filePath
     || typeof details.root !== 'string' || !isAbsolute(details.root)
@@ -1982,7 +1987,7 @@ function matchesTestRunReceiptReadback(
     || candidate.runGroupId !== runGroupId || candidate.detailsRunGroupId !== runGroupId
     || candidate.filePath !== row.filePath || candidate.detailsFilePath !== row.filePath
     || candidate.framework !== (row.framework ?? 'vitest') || candidate.status !== row.status
-    || candidate.durationMs !== row.durationMs
+    || !Number.isSafeInteger(durationMs) || durationMs !== row.durationMs
     || receiptTimestamp(candidate.startedAt) !== startedAt
     || receiptTimestamp(candidate.finishedAt) !== finishedAt
     || candidate.commitSha !== row.commitSha || candidate.detailsCommitSha !== row.commitSha
@@ -2051,7 +2056,6 @@ export async function reconcileTimedOutTestRunReceipts(
   const pg = await tryGetPg();
   if (!pg) return [];
   try {
-    if (typeof pg.sql.array !== 'function') return [];
     const filePaths = [...new Set(timedOutReceipts.map(receipt => receipt.row.filePath))];
     const maxRows = Math.min(TEST_RUN_RECEIPT_READBACK_MAX_ROWS, timedOutReceipts.length * 2 + 1);
     let readbacks: unknown = [];
@@ -2077,8 +2081,8 @@ export async function reconcileTimedOutTestRunReceipts(
           execution_details->>'harnessSlug' AS "detailsHarnessSlug",
           execution_details->>'workspaceId' AS "detailsWorkspaceId"
         FROM harness_shared.test_runs
-        WHERE run_group_id = ANY(${pg.sql.array([runGroupId])})
-          AND file_path = ANY(${pg.sql.array(filePaths)})
+        WHERE run_group_id = ${runGroupId}
+          AND file_path IN ${pg.sql(filePaths)}
         ORDER BY id
         LIMIT ${maxRows}
       `;

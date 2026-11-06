@@ -1442,6 +1442,24 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         }]);
       });
 
+      it('recovers PostgreSQL bigint durations without weakening the run identity', () => {
+        const readback = { ...candidate, durationMs: '1' };
+        expect(recoverTimedOutTestRunReceipts([receipt], [readback], 'group-a')).toEqual([
+          { ...base, outcome: 'inserted', id: '901' },
+        ]);
+        expect(recoverTimedOutTestRunReceipts([receipt], [
+          { ...readback, detailsCommitSha: 'other' },
+        ], 'group-a')).toEqual([]);
+      });
+
+      it.each(['2', '-1', '1.0', '1e0', '0x1', ' 1', '', '9007199254740993'])(
+        'keeps the timeout for a different or invalid bigint duration %j', durationMs => {
+          expect(recoverTimedOutTestRunReceipts([receipt], [
+            { ...candidate, durationMs },
+          ], 'group-a')).toEqual([]);
+        },
+      );
+
       it('recovers a committed row after the same timed-out connection was destroyed', () => {
         const failed: TestRunReceipt = { ...receipt, outcome: 'failed',
           reason: 'write CONNECTION_DESTROYED localhost:5432',

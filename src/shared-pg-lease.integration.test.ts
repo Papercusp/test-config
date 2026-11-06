@@ -21,6 +21,57 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(async () => { await pg?.stop(); }, 30_000);
 
+it('recovers an exact timed-out receipt through real PG array and bigint decoding', async () => {
+  const require = createRequire(import.meta.url);
+  const script = `
+    const rep = await import(${JSON.stringify(new URL('./admin-test-runs-reporter.ts', import.meta.url).href)});
+    const handle = await rep.tryGetPg();
+    if (!handle) throw new Error('real reporter client unavailable');
+    try {
+      await handle.sql.unsafe('CREATE SCHEMA harness_shared; CREATE TABLE harness_shared.test_runs (' +
+        'id bigserial PRIMARY KEY, run_group_id text, file_path text, framework text, status text, ' +
+        'duration_ms bigint, started_at timestamptz, finished_at timestamptz, commit_sha text, ' +
+        'harness_slug text, workspace_id text, is_scratch_config boolean, worktree_dirty boolean, execution_details jsonb)');
+      const at = new Date('2026-11-06T00:00:00.000Z');
+      const details = { root: '/workspace/receipt-readback', filePath: 'guard.test.ts',
+        runGroupId: 'receipt-group', commitSha: 'a'.repeat(40), harnessSlug: 'test', workspaceId: 'test' };
+      const base = rep.testRunReceiptBaseFor({ filePath: details.filePath, status: 'pass', durationMs: 17,
+        startedAt: at, finishedAt: at, outputTail: null, isScratchConfig: false, worktreeDirty: false,
+        commitSha: details.commitSha, executionDetails: details });
+      const receipt = { ...base, outcome: 'timeout', reason: 'pg_insert_timeout_25000ms', replayable: false };
+      const insert = () => handle.sql\`INSERT INTO harness_shared.test_runs
+        (run_group_id, file_path, framework, status, duration_ms, started_at, finished_at, commit_sha,
+          harness_slug, workspace_id, is_scratch_config, worktree_dirty, execution_details)
+        VALUES (\${details.runGroupId}, \${details.filePath}, 'vitest', 'pass', 17, \${at}, \${at},
+          \${details.commitSha}, 'test', 'test', false, false, \${handle.sql.json(details)}) RETURNING id::text\`;
+      const [inserted] = await insert();
+      // Keep this test's client alive across the reader's normal unheld-client cleanup.
+      const release = rep.retainSharedPg();
+      try {
+        const options = { expectedPaths: [details.filePath], expectedRoot: details.root,
+          runGroupId: details.runGroupId, env: {} };
+        const read = value => rep.reconcileTimedOutTestRunReceipts(JSON.stringify(value), options);
+        const recovered = await read(receipt);
+        const wrongCommit = await read({ ...receipt, row: { ...receipt.row, commitSha: 'b'.repeat(40),
+          executionDetails: { ...details, commitSha: 'b'.repeat(40) } } });
+        await insert();
+        const ambiguous = await read(receipt);
+        console.log(JSON.stringify({ inserted: inserted.id, recovered: recovered.map(row => row.id),
+          wrongCommit: wrongCommit.map(row => row.id), ambiguous: ambiguous.map(row => row.id) }));
+      } finally { await release(); }
+    } finally { await rep.closeSharedPg(); }
+  `;
+  const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    execFile(process.execPath, ['--import', require.resolve('tsx'), '--input-type=module', '-e', script],
+      { timeout: 45_000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, PAPERCUSP_TEST_RUNS_DB_URL: pg.getConnectionUri() } },
+      (error, stdout, stderr) => error ? reject(Object.assign(error, { stdout, stderr })) : resolve({ stdout, stderr }));
+  });
+  const measured = JSON.parse(result.stdout.trim());
+  expect(measured).toEqual({ inserted: expect.any(String), recovered: [measured.inserted],
+    wrongCommit: [], ambiguous: [] });
+}, 60_000);
+
 it.each(['pending', 'drained'] as const)('closes the parent cleanly with a %s leased real PG query', async mode => {
   const root = mkdtempSync(join(tmpdir(), 'shared-pg-parent-close-'));
   const require = createRequire(import.meta.url);
