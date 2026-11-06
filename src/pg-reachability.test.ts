@@ -155,14 +155,20 @@ describe("assertPgReachable — EI-2627", () => {
     expect(unsafe).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps EI-2627 guidance for retryable startup failures", async () => {
-    unsafe.mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:5432"));
-    const rejection = assertPgReachable("postgres://x", "myFixture", 500)
+  it.each([
+    ['postgres://user:private-password@localhost:32773/org_clone', 'localhost:32773/org_clone'],
+    ['postgres://user:private-password@localhost:32774/papercusp_it', 'localhost:32774/papercusp_it'],
+    ['postgres://user:private-password@native-host/native_fixture', 'native-host:5432/native_fixture'],
+  ])("identifies the actual failed endpoint without assuming its lifecycle: %s", async (dsn, endpoint) => {
+    unsafe.mockRejectedValue(new Error("write CONNECT_TIMEOUT"));
+    const rejection = assertPgReachable(dsn, "myFixture", 500)
       .then(() => null, (error: unknown) => error as Error);
     await vi.runAllTimersAsync();
     const error = await rejection;
     expect(error).toBeInstanceOf(Error);
-    expect(error?.message).toMatch(/myFixture.*EI-2627.*docker ps/s);
+    expect(error?.message).toContain(`myFixture: integration Postgres at ${endpoint} is unreachable`);
+    expect(error?.message).toContain('write CONNECT_TIMEOUT');
+    expect(error?.message).not.toMatch(/private-password|shared baseline|reaped|recycled|NOT a code regression|CI is unaffected/);
     expect(unsafe).toHaveBeenCalledTimes(2);
   });
 });

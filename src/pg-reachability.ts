@@ -105,10 +105,9 @@ function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<vo
 }
 
 /**
- * `probePgReachable` and throw class-specific actionable guidance. Retryable
- * startup/recovery failures retain the EI-2627 local-container diagnosis;
- * non-retryable connection/setup errors (such as authentication or a missing
- * database) fail fast with DSN guidance instead of being labeled container churn.
+ * `probePgReachable` and report the selected endpoint without credentials.
+ * Retryability describes the error class, not the server's lifecycle: callers
+ * include private clones and injected native servers as well as the baseline.
  */
 export async function assertPgReachable(
   dsn: string,
@@ -117,19 +116,20 @@ export async function assertPgReachable(
 ): Promise<void> {
   const result = await probePgReachable(dsn, budgetMs);
   if (result.ok) return;
+  const target = new URL(dsn);
+  const endpoint = `${target.hostname}:${target.port || '5432'}${target.pathname}`;
   const lastError = result.lastError ?? 'unknown Postgres connection error';
   if (RETRYABLE_MSG.test(lastError)) {
     throw new Error(
-      `${label}: the integration baseline Postgres is unreachable after ${result.elapsedMs}ms of startup retry ` +
-        `(${lastError}). This is very likely EI-2627 — local box/testcontainer churn reaped or ` +
-        `recycled the shared baseline-schema container (pgvector/pgvector:pg18, db "papercusp_it") — NOT a ` +
-        `code regression. Check \`docker ps\` for a live papercusp_it container and re-run; CI is unaffected.`,
+      `${label}: integration Postgres at ${endpoint} is unreachable after ${result.elapsedMs}ms of startup retry ` +
+        `(${lastError}). Verify this endpoint is reachable and accepting connections; ` +
+        `inspect the selected server's lifecycle and logs.`,
     );
   }
   throw new Error(
-    `${label}: the integration baseline Postgres probe failed fast on a non-retryable error ` +
+    `${label}: integration Postgres at ${endpoint} failed fast on a non-retryable error ` +
       `(${lastError}). This failure is not retried. ` +
-      `Verify the injected DSN credentials/database and confirm it points at the container selected by global setup.`,
+      `Verify the injected DSN credentials/database and confirm this is the server selected by the fixture.`,
   );
 }
 
