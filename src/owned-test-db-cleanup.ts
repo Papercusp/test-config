@@ -1,5 +1,5 @@
 /** Durable ownership for the maintained runner's test databases. No PG is started here. */
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DropDatabaseWithLockOptions, TestDbDropResult } from './pg-migrate.ts';
@@ -81,11 +81,63 @@ export interface OwnedTestDbCleanupResult {
   complete: boolean;
   databases: Array<{ name: string; outcome: OwnedTestDatabase['outcome'] }>;
   errors: string[];
+  /** Read-only observations of child owners, never attempts to reopen their servers. */
+  scopes?: Array<OwnedTestDbCleanupResult & { path: string }>;
+}
+
+function readOwnedDatabase(dir: string, file: string, runId: string): OwnedTestDatabase {
+  const path = join(dir, file);
+  if (!lstatSync(path).isFile()) throw new Error('database receipt is not an unlinked regular file');
+  const record: OwnedTestDatabase = JSON.parse(readFileSync(path, 'utf8'));
+  if (record.runId !== runId || registryPath(dir, record.name) !== path) {
+    throw new Error('database ownership does not match this run');
+  }
+  if (typeof record.adminUri !== 'string') throw new Error('missing private database endpoint');
+  return record;
+}
+
+/** A child cluster cleans its own endpoint before stopping it. The run owner
+ * only reads its retained receipts: retrying a child DROP here is too late. */
+function observeNestedScopes(dir: string, runId: string, deadlineAtMs: number): NonNullable<OwnedTestDbCleanupResult['scopes']> {
+  const scopes: NonNullable<OwnedTestDbCleanupResult['scopes']> = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.name.startsWith('private-pg-')) continue;
+    const scope: (typeof scopes)[number] = { path: entry.name, complete: false, databases: [], errors: [] };
+    scopes.push(scope);
+    try {
+      if (!entry.isDirectory()) throw new Error('private database scope is not an unlinked directory');
+      if (Date.now() >= deadlineAtMs) throw new Error('nested scope observation exceeded cleanup deadline');
+      const child = join(dir, entry.name);
+      for (const file of readdirSync(child).filter(name => name.endsWith('.json')).sort()) {
+        const record = readOwnedDatabase(child, file, runId);
+        scope.databases.push({ name: record.name, outcome: record.outcome });
+      }
+      const receipt = join(child, 'cleanup.jsonl');
+      if (!lstatSync(receipt).isFile()) throw new Error('cleanup receipt is not an unlinked regular file');
+      const lines = readFileSync(receipt, 'utf8').trim().split('\n');
+      const last = JSON.parse(lines.at(-1)!);
+      if (last.kind !== 'owned-test-db-cleanup' || last.runId !== runId || last.stage !== 'complete'
+          || last.complete !== true || !Array.isArray(last.errors) || last.errors.length !== 0
+          || !Array.isArray(last.databases) || last.databases.length !== scope.databases.length
+          || !scope.databases.every(db => db.outcome === 'dropped'
+            && last.databases.some((saved: { name?: string; outcome?: string }) => saved.name === db.name && saved.outcome === 'dropped'))) {
+        throw new Error('nested owner has no matching confirmed database cleanup receipt');
+      }
+      const nested = observeNestedScopes(child, runId, deadlineAtMs);
+      if (nested.length) scope.scopes = nested;
+      scope.complete = nested.every(item => item.complete);
+    } catch (cause) {
+      scope.errors.push(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+  return scopes;
 }
 
 /** Reap only this run's recorded databases after its writers have confirmed close.
  * A wait deadline does not cancel a server-side DROP. Its late result remains
- * observed and updates the same retained receipt. */
+ * observed and updates the same retained receipt. Without an endpoint pin this
+ * is the run finalizer, which also observes all nested owners without dropping
+ * their databases. An endpoint-pinned owner reports only its own cluster. */
 export async function cleanupOwnedTestDatabases(options: {
   dir: string; runId: string; deadlineAtMs: number; drop: Drop;
   /** When the owning cluster stops next, refuse records for any other server. */
@@ -104,11 +156,7 @@ export async function cleanupOwnedTestDatabases(options: {
   for (const file of readdirSync(options.dir).filter(name => name.endsWith('.json')).sort()) {
     let record: OwnedTestDatabase;
     try {
-      record = JSON.parse(readFileSync(join(options.dir, file), 'utf8'));
-      if (record.runId !== options.runId || registryPath(options.dir, record.name) !== join(options.dir, file)) {
-        throw new Error('database ownership does not match this run');
-      }
-      if (typeof record.adminUri !== 'string') throw new Error('missing private database endpoint');
+      record = readOwnedDatabase(options.dir, file, options.runId);
       if (options.adminUri) {
         const expected = new URL(options.adminUri);
         const actual = new URL(record.adminUri);
@@ -155,6 +203,13 @@ export async function cleanupOwnedTestDatabases(options: {
     result.databases.push({ name: record.name, outcome: record.outcome });
   }
   result.complete = result.errors.length === 0 && result.databases.every(db => db.outcome === 'dropped');
+  if (!options.adminUri) {
+    const scopes = observeNestedScopes(options.dir, options.runId, options.deadlineAtMs);
+    if (scopes.length) {
+      result.scopes = scopes;
+      result.complete = result.complete && scopes.every(scope => scope.complete);
+    }
+  }
   observe('*', result.complete ? 'complete' : 'retained', { ...result });
   result.complete = result.complete && result.errors.length === 0;
   return result;

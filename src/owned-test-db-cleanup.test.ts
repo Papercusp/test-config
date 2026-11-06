@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, readFileSync, rmSync, statSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { cleanupOwnedTestDatabases, createOwnedTestDatabaseScope, registerOwnedTestDatabase } from './owned-test-db-cleanup';
 
@@ -84,6 +84,70 @@ describe('maintained owned database cleanup', () => {
     expect(drop).not.toHaveBeenCalled();
     expect(readFileSync(join(dir, 'cleanup.jsonl'), 'utf8')).not.toContain('postgres://');
   });
+
+  it('keeps failed nested cleanup visible without reopening its stopped endpoint', async () => {
+    const { dir, env } = fixture();
+    const childDir = createOwnedTestDatabaseScope(env)!;
+    const childEnv = { ...env, PAPERCUSP_TEST_OWNED_DB_DIR: childDir };
+    const record = registerOwnedTestDatabase('org_abcdef012345', 'postgres://private@localhost:41236/postgres', childEnv);
+    await cleanupOwnedTestDatabases({ dir: childDir, runId: 'run-a', adminUri: 'postgres://private@localhost:41236/postgres',
+      deadlineAtMs: Date.now() + 1000, drop: async () => { throw new Error('the database system is shutting down'); } });
+    const original = readFileSync(join(childDir, 'org_abcdef012345.json'), 'utf8');
+    const drop = vi.fn();
+    const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop });
+    expect(result).toMatchObject({ complete: false, databases: [], errors: [], scopes: [{ path: basename(childDir),
+      complete: false, databases: [{ name: 'org_abcdef012345', outcome: 'error' }] }] });
+    expect(drop).not.toHaveBeenCalled();
+    expect(readFileSync(join(childDir, 'org_abcdef012345.json'), 'utf8')).toBe(original);
+    expect(readFileSync(join(dir, 'cleanup.jsonl'), 'utf8')).not.toContain('postgres://');
+    // A late result alone cannot erase the owner's retained/unconfirmed receipt.
+    record('dropped');
+    expect((await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop })).complete).toBe(false);
+    await cleanupOwnedTestDatabases({ dir: childDir, runId: 'run-a', adminUri: 'postgres://private@localhost:41236/postgres',
+      deadlineAtMs: Date.now() + 1000, drop });
+    expect((await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop })).complete).toBe(true);
+    expect(drop).not.toHaveBeenCalled();
+  });
+
+  it('aggregates a failed grandchild while endpoint-pinned owners remain isolated', async () => {
+    const { dir, env } = fixture();
+    const childDir = createOwnedTestDatabaseScope(env)!;
+    const grandchildDir = createOwnedTestDatabaseScope({ ...env, PAPERCUSP_TEST_OWNED_DB_DIR: childDir })!;
+    const drop = vi.fn();
+    const child = await cleanupOwnedTestDatabases({ dir: childDir, runId: 'run-a', adminUri: 'postgres://private@localhost:41236/postgres',
+      deadlineAtMs: Date.now() + 1000, drop });
+    expect(child.complete).toBe(true);
+    const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop });
+    expect(result).toMatchObject({ complete: false, scopes: [{ path: basename(childDir), complete: false,
+      scopes: [{ path: basename(grandchildDir), complete: false }] }] });
+    expect(drop).not.toHaveBeenCalled();
+  });
+
+  it.each(['missing', 'malformed', 'foreign', 'linked', 'expired'] as const)(
+    'withholds run cleanup for a %s nested owner receipt', async mode => {
+      const { dir, env } = fixture();
+      const childDir = createOwnedTestDatabaseScope(env)!;
+      const drop = vi.fn();
+      await cleanupOwnedTestDatabases({ dir: childDir, runId: 'run-a', adminUri: 'postgres://private@localhost:41236/postgres',
+        deadlineAtMs: Date.now() + 1000, drop });
+      const receipt = join(childDir, 'cleanup.jsonl');
+      const original = readFileSync(receipt, 'utf8');
+      if (mode === 'missing') rmSync(receipt);
+      if (mode === 'malformed') writeFileSync(receipt, '{');
+      if (mode === 'foreign') writeFileSync(receipt, original.replaceAll('run-a', 'run-b'));
+      if (mode === 'linked') {
+        rmSync(childDir, { recursive: true });
+        const foreign = fixture().dir;
+        writeFileSync(join(foreign, 'cleanup.jsonl'), original);
+        symlinkSync(foreign, childDir);
+      }
+      const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a',
+        deadlineAtMs: Date.now() + (mode === 'expired' ? -1 : 1000), drop });
+      expect(result).toMatchObject({ complete: false, scopes: [{ path: basename(childDir), complete: false }] });
+      expect(result.scopes![0]!.errors.length).toBeGreaterThan(0);
+      expect(drop).not.toHaveBeenCalled();
+    },
+  );
 
   it('refuses a foreign server before connecting and cleans only the pinned private server', async () => {
     const { dir, env } = fixture();
