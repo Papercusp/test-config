@@ -33,7 +33,12 @@
 export {}; // mark this a module (not a script) so top-level `await` below typechecks (TS1375)
 
 try {
-  const { configure } = await import('@testing-library/dom');
+  // Keep the optional specifier in a variable: Vite resolves literal dynamic
+  // imports during transform, before this catch can handle a missing package.
+  const testingLibraryDomSpecifier: string = '@testing-library/dom';
+  const { configure } = await import(
+    /* @vite-ignore */ /* turbopackIgnore: true */ /* webpackIgnore: true */ testingLibraryDomSpecifier
+  );
   configure({ asyncUtilTimeout: 5_000 });
 } catch {
   // @testing-library/dom not on this package's dependency graph — nothing to configure.
