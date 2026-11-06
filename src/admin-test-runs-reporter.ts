@@ -2756,6 +2756,9 @@ export default class AdminTestRunsReporter implements Reporter {
   private interimFlush: Promise<void> | null = null;
   /** A flush deadline does not cancel the underlying writer. Keep its ownership until settlement. */
   private pendingWrite: Promise<void> | null = null;
+  /** Provenance uses the same source-reader lifecycle as a final pass flush.
+   * A database write deadline must not abandon that reader before it writes. */
+  private pendingPreparation: Promise<TestRunRow[]> | null = null;
   /** EI-18767688096795873: computed once in onInit from the run's resolved
    *  config file — see computeIsScratchConfig / isScratchConfigFile. */
   private isScratchConfig = false;
@@ -2999,6 +3002,11 @@ export default class AdminTestRunsReporter implements Reporter {
     this.flushed = true;
     const { flushBudgetMs } = reporterWriteBudget(process.env);
     if (this.interimFlush) {
+      // An interim failure has already left pending[]. Wait for its provenance
+      // just as persistRows does for a final pass; only then apply the bounded
+      // database-write wait. Otherwise a large frozen-source census outlives
+      // both this hook and Vitest's close deadline, silently dropping the row.
+      await this.pendingPreparation;
       // Never race the final write against an interim one on the shared client,
       // and never let a hung interim write consume more than the flush budget.
       let interimTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3023,8 +3031,7 @@ export default class AdminTestRunsReporter implements Reporter {
     await this.persistRows(this.pending.splice(0));
   }
 
-  private async persistRows(pendingRows: PendingTestRunRow[]): Promise<void> {
-    if (pendingRows.length === 0) return;
+  private async prepareRows(pendingRows: PendingTestRunRow[]): Promise<TestRunRow[]> {
     let worktreeDirty = true;
     let dirtReason: string | null = 'snapshot not taken';
     let commitSha: string | null = null;
@@ -3059,7 +3066,7 @@ export default class AdminTestRunsReporter implements Reporter {
     }
 
     const runtimeEnvironmentAfter = await this.captureRuntimeEnvironment();
-    const rows = pendingRows.map((row) => ({
+    return pendingRows.map((row) => ({
       ...row,
       worktreeDirty,
       commitSha,
@@ -3071,6 +3078,15 @@ export default class AdminTestRunsReporter implements Reporter {
             ? { runtimeEnvironmentAfter: runtimeEnvironmentAfter.witness } : {}) }
         : null,
     }));
+  }
+
+  private async persistRows(pendingRows: PendingTestRunRow[]): Promise<void> {
+    if (pendingRows.length === 0) return;
+    const preparation = this.prepareRows(pendingRows);
+    this.pendingPreparation = preparation;
+    let rows: TestRunRow[];
+    try { rows = await preparation; }
+    finally { if (this.pendingPreparation === preparation) this.pendingPreparation = null; }
     const { flushBudgetMs } = reporterWriteBudget(process.env);
     const write = Promise.resolve().then(() => this.writeRows(rows));
     this.pendingWrite = write;

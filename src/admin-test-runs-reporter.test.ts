@@ -2196,6 +2196,42 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   }, 20_000);
 
+  it('waits for pending interim provenance before applying the database flush budget', async () => {
+    let reads = 0;
+    let release: (value: { commit: string; porcelain: string }) => void = () => undefined;
+    const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => {});
+    const reporter = new AdminTestRunsReporter(async () => ++reads === 1
+      ? { commit: 'abc', porcelain: '' } : new Promise(resolve => { release = resolve; }), undefined, writeRows);
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    vi.useFakeTimers();
+    let final: Promise<void> | undefined;
+    try {
+      reporter.onTestModuleEnd({ moduleId: join(TEST_CONFIG_ROOT, 'src/interim-provenance.test.ts'),
+        state: () => 'failed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+        children: { allTests: () => [] } } as never);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads).toBe(2);
+      let finished = false;
+      final = reporter.onTestRunEnd().then(() => { finished = true; });
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs + 10_000);
+      expect(finished).toBe(false);
+      expect(writeRows).not.toHaveBeenCalled();
+      release({ commit: 'abc', porcelain: '' });
+      await vi.advanceTimersByTimeAsync(0);
+      await final;
+      expect(writeRows).toHaveBeenCalledExactlyOnceWith([
+        expect.objectContaining({ status: 'fail', commitSha: 'abc', worktreeDirty: false }),
+      ]);
+      await reporter.onExit();
+      expect(writeRows).toHaveBeenCalledTimes(1);
+    } finally {
+      release({ commit: 'abc', porcelain: '' });
+      await vi.runAllTimersAsync();
+      await final;
+      vi.useRealTimers();
+    }
+  });
+
   it('EI-26701962157024953: a timed-out interim writer never overlaps final persistence', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-timeout-'));
     const receiptPath = join(dir, 'receipts.jsonl');
