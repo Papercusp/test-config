@@ -2712,7 +2712,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       await r.onTestRunEnd();
       const lines = stderr.mock.calls.map(([chunk]) => String(chunk)).filter((s) => s.startsWith('[admin-test-runs]'));
       expect(lines).toEqual(expectLine
-        ? ['[admin-test-runs] 1 row(s) recorded source=local, not ci: worktree not proven stable — 1 porcelain line(s) after the run: ?? leaked-by-a-test.json\n']
+        ? ['[admin-test-runs] 1 row(s) prepared source=local, not ci: worktree not proven stable — 1 porcelain line(s) after the run: ?? leaked-by-a-test.json\n']
         : []);
     } finally {
       stderr.mockRestore();

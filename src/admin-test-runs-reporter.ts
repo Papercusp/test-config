@@ -3065,7 +3065,7 @@ export default class AdminTestRunsReporter implements Reporter {
       // WI-10004076: the demotion erases every row of this invocation from source='ci'
       // triage, and the tree that caused it is gone by the next run — say why, once.
       process.stderr.write(
-        `[admin-test-runs] ${pendingRows.length} row(s) recorded source=local, not ci: worktree not proven stable — ${dirtReason}\n`,
+        `[admin-test-runs] ${pendingRows.length} row(s) prepared source=local, not ci: worktree not proven stable — ${dirtReason}\n`,
       );
     }
 
