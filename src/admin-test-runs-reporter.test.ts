@@ -939,7 +939,7 @@ describe('durable module execution measurement', () => {
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
       async row => { rows.push(row); });
     try {
-      reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
+      await reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
       const cases = Array.from({ length: MAX_RECORDED_PASSED_CASES + 16 }, (_, i) => ({
         fullName: i === MAX_RECORDED_PASSED_CASES + 15 ? 'suite > late-proof' : 'suite > case-' + i,
         result: () => ({ state: 'passed' }),
@@ -968,7 +968,7 @@ describe('durable module execution measurement', () => {
       const rows: TestRunRow[] = [];
       const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
         async row => { rows.push(row); });
-      reporter.onInit({ config: { root: TEST_CONFIG_ROOT },
+      await reporter.onInit({ config: { root: TEST_CONFIG_ROOT },
         vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
       reporter.onTestModuleEnd({ state: () => 'failed',
         children: { allTests: () => Array.from({ length: passed }, (_, index) => ({
@@ -1003,7 +1003,7 @@ describe('durable module execution measurement', () => {
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
       async row => { rows.push(row); });
     try {
-      reporter.onInit({ config: { root: TEST_CONFIG_ROOT, testNamePattern: /selected case/ },
+      await reporter.onInit({ config: { root: TEST_CONFIG_ROOT, testNamePattern: /selected case/ },
         vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
       reporter.onTestModuleEnd({ ...module(['passed', 'skipped']),
         moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
@@ -1041,7 +1041,7 @@ describe('durable module execution measurement', () => {
     const rows: TestRunRow[] = [];
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
       async row => { rows.push(row); });
-    reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
+    await reporter.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
     reporter.onTestModuleEnd(fakeModule as never);
     await reporter.onTestRunEnd();
     expect(rows).toHaveLength(1);
@@ -1122,7 +1122,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     const rows: TestRunRow[] = [];
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
       async (row) => { rows.push(row); });
-    reporter.onInit({ config: { provide: { papercuspTestLayer: 'browser' } },
+    await reporter.onInit({ config: { provide: { papercuspTestLayer: 'browser' } },
       vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
     reporter.onTestModuleEnd({
       moduleId: join(TEST_CONFIG_ROOT, 'src/runtime-layer.test.ts'),
@@ -1212,7 +1212,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       undefined,
       async (rows) => { batches.push(rows); },
     );
-    r.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    await r.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
     for (let i = 0; i < 674; i += 1) {
       r.onTestModuleEnd({
         moduleId: join(TEST_CONFIG_ROOT, `src/shard-${i}.test.ts`),
@@ -1844,7 +1844,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
         diagnostic: () => ({ duration: 1 }), errors: () => [],
       } as unknown as Parameters<typeof r.onTestModuleEnd>[0];
-      r.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
+      await r.onInit({ config: { root: TEST_CONFIG_ROOT }, vite: { config: { root: TEST_CONFIG_ROOT } } } as never);
       expect(() => r.onTestModuleEnd(fakeModule)).not.toThrow();
       await r.onTestRunEnd();
       expect(rows).toHaveLength(1);
@@ -2334,7 +2334,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         async () => ({ commit: 'abc', porcelain: '' }),
         async () => undefined,
       );
-      reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
       // A pure beforeAll throw: the module state is 'failed', testModule.errors()
       // carries the real thrown error (the same source buildOutputTail already
       // reads), and children.allTests() is EMPTY — collection never got far
@@ -2377,7 +2377,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         async () => ({ commit: 'abc', porcelain: '' }),
         async () => undefined,
       );
-      reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
       // A module that collected fine and ran a real assertion with a
       // structured actual/expected diff (so the pre-existing narrow filter
       // records it) — errors() is ALSO non-empty (Vitest often still reports
@@ -2519,11 +2519,11 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(computeIsScratchConfig(null as unknown as Parameters<typeof computeIsScratchConfig>[0])).toBe(false);
   });
 
-  it('onInit (EI-18767688096795873): wires computeIsScratchConfig without throwing, even on a bogus ctx', () => {
+  it('onInit (EI-18767688096795873): wires computeIsScratchConfig without throwing, even on a bogus ctx', async () => {
     const r = new AdminTestRunsReporter();
     const fakeCtx = { vite: { config: { configFile: '/tmp/mutant-xyz/vitest.mutant.config.ts' } } } as unknown as Parameters<typeof r.onInit>[0];
-    expect(() => r.onInit(fakeCtx)).not.toThrow();
-    expect(() => r.onInit(null as never)).not.toThrow();
+    await expect(r.onInit(fakeCtx)).resolves.toBeUndefined();
+    await expect(r.onInit(null as never)).resolves.toBeUndefined();
   });
 
   it('onTestRunEnd resolves cleanly with no pending work', async () => {
@@ -2548,7 +2548,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         persisted.push(row);
       },
     );
-    r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+    await r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
     r.onTestModuleEnd({
       moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
       state: () => 'passed',
@@ -2574,7 +2574,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         persisted.push(row);
       },
     );
-    r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+    await r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
     r.onTestModuleEnd({
       moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
       state: () => 'passed',
@@ -2606,7 +2606,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       async row => { persisted.push(row); },
     );
     try {
-      reporter.onInit({
+      await reporter.onInit({
         config: { root: process.cwd() },
         vite: { config: { root: process.cwd(), configFile: join(process.cwd(), 'vitest.config.ts') } },
       } as never);
@@ -2646,7 +2646,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       async (row) => { persisted.push(row); },
     );
     try {
-      reporter.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      await reporter.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
       reporter.onTestModuleEnd({
         moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
         state: () => 'passed', diagnostic: () => ({ duration: 12 }), errors: () => [],
@@ -2673,7 +2673,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       async () => snapshots.shift()!,
       async (row) => { persisted.push(row); },
     );
-    reporter.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+    await reporter.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
     reporter.onTestModuleEnd({
       moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
       state: () => 'passed', diagnostic: () => ({ duration: 12 }), errors: () => [],
@@ -2701,7 +2701,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         { commit: 'abc', porcelain: '?? leaked-by-a-test.json' },
       ];
       const r = new AdminTestRunsReporter(async () => snapshots.shift()!, async () => {});
-      r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
+      await r.onInit({ vite: { config: { configFile: `${process.cwd()}/vitest.config.ts` } } } as never);
       r.onTestModuleEnd({
         moduleId: join(process.cwd(), 'src/admin-test-runs-reporter.test.ts'),
         state: () => 'passed',
@@ -3057,23 +3057,23 @@ describe('WI-10000776 — the recorded root is the CHECKOUT UNDER TEST, not the 
     expect(readRunConfigRoot(undefined)).toBeNull();
   });
 
-  it('onInit pins the run root BEFORE anything else in it reads a root', () => {
+  it('onInit pins the run root BEFORE anything else in it reads a root', async () => {
     const sibling = checkout('oninit');
     const r = new AdminTestRunsReporter();
-    r.onInit({
+    await r.onInit({
       config: { root: sibling },
       vite: { config: { configFile: join(sibling, 'vitest.config.ts') } },
     } as never);
     expect(toWorkspaceRel(join(sibling, 'tests', 'b.test.ts'))).toBe('tests/b.test.ts');
   });
 
-  it('fail-soft: a ctx carrying no root clears the run root, restoring cwd behaviour', () => {
+  it('fail-soft: a ctx carrying no root clears the run root, restoring cwd behaviour', async () => {
     const sibling = checkout('nofix');
     setRunRoot(sibling);
     const r = new AdminTestRunsReporter();
-    expect(() => r.onInit({ vite: { config: { configFile: 'x' } } } as never)).not.toThrow();
+    await expect(r.onInit({ vite: { config: { configFile: 'x' } } } as never)).resolves.toBeUndefined();
     expect(toWorkspaceRel(join(sibling, 'tests', 'c.test.ts')).startsWith('../')).toBe(true);
-    expect(() => r.onInit(null as never)).not.toThrow();
+    await expect(r.onInit(null as never)).resolves.toBeUndefined();
   });
 
   it('a sibling checkout’s OWN vitest.config.ts stops being misread as a scratch config', () => {
