@@ -2126,8 +2126,9 @@ export function appendTestRunReceipts(
 }
 
 /**
- * Keep the reporter's receipt deadline under Vitest's 10s main-process close
- * timeout. Evidence runs can give the database writer a longer independent
+ * Keep the reporter's SQL receipt deadline under Vitest's 10s main-process close
+ * timeout. Final full provenance is awaited separately before this clock starts.
+ * Evidence runs can give the database writer a longer independent
  * query budget; the local timeout receipt must still be written before Vitest
  * force-closes the reporter process.
  */

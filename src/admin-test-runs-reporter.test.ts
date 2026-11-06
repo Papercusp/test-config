@@ -2366,6 +2366,42 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   });
 
+  it('retains timed-out preparation ownership until a noncooperative reader actually settles', async () => {
+    let reads = 0;
+    let release: (value: { commit: string; porcelain: string }) => void = () => undefined;
+    const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => {});
+    const reporter = new AdminTestRunsReporter(async () => ++reads === 2
+      ? new Promise(resolve => { release = resolve; }) : { commit: 'abc', porcelain: '' }, undefined, writeRows);
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    const module = (file: string) => ({ moduleId: join(TEST_CONFIG_ROOT, file), state: () => 'failed',
+      diagnostic: () => ({ duration: 1 }), errors: () => [], children: { allTests: () => [] } });
+    vi.useFakeTimers();
+    try {
+      reporter.onTestModuleEnd(module('first-reader.test.ts') as never);
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs);
+      expect(reads).toBe(2);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      reporter.onTestModuleEnd(module('queued-reader.test.ts') as never);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads).toBe(2);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      release({ commit: 'abc', porcelain: '' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads).toBe(3);
+      expect(writeRows).toHaveBeenCalledTimes(2);
+      expect(writeRows.mock.calls[1][0][0]).toMatchObject({ filePath: expect.stringMatching(/queued-reader\.test\.ts$/),
+        status: 'fail', commitSha: 'abc', worktreeDirty: false });
+      await reporter.onTestRunEnd();
+      await reporter.onExit();
+      expect(writeRows).toHaveBeenCalledTimes(2);
+    } finally {
+      release({ commit: 'abc', porcelain: '' });
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+      await reporter.onExit();
+    }
+  });
+
   it('EI-26701962157024953: a timed-out interim writer never overlaps final persistence', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-timeout-'));
     const receiptPath = join(dir, 'receipts.jsonl');
