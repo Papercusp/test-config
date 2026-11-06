@@ -2314,14 +2314,22 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   });
 
-  it('preserves the original failure with unknown provenance when preparation misses the close-safe budget', async () => {
+  it('writes an inserted failure receipt before Vitest close when provenance misses the close-safe budget', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-preparation-timeout-'));
     const receiptPath = join(dir, 'receipts.jsonl');
     const previousReceiptPath = process.env[TEST_RUN_RECEIPT_ENV];
+    const previousRunGroup = process.env.PAPERCUSP_TEST_RUN_GROUP;
     process.env[TEST_RUN_RECEIPT_ENV] = receiptPath;
+    process.env.PAPERCUSP_TEST_RUN_GROUP = '8c1c3b18-973d-4f61-925a-411c82e08a4a';
     let reads = 0;
     let release: (value: { commit: string; porcelain: string }) => void = () => undefined;
-    const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => {});
+    const writeRows = vi.fn(async (rows: readonly TestRunRow[]) => {
+      appendTestRunReceipts(process.env, rows.map((row, index) => ({
+        ...testRunReceiptBaseFor(row),
+        outcome: 'inserted' as const,
+        id: `close-safe-insert-${index + 1}`,
+      })));
+    });
     let aborted = false;
     const reporter = new AdminTestRunsReporter(async (_phase, signal) => ++reads === 1
       ? { commit: 'abc', porcelain: '' } : new Promise(resolve => {
@@ -2331,24 +2339,32 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
     vi.useFakeTimers();
     let final: Promise<void> | undefined;
+    const testFile = join(TEST_CONFIG_ROOT, 'src/interim-provenance.test.ts');
     try {
-      reporter.onTestModuleEnd({ moduleId: join(TEST_CONFIG_ROOT, 'src/interim-provenance.test.ts'),
+      reporter.onTestModuleEnd({ moduleId: testFile,
         state: () => 'failed', diagnostic: () => ({ duration: 1 }), errors: () => [],
         children: { allTests: () => [] } } as never);
       await vi.advanceTimersByTimeAsync(0);
       expect(reads).toBe(2);
       let finished = false;
+      const closeStartedAt = Date.now();
       final = reporter.onTestRunEnd().then(() => { finished = true; });
       await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs + 3_000);
       expect(finished).toBe(true);
+      expect(Date.now() - closeStartedAt).toBeLessThan(10_000);
       expect(aborted).toBe(true);
       expect(writeRows).toHaveBeenCalledTimes(1);
       expect(writeRows.mock.calls[0][0]).toEqual([expect.objectContaining({
-        filePath: expect.stringMatching(/interim-provenance\.test\.ts$/),
+        filePath: testFile,
         status: 'fail', commitSha: null, worktreeDirty: true,
         executionDetails: expect.objectContaining({ commitSha: null, worktreeDirty: true,
           worktreeDirtyReason: 'provenance preparation exceeded its close-safe budget' }),
       })]);
+      const receiptLog = readFileSync(receiptPath, 'utf8');
+      expect(latestTestRunReceipts(receiptLog)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ filePath: testFile, status: 'fail', outcome: 'inserted', id: 'close-safe-insert-1' }),
+      ]));
+      expect(missingTestRunReceiptPaths(receiptLog, [testFile], TEST_CONFIG_ROOT)).toEqual([]);
       release({ commit: 'abc', porcelain: '' });
       await vi.advanceTimersByTimeAsync(0);
       await final;
@@ -2362,6 +2378,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       vi.useRealTimers();
       if (previousReceiptPath === undefined) delete process.env[TEST_RUN_RECEIPT_ENV];
       else process.env[TEST_RUN_RECEIPT_ENV] = previousReceiptPath;
+      if (previousRunGroup === undefined) delete process.env.PAPERCUSP_TEST_RUN_GROUP;
+      else process.env.PAPERCUSP_TEST_RUN_GROUP = previousRunGroup;
       rmSync(dir, { recursive: true, force: true });
     }
   });
