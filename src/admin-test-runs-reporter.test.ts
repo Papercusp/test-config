@@ -1899,7 +1899,9 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       });
       const evidence = reporterWriteBudget({ [TEST_RUN_RECEIPT_ENV]: '/tmp/r.jsonl' });
       expect(evidence.insertTimeoutMs).toBeGreaterThan(1_000);
-      expect(evidence.flushBudgetMs).toBeGreaterThan(evidence.totalInsertMs);
+      expect(evidence.flushBudgetMs).toBe(5_000);
+      expect(evidence.flushBudgetMs).toBeLessThan(10_000);
+      expect(evidence.totalInsertMs).toBeGreaterThan(evidence.flushBudgetMs);
     });
   });
 
@@ -2270,7 +2272,11 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   }, 20_000);
 
-  it('waits for pending interim provenance before applying the database flush budget', async () => {
+  it('writes a timeout receipt when pending interim provenance misses the close-safe budget', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-preparation-timeout-'));
+    const receiptPath = join(dir, 'receipts.jsonl');
+    const previousReceiptPath = process.env[TEST_RUN_RECEIPT_ENV];
+    process.env[TEST_RUN_RECEIPT_ENV] = receiptPath;
     let reads = 0;
     let release: (value: { commit: string; porcelain: string }) => void = () => undefined;
     const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => {});
@@ -2287,22 +2293,31 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       expect(reads).toBe(2);
       let finished = false;
       final = reporter.onTestRunEnd().then(() => { finished = true; });
-      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs + 10_000);
-      expect(finished).toBe(false);
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs + 3_000);
+      expect(finished).toBe(true);
       expect(writeRows).not.toHaveBeenCalled();
+      const receipts = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(receipts).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          filePath: expect.stringMatching(/interim-provenance\.test\.ts$/),
+          outcome: 'timeout',
+          reason: expect.stringMatching(/preparation|interim_flush_finalization_deadline/),
+        }),
+      ]));
       release({ commit: 'abc', porcelain: '' });
       await vi.advanceTimersByTimeAsync(0);
       await final;
-      expect(writeRows).toHaveBeenCalledExactlyOnceWith([
-        expect.objectContaining({ status: 'fail', commitSha: 'abc', worktreeDirty: false }),
-      ]);
+      expect(writeRows).not.toHaveBeenCalled();
       await reporter.onExit();
-      expect(writeRows).toHaveBeenCalledTimes(1);
+      expect(writeRows).not.toHaveBeenCalled();
     } finally {
       release({ commit: 'abc', porcelain: '' });
       await vi.runAllTimersAsync();
       await final;
       vi.useRealTimers();
+      if (previousReceiptPath === undefined) delete process.env[TEST_RUN_RECEIPT_ENV];
+      else process.env[TEST_RUN_RECEIPT_ENV] = previousReceiptPath;
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

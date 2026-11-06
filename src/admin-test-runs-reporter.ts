@@ -2125,12 +2125,10 @@ export function appendTestRunReceipts(
 }
 
 /**
- * Write budget. The 1s connect / 1s per-batch / 4.5s total / 5s flush defaults
- * keep an ordinary run from ever stalling on the ledger. An evidence run (one
- * that names a receipt file) gets a longer budget, because a missing row there
- * costs a whole re-run. Suspected cause of the missing mutant rows: this budget
- * expiring while the gate held the box [inferred — the receipt reason is what
- * confirms or refutes it].
+ * Keep the reporter's receipt deadline under Vitest's 10s main-process close
+ * timeout. Evidence runs can give the database writer a longer independent
+ * query budget; the local timeout receipt must still be written before Vitest
+ * force-closes the reporter process.
  */
 export function reporterWriteBudget(env: NodeJS.ProcessEnv): {
   connectTimeoutSec: number;
@@ -2139,7 +2137,7 @@ export function reporterWriteBudget(env: NodeJS.ProcessEnv): {
   flushBudgetMs: number;
 } {
   return env[TEST_RUN_RECEIPT_ENV]?.trim()
-    ? { connectTimeoutSec: 10, insertTimeoutMs: 15_000, totalInsertMs: 25_000, flushBudgetMs: 30_000 }
+    ? { connectTimeoutSec: 10, insertTimeoutMs: 15_000, totalInsertMs: 25_000, flushBudgetMs: 5_000 }
     : { connectTimeoutSec: 1, insertTimeoutMs: 1_000, totalInsertMs: 4_500, flushBudgetMs: 5_000 };
 }
 
@@ -2803,11 +2801,13 @@ export default class AdminTestRunsReporter implements Reporter {
   private flushed = false;
   /** EI-26701962157024953: the in-flight mid-run write of failing rows, if any. */
   private interimFlush: Promise<void> | null = null;
+  private interimRows: PendingTestRunRow[] = [];
   /** A flush deadline does not cancel the underlying writer. Keep its ownership until settlement. */
   private pendingWrite: Promise<void> | null = null;
   /** Provenance uses the same source-reader lifecycle as a final pass flush.
    * A database write deadline must not abandon that reader before it writes. */
   private pendingPreparation: Promise<TestRunRow[]> | null = null;
+  private finalizationDeadlineMs: number | null = null;
   /** EI-18767688096795873: computed once in onInit from the run's resolved
    *  config file — see computeIsScratchConfig / isScratchConfigFile. */
   private isScratchConfig = false;
@@ -3035,7 +3035,9 @@ export default class AdminTestRunsReporter implements Reporter {
           const failing = this.pending.filter(row => isInterimFlushStatus(row.status));
           if (failing.length === 0) return;
           this.pending = this.pending.filter(row => !isInterimFlushStatus(row.status));
-          await this.persistRows(failing);
+          this.interimRows = failing;
+          try { await this.persistRows(failing); }
+          finally { if (this.interimRows === failing) this.interimRows = []; }
         }
       } catch {
         /* swallow — D-007 */
@@ -3050,23 +3052,33 @@ export default class AdminTestRunsReporter implements Reporter {
     if (this.flushed) return;
     this.flushed = true;
     const { flushBudgetMs } = reporterWriteBudget(process.env);
+    const deadlineMs = Date.now() + flushBudgetMs;
+    this.finalizationDeadlineMs = deadlineMs;
     if (this.interimFlush) {
-      // An interim failure has already left pending[]. Wait for its provenance
-      // just as persistRows does for a final pass; only then apply the bounded
-      // database-write wait. Otherwise a large frozen-source census outlives
-      // both this hook and Vitest's close deadline, silently dropping the row.
-      await this.pendingPreparation;
-      // Never race the final write against an interim one on the shared client,
-      // and never let a hung interim write consume more than the flush budget.
+      // The failure rows have left pending[] while their source provenance is
+      // prepared. Bound the whole finalization wait, including that preparation,
+      // and write an explicit timeout receipt before Vitest's close deadline.
       let interimTimer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        this.interimFlush,
-        new Promise<void>((r) => { interimTimer = setTimeout(r, flushBudgetMs); }),
+      const finished = await Promise.race([
+        this.interimFlush.then(() => true),
+        new Promise<false>((r) => {
+          interimTimer = setTimeout(() => r(false), Math.max(0, deadlineMs - Date.now()));
+        }),
       ]);
       if (interimTimer) clearTimeout(interimTimer);
+      if (!finished) {
+        const unresolved = [...this.interimRows, ...this.pending.splice(0)].map(row => ({
+          ...row, worktreeDirty: true, commitSha: null,
+          executionDetails: row.executionDetails
+            ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
+        }));
+        appendTestRunReceipts(process.env,
+          unwrittenReceipts(unresolved, 'timeout', 'interim_flush_finalization_deadline'));
+        return;
+      }
     }
     if (this.pending.length === 0) return;
-    if (this.interimFlush || this.pendingWrite) {
+    if (this.interimFlush || this.pendingWrite || this.pendingPreparation) {
       // Promise.race bounds waiting, not the operation. A second writer here
       // would overlap the interim writer (or its unfinished provenance read).
       // Keep the missing final rows explicit without issuing competing inserts.
@@ -3077,7 +3089,7 @@ export default class AdminTestRunsReporter implements Reporter {
       })), 'timeout', 'interim_flush_incomplete'));
       return;
     }
-    await this.persistRows(this.pending.splice(0));
+    await this.persistRows(this.pending.splice(0), deadlineMs);
   }
 
   private async prepareRows(pendingRows: PendingTestRunRow[]): Promise<TestRunRow[]> {
@@ -3129,14 +3141,54 @@ export default class AdminTestRunsReporter implements Reporter {
     }));
   }
 
-  private async persistRows(pendingRows: PendingTestRunRow[]): Promise<void> {
+  private async persistRows(pendingRows: PendingTestRunRow[], requestedDeadlineMs?: number): Promise<void> {
     if (pendingRows.length === 0) return;
+    const { flushBudgetMs } = reporterWriteBudget(process.env);
+    const localDeadlineMs = requestedDeadlineMs ?? Date.now() + flushBudgetMs;
+    const deadlineMs = () => Math.min(
+      localDeadlineMs,
+      this.finalizationDeadlineMs ?? Number.POSITIVE_INFINITY,
+    );
     const preparation = this.prepareRows(pendingRows);
     this.pendingPreparation = preparation;
-    let rows: TestRunRow[];
-    try { rows = await preparation; }
-    finally { if (this.pendingPreparation === preparation) this.pendingPreparation = null; }
-    const { flushBudgetMs } = reporterWriteBudget(process.env);
+    let preparationTimer: ReturnType<typeof setTimeout> | undefined;
+    let rows: TestRunRow[] | null;
+    try {
+      rows = await Promise.race([
+        preparation,
+        new Promise<null>((resolve) => {
+          preparationTimer = setTimeout(() => resolve(null), Math.max(0, deadlineMs() - Date.now()));
+        }),
+      ]);
+    } catch (error) {
+      const unverified = pendingRows.map(row => ({
+        ...row, worktreeDirty: true, commitSha: null,
+        executionDetails: row.executionDetails
+          ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
+      }));
+      appendTestRunReceipts(process.env, unwrittenReceipts(unverified, 'failed',
+        `preparation_failed:${receiptReason(error)}`, { error, replayable: true }));
+      return;
+    } finally {
+      if (preparationTimer) clearTimeout(preparationTimer);
+      if (this.pendingPreparation === preparation) this.pendingPreparation = null;
+    }
+    if (!rows) {
+      const unverified = pendingRows.map(row => ({
+        ...row, worktreeDirty: true, commitSha: null,
+        executionDetails: row.executionDetails
+          ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
+      }));
+      appendTestRunReceipts(process.env, unwrittenReceipts(unverified, 'timeout',
+        `preparation_budget_${flushBudgetMs}ms`));
+      return;
+    }
+    const remainingMs = Math.max(0, deadlineMs() - Date.now());
+    if (remainingMs === 0) {
+      appendTestRunReceipts(process.env,
+        unwrittenReceipts(rows, 'timeout', 'finalization_deadline'));
+      return;
+    }
     // Vitest's completion barrier tracks settlement; Node consumes the receipts.
     const write = Promise.resolve().then(async () => { await this.writeRows(rows); });
     this.pendingWrite = write;
@@ -3151,7 +3203,7 @@ export default class AdminTestRunsReporter implements Reporter {
     const finished = await Promise.race([
       write.then(() => true),
       new Promise<false>((r) => {
-        flushTimer = setTimeout(() => r(false), flushBudgetMs);
+        flushTimer = setTimeout(() => r(false), remainingMs);
       }),
     ]);
     if (flushTimer) clearTimeout(flushTimer);
