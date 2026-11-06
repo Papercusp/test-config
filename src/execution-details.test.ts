@@ -10,6 +10,8 @@ import {
   parseExecutionBoundaryReceipt,
   parseTestBoundaryObservations,
   passedCaseTitlesIncomplete,
+  isRecordedCaseIdentity,
+  isRecordedCaseTitle,
   registeredVitestFileLayer,
   stableRecordedRuntimeEnvironment,
   type TestRunExecutionDetails,
@@ -305,6 +307,14 @@ describe('parseTestRunExecutionDetails — runStartedAt (EI-24827834166866368)',
 });
 
 describe('parseTestRunExecutionDetails — measured case identities', () => {
+  it('preserves multiline case-ledger identities without relaxing compact title parsing', () => {
+    const title = 'suite > parameter: <context>\n\tvalue\r\n</context>';
+    expect(isRecordedCaseIdentity(title)).toBe(true);
+    expect(isRecordedCaseTitle(title)).toBe(false);
+    for (const invalid of [' leading', 'trailing\n', 'case\u0000value', 'case\u001bvalue', 'x'.repeat(2_049)]) {
+      expect(isRecordedCaseIdentity(invalid)).toBe(false);
+    }
+  });
   it('accepts exact structured identities and stored JSON strings without changing legacy rows', () => {
     const row = { ...details({ failed: 2 }), failedCaseTitles: ['suite — fails: with a colon', 'suite > also fails'] };
     expect(parseTestRunExecutionDetails(row)).toMatchObject({ failedCaseTitles: row.failedCaseTitles });

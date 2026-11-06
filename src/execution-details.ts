@@ -36,6 +36,11 @@ export function isRecordedCaseTitle(value: unknown): value is string {
     && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
+/** The normalized case ledger preserves parameterized titles containing text whitespace. */
+export function isRecordedCaseIdentity(value: unknown): value is string {
+  return typeof value === 'string' && isRecordedCaseTitle(value.replace(/[\t\r\n]/g, ' '));
+}
+
 /**
  * THE test-layer taxonomy (EI-24434635346407728). One vocabulary for what a ledger row
  * may RECORD and what an acceptance BAR may REQUIRE: operator-core's
