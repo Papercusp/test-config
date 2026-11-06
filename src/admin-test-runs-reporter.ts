@@ -1531,7 +1531,18 @@ export function tryGetPg(): Promise<PgHandle> {
       // results points PAPERCUSP_TEST_RUNS_DB_URL at the shared ledger. Keep this order in
       // step with resolveExecutedMapPgUrl (scripts/lib/executed-source-map.mjs).
       const url = resolveTestRunsPgUrl();
+      let localHost: { host: string } | undefined;
+      try {
+        const parsed = new URL(url);
+        const tlsConfigured = Boolean(process.env.PGSSL?.trim())
+          || [...parsed.searchParams.keys()].some(key => key.toLowerCase().startsWith('ssl'));
+        // The driver starts connect_timeout before Node's hostname lookup.
+        // Plain local ledger connections need no DNS/interface enumeration;
+        // keep remote/TLS names and the original DSN for driver semantics.
+        if (parsed.hostname === 'localhost' && !tlsConfigured) localHost = { host: '127.0.0.1' };
+      } catch { /* Preserve the driver's own URL/multihost parser and safe setup failure. */ }
       const sql = pg(url, {
+        ...localHost,
         max: 2,
         // Ledger writes use scalar and JSON columns, not custom PostgreSQL
         // array types. postgres.js starts an unobserved async catalog lookup
