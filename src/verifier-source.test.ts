@@ -37,7 +37,8 @@ describe('full verifier source census', () => {
         progress: () => controller.abort(),
       })).rejects.toThrow('verifier source read aborted');
       expect(terminate).toHaveBeenCalledTimes(1);
-      expect(terminate.mock.instances[0].threadId).toBe(-1);
+      expect(terminate.mock.contexts[0]).toBeInstanceOf(Worker);
+      expect((terminate.mock.contexts[0] as Worker).threadId).toBe(-1);
     } finally { terminate.mockRestore(); }
   });
 
