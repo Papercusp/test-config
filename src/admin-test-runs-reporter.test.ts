@@ -2272,7 +2272,49 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   }, 20_000);
 
-  it('writes a timeout receipt when pending interim provenance misses the close-safe budget', async () => {
+  it.each([false, true])('awaits final provenance beyond the SQL budget and preserves dirty=%s with a fresh bounded write', async dirty => {
+    let releaseSnapshot: (value: { commit: string; porcelain: string }) => void = () => undefined;
+    let releaseWrite: () => void = () => undefined;
+    const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => {
+      await new Promise<void>(resolve => { releaseWrite = resolve; });
+    });
+    const reporter = new AdminTestRunsReporter(async phase => phase === 'before'
+      ? { commit: 'abc', porcelain: '' }
+      : new Promise(resolve => { releaseSnapshot = resolve; }), undefined, writeRows);
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    vi.useFakeTimers();
+    let final: Promise<void> | undefined;
+    try {
+      reporter.onTestModuleEnd({ moduleId: join(TEST_CONFIG_ROOT, 'src/final-provenance.test.ts'),
+        state: () => 'passed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+        children: { allTests: () => [] } } as never);
+      let finished = false;
+      final = reporter.onTestRunEnd().then(() => { finished = true; });
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs * 3);
+      expect(finished).toBe(false);
+      expect(writeRows).not.toHaveBeenCalled();
+      releaseSnapshot({ commit: 'abc', porcelain: dirty ? ' M source.ts' : '' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      expect(writeRows.mock.calls[0][0][0]).toMatchObject({ status: 'pass', commitSha: 'abc', worktreeDirty: dirty });
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs - 1);
+      expect(finished).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await final;
+      expect(finished).toBe(true);
+      releaseWrite();
+      await reporter.onExit();
+      expect(writeRows).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseSnapshot({ commit: 'abc', porcelain: '' });
+      releaseWrite();
+      await vi.runAllTimersAsync();
+      await final;
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves the original failure with unknown provenance when preparation misses the close-safe budget', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-preparation-timeout-'));
     const receiptPath = join(dir, 'receipts.jsonl');
     const previousReceiptPath = process.env[TEST_RUN_RECEIPT_ENV];
@@ -2280,8 +2322,12 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     let reads = 0;
     let release: (value: { commit: string; porcelain: string }) => void = () => undefined;
     const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => {});
-    const reporter = new AdminTestRunsReporter(async () => ++reads === 1
-      ? { commit: 'abc', porcelain: '' } : new Promise(resolve => { release = resolve; }), undefined, writeRows);
+    let aborted = false;
+    const reporter = new AdminTestRunsReporter(async (_phase, signal) => ++reads === 1
+      ? { commit: 'abc', porcelain: '' } : new Promise(resolve => {
+        release = resolve;
+        signal?.addEventListener('abort', () => { aborted = true; release({ commit: 'abc', porcelain: '' }); }, { once: true });
+      }), undefined, writeRows);
     await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
     vi.useFakeTimers();
     let final: Promise<void> | undefined;
@@ -2295,21 +2341,20 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       final = reporter.onTestRunEnd().then(() => { finished = true; });
       await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs + 3_000);
       expect(finished).toBe(true);
-      expect(writeRows).not.toHaveBeenCalled();
-      const receipts = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      expect(receipts).toEqual(expect.arrayContaining([
-        expect.objectContaining({
-          filePath: expect.stringMatching(/interim-provenance\.test\.ts$/),
-          outcome: 'timeout',
-          reason: expect.stringMatching(/preparation|interim_flush_finalization_deadline/),
-        }),
-      ]));
+      expect(aborted).toBe(true);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      expect(writeRows.mock.calls[0][0]).toEqual([expect.objectContaining({
+        filePath: expect.stringMatching(/interim-provenance\.test\.ts$/),
+        status: 'fail', commitSha: null, worktreeDirty: true,
+        executionDetails: expect.objectContaining({ commitSha: null, worktreeDirty: true,
+          worktreeDirtyReason: 'provenance preparation exceeded its close-safe budget' }),
+      })]);
       release({ commit: 'abc', porcelain: '' });
       await vi.advanceTimersByTimeAsync(0);
       await final;
-      expect(writeRows).not.toHaveBeenCalled();
+      expect(writeRows).toHaveBeenCalledTimes(1);
       await reporter.onExit();
-      expect(writeRows).not.toHaveBeenCalled();
+      expect(writeRows).toHaveBeenCalledTimes(1);
     } finally {
       release({ commit: 'abc', porcelain: '' });
       await vi.runAllTimersAsync();

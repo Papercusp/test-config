@@ -771,12 +771,13 @@ async function consumePreparedRootSnapshot(
 export async function captureWorktreeSnapshot(
   run: WorktreeGitRunner = runGit,
   phase?: WorktreeSnapshotPhase,
+  signal?: AbortSignal,
 ): Promise<WorktreeGitSnapshot> {
   const root = resolveWorktreeSnapshotRoot();
   if (existsSync(join(root, '.verifier-source.json'))) {
     try {
       const mutation = mutationSubjectForVerifierSource(root);
-      return { commit: (await readVerifierSourceReceipt(root, undefined, { mutation,
+      return { commit: (await readVerifierSourceReceipt(root, undefined, { mutation, signal,
         progress: record => process.stderr.write('TEST_FILE_FINALIZATION ' + JSON.stringify({
           pid: process.pid, phase: 'provenance-progress', origin: 'reporter-snapshot', ...record,
         }) + '\n'),
@@ -1269,7 +1270,7 @@ function writeFailureDetails(details: TestFailureDetail[]): void {
   }
 }
 
-export type WorktreeSnapshotReader = (phase?: WorktreeSnapshotPhase) => Promise<WorktreeGitSnapshot>;
+export type WorktreeSnapshotReader = (phase?: WorktreeSnapshotPhase, signal?: AbortSignal) => Promise<WorktreeGitSnapshot>;
 export type TestRunRowWriter = (row: TestRunRow) => Promise<void>;
 export type TestRunRowsWriter = (rows: readonly TestRunRow[]) => Promise<void | readonly TestRunReceipt[]>;
 
@@ -2833,12 +2834,12 @@ export default class AdminTestRunsReporter implements Reporter {
     // snapshot/writer seams.
     const snapshotReader: WorktreeSnapshotReader = typeof readWorktreeSnapshotOrOptions === 'function'
       ? readWorktreeSnapshotOrOptions
-      : (phase) => captureWorktreeSnapshot(runGit, phase);
+      : (phase, signal) => captureWorktreeSnapshot(runGit, phase, signal);
     // Snapshot collection starts before any tests run. Handle synchronous
     // throws and rejected promises immediately and retain dirty provenance.
-    this.readWorktreeSnapshot = async (phase?: WorktreeSnapshotPhase) => {
+    this.readWorktreeSnapshot = async (phase?: WorktreeSnapshotPhase, signal?: AbortSignal) => {
       try {
-        return await observeReporterStage('test-runs', 'source-snapshot', () => snapshotReader(phase));
+        return await observeReporterStage('test-runs', 'source-snapshot', () => snapshotReader(phase, signal));
       } catch (error) {
         return {
           commit: null,
@@ -3027,11 +3028,11 @@ export default class AdminTestRunsReporter implements Reporter {
    * failures that arrive meanwhile are picked up by the follow-up batch.
    */
   private scheduleInterimFlush(): void {
-    if (this.flushed || this.interimFlush || this.pendingWrite ||
+    if (this.flushed || this.interimFlush || this.pendingWrite || this.pendingPreparation ||
       !this.pending.some(row => isInterimFlushStatus(row.status))) return;
     this.interimFlush = (async () => {
       try {
-        while (!this.flushed && !this.pendingWrite) {
+        while (!this.flushed && !this.pendingWrite && !this.pendingPreparation) {
           const failing = this.pending.filter(row => isInterimFlushStatus(row.status));
           if (failing.length === 0) return;
           this.pending = this.pending.filter(row => !isInterimFlushStatus(row.status));
@@ -3051,6 +3052,9 @@ export default class AdminTestRunsReporter implements Reporter {
   private async flushPending(): Promise<void> {
     if (this.flushed) return;
     this.flushed = true;
+    // The before census belongs to this run even when every failure was already
+    // flushed. Drain it before the terminal hook releases process ownership.
+    await this.worktreeBefore;
     const { flushBudgetMs } = reporterWriteBudget(process.env);
     const deadlineMs = Date.now() + flushBudgetMs;
     this.finalizationDeadlineMs = deadlineMs;
@@ -3089,16 +3093,20 @@ export default class AdminTestRunsReporter implements Reporter {
       })), 'timeout', 'interim_flush_incomplete'));
       return;
     }
-    await this.persistRows(this.pending.splice(0), deadlineMs);
+    // Vitest awaits onTestRunEnd before starting its close timeout. A complete
+    // source census is an awaited proof stage, not part of the SQL write budget.
+    this.finalizationDeadlineMs = null;
+    await this.persistRows(this.pending.splice(0), true);
   }
 
-  private async prepareRows(pendingRows: PendingTestRunRow[]): Promise<TestRunRow[]> {
+  private async prepareRows(pendingRows: PendingTestRunRow[], signal: AbortSignal): Promise<TestRunRow[]> {
     let worktreeDirty = true;
     let dirtReason: string | null = 'snapshot not taken';
     let commitSha: string | null = null;
     try {
       const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot('before');
-      const after = await this.readWorktreeSnapshot('after');
+      signal.throwIfAborted();
+      const after = await this.readWorktreeSnapshot('after', signal);
       dirtReason = describeWorktreeDirt(before, after);
       worktreeDirty = dirtReason !== null;
       commitSha = after.commit;
@@ -3107,6 +3115,7 @@ export default class AdminTestRunsReporter implements Reporter {
       worktreeDirty = true;
       dirtReason = `snapshot threw: ${err instanceof Error ? err.message : String(err)}`;
     }
+    signal.throwIfAborted();
     const verifierSourceReasons = [...new Set(pendingRows
       .map(row => row.verifierSourceReason)
       .filter((reason): reason is string => Boolean(reason)))];
@@ -3141,48 +3150,50 @@ export default class AdminTestRunsReporter implements Reporter {
     }));
   }
 
-  private async persistRows(pendingRows: PendingTestRunRow[], requestedDeadlineMs?: number): Promise<void> {
+  private async persistRows(pendingRows: PendingTestRunRow[], finalProvenance = false): Promise<void> {
     if (pendingRows.length === 0) return;
     const { flushBudgetMs } = reporterWriteBudget(process.env);
-    const localDeadlineMs = requestedDeadlineMs ?? Date.now() + flushBudgetMs;
+    let localDeadlineMs = finalProvenance ? Number.POSITIVE_INFINITY : Date.now() + flushBudgetMs;
     const deadlineMs = () => Math.min(
       localDeadlineMs,
       this.finalizationDeadlineMs ?? Number.POSITIVE_INFINITY,
     );
-    const preparation = this.prepareRows(pendingRows);
+    // Provenance enriches an observed result; it must not consume the entire
+    // close-safe budget and erase that result from the canonical ledger.
+    const preparationDeadlineMs = deadlineMs() - Math.min(1_000, Math.floor(flushBudgetMs / 2));
+    const withoutProvenance = (reason: string): TestRunRow[] => pendingRows.map(row => ({
+      ...row, worktreeDirty: true, commitSha: null,
+      executionDetails: row.executionDetails ? { ...row.executionDetails,
+        worktreeDirty: true, commitSha: null, worktreeDirtyReason: reason } : null,
+    }));
+    const controller = new AbortController();
+    const preparation = this.prepareRows(pendingRows, controller.signal);
     this.pendingPreparation = preparation;
+    const prepared = () => {
+      if (this.pendingPreparation === preparation) this.pendingPreparation = null;
+      this.scheduleInterimFlush();
+    };
+    // A race timeout never releases the underlying operation's ownership.
+    void preparation.then(prepared, prepared);
     let preparationTimer: ReturnType<typeof setTimeout> | undefined;
     let rows: TestRunRow[] | null;
     try {
-      rows = await Promise.race([
+      rows = finalProvenance ? await preparation : await Promise.race([
         preparation,
         new Promise<null>((resolve) => {
-          preparationTimer = setTimeout(() => resolve(null), Math.max(0, deadlineMs() - Date.now()));
+          preparationTimer = setTimeout(() => resolve(null), Math.max(0, preparationDeadlineMs - Date.now()));
         }),
       ]);
     } catch (error) {
-      const unverified = pendingRows.map(row => ({
-        ...row, worktreeDirty: true, commitSha: null,
-        executionDetails: row.executionDetails
-          ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
-      }));
-      appendTestRunReceipts(process.env, unwrittenReceipts(unverified, 'failed',
-        `preparation_failed:${receiptReason(error)}`, { error, replayable: true }));
-      return;
+      rows = withoutProvenance(`provenance preparation failed: ${receiptReason(error)}`);
     } finally {
       if (preparationTimer) clearTimeout(preparationTimer);
-      if (this.pendingPreparation === preparation) this.pendingPreparation = null;
     }
     if (!rows) {
-      const unverified = pendingRows.map(row => ({
-        ...row, worktreeDirty: true, commitSha: null,
-        executionDetails: row.executionDetails
-          ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
-      }));
-      appendTestRunReceipts(process.env, unwrittenReceipts(unverified, 'timeout',
-        `preparation_budget_${flushBudgetMs}ms`));
-      return;
+      controller.abort();
+      rows = withoutProvenance('provenance preparation exceeded its close-safe budget');
     }
+    if (finalProvenance) localDeadlineMs = Date.now() + flushBudgetMs;
     const remainingMs = Math.max(0, deadlineMs() - Date.now());
     if (remainingMs === 0) {
       appendTestRunReceipts(process.env,

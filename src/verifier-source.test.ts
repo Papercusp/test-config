@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, symlinkSync,
   truncateSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
@@ -19,6 +20,38 @@ afterEach(() => {
 });
 
 describe('full verifier source census', () => {
+  it('rejects a cancelled census only after its actual worker exits', async () => {
+    const root = archive();
+    writeFileSync(join(root, 'source.ts'), 'export {};');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    const independentReceipt = join(archive(), 'receipt.json');
+    writeFileSync(independentReceipt, JSON.stringify(receipt));
+    const controller = new AbortController();
+    const terminate = vi.spyOn(Worker.prototype, 'terminate');
+    try {
+      await expect(readVerifierSourceReceipt(root, independentReceipt, {
+        signal: controller.signal,
+        progress: () => controller.abort(),
+      })).rejects.toThrow('verifier source read aborted');
+      expect(terminate).toHaveBeenCalledTimes(1);
+      expect(terminate.mock.instances[0].threadId).toBe(-1);
+    } finally { terminate.mockRestore(); }
+  });
+
+  it('does not start a census worker when already cancelled', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const terminate = vi.spyOn(Worker.prototype, 'terminate');
+    try {
+      await expect(readVerifierSourceReceipt(archive(), undefined, { signal: controller.signal }))
+        .rejects.toThrow('verifier source read aborted');
+      expect(terminate).not.toHaveBeenCalled();
+    } finally { terminate.mockRestore(); }
+  });
+
   it.each([
     'papercusp-desktop/src-tauri/resources/workbench@papercusp.ai.shell-extension.zip',
     'papercusp-desktop/src-tauri/resources/workbench-install.js',

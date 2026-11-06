@@ -74,13 +74,25 @@ export function readVerifierSourceReceiptSync(root: string, receiptPath = proces
  */
 export function readVerifierSourceReceipt(root: string,
   receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT,
-  options: { mutation?: VerifierSourceMutation; progress?: (record: VerifierSourceProgress) => void } = {}): Promise<VerifierSourceReceipt> {
+  options: { mutation?: VerifierSourceMutation; progress?: (record: VerifierSourceProgress) => void;
+    signal?: AbortSignal } = {}): Promise<VerifierSourceReceipt> {
   return new Promise((resolveReceipt, reject) => {
+    if (options.signal?.aborted) {
+      reject(new VerifierSourceError('verifier source read aborted'));
+      return;
+    }
     const worker = new Worker(new URL('./verifier-source-worker.mjs', import.meta.url), {
       workerData: { root, receiptPath, mutation: options.mutation },
     });
     let receipt: VerifierSourceReceipt | undefined;
     let failure: Error | undefined;
+    const abort = () => {
+      failure = new VerifierSourceError('verifier source read aborted');
+      // A deadline bounds the caller's wait, not the worker's lifetime. Do not
+      // settle until exit: no abandoned census may retain files or the process.
+      void worker.terminate().catch(error => { failure = error; });
+    };
+    options.signal?.addEventListener('abort', abort, { once: true });
     worker.on('message', (result: { receipt?: VerifierSourceReceipt; error?: string; progress?: VerifierSourceProgress }) => {
       if (result.progress) {
         // Diagnostics must not change the full census or its terminal verdict.
@@ -92,6 +104,7 @@ export function readVerifierSourceReceipt(root: string,
     });
     worker.once('error', error => { failure = error; });
     worker.once('exit', code => {
+      options.signal?.removeEventListener('abort', abort);
       if (failure) reject(failure);
       else if (code === 0 && receipt) resolveReceipt(receipt);
       else reject(new VerifierSourceError(`verifier source worker exited without a receipt (code ${code})`));
