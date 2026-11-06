@@ -2340,6 +2340,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     vi.useFakeTimers();
     let final: Promise<void> | undefined;
     const testFile = join(TEST_CONFIG_ROOT, 'src/interim-provenance.test.ts');
+    const expectedFilePath = 'libs/test-config/src/interim-provenance.test.ts';
     try {
       reporter.onTestModuleEnd({ moduleId: testFile,
         state: () => 'failed', diagnostic: () => ({ duration: 1 }), errors: () => [],
@@ -2355,16 +2356,17 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       expect(aborted).toBe(true);
       expect(writeRows).toHaveBeenCalledTimes(1);
       expect(writeRows.mock.calls[0][0]).toEqual([expect.objectContaining({
-        filePath: testFile,
+        filePath: expectedFilePath,
         status: 'fail', commitSha: null, worktreeDirty: true,
         executionDetails: expect.objectContaining({ commitSha: null, worktreeDirty: true,
           worktreeDirtyReason: 'provenance preparation exceeded its close-safe budget' }),
       })]);
       const receiptLog = readFileSync(receiptPath, 'utf8');
       expect(latestTestRunReceipts(receiptLog)).toEqual(expect.arrayContaining([
-        expect.objectContaining({ filePath: testFile, status: 'fail', outcome: 'inserted', id: 'close-safe-insert-1' }),
+        expect.objectContaining({ filePath: expectedFilePath, status: 'fail', outcome: 'inserted', id: 'close-safe-insert-1' }),
       ]));
-      expect(missingTestRunReceiptPaths(receiptLog, [testFile], TEST_CONFIG_ROOT)).toEqual([]);
+      expect(missingTestRunReceiptPaths(receiptLog, [expectedFilePath], computeWorkspaceRootFrom(TEST_CONFIG_ROOT)))
+        .toEqual([]);
       release({ commit: 'abc', porcelain: '' });
       await vi.advanceTimersByTimeAsync(0);
       await final;
