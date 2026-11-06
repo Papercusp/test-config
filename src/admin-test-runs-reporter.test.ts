@@ -3283,6 +3283,44 @@ describe('WI-10000776 — the recorded root is the CHECKOUT UNDER TEST, not the 
     expect(toWorkspaceRel(join(sub, 'x.test.ts'))).toBe('libs/sub/x.test.ts');
   });
 
+  function preparedNestedClone(trackGitlink: boolean): { parent: string; sub: string } {
+    const parent = mkdtempSync(join(tmpdir(), 'pc-prepared-parent-'));
+    made.push(parent);
+    const sub = join(parent, 'libs', 'sub with spaces');
+    mkdirSync(sub, { recursive: true });
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    for (const root of [parent, sub]) git(root, 'init', '-q');
+    writeFileSync(join(sub, 'x.test.ts'), 'export const observed = true;\n');
+    git(sub, 'add', 'x.test.ts');
+    git(sub, '-c', 'user.name=Reporter fixture', '-c', 'user.email=reporter@example.test',
+      'commit', '-qm', 'child');
+    writeFileSync(join(parent, '.gitmodules'),
+      '[submodule "fixture"]\n\tpath = libs/sub with spaces\n\turl = ./fixture\n');
+    git(parent, 'add', '.gitmodules');
+    if (trackGitlink) {
+      git(parent, 'update-index', '--add', '--cacheinfo',
+        `160000,${git(sub, 'rev-parse', 'HEAD')},libs/sub with spaces`);
+    }
+    git(parent, '-c', 'user.name=Reporter fixture', '-c', 'user.email=reporter@example.test',
+      'commit', '-qm', 'parent');
+    return { parent, sub };
+  }
+
+  it('records a prepared standalone submodule clone under its committed parent gitlink', () => {
+    const { parent, sub } = preparedNestedClone(true);
+    expect(existsSync(join(sub, '.git', 'HEAD'))).toBe(true);
+    expect(setRunRoot(sub)).toBe(parent);
+    expect(toWorkspaceRel(join(sub, 'x.test.ts'))).toBe('libs/sub with spaces/x.test.ts');
+  });
+
+  it('keeps an independent nested clone local when .gitmodules has no matching committed gitlink', () => {
+    const { sub } = preparedNestedClone(false);
+    expect(setRunRoot(sub)).toBe(sub);
+    expect(toWorkspaceRel(join(sub, 'x.test.ts'))).toBe('x.test.ts');
+  });
+
   it('computeWorkspaceRootFrom answers about the directory it was ASKED about', () => {
     // Why the walk had to be split from the cache: inferWorkspaceRoot short-circuits on
     // its cached process root and silently ignores its own `from` once warm, so calling

@@ -33,7 +33,7 @@
 
 import type { Reporter, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
-import { exec } from 'node:child_process';
+import { exec, execFileSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
@@ -300,7 +300,28 @@ export function computeWorkspaceRootFrom(from: string): string {
   if (archive) return archive;
   let dir = resolve(from);
   while (true) {
-    if (classifyGitEntry(dir) === 'root') return dir;
+    if (classifyGitEntry(dir) === 'root') {
+      // Prepared checkouts may materialize a submodule as a standalone clone
+      // with a .git directory. Its parent still owns the ledger path. Require
+      // an exact committed gitlink; merely nesting a repository (or naming it
+      // in .gitmodules) must not change its identity.
+      let root = dir;
+      let ancestor = dirname(dir);
+      while (ancestor !== dirname(ancestor)) {
+        if (classifyGitEntry(ancestor) === 'root' && existsSync(join(ancestor, '.gitmodules'))) {
+          const path = relative(ancestor, root).split(sep).join('/');
+          try {
+            const entry = execFileSync('git', ['ls-tree', '-z', 'HEAD', '--', `:(literal)${path}`], {
+              cwd: ancestor, encoding: 'utf8', timeout: 1_000, stdio: ['ignore', 'pipe', 'ignore'],
+            });
+            if (/^160000 commit [a-f0-9]{40,64}\t/.test(entry)
+              && entry.slice(entry.indexOf('\t') + 1) === `${path}\0`) root = ancestor;
+          } catch { /* Unverified ancestry keeps the original checkout identity. */ }
+        }
+        ancestor = dirname(ancestor);
+      }
+      return root;
+    }
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
