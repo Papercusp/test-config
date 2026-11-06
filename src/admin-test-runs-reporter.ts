@@ -1271,7 +1271,7 @@ function writeFailureDetails(details: TestFailureDetail[]): void {
 
 export type WorktreeSnapshotReader = (phase?: WorktreeSnapshotPhase) => Promise<WorktreeGitSnapshot>;
 export type TestRunRowWriter = (row: TestRunRow) => Promise<void>;
-export type TestRunRowsWriter = (rows: readonly TestRunRow[]) => Promise<void>;
+export type TestRunRowsWriter = (rows: readonly TestRunRow[]) => Promise<void | readonly TestRunReceipt[]>;
 
 /**
  * Resolve a host-level loop-lag value from the resource-governor snapshot.
@@ -2534,8 +2534,8 @@ export function nativeTestRunAttribution(env: NodeJS.ProcessEnv): Pick<TestRunEx
   return { attribution: { ownerId, workItemId } };
 }
 
-export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
-  if (rows.length === 0) return;
+export async function insertRows(rows: readonly TestRunRow[]): Promise<TestRunReceipt[]> {
+  if (rows.length === 0) return [];
   let branch: string | null = null;
   let inferredCommit: string | null = null;
   try {
@@ -2546,10 +2546,11 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
 
   const pg = await tryGetPg();
   if (!pg) {
-    appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'failed', 'pg_unavailable', {
+    const receipts = unwrittenReceipts(rows, 'failed', 'pg_unavailable', {
       pgSetupFailure: sharedPg.setupFailure,
-    }));
-    return;
+    });
+    appendTestRunReceipts(process.env, receipts);
+    return receipts;
   }
 
   const { loopLagP95Ms, rssMb } = captureReporterSaturationSnapshot();
@@ -2566,9 +2567,12 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<void> {
       configurationSnapshot: captureConfigurationSnapshot(process.env),
     });
     appendTestRunReceipts(process.env, receipts);
+    return receipts;
   } catch (error) {
     /* swallow — D-007; an evidence run still learns why through its receipt */
-    appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'failed', receiptReason(error)));
+    const receipts = unwrittenReceipts(rows, 'failed', receiptReason(error));
+    appendTestRunReceipts(process.env, receipts);
+    return receipts;
   }
 }
 
@@ -3088,7 +3092,8 @@ export default class AdminTestRunsReporter implements Reporter {
     try { rows = await preparation; }
     finally { if (this.pendingPreparation === preparation) this.pendingPreparation = null; }
     const { flushBudgetMs } = reporterWriteBudget(process.env);
-    const write = Promise.resolve().then(() => this.writeRows(rows));
+    // Vitest's completion barrier tracks settlement; Node consumes the receipts.
+    const write = Promise.resolve().then(async () => { await this.writeRows(rows); });
     this.pendingWrite = write;
     const settled = () => {
       if (this.pendingWrite === write) this.pendingWrite = null;

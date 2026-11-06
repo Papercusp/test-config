@@ -22,6 +22,7 @@ import {
   closeSharedPgIfUnheld,
   describeWorktreeDirt,
   insertRows,
+  nativeTestRunAttribution,
   resolveMutationProbePhase,
   resolveTestRunHarnessSlug,
   resolveTestRunWorkspaceId,
@@ -29,7 +30,7 @@ import {
   setRunRoot,
   shouldRecordTestRunPath,
 } from './admin-test-runs-reporter.ts';
-import type { TestRunRow } from './admin-test-runs-reporter.ts';
+import type { TestRunRow, TestRunRowsWriter } from './admin-test-runs-reporter.ts';
 import {
   MAX_RECORDED_PASSED_CASES,
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
@@ -59,6 +60,7 @@ export interface NodeTestRowContext {
   worktreeDirtyReason: string | null;
   commitSha: string | null;
   runGroupId: string | null;
+  attribution?: TestRunExecutionDetails['attribution'];
   workspaceId: string | null;
   harnessSlug: string | null;
   mutationPhase: string | null;
@@ -139,6 +141,7 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
       root: runContext.repoRoot,
       filePath,
       runGroupId: runContext.runGroupId,
+      ...(runContext.attribution ? { attribution: runContext.attribution } : {}),
       workspaceId: runContext.workspaceId,
       harnessSlug: runContext.harnessSlug,
       testNamePattern: runContext.testNamePattern,
@@ -180,7 +183,10 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
 }
 
 export interface NodeTestLedgerOutcome {
+  /** Only rows with an INSERT acknowledgement count as recorded. */
   recorded: number;
+  /** Rows submitted to the fail-soft writer, independently of persistence. */
+  attempted?: number;
   reason: string | null;
   /** Actual case counts from the collector, independent of persistence success. */
   counts?: { executed: number; skipped: number };
@@ -221,7 +227,7 @@ export interface BeginNodeTestLedgerOptions {
   };
   /** Test seams; production uses the real snapshot and the shared ledger writer. */
   readSnapshot?: () => Promise<WorktreeSnapshot>;
-  writeRows?: (rows: readonly TestRunRow[]) => Promise<void>;
+  writeRows?: TestRunRowsWriter;
 }
 
 /**
@@ -238,6 +244,10 @@ export interface BeginNodeTestLedgerOptions {
 export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): Promise<NodeTestLedgerSession> {
   const { repoRoot } = options;
   const runStartedAt = new Date().toISOString();
+  // Bind evidence to the invocation which actually starts the child. A later
+  // environment change must neither reassign it nor attribute an anonymous run.
+  const runGroupId = process.env.PAPERCUSP_TEST_RUN_GROUP ?? null;
+  const { attribution } = nativeTestRunAttribution(process.env);
   // Capture the invocation-level export before the child starts. Each row then receives
   // the same descriptor with its own phase and test-file hash, matching the Vitest writer.
   const mutationInvocation = readMutationInvocationDescriptor();
@@ -263,6 +273,7 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
     async record(opts = {}) {
       let assertionFailures: NodeTestLedgerOutcome['assertionFailures'] = [];
       let counts: NodeTestLedgerOutcome['counts'];
+      let attempted = 0;
       try {
         let text: string;
         try {
@@ -328,7 +339,8 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
           worktreeDirty,
           worktreeDirtyReason,
           commitSha,
-          runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+          runGroupId,
+          attribution,
           workspaceId: resolveTestRunWorkspaceId(),
           harnessSlug: resolveTestRunHarnessSlug(),
           mutationPhase: resolveMutationProbePhase(),
@@ -336,10 +348,19 @@ export async function beginNodeTestLedger(options: BeginNodeTestLedgerOptions): 
           testNamePattern: opts.testNamePattern ?? null,
         });
         if (rows.length === 0) return { recorded: 0, reason: 'no recordable file executed a case', assertionFailures, counts };
-        await writeRows(rows);
-        return { recorded: rows.length, reason: worktreeDirty ? `worktree_dirty: ${worktreeDirtyReason}` : null, assertionFailures, counts };
+        attempted = rows.length;
+        const receipts = await writeRows(rows);
+        const recorded = rows.filter(row => receipts?.some(receipt =>
+          receipt.outcome === 'inserted' && receipt.id.trim().length > 0
+          && receipt.filePath === row.filePath && receipt.status === row.status)).length;
+        const reasons = [
+          ...(worktreeDirty ? [`worktree_dirty: ${worktreeDirtyReason}`] : []),
+          ...(recorded < attempted ? [`ledger insert unconfirmed: ${recorded}/${attempted} row(s) inserted`] : []),
+        ];
+        return { recorded, attempted, reason: reasons.join('; ') || null, assertionFailures, counts };
       } catch (err) {
         return { recorded: 0, reason: `recording failed: ${err instanceof Error ? err.message : String(err)}`, assertionFailures,
+          ...(attempted ? { attempted } : {}),
           ...(counts ? { counts } : {}) };
       } finally {
         rmSync(dir, { recursive: true, force: true });

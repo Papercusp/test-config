@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runGit } from './admin-test-runs-reporter.ts';
+import { runGit, testRunReceiptBaseFor } from './admin-test-runs-reporter.ts';
 import type { TestRunRow, WorktreeGitSnapshot } from './admin-test-runs-reporter.ts';
 import { MAX_RECORDED_PASSED_CASES, parseTestRunExecutionDetails } from './execution-details.ts';
 import { createNodeTestLedgerFold, oneLineMessage } from './node-test-ledger-collector.ts';
@@ -276,7 +276,8 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     dir = null;
   });
 
-  async function runChild(fixture: string, readExecutedSource?: Parameters<typeof beginNodeTestLedger>[0]['readExecutedSource']) {
+  async function runChild(fixture: string, readExecutedSource?: Parameters<typeof beginNodeTestLedger>[0]['readExecutedSource'],
+    writeOutcome: 'inserted' | 'failed' | 'timeout' | 'unknown' = 'inserted') {
     dir = mkdtempSync(join(tmpdir(), 'node-test-ledger-fixture-'));
     writeFileSync(join(dir, 'fx.test.mjs'), fixture);
     const written: TestRunRow[] = [];
@@ -287,6 +288,10 @@ describe('beginNodeTestLedger — a real node --test child', () => {
       readSnapshot: async () => snapshot,
       writeRows: async (rows) => {
         written.push(...rows);
+        if (writeOutcome === 'unknown') return;
+        return rows.map(row => ({ ...testRunReceiptBaseFor(row), ...(writeOutcome === 'inserted'
+          ? { outcome: 'inserted' as const, id: '12345' }
+          : { outcome: writeOutcome, reason: 'injected insert failure', replayable: true }) }));
       },
     });
     // Keep actual native ordering when a collector assertion fails; synthetic
@@ -333,6 +338,55 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     mutantDiffTruncated: false,
     testCommandSha256: 'c'.repeat(64),
   };
+
+  it.each(['inserted', 'failed', 'timeout', 'unknown'] as const)(
+    'reports confirmed persistence separately from attempts when the writer returns %s', async outcome => {
+      const { session, child } = await runChild(
+        "import { test } from 'node:test'; test('passes independently of ledger persistence', () => {});",
+        undefined, outcome);
+      expect(child.status).toBe(0);
+      const result = await session.record();
+      expect(result).toMatchObject({ attempted: 1, recorded: outcome === 'inserted' ? 1 : 0,
+        counts: { executed: 1, skipped: 0 }, assertionFailures: [] });
+      if (outcome === 'inserted') expect(result.reason).toBeNull();
+      else expect(result.reason).toContain('insert unconfirmed');
+    });
+
+  it('binds the child to its original owner and work item when identity changes before recording', async () => {
+    vi.stubEnv('PAPERCUSP_SID', 'original-owner');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_WORK_ITEM', 'EI-original-item');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'original-group');
+    const { session, child, written } = await runChild(
+      "import { test } from 'node:test'; test('attributed guard', () => {});",
+    );
+    expect(child.status).toBe(0);
+    vi.stubEnv('PAPERCUSP_SID', 'later-owner');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_WORK_ITEM', 'EI-later-item');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'later-group');
+    expect(await session.record()).toMatchObject({ recorded: 1, reason: null });
+    expect(written[0].executionDetails).toMatchObject({
+      runGroupId: 'original-group',
+      attribution: { ownerId: 'original-owner', workItemId: 'EI-original-item' },
+    });
+  });
+
+  it.each(['PAPERCUSP_SID', 'PAPERCUSP_TEST_RUN_WORK_ITEM', 'PAPERCUSP_TEST_RUN_GROUP', 'invalid-item'])
+    ('does not acquire attribution after starting with incomplete identity: %s', async missing => {
+      vi.stubEnv('PAPERCUSP_SID', 'original-owner');
+      vi.stubEnv('PAPERCUSP_TEST_RUN_WORK_ITEM', 'EI-original-item');
+      vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'original-group');
+      if (missing === 'invalid-item') vi.stubEnv('PAPERCUSP_TEST_RUN_WORK_ITEM', 'unregistered-item');
+      else vi.stubEnv(missing, undefined);
+      const { session, child, written } = await runChild(
+        "import { test } from 'node:test'; test('unattributed guard', () => {});",
+      );
+      expect(child.status).toBe(0);
+      vi.stubEnv('PAPERCUSP_SID', 'later-owner');
+      vi.stubEnv('PAPERCUSP_TEST_RUN_WORK_ITEM', 'EI-later-item');
+      vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'later-group');
+      expect(await session.record()).toMatchObject({ recorded: 1, reason: null });
+      expect(written[0].executionDetails).not.toHaveProperty('attribution');
+    });
 
   it.each(['baseline', 'copy-baseline', 'mutant'])
     ('persists the exported mutation descriptor for a native %s leg', async phase => {
@@ -499,8 +553,9 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     });
     writeFileSync(join(dir, 'behavior.mjs'), committed);
     expect(child.status, child.stderr).toBe(0);
-    // node:test's spec reporter forwards the worker's stderr onto its stdout.
-    expect(child.stdout + child.stderr).toContain('COMMITTED_SOURCE substituted behavior.mjs');
+    // Successful notice-file delivery suppresses the human stderr fallback.
+    expect(readFileSync(noticePath, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
+      .toContainEqual(expect.objectContaining({ kind: 'substituted', via: 'esm', rel: 'behavior.mjs' }));
     await session.record();
     expect(written[0]).toMatchObject({ status: 'pass', worktreeDirty: true, commitSha: null });
     expect(parseTestRunExecutionDetails(written[0].executionDetails)?.worktreeDirtyReason)
@@ -550,13 +605,14 @@ describe('the before-snapshot survives a caller that blocks the event loop (EI-2
         },
         writeRows: async (rows) => {
           written.push(...rows);
+          return rows.map(row => ({ ...testRunReceiptBaseFor(row), outcome: 'inserted' as const, id: '12345' }));
         },
       });
       spawnSync(process.execPath, ['--test', ...session.reporterArgs, 'fx.test.mjs'], {
         cwd: dir, encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' },
       });
       const outcome = await session.record();
-      expect(outcome).toEqual({ recorded: 1, reason: 'worktree_dirty: snapshot threw: git unavailable', assertionFailures: [],
+      expect(outcome).toEqual({ recorded: 1, attempted: 1, reason: 'worktree_dirty: snapshot threw: git unavailable', assertionFailures: [],
         counts: { executed: 1, skipped: 0 } });
       expect(written[0]).toMatchObject({ status: 'pass', worktreeDirty: true, commitSha: null });
     } finally {

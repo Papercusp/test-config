@@ -83,12 +83,13 @@ describe('shared PG setup failure receipts', () => {
       worktreeDirty: false, commitSha: 'abc123', executionDetails: null };
     try {
       await closeSharedPg();
-      await insertRows([row]);
+      const firstReceipts = await insertRows([row]);
       // Every file shares the cached setup failure rather than losing its cause.
       await insertRows([{ ...row, filePath: 'second.test.ts' }]);
       const text = readFileSync(file, 'utf8');
       const receipts = text.trim().split('\n').map(line => JSON.parse(line));
       expect(receipts).toHaveLength(2);
+      expect(firstReceipts).toEqual([receipts[0]]);
       for (const receipt of receipts) {
         expect(receipt).toMatchObject({ outcome: 'failed', reason: 'pg_unavailable',
           pgSetupFailure: { phase, ...(expectedCode ? { code: expectedCode } : {}) } });
@@ -118,10 +119,11 @@ describe('shared PG setup failure receipts', () => {
     const at = new Date('2026-10-26T20:00:00Z');
     try {
       await closeSharedPg();
-      await insertRows([{ filePath: 'query.test.ts', status: 'pass', durationMs: 1,
+      const returnedReceipts = await insertRows([{ filePath: 'query.test.ts', status: 'pass', durationMs: 1,
         startedAt: at, finishedAt: at, outputTail: null, isScratchConfig: false,
         worktreeDirty: false, commitSha: 'abc123', executionDetails: null }]);
       const receipt = JSON.parse(readFileSync(file, 'utf8').trim());
+      expect(returnedReceipts).toEqual([receipt]);
       expect(receipt).toMatchObject({ outcome: 'failed', errorCode: 'ECONNREFUSED' });
       expect(receipt).not.toHaveProperty('pgSetupFailure');
       expect(receipt.reason).not.toBe('pg_unavailable');
