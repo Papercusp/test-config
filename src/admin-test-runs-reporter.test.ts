@@ -88,6 +88,18 @@ describe('native test execution custody', () => {
       expect(nativeTestRunAttribution({ ...env, [missing]: '' })).toEqual({});
     expect(nativeTestRunAttribution({ ...env, PAPERCUSP_TEST_RUN_WORK_ITEM: 'unrelated-goal' })).toEqual({});
   });
+  it('retains reporter attribution with no operational session identity', () => {
+    const env = { PAPERCUSP_TEST_RUN_OWNER_ID: 'agent-evidence',
+      PAPERCUSP_TEST_RUN_WORK_ITEM: 'EI-123', PAPERCUSP_TEST_RUN_GROUP: 'isolated-1' };
+    expect(nativeTestRunAttribution(env)).toEqual({
+      attribution: { ownerId: 'agent-evidence', workItemId: 'EI-123' },
+    });
+    expect(nativeTestRunAttribution({ ...env, PAPERCUSP_SID: 'private-product' })).toEqual({
+      attribution: { ownerId: 'agent-evidence', workItemId: 'EI-123' },
+    });
+    for (const missing of ['PAPERCUSP_TEST_RUN_OWNER_ID', 'PAPERCUSP_TEST_RUN_WORK_ITEM', 'PAPERCUSP_TEST_RUN_GROUP'])
+      expect(nativeTestRunAttribution({ ...env, [missing]: '' })).toEqual({});
+  });
   it('persists custody through the real reporter hooks', async () => {
     vi.stubEnv('PAPERCUSP_SID', 'agent-native');
     vi.stubEnv('PAPERCUSP_TEST_RUN_WORK_ITEM', 'EI-123');

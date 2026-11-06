@@ -2549,7 +2549,7 @@ export async function insertTestCaseRowsWithSql(
  */
 /** Only an explicitly named work item binds native results to a close. */
 export function nativeTestRunAttribution(env: NodeJS.ProcessEnv): Pick<TestRunExecutionDetails, 'attribution'> {
-  const ownerId = env.PAPERCUSP_SID?.trim();
+  const ownerId = env.PAPERCUSP_TEST_RUN_OWNER_ID?.trim() || env.PAPERCUSP_SID?.trim();
   const workItemId = env.PAPERCUSP_TEST_RUN_WORK_ITEM?.trim();
   if (!ownerId || !workItemId || !/^(?:WI|EI|F)-[A-Za-z0-9._-]+$/.test(workItemId)
     || !env.PAPERCUSP_TEST_RUN_GROUP?.trim()) return {};
