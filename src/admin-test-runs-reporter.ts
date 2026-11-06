@@ -2611,7 +2611,7 @@ export function buildOutputTail(
   const boundedTail = (value: string): string => redactSensitiveText(value).slice(-4000);
   let tail: string | null = null;
   try {
-    const errs = testModule.errors?.() ?? [];
+    const errs = collectModuleErrors(testModule);
     if (errs.length > 0) {
       tail = boundedTail(errs
         .map((e: unknown) => formatTestCaseError(e, { includeStack: true }))
@@ -2640,6 +2640,29 @@ export function buildOutputTail(
     if (lines.length > 0) tail = boundedTail(lines.join('\n'));
   } catch { /* fail-soft */ }
   return tail;
+}
+
+/**
+ * Vitest stores collection and hook errors on the suite where they occurred.
+ * TestModule.errors() only reports errors attached to the file module itself;
+ * nested beforeAll failures live on descendant TestSuite.errors().
+ */
+function collectModuleErrors(testModule: TestModule): unknown[] {
+  const errors: unknown[] = [];
+  const collect = (task: { errors?: () => readonly unknown[] }) => {
+    try {
+      errors.push(...(task.errors?.() ?? []));
+    } catch { /* fail-soft */ }
+  };
+
+  collect(testModule);
+  try {
+    const suites = (testModule as unknown as {
+      children?: { allSuites?: () => Iterable<{ errors?: () => readonly unknown[] }> };
+    }).children?.allSuites?.() ?? [];
+    for (const suite of suites) collect(suite);
+  } catch { /* fail-soft */ }
+  return errors;
 }
 
 function collectTestFailureDetails(testModule: TestModule, file: string): TestFailureDetail[] {
@@ -2704,7 +2727,7 @@ function collectTestFailureDetails(testModule: TestModule, file: string): TestFa
   if (!sawFailingTestCase) {
     try {
       if (moduleStatus(testModule) === 'fail') {
-        const errs = testModule.errors?.() ?? [];
+        const errs = collectModuleErrors(testModule);
         if (errs.length > 0) {
           const message = formatTestCaseError(errs[0], { includeStack: true });
           if (message) {

@@ -2411,6 +2411,62 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   });
 
+  it('EI-27740011831602428: a nested beforeAll error survives registered passed and skipped cases in output_tail and the failure sidecar', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'papercusp-reporter-nested-collection-failure-'));
+    const detailsPath = join(dir, 'failure-details.json');
+    const previous = process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+    process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = detailsPath;
+    const written: TestRunRow[] = [];
+    const error = {
+      message: 'nested beforeAll failed: auditDefinition was null',
+      stack: 'Error: nested beforeAll failed: auditDefinition was null\n    at beforeAll (admin-test-runs-reporter.test.ts:2400:11)',
+    };
+    const registeredCases = [
+      { fullName: 'parent > broken setup > already ran', result: () => ({ state: 'passed', errors: [] }) },
+      { fullName: 'parent > broken setup > blocked one', result: () => ({ state: 'skipped', errors: [] }) },
+      { fullName: 'parent > broken setup > blocked two', result: () => ({ state: 'skipped', errors: [] }) },
+    ];
+    const reporter = new AdminTestRunsReporter(
+      async () => ({ commit: 'abc', porcelain: '' }),
+      undefined,
+      async rows => { written.push(...rows); },
+    );
+    try {
+      await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      reporter.onTestModuleEnd({
+        moduleId: join(TEST_CONFIG_ROOT, 'src/nested-suite.integration.test.ts'),
+        state: () => 'failed',
+        diagnostic: () => ({ duration: 3 }),
+        errors: () => [],
+        children: {
+          allTests: () => registeredCases,
+          allSuites: () => [{ errors: () => [error] }],
+        },
+      } as never);
+      await reporter.onTestRunEnd();
+
+      expect(written).toHaveLength(1);
+      expect(written[0]).toMatchObject({
+        status: 'fail',
+        outputTail: expect.stringContaining('nested beforeAll failed: auditDefinition was null'),
+      });
+      const payload = JSON.parse(readFileSync(detailsPath, 'utf8')) as {
+        failures: Array<{ file: string; test: string; message?: string }>;
+      };
+      expect(payload.failures).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: expect.stringMatching(/(?:^|\/)src\/nested-suite\.integration\.test\.ts$/),
+          test: '(file failed to collect)',
+          message: expect.stringContaining('nested beforeAll failed: auditDefinition was null'),
+        }),
+      ]));
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+      else process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('EI-22137062583459326: a module with a real per-test failure does NOT also get a spurious "(file failed to collect)" entry', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'papercusp-reporter-no-spurious-collection-'));
     const detailsPath = join(dir, 'failure-details.json');
