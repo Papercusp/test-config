@@ -80,6 +80,12 @@ import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+const MUTATION_FINALIZATION_DESCRIPTOR = JSON.stringify({
+  schemaVersion: 1, probeInvocationId: 'qualified-mutation-finalization', mode: 'copy-out',
+  subjectPath: 'source.ts', mutateExpression: 's/before/after/', againstCommit: null,
+  subjectBeforeSha256: 'a'.repeat(64), subjectAfterSha256: 'b'.repeat(64),
+  testCommandSha256: 'c'.repeat(64), mutantDiff: '-before\n+after', mutantDiffTruncated: false,
+});
 describe('native test execution custody', () => {
   it('requires an explicit item, actor and stable group rather than a guessed goal', () => {
     const env = { PAPERCUSP_SID: 'agent-a', PAPERCUSP_TEST_RUN_WORK_ITEM: 'EI-123',
@@ -2347,12 +2353,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
   it.each([false, true])('awaits complete mutation failure provenance beyond the SQL budget and preserves dirty=%s', async dirty => {
     vi.stubEnv('PAPERCUSP_MUTATION_PROBE', '1');
     vi.stubEnv('PAPERCUSP_MUTATION_PHASE', 'mutant');
-    vi.stubEnv('PAPERCUSP_MUTATION_DESCRIPTOR', JSON.stringify({
-      schemaVersion: 1, probeInvocationId: 'qualified-mutation-finalization', mode: 'copy-out',
-      subjectPath: 'source.ts', mutateExpression: 's/before/after/', againstCommit: null,
-      subjectBeforeSha256: 'a'.repeat(64), subjectAfterSha256: 'b'.repeat(64),
-      testCommandSha256: 'c'.repeat(64), mutantDiff: '-before\n+after', mutantDiffTruncated: false,
-    }));
+    vi.stubEnv('PAPERCUSP_MUTATION_DESCRIPTOR', MUTATION_FINALIZATION_DESCRIPTOR);
     let releaseSnapshot: (value: { commit: string; porcelain: string }) => void = () => undefined;
     const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => undefined);
     const reporter = new AdminTestRunsReporter(async phase => phase === 'before'
@@ -2398,15 +2399,20 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   });
 
-  it.each([undefined, '{invalid'])('keeps mutation marker without a valid descriptor bounded (%s)', async descriptor => {
+  it.each([
+    { name: 'missing descriptor', descriptor: undefined, phase: 'mutant', beforePorcelain: '' },
+    { name: 'malformed descriptor', descriptor: '{invalid', phase: 'mutant', beforePorcelain: '' },
+    { name: 'failed calibration', descriptor: MUTATION_FINALIZATION_DESCRIPTOR, phase: 'baseline', beforePorcelain: '' },
+    { name: 'dirty initial source', descriptor: MUTATION_FINALIZATION_DESCRIPTOR, phase: 'mutant', beforePorcelain: ' M source.ts' },
+  ])('keeps unqualified mutation failure bounded ($name)', async ({ descriptor, phase, beforePorcelain }) => {
     vi.stubEnv('PAPERCUSP_MUTATION_PROBE', '1');
-    vi.stubEnv('PAPERCUSP_MUTATION_PHASE', 'mutant');
+    vi.stubEnv('PAPERCUSP_MUTATION_PHASE', phase);
     vi.stubEnv('PAPERCUSP_MUTATION_DESCRIPTOR', descriptor);
     let releaseSnapshot: (value: { commit: string; porcelain: string }) => void = () => undefined;
     let aborted = false;
     const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => undefined);
     const reporter = new AdminTestRunsReporter(async (phase, signal) => phase === 'before'
-      ? { commit: 'abc', porcelain: '' }
+      ? { commit: 'abc', porcelain: beforePorcelain }
       : new Promise(resolve => {
           releaseSnapshot = resolve;
           signal?.addEventListener('abort', () => { aborted = true; }, { once: true });

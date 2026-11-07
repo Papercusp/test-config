@@ -337,6 +337,51 @@ describe('shared PG lease (WI-10003715)', () => {
     }
   });
 
+  it('bounds an evidence writer that never settles by its total budget and final drain', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'reporter-final-budget-'));
+    const receiptFile = join(directory, 'receipts.jsonl');
+    const previousReceipt = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = receiptFile;
+    let releaseWrite = () => {};
+    const end = vi.fn(async () => { releaseWrite(); });
+    const sql = Object.assign(() => Promise.resolve([]), { end }) as unknown as PgSql;
+    shared.promise = Promise.resolve({ sql });
+    const writeRows = vi.fn(async () => { await new Promise<void>(resolve => { releaseWrite = resolve; }); });
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }), undefined, writeRows);
+    let final: Promise<void> | undefined;
+    try {
+      await reporter.onInit({ config: { root: process.cwd() } } as never);
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      reporter.onTestModuleEnd({ moduleId: fileURLToPath(import.meta.url), state: () => 'passed',
+        diagnostic: () => ({ duration: 1 }), children: { allTests: () => [] } } as unknown as TestModule);
+      let finished = false;
+      final = reporter.onTestRunEnd().then(() => { finished = true; });
+      await vi.advanceTimersByTimeAsync(24_999);
+      expect(writeRows).toHaveBeenCalledOnce();
+      expect(finished).toBe(false);
+      expect(end).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      const receipts = readFileSync(receiptFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(receipts).toMatchObject([{ outcome: 'timeout', reason: 'flush_budget_25000ms' }]);
+      expect(end).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(SHARED_PG_DRAIN_TIMEOUT_MS);
+      await final;
+      expect(end).toHaveBeenCalledExactlyOnceWith({ timeout: 0 });
+      expect(finished).toBe(true);
+      await reporter.onExit();
+      expect(writeRows).toHaveBeenCalledOnce();
+    } finally {
+      releaseWrite();
+      await vi.runAllTimersAsync();
+      await final;
+      await reporter.onExit();
+      vi.useRealTimers();
+      if (previousReceipt === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+      else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previousReceipt;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('reports a pending bounded drain and preserves a query that settles during it', async () => {
     const { end } = installFakeClient();
     const release = retainSharedPg();

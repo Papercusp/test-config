@@ -2909,6 +2909,8 @@ export default class AdminTestRunsReporter implements Reporter {
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
   /** Vitest can call both onTestRunEnd and onExit; flush rows exactly once. */
   private flushed = false;
+  /** Both hooks must await the same work before either releases the PG lease. */
+  private finalFlush: Promise<void> | null = null;
   /** EI-26701962157024953: the in-flight mid-run write of failing rows, if any. */
   private interimFlush: Promise<void> | null = null;
   private interimRows: PendingTestRunRow[] = [];
@@ -2930,6 +2932,8 @@ export default class AdminTestRunsReporter implements Reporter {
     'filePath' | 'passed' | 'failed' | 'skipped' | 'collectionFailed' | 'commitSha' | 'worktreeDirty'> | null = null;
   /** The probe's invocation-level descriptor, read once per run (mutation-descriptor.ts). */
   private mutationInvocation: MutationInvocationDescriptor | null = null;
+  /** Only a validated mutant with a proven initial source can supply terminal mutation proof. */
+  private terminalMutationProvenance = false;
 
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
@@ -3040,6 +3044,7 @@ export default class AdminTestRunsReporter implements Reporter {
     this.isScratchConfig = computeIsScratchConfig(ctx);
     this.worktreeBefore = this.readWorktreeSnapshot('before');
     this.flushed = false;
+    this.finalFlush = null;
     this.failureDetails = [];
     this.failureDetailsFlushed = false;
     this.executionContext = {
@@ -3065,7 +3070,9 @@ export default class AdminTestRunsReporter implements Reporter {
     // source read here: synchronous import/build work must not overlap its
     // subprocess callbacks or move the "before" snapshot into test execution.
     // The reader already turns failures into dirty provenance without throwing.
-    await this.worktreeBefore;
+    const before = await this.worktreeBefore;
+    this.terminalMutationProvenance = this.mutationInvocation !== null &&
+      this.executionContext.mutationPhase === 'mutant' && describeWorktreeDirt(before, before) === null;
     // After the bounded source read, for the same reason: module loading is synchronous work.
     this.evidenceRoot = await loadEvidenceRootResolver();
   }
@@ -3143,7 +3150,7 @@ export default class AdminTestRunsReporter implements Reporter {
    * that the ordinary finalization path would have awaited.
    */
   private scheduleInterimFlush(): void {
-    if (resolveTestRunSource() === 'mutation-probe' ||
+    if (this.terminalMutationProvenance ||
       this.flushed || this.interimFlush || this.pendingWrite || this.pendingPreparation ||
       !this.pending.some(row => isInterimFlushStatus(row.status))) return;
     this.interimFlush = (async () => {
@@ -3165,7 +3172,11 @@ export default class AdminTestRunsReporter implements Reporter {
     })();
   }
 
-  private async flushPending(): Promise<void> {
+  private flushPending(): Promise<void> {
+    return this.finalFlush ??= this.flushPendingRows();
+  }
+
+  private async flushPendingRows(): Promise<void> {
     if (this.flushed) return;
     this.flushed = true;
     // The before census belongs to this run even when every failure was already
