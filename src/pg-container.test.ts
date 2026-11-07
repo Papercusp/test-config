@@ -29,10 +29,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { getContainerRuntimeClient } from "testcontainers";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { assertSharedTestPgStorageHeadroom, NON_DESTRUCTIVE_PG_HEALTHCHECK } from "./pg-container.ts";
@@ -675,52 +675,64 @@ export function findHealthcheckOffenders(
   return offenders;
 }
 
+/** Same generated/archive boundaries as defineVitestConfig; retain new source files and submodules. */
+const PG_CENSUS_EXCLUDED_DIRS = ["node_modules", ".git", ".papercusp", "dist", "dist-verify", ".next", "_retired"];
+
+export function discoverPgContainerCallSites(root: string): string[] {
+  let out: string;
+  try {
+    out = execFileSync("rg", [
+      "--files-with-matches", "--null", "--hidden", "--glob", "*.ts",
+      ...PG_CENSUS_EXCLUDED_DIRS.flatMap(dir => ["--glob", `!**/${dir}/**`]),
+      "new PostgreSqlContainer", ".",
+    ], { cwd: root, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000 });
+  } catch (error) {
+    // rg's documented no-match result is the only empty census. Tool, IO and timeout
+    // errors must fail the guard rather than manufacture a successful negative result.
+    if ((error as { status?: number }).status === 1) return [];
+    throw new Error(`PostgreSQL constructor source census failed in ${root}`, { cause: error });
+  }
+  return out.split("\0")
+    .map(path => path.replace(/^\.\//, ""))
+    .filter(path => path.length > 0 && path !== GUARD_SELF)
+    .filter(path => constructsPgContainer(readFileSync(join(root, path), "utf8")))
+    .sort();
+}
+
 describe("PostgreSqlContainer healthcheck rollout (EI-21340200136336953)", () => {
   const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
-
-  /**
-   * Every canonical, non-node_modules .ts file constructing a
-   * PostgreSqlContainer. `.papercusp/worktrees` contains isolated release
-   * snapshots that are not part of the source corpus under test; walking them
-   * makes this negative guard report stale call sites from another checkout.
-   *
-   * `grep -rl` (one line per FILE) deliberately, not `-rn` piped through a line
-   * cap: this list drives a NEGATIVE conclusion ("no unguarded site exists"),
-   * and a positional truncation is exactly what manufactures a false clean here.
-   * A no-match grep exits 1, which would throw out of execFileSync as an opaque
-   * error — caught and returned as [] so the vacuity guard below reports it as
-   * the broken walk it is, rather than an unreadable stack.
-   */
+  let callSites: string[] | undefined;
+  // One complete source census per run: the three assertions share its population.
+  // Source test files remain covered; only this guard's string fixtures are excluded.
   function containerCallSites(): string[] {
-    let out = "";
-    try {
-      out = execFileSync(
-        "grep",
-        [
-          "-rl",
-          "--include=*.ts",
-          "--exclude-dir=node_modules",
-          "--exclude-dir=.git",
-          "--exclude-dir=.papercusp",
-          "new PostgreSqlContainer",
-          ".",
-        ],
-        { cwd: REPO_ROOT, encoding: "utf8" },
-      );
-    } catch {
-      return [];
-    }
-    // Test files ARE call sites (2026-09-27): excluding every `.test.ts` let four
-    // P-013 rig suites construct long-lived dedicated clusters with the stock
-    // healthcheck, and one crash-restarted mid-run. Only this guard's own
-    // fixture file and prose-only mentions are excluded.
-    return out
-      .split("\n")
-      .map((l) => l.trim().replace(/^\.\//, ""))
-      .filter((l) => l.length > 0 && l !== GUARD_SELF)
-      .filter((l) => constructsPgContainer(readFileSync(join(REPO_ROOT, l), "utf8")))
-      .sort();
+    return callSites ??= discoverPgContainerCallSites(REPO_ROOT);
   }
+
+  it("excludes generated snapshots while retaining genuine new TS source and test constructors", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pg-constructor-census-"));
+    try {
+      const live = ["packages/live/src/main.ts", "packages/live/src/control.test.ts", "libs/nested/src/pg.ts"];
+      const generated = PG_CENSUS_EXCLUDED_DIRS.map(dir => `apps/operator/${dir}/snapshot/old.ts`);
+      for (const path of [...live, ...generated]) {
+        await mkdir(dirname(join(root, path)), { recursive: true });
+        await writeFile(join(root, path), "const pg = new PostgreSqlContainer(IMG).start();\n");
+      }
+      await writeFile(join(root, "packages/live/src/comment.ts"), "// new PostgreSqlContainer(IMG) is prose\n");
+      const discovered = discoverPgContainerCallSites(root);
+      expect(discovered).toEqual([...live].sort());
+      expect(findHealthcheckOffenders(discovered, path => readFileSync(join(root, path), "utf8"), {}))
+        .toEqual([...live].sort());
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("distinguishes an empty source cohort from an unreadable census root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pg-empty-census-"));
+    try {
+      await writeFile(join(root, "empty.ts"), "export const noContainer = true;\n");
+      expect(discoverPgContainerCallSites(root)).toEqual([]);
+      expect(() => discoverPgContainerCallSites(join(root, "absent"))).toThrow("source census failed");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
 
   it("discovers the call sites at all (guards a broken discovery walk)", () => {
     // A discovery guard whose walk silently matches nothing passes vacuously and
