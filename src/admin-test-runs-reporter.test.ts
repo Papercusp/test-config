@@ -1629,6 +1629,50 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       expect(statement).toHaveBeenCalledTimes(1);
     });
 
+    it.each([0, 1])('distinguishes %i received result rows from an unacknowledged insert without leaking driver data', async rowCount => {
+      vi.useFakeTimers();
+      const NEVER_EMIT_MARKER = 'never-emit-me';
+      const pending = Object.assign(new Promise(() => {}), {
+        executed: true, active: true, state: { pid: 1198083, secret: NEVER_EMIT_MARKER },
+        resultDiagnostic: { rowCount, wireBytes: rowCount * 42, query: 'private-sql-sentinel',
+          context: { credential: 'driver-context-sentinel' } },
+      });
+      const statement = vi.fn(() => pending);
+      try {
+        const write = insertTestRunRowsWithSql(fakeSql(statement), [row('a.test.ts')], context, {
+          insertTimeoutMs: 20, totalInsertMs: 40,
+        });
+        await vi.advanceTimersByTimeAsync(40);
+        const [receipt] = await write;
+        expect(receipt).toMatchObject({ outcome: 'timeout',
+          insertDiagnostics: { settledAt: null, driverState: {
+            executed: true, active: true, resultRowCount: rowCount, resultWireBytes: rowCount * 42,
+          } } });
+        const text = JSON.stringify(receipt);
+        for (const sentinel of [NEVER_EMIT_MARKER, 'private-sql-sentinel', 'driver-context-sentinel']) {
+          expect(text).not.toContain(sentinel);
+        }
+        expect(statement).toHaveBeenCalledTimes(1);
+      } finally { vi.useRealTimers(); }
+    });
+
+    it('keeps unavailable or invalid driver progress unknown without losing an inserted receipt', async () => {
+      const result = [{ id: '901', file_path: 'a.test.ts' }];
+      const pending = Object.assign(Promise.resolve(result), {
+        executed: 'unknown', active: 1,
+        resultDiagnostic: { rowCount: -1, wireBytes: Number.POSITIVE_INFINITY },
+      });
+      const [receipt] = await insertTestRunRowsWithSql(fakeSql(() => pending), [row('a.test.ts')], context);
+      expect(receipt).toMatchObject({ outcome: 'inserted', id: '901',
+        insertDiagnostics: { driverState: {
+          executed: null, active: null, resultRowCount: null, resultWireBytes: null,
+        } } });
+      Object.defineProperty(pending, 'resultDiagnostic', { get: () => { throw new Error('diagnostic getter'); } });
+      const [guarded] = await insertTestRunRowsWithSql(fakeSql(() => pending), [row('a.test.ts')], context);
+      expect(guarded).toMatchObject({ outcome: 'inserted', id: '901' });
+      expect(guarded?.insertDiagnostics?.driverState).toBeUndefined();
+    });
+
     it('bounds a permanently pending insert by the total budget without replaying it', async () => {
       vi.useFakeTimers();
       const pending = Object.assign(new Promise(() => {}), { state: null as { pid: number } | null });
