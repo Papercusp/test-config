@@ -2175,11 +2175,10 @@ export function appendTestRunReceipts(
 }
 
 /**
- * Keep the reporter's SQL receipt deadline under Vitest's 10s main-process close
- * timeout. Final full provenance is awaited separately before this clock starts.
- * Evidence runs can give the database writer a longer independent
- * query budget; the local timeout receipt must still be written before Vitest
- * force-closes the reporter process.
+ * Interim writes use a close-safe foreground deadline. Terminal provenance and
+ * evidence writes are awaited by onTestRunEnd, before Vitest starts its close
+ * timeout. Their finalization must honor the writer's existing total budget;
+ * releasing the lease at the shorter interim deadline destroys valid queries.
  */
 export function reporterWriteBudget(env: NodeJS.ProcessEnv): {
   connectTimeoutSec: number;
@@ -3138,9 +3137,14 @@ export default class AdminTestRunsReporter implements Reporter {
    * batch is stamped by its own before/after snapshot, so stability is still proven
    * for the window in which the failure was observed. At most one write is in flight;
    * failures that arrive meanwhile are picked up by the follow-up batch.
+   * Mutation failures are expected falsifiability evidence: like passing controls,
+   * they need the complete terminal source snapshot. Their diagnostic sidecar is
+   * still written immediately, but an early SQL deadline must not discard proof
+   * that the ordinary finalization path would have awaited.
    */
   private scheduleInterimFlush(): void {
-    if (this.flushed || this.interimFlush || this.pendingWrite || this.pendingPreparation ||
+    if (resolveTestRunSource() === 'mutation-probe' ||
+      this.flushed || this.interimFlush || this.pendingWrite || this.pendingPreparation ||
       !this.pending.some(row => isInterimFlushStatus(row.status))) return;
     this.interimFlush = (async () => {
       try {
@@ -3264,7 +3268,8 @@ export default class AdminTestRunsReporter implements Reporter {
 
   private async persistRows(pendingRows: PendingTestRunRow[], finalProvenance = false): Promise<void> {
     if (pendingRows.length === 0) return;
-    const { flushBudgetMs } = reporterWriteBudget(process.env);
+    const { flushBudgetMs, totalInsertMs } = reporterWriteBudget(process.env);
+    const writeBudgetMs = finalProvenance ? Math.max(flushBudgetMs, totalInsertMs) : flushBudgetMs;
     let localDeadlineMs = finalProvenance ? Number.POSITIVE_INFINITY : Date.now() + flushBudgetMs;
     const deadlineMs = () => Math.min(
       localDeadlineMs,
@@ -3305,7 +3310,7 @@ export default class AdminTestRunsReporter implements Reporter {
       controller.abort();
       rows = withoutProvenance('provenance preparation exceeded its close-safe budget');
     }
-    if (finalProvenance) localDeadlineMs = Date.now() + flushBudgetMs;
+    if (finalProvenance) localDeadlineMs = Date.now() + writeBudgetMs;
     const remainingMs = Math.max(0, deadlineMs() - Date.now());
     if (remainingMs === 0) {
       appendTestRunReceipts(process.env,
@@ -3335,7 +3340,7 @@ export default class AdminTestRunsReporter implements Reporter {
     if (!finished) {
       // The writer may still finish (and append its own `inserted` lines) before the
       // process exits; a reader takes `inserted` over `timeout` for the same file.
-      appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'timeout', `flush_budget_${flushBudgetMs}ms`));
+      appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'timeout', `flush_budget_${writeBudgetMs}ms`));
     }
   }
 

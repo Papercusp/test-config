@@ -2344,6 +2344,99 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   });
 
+  it.each([false, true])('awaits complete mutation failure provenance beyond the SQL budget and preserves dirty=%s', async dirty => {
+    vi.stubEnv('PAPERCUSP_MUTATION_PROBE', '1');
+    vi.stubEnv('PAPERCUSP_MUTATION_PHASE', 'mutant');
+    vi.stubEnv('PAPERCUSP_MUTATION_DESCRIPTOR', JSON.stringify({
+      schemaVersion: 1, probeInvocationId: 'qualified-mutation-finalization', mode: 'copy-out',
+      subjectPath: 'source.ts', mutateExpression: 's/before/after/', againstCommit: null,
+      subjectBeforeSha256: 'a'.repeat(64), subjectAfterSha256: 'b'.repeat(64),
+      testCommandSha256: 'c'.repeat(64), mutantDiff: '-before\n+after', mutantDiffTruncated: false,
+    }));
+    let releaseSnapshot: (value: { commit: string; porcelain: string }) => void = () => undefined;
+    const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => undefined);
+    const reporter = new AdminTestRunsReporter(async phase => phase === 'before'
+      ? { commit: 'abc', porcelain: '' }
+      : new Promise(resolve => { releaseSnapshot = resolve; }), undefined, writeRows);
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    vi.useFakeTimers();
+    let final: Promise<void> | undefined;
+    try {
+      reporter.onTestModuleEnd({ moduleId: join(TEST_CONFIG_ROOT, 'src/mutation-provenance.test.ts'),
+        state: () => 'failed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+        children: { allTests: () => [{ fullName: 'mutant is caught', result: () => ({ state: 'failed' }) }] } } as never);
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs * 3);
+      expect(writeRows).not.toHaveBeenCalled();
+      let finished = false;
+      final = reporter.onTestRunEnd().then(() => { finished = true; });
+      let exited = false;
+      const exit = reporter.onExit().then(() => { exited = true; });
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs * 3);
+      expect(finished).toBe(false);
+      expect(exited).toBe(false);
+      expect(writeRows).not.toHaveBeenCalled();
+      releaseSnapshot({ commit: 'abc', porcelain: dirty ? ' M source.ts' : '' });
+      await vi.advanceTimersByTimeAsync(0);
+      await final;
+      await exit;
+      expect(finished).toBe(true);
+      expect(exited).toBe(true);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      expect(writeRows.mock.calls[0][0]).toEqual([expect.objectContaining({
+        status: 'fail', commitSha: 'abc', worktreeDirty: dirty,
+        executionDetails: expect.objectContaining({ failed: 1, mutationPhase: 'mutant',
+          commitSha: 'abc', worktreeDirty: dirty }),
+      })]);
+      await reporter.onExit();
+      expect(writeRows).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseSnapshot({ commit: 'abc', porcelain: '' });
+      await vi.runAllTimersAsync();
+      await final;
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([undefined, '{invalid'])('keeps mutation marker without a valid descriptor bounded (%s)', async descriptor => {
+    vi.stubEnv('PAPERCUSP_MUTATION_PROBE', '1');
+    vi.stubEnv('PAPERCUSP_MUTATION_PHASE', 'mutant');
+    vi.stubEnv('PAPERCUSP_MUTATION_DESCRIPTOR', descriptor);
+    let releaseSnapshot: (value: { commit: string; porcelain: string }) => void = () => undefined;
+    let aborted = false;
+    const writeRows = vi.fn(async (_rows: readonly TestRunRow[]) => undefined);
+    const reporter = new AdminTestRunsReporter(async (phase, signal) => phase === 'before'
+      ? { commit: 'abc', porcelain: '' }
+      : new Promise(resolve => {
+          releaseSnapshot = resolve;
+          signal?.addEventListener('abort', () => { aborted = true; }, { once: true });
+        }), undefined, writeRows);
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    vi.useFakeTimers();
+    let final: Promise<void> | undefined;
+    try {
+      reporter.onTestModuleEnd({ moduleId: join(TEST_CONFIG_ROOT, 'src/unqualified-mutation.test.ts'),
+        state: () => 'failed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+        children: { allTests: () => [] } } as never);
+      await vi.advanceTimersByTimeAsync(0);
+      let finished = false;
+      final = reporter.onTestRunEnd().then(() => { finished = true; });
+      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs + 1_000);
+      expect(finished).toBe(true);
+      expect(aborted).toBe(true);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+      expect(writeRows.mock.calls[0][0]).toEqual([expect.objectContaining({
+        status: 'fail', commitSha: null, worktreeDirty: true,
+      })]);
+    } finally {
+      releaseSnapshot({ commit: 'abc', porcelain: '' });
+      await vi.runAllTimersAsync();
+      await final;
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('writes an inserted failure receipt before Vitest close when provenance misses the close-safe budget', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-preparation-timeout-'));
     const receiptPath = join(dir, 'receipts.jsonl');

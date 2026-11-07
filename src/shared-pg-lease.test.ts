@@ -262,8 +262,15 @@ describe('same-process evidence ledger preflight', () => {
 });
 
 describe('shared PG lease (WI-10003715)', () => {
-  it('keeps the file-to-case writer alive after the reporter foreground flush expires', async () => {
+  it.each([
+    { evidence: false, settleAfterMs: 5_000 },
+    { evidence: true, settleAfterMs: 8_000 },
+  ])('keeps the file-to-case writer alive until $settleAfterMs ms (evidence=$evidence)', async ({ evidence, settleAfterMs }) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const previousReceipt = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    const directory = mkdtempSync(join(tmpdir(), 'reporter-write-budget-'));
+    if (evidence) process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = join(directory, 'receipts.jsonl');
+    else delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
     let resolveFile!: (value: unknown) => void;
     let enterFile!: () => void;
     const enteredFile = new Promise<void>(resolve => { enterFile = resolve; });
@@ -274,6 +281,7 @@ describe('shared PG lease (WI-10003715)', () => {
     const sql = Object.assign((first: unknown) => {
       if (Array.isArray(first) && !('raw' in first)) return {};
       const statement = (first as TemplateStringsArray).join('?');
+      if (statement.trimStart().startsWith('EXPLAIN')) return Promise.resolve([]);
       statements.push(statement);
       if (ended) return Promise.reject(new Error('write CONNECTION_ENDED localhost:5432'));
       if (statement.includes('harness_shared.test_runs')) { enterFile(); return fileInsert; }
@@ -305,7 +313,7 @@ describe('shared PG lease (WI-10003715)', () => {
       } as unknown as TestModule);
       done = reporter.onTestRunEnd();
       await enteredFile;
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(settleAfterMs);
       expect(end).not.toHaveBeenCalled();
       resolveFile([{ id: '903', file_path: recordedPath }]);
       await vi.advanceTimersByTimeAsync(0);
@@ -323,6 +331,9 @@ describe('shared PG lease (WI-10003715)', () => {
       await done;
       await reporter.onExit();
       vi.useRealTimers();
+      if (previousReceipt === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+      else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previousReceipt;
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
