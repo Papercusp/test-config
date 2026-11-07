@@ -143,6 +143,11 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
     expect(child.status, child.output.slice(-3000)).toBe(1);
     expect(child.output).toContain('case-ledger-expected');
     expect(receiptLines.map((line) => JSON.parse(line).outcome)).toContain('inserted');
+    const receipt = receiptLines.map((line) => JSON.parse(line)).find(row => row.outcome === 'inserted');
+    expect(receipt).toMatchObject({ insertDiagnostics: { driverState: {
+      executed: true, active: false, resultRowCount: 1, resultWireBytes: expect.any(Number),
+    } }, caseInsertOutcome: { written: 5, unwritten: 0, reason: null } });
+    expect(receipt.insertDiagnostics.driverState.resultWireBytes).toBeGreaterThan(0);
   });
 
   it('records one case row per case, in module order, keyed by the describe/it title path', async () => {

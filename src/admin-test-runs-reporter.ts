@@ -1857,6 +1857,14 @@ export type TestRunInsertDiagnostics = {
   settledElapsedMs: number | null;
   /** Remaining total write budget when this statement was created. */
   budgetMs: number;
+  /** Client parser progress, not server execution or commit evidence. Missing
+   * driver fields stay unknown; never serialize the Query, SQL or cancel secret. */
+  driverState?: {
+    executed: boolean | null;
+    active: boolean | null;
+    resultRowCount: number | null;
+    resultWireBytes: number | null;
+  };
 };
 
 export type TestRunReceipt =
@@ -2424,13 +2432,34 @@ export async function insertTestRunRowsWithSql(
       settledElapsedMs = Math.max(0, performance.now() - started);
       settledBackendPid = backendPid(pending) ?? backendPid(value);
     };
-    const readDiagnostics = (): TestRunInsertDiagnostics => ({
-      schemaVersion: 1, statementId, clientPid: process.pid,
-      backendPid: settledAt === null ? backendPid(pending) : settledBackendPid,
-      startedAt, observedAt: new Date().toISOString(),
-      elapsedMs: Math.max(0, performance.now() - started),
-      settledAt, settledElapsedMs, budgetMs: remainingMs,
-    });
+    const readDriverState = (): TestRunInsertDiagnostics['driverState'] => {
+      try {
+        const { executed, active, resultDiagnostic } = pending as unknown as {
+          executed?: unknown; active?: unknown;
+          resultDiagnostic?: { rowCount?: unknown; wireBytes?: unknown };
+        };
+        if (executed === undefined && active === undefined && resultDiagnostic === undefined) return undefined;
+        const count = (value: unknown): number | null => typeof value === 'number'
+          && Number.isSafeInteger(value) && value >= 0 ? value : null;
+        return {
+          executed: typeof executed === 'boolean' ? executed : null,
+          active: typeof active === 'boolean' ? active : null,
+          resultRowCount: count(resultDiagnostic?.rowCount),
+          resultWireBytes: count(resultDiagnostic?.wireBytes),
+        };
+      } catch { return undefined; /* Optional diagnostics cannot change a write's outcome. */ }
+    };
+    const readDiagnostics = (): TestRunInsertDiagnostics => {
+      const driverState = readDriverState();
+      return {
+        schemaVersion: 1, statementId, clientPid: process.pid,
+        backendPid: settledAt === null ? backendPid(pending) : settledBackendPid,
+        startedAt, observedAt: new Date().toISOString(),
+        elapsedMs: Math.max(0, performance.now() - started),
+        settledAt, settledElapsedMs, budgetMs: remainingMs,
+        ...(driverState ? { driverState } : {}),
+      };
+    };
     const query = trackSharedPgOperation(Promise.resolve(pending).then(
       (value) => { written = value; recordSettlement(value); },
       (error) => { recordSettlement(null); failure = error ?? new Error('insert_rejected'); throw failure; },
