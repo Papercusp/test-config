@@ -48,6 +48,7 @@ import {
   parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment, type RuntimeEnvironmentCaptureStatus,
   parseIsolatedRuntimeReceipts, type IsolatedRuntimeReceipt,
   parseExecutionBoundaryReceipt, type TestBoundaryObservation,
+  parseTestSqlCoverageObservations, type TestSqlCoverageObservation,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import {
@@ -95,6 +96,7 @@ declare module 'vitest' {
   interface TaskMeta {
     papercuspIsolatedRuntimeRunId?: string;
     papercuspExecutionObservations?: unknown[];
+    papercuspSqlCoverageObservations?: unknown[];
   }
 }
 
@@ -121,6 +123,29 @@ export function collectBoundaryObservations(testModule: TestModule): TestBoundar
       }
     }
     return rows.length ? rows : undefined;
+  } catch { return undefined; }
+}
+
+/** Use framework names/occurrences and passing cases, never identities supplied
+ * by fixture metadata. An invalid or oversized batch supplies no coverage. */
+export function collectSqlCoverageObservations(testModule: TestModule): TestSqlCoverageObservation[] | undefined {
+  try {
+    const rows: unknown[] = [];
+    const occurrences = new Map<string, number>();
+    for (const test of testModule.children.allTests()) {
+      const caseKey = test.fullName;
+      const occurrence = (occurrences.get(caseKey) ?? 0) + 1;
+      occurrences.set(caseKey, occurrence);
+      if (test.result()?.state !== 'passed') continue;
+      const values = test.meta?.()?.papercuspSqlCoverageObservations;
+      if (values === undefined) continue;
+      if (!Array.isArray(values) || !isRecordedCaseTitle(caseKey)) return undefined;
+      for (const value of values) {
+        if (typeof value !== 'object' || value === null || Array.isArray(value) || rows.length >= 32) return undefined;
+        rows.push({ ...value, caseKey, occurrence });
+      }
+    }
+    return rows.length ? parseTestSqlCoverageObservations(rows) : undefined;
   } catch { return undefined; }
 }
 
@@ -3018,6 +3043,8 @@ export default class AdminTestRunsReporter implements Reporter {
       if (executionDetails) {
         const boundaryObservations = collectBoundaryObservations(testModule);
         if (boundaryObservations) Object.assign(executionDetails, { boundaryObservations });
+        const sqlCoverageObservations = collectSqlCoverageObservations(testModule);
+        if (sqlCoverageObservations) Object.assign(executionDetails, { sqlCoverageObservations });
       }
       // The receipt describes the isolated worker lifetime, independently of
       // whether the owning test exercises an integration seam or an e2e journey.

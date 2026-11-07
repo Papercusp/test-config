@@ -9,6 +9,8 @@ import {
   parseRecordedRubricCheck,
   parseExecutionBoundaryReceipt,
   parseTestBoundaryObservations,
+  parseSqlCoverageExecutionReceipt,
+  parseTestSqlCoverageObservations,
   passedCaseTitlesIncomplete,
   isRecordedCaseIdentity,
   isRecordedCaseTitle,
@@ -125,6 +127,48 @@ describe('instrumented boundary custody', () => {
     }
     expect(parseTestBoundaryObservations([{ caseKey: 'suite > test', occurrence: 0, receipt: receipt() }])).toBeUndefined();
     expect(parseTestBoundaryObservations(Array(33).fill({ caseKey: 'test', occurrence: 1, receipt: receipt() }))).toBeUndefined();
+  });
+});
+
+describe('SQL coverage execution custody', () => {
+  const execution = (toolName = 'dev:pg_query', callId = 'sql') => ({ schemaVersion: 1, callId,
+    workspaceId: 'ws', harness: 'repo', scopeId: 'a'.repeat(64), toolName, startedAt: 1, endedAt: 2,
+    outcome: 'ok', argsToken: 'b'.repeat(64), resultToken: 'c'.repeat(64), sourceFingerprint: 'd'.repeat(64),
+    buildSha: 'e'.repeat(40), artifactFingerprint: 'f'.repeat(64), environmentFingerprint: '1'.repeat(64) });
+  const observation = () => ({ caseKey: 'suite > exact fixture', occurrence: 1, fixtureRef: 'fixture:jobs-v1',
+    scopeId: 'a'.repeat(64), parserVersion: 'parser-v1', fingerprint: '2'.repeat(64), featuresToken: '3'.repeat(64),
+    contractRef: 'contract-v1', verdict: 'exact', missingFeatures: [], sqlExecution: execution(),
+    toolExecution: execution('jobs:list', 'tool') });
+  it('roundtrips bounded hints in the existing strict ledger while preserving legacy rows', () => {
+    const sqlCoverageObservations = [observation()];
+    expect(parseSqlCoverageExecutionReceipt(execution())).toEqual(execution());
+    expect(parseTestSqlCoverageObservations(sqlCoverageObservations)).toEqual(sqlCoverageObservations);
+    expect(parseTestRunExecutionDetails(details({ sqlCoverageObservations }))).toMatchObject({ sqlCoverageObservations });
+    expect(parseTestRunExecutionDetails(details())).toBeDefined();
+  });
+  it('rejects forged, partial, private, cross-scope and drifting execution identities', () => {
+    for (const patch of [{ sql: 'private SQL' }, { args: { private: true } }, { outcome: 'error' },
+      { argsToken: '' }, { resultToken: 'unkeyed value' }, { artifactFingerprint: null }, { buildSha: 'short' },
+      { endedAt: 0 }, { startedAt: 1.5 }, { environmentFingerprint: undefined }])
+      expect(parseSqlCoverageExecutionReceipt({ ...execution(), ...patch })).toBeUndefined();
+    for (const patch of [{ sql: 'private SQL' }, { occurrence: 0 }, { fingerprint: 'plain SQL' },
+      { missingFeatures: ['limit'] }, { featuresToken: '' }, { scopeId: '4'.repeat(64) },
+      { toolExecution: execution('jobs:list', 'sql') },
+      { toolExecution: { ...execution('jobs:list', 'tool'), workspaceId: 'foreign' } },
+      { toolExecution: { ...execution('jobs:list', 'tool'), buildSha: '4'.repeat(40) } },
+      { toolExecution: { ...execution('jobs:list', 'tool'), resultToken: '4'.repeat(64) } }])
+      expect(parseTestSqlCoverageObservations([{ ...observation(), ...patch }])).toBeUndefined();
+  });
+  it('requires measured counterexamples and rejects duplicates or truncated batches', () => {
+    const partial = { ...observation(), verdict: 'partial', missingFeatures: ['projection'],
+      toolExecution: { ...execution('jobs:list', 'tool'), resultToken: '4'.repeat(64) } };
+    expect(parseTestSqlCoverageObservations([partial])).toEqual([partial]);
+    expect(parseTestSqlCoverageObservations([{ ...partial, verdict: 'none' }])).toBeDefined();
+    expect(parseTestSqlCoverageObservations([{ ...partial, missingFeatures: [] }])).toBeUndefined();
+    expect(parseTestSqlCoverageObservations([{ ...partial, missingFeatures: ['limit', 'limit'] }])).toBeUndefined();
+    expect(parseTestSqlCoverageObservations([{ ...partial, toolExecution: execution('jobs:list', 'tool') }])).toBeUndefined();
+    expect(parseTestSqlCoverageObservations([observation(), observation()])).toBeUndefined();
+    expect(parseTestSqlCoverageObservations(Array(33).fill(observation()))).toBeUndefined();
   });
 });
 

@@ -29,6 +29,7 @@ import AdminTestRunsReporter, {
   collectModuleExecution,
   collectIsolatedRuntimeReceipts,
   collectBoundaryObservations,
+  collectSqlCoverageObservations,
   captureReporterSaturationSnapshot,
   classifyGitEntry,
   computeWorkspaceRootFrom,
@@ -210,6 +211,31 @@ describe('framework boundary case identities', () => {
 
 const collectReceipts = (testModule: Parameters<typeof collectIsolatedRuntimeReceipts>[0]) =>
   collectIsolatedRuntimeReceipts(testModule, defaultEvidenceRoot);
+
+describe('framework SQL coverage case identities', () => {
+  const execution = (toolName: string, callId: string) => ({ schemaVersion: 1, callId, workspaceId: 'ws', harness: 'repo',
+    scopeId: 'a'.repeat(64), toolName, startedAt: 1, endedAt: 2, outcome: 'ok', argsToken: 'b'.repeat(64),
+    resultToken: 'c'.repeat(64), sourceFingerprint: 'd'.repeat(64), buildSha: 'e'.repeat(40),
+    artifactFingerprint: 'f'.repeat(64), environmentFingerprint: '1'.repeat(64) });
+  const hint = () => ({ fixtureRef: 'fixture:jobs-v1', scopeId: 'a'.repeat(64), parserVersion: 'parser-v1',
+    fingerprint: '2'.repeat(64), featuresToken: '3'.repeat(64), contractRef: 'contract-v1', verdict: 'exact',
+    missingFeatures: [], sqlExecution: execution('dev:pg_query', 'sql'), toolExecution: execution('jobs:list', 'tool') });
+  const module = (cases: unknown[]) => ({ children: { allTests: () => cases } }) as never;
+  const test = (state: string, values?: unknown) => ({ fullName: 'same case', result: () => ({ state }),
+    meta: () => ({ papercuspSqlCoverageObservations: values }) });
+  it('uses framework identities and only passing occurrences, including earlier skipped/failed duplicates', () => {
+    expect(collectSqlCoverageObservations(module([test('skipped', [hint()]), test('failed', [hint()]),
+      test('passed', [{ ...hint(), caseKey: 'forged', occurrence: 99 }])])))
+      .toEqual([{ ...hint(), caseKey: 'same case', occurrence: 3 }]);
+    expect(collectSqlCoverageObservations(module([test('failed', [hint()])]))).toBeUndefined();
+    expect(collectSqlCoverageObservations(module([test('passed')]))).toBeUndefined();
+  });
+  it('fails closed for private fields, invalid receipts and oversized or duplicate metadata', () => {
+    for (const values of [[{ ...hint(), sql: 'private SQL' }], [{ ...hint(), toolExecution: {} }],
+      [hint(), hint()], Array(33).fill(hint()), ['bad'], {}])
+      expect(collectSqlCoverageObservations(module([test('passed', values)]))).toBeUndefined();
+  });
+});
 
 describe('Vitest before-source boundary', () => {
   it('keeps module discovery behind the completed before-run snapshot', async () => {
