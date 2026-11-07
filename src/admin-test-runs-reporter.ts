@@ -1840,6 +1840,9 @@ export type TestRunReceiptBase = {
   row: SerializedTestRunReceiptRow;
   /** Client observations, not server execution or commit timestamps. */
   insertDiagnostics?: TestRunInsertDiagnostics;
+  /** This file's secondary case acknowledgements; file insertion alone proves none.
+   * Unwritten means unacknowledged, including an INSERT still pending at timeout. */
+  caseInsertOutcome?: TestCaseInsertOutcome;
 };
 
 export type TestRunInsertDiagnostics = {
@@ -2316,6 +2319,26 @@ export async function insertTestRunRowsWithSql(
   // every file row has been attempted, inside whatever remains of the same deadline.
   const caseParents: Array<{ testRunId: string; cases: readonly TestCaseRecord[] }> = [];
   const expectedCases = identifiedRows.reduce((total, row) => total + (row.cases?.length ?? 0), 0);
+  const withCaseOutcomes = (sourceReceipts: TestRunReceipt[], outcome: TestCaseInsertOutcome): TestRunReceipt[] => {
+    // Case INSERTs consume this ordered population in sequential batches. Only
+    // the acknowledged prefix may be attributed back to individual file ids.
+    let acknowledged = outcome.written;
+    const reason = outcome.reason === null ? null : redactSensitiveText(outcome.reason).slice(0, 200);
+    const byId = new Map<string, TestCaseInsertOutcome>();
+    for (const parent of caseParents) {
+      const written = Math.min(acknowledged, parent.cases.length);
+      acknowledged -= written;
+      const unwritten = parent.cases.length - written;
+      byId.set(parent.testRunId, { written, unwritten, reason: unwritten ? reason : null });
+    }
+    return sourceReceipts.map(receipt => {
+      const expected = receipt.row.cases?.length ?? 0;
+      if (expected === 0) return receipt;
+      const inserted = receipt.outcome === 'inserted' ? byId.get(receipt.id) : undefined;
+      return { ...receipt, caseInsertOutcome: inserted ?? { written: 0, unwritten: expected,
+        reason: reason ?? 'file_insert_unacknowledged' } };
+    });
+  };
   const finish = async (skipReason?: string): Promise<TestRunReceipt[]> => {
     if (expectedCases > 0) {
       // A failed/unacknowledged file has no case parent, and a pending file
@@ -2335,9 +2358,11 @@ export async function insertTestRunRowsWithSql(
           outcome.reason = receiptReason(error);
         }
       }
+      const recordedReceipts = withCaseOutcomes(receipts, outcome);
       try {
         onCaseOutcome?.(outcome);
       } catch { /* swallow — D-007: case rows never cost the file rows */ }
+      return recordedReceipts;
     }
     return receipts;
   };
@@ -2484,11 +2509,13 @@ export async function insertTestRunRowsWithSql(
       if (!failure && query) {
         // The wait expired, not the INSERT. Preserve its eventual RETURNING ids
         // without retrying the statement or extending the foreground budget.
+        const omittedCases: TestCaseInsertOutcome = { written: 0, unwritten: expectedCases, reason: 'file_insert_timeout' };
         void query.then(
-          () => appendTestRunReceipts(receiptEnv, insertedReceipts(sourceRows, attempt.readWritten(), attempt.readDiagnostics())),
-          (error) => appendTestRunReceipts(receiptEnv, unwrittenReceipts(sourceRows, 'failed', receiptReason(error), {
+          () => appendTestRunReceipts(receiptEnv, withCaseOutcomes(
+            insertedReceipts(sourceRows, attempt.readWritten(), attempt.readDiagnostics()), omittedCases)),
+          (error) => appendTestRunReceipts(receiptEnv, withCaseOutcomes(unwrittenReceipts(sourceRows, 'failed', receiptReason(error), {
             error, insertDiagnostics: attempt.readDiagnostics(),
-          })),
+          }), omittedCases)),
         );
       }
       return finish(failure ? 'file_insert_failed' : 'file_insert_timeout');

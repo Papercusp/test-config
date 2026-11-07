@@ -101,8 +101,12 @@ describe('native test execution custody', () => {
     for (const missing of ['PAPERCUSP_TEST_RUN_OWNER_ID', 'PAPERCUSP_TEST_RUN_WORK_ITEM', 'PAPERCUSP_TEST_RUN_GROUP'])
       expect(nativeTestRunAttribution({ ...env, [missing]: '' })).toEqual({});
   });
-  it('persists custody through the real reporter hooks', async () => {
+  it.each([
+    { ownerId: undefined, expectedOwner: 'agent-native' },
+    { ownerId: 'agent-evidence', expectedOwner: 'agent-evidence' },
+  ])('persists custody through the real reporter hooks for $expectedOwner', async ({ ownerId, expectedOwner }) => {
     vi.stubEnv('PAPERCUSP_SID', 'agent-native');
+    vi.stubEnv('PAPERCUSP_TEST_RUN_OWNER_ID', ownerId);
     vi.stubEnv('PAPERCUSP_TEST_RUN_WORK_ITEM', 'EI-123');
     vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'native-hooks');
     const persisted: TestRunRow[] = [];
@@ -116,7 +120,7 @@ describe('native test execution custody', () => {
     await reporter.onTestRunEnd();
     expect(persisted).toHaveLength(1);
     expect(persisted[0].executionDetails).toMatchObject({ runGroupId: 'native-hooks',
-      attribution: { ownerId: 'agent-native', workItemId: 'EI-123' } });
+      attribution: { ownerId: expectedOwner, workItemId: 'EI-123' } });
   });
 });
 describe('reporter finalization stage diagnostics', () => {
