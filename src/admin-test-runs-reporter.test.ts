@@ -2333,7 +2333,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(writeRows).toHaveBeenCalledTimes(1);
       expect(writeRows.mock.calls[0][0][0]).toMatchObject({ status: 'pass', commitSha: 'abc', worktreeDirty: dirty });
-      await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs - 1);
+      const budget = reporterWriteBudget(process.env);
+      await vi.advanceTimersByTimeAsync(Math.max(budget.flushBudgetMs, budget.totalInsertMs) - 1);
       expect(finished).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       await final;
