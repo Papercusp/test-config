@@ -153,6 +153,16 @@ export function verifierSourceFiles(root: string, {
   includedPaths?: ReadonlySet<string>;
   progress?: (record: VerifierSourceProgress) => void } = {}): VerifierSourceFile[] {
   const rows: VerifierSourceFile[] = [];
+  // Runtime admission asks about the same recorded population for every entry.
+  // Index it once per census; repeated array scans make a full archive quadratic.
+  // These indexes contain only paths, never previously measured file identities.
+  const recorded = new Set(recordedPaths);
+  const recordedParents = new Set<string>();
+  for (const path of recorded) {
+    for (let slash = path.indexOf('/'); slash !== -1; slash = path.indexOf('/', slash + 1))
+      recordedParents.add(path.slice(0, slash));
+  }
+  const containsRecorded = (path: string): boolean => recorded.has(path) || recordedParents.has(path);
   // Archives include large recorded binaries. Allocating a complete Buffer for
   // each file repeatedly faults/collects gigabytes on every completion census.
   // Reuse bounded storage, but still open and hash every byte on every census.
@@ -174,7 +184,7 @@ export function verifierSourceFiles(root: string, {
     const staging = dependencyStaging || recordedPaths.length ? entries.filter(entry => {
       if (!entry.name.startsWith('node_modules.pinned-deps-tmp')) return false;
       const rel = relative(root, join(dir, entry.name)).split(sep).join('/');
-      return !recordedPaths.some(path => path === rel || path.startsWith(`${rel}/`));
+      return !containsRecorded(rel);
     }) : [];
     // Directories have no source-file row, so even empty staging must be
     // checked explicitly rather than disappearing from the census.
@@ -193,14 +203,14 @@ export function verifierSourceFiles(root: string, {
       if (staging.includes(entry)) continue;
       if (rel === '.verifier-source.json' && !includedPaths) continue;
       // Only independently verified checkout metadata is outside the source population.
-      if (gitMetadataPaths.includes(rel) && !recordedPaths.includes(rel)) {
+      if (gitMetadataPaths.includes(rel) && !recorded.has(rel)) {
         if (!lstatSync(path).isDirectory()) throw new VerifierSourceError(`verification Git metadata is not independent: ${rel}`);
         continue;
       }
       // The maintained installer records its external generation store here.
       // Admit only its two exact regular metadata files, never the state
       // directory wholesale or any path already attested as source.
-      if (runtimeArtifacts && !recordedPaths.includes(rel)
+      if (runtimeArtifacts && !recorded.has(rel)
         && (rel === '.papercusp/dependency-generation-root'
           || rel === '.papercusp/dependency-generation-root.state/.gitignore')) {
         const metadata = lstatSync(path);
@@ -215,7 +225,7 @@ export function verifierSourceFiles(root: string, {
         continue;
       }
       if (runtimeArtifacts && rel === '.papercusp/dependency-generation-root.state'
-        && !recordedPaths.some(value => value === rel || value.startsWith(`${rel}/`))
+        && !containsRecorded(rel)
         && !lstatSync(path).isDirectory())
         throw new VerifierSourceError(`generation root state is not an independent directory: ${rel}`);
       // TanStack derives this file from the recorded routes/config on startup.
@@ -245,7 +255,7 @@ export function verifierSourceFiles(root: string, {
         'papercusp-desktop/src-tauri/seed/PLACEHOLDER-README.txt',
         'papercusp-desktop/src-tauri/doc-vector-seed/PLACEHOLDER-README.txt',
       ].includes(rel))
-        && !recordedPaths.includes(rel)) {
+        && !recorded.has(rel)) {
         if (!lstatSync(path).isFile()) throw new VerifierSourceError(`runtime artifact is not an independent file: ${rel}`);
         continue;
       }
@@ -266,7 +276,7 @@ export function verifierSourceFiles(root: string, {
         'apps/operator/public/porcupine', 'apps/operator/public/elevenlabs-runtime',
       ].includes(rel);
       if (runtimeArtifacts && runtimeDirectory
-        && !recordedPaths.some(p => p === rel || p.startsWith(`${rel}/`))) {
+        && !containsRecorded(rel)) {
         if (!entry.isDirectory()) throw new VerifierSourceError(`runtime artifact is not an independent directory: ${rel}`);
         continue;
       }
