@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, symlinkSync,
+import nativeFs, { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, symlinkSync,
   truncateSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { readVerifierSourceReceipt, verifierSourceFiles, verifyVerifierSourceSync, type VerifierSourceProgress } from './verifier-source.ts';
@@ -20,6 +21,33 @@ afterEach(() => {
 });
 
 describe('full verifier source census', () => {
+  it('refuses unrecorded dependencies before traversing them when runtime mode was omitted', () => {
+    const root = archive();
+    writeFileSync(join(root, 'source.ts'), 'export {};');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+    const dependency = join(root, 'node_modules');
+    mkdirSync(dependency);
+    writeFileSync(join(dependency, 'extra.js'), 'separately verified dependency');
+    const readdir = vi.spyOn(nativeFs, 'readdirSync');
+    syncBuiltinESMExports();
+    try {
+      expect(() => verifyVerifierSourceSync(root, receipt))
+        .toThrow('tampered verification source archive: added node_modules');
+      expect(readdir.mock.calls.some(([path]) => path === dependency)).toBe(false);
+      expect(verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true })).toEqual(receipt);
+      expect(readdir.mock.calls.some(([path]) => path === dependency)).toBe(false);
+      writeFileSync(join(root, 'source.ts'), 'changed source');
+      expect(() => verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true }))
+        .toThrow('changed source.ts');
+    } finally {
+      readdir.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
   it('hashes the full archive with linear recorded-path lookup work', () => {
     const root = archive();
     for (let index = 0; index < 256; index++)

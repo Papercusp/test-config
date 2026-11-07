@@ -275,6 +275,12 @@ export function verifierSourceFiles(root: string, {
         'apps/operator/public/monaco', 'apps/operator/public/excalidraw',
         'apps/operator/public/porcupine', 'apps/operator/public/elevenlabs-runtime',
       ].includes(rel);
+      // A strict source check already knows this whole directory is extra.
+      // Do not hash an installed dependency/build tree just to reject it later.
+      // Recorded paths remain source in either mode, including vendored deps.
+      if (!runtimeArtifacts && recordedPaths.length && runtimeDirectory
+        && entry.isDirectory() && !containsRecorded(rel))
+        throw new VerifierSourceError(`tampered verification source archive: added ${rel} (runtime artifacts require --runtime-artifacts)`);
       if (runtimeArtifacts && runtimeDirectory
         && !containsRecorded(rel)) {
         if (!entry.isDirectory()) throw new VerifierSourceError(`runtime artifact is not an independent directory: ${rel}`);
