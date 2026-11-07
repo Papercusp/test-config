@@ -490,14 +490,18 @@ describe('receipt-backed native archive reporter', () => {
       }, undefined, { stdout: stream, stderr: stream });
       try { await runner.start(); } finally { await runner.close(); }
       console.log(JSON.stringify({ mode, events, snapshot, osExitObserved: existsSync(exitedPath),
-        warning: logs.join('').includes('Timeout terminating receipt-forks worker') }));
+        warning: logs.join('').includes('Timeout terminating receipt-forks worker'), logs: logs.join('') }));
     `);
+    let verified = false;
     try {
       const results = [];
       for (const mode of ['sync', 'async']) {
         const { stdout } = await promisify(execFile)(process.execPath,
           ['--import', require.resolve('tsx'), probePath, root, receiptPath, mode, parent],
-          { timeout: 20_000, maxBuffer: 1024 * 1024 });
+          { timeout: 20_000, maxBuffer: 1024 * 1024 }).catch(error => {
+            throw new Error(`fork-stop probe ${mode} failed: code=${error.code} signal=${error.signal}` +
+              ` killed=${error.killed}\nstdout:\n${error.stdout}\nstderr:\n${error.stderr}`, { cause: error });
+          });
         results.push(JSON.parse(stdout.trim().split('\n').at(-1)!));
       }
       const [sync, async] = results;
@@ -513,8 +517,10 @@ describe('receipt-backed native archive reporter', () => {
       expect(async.warning, JSON.stringify(async)).toBe(false);
       expect(async.events.indexOf('stopped-ipc'), JSON.stringify(async)).toBeLessThan(async.events.indexOf('snapshot-end'));
       expect(async.events.indexOf('worker-exited'), JSON.stringify(async)).toBeLessThan(async.events.indexOf('snapshot-end'));
+      verified = true;
     } finally {
-      rmSync(parent, { recursive: true, force: true });
+      if (verified) rmSync(parent, { recursive: true, force: true });
+      else console.error(`fork-stop probe diagnostics retained at ${parent}`);
     }
   }, 45_000);
 
