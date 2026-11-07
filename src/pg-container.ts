@@ -5,7 +5,8 @@ import {
 import { getContainerRuntimeClient, Wait } from "testcontainers";
 import postgres from "postgres";
 import { randomBytes } from "node:crypto";
-import { readFile, rename, statfs, writeFile } from "node:fs/promises";
+import { access, readFile, rename, statfs, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
 import { SubstrateCircuitBreaker } from "./substrate-circuit-breaker.ts";
@@ -17,6 +18,60 @@ import {
 } from "./pg-reachability.ts";
 
 let containerPromise: Promise<StartedPostgreSqlContainer> | null = null;
+
+/** Docker's network record can survive deletion of its Linux bridge (EI-28142384637532617).
+ * Check before image pulls, Ryuk or container creation. Never repair a shared daemon here.
+ * Remote, desktop and rootless daemons have their own network namespace; a host sysfs check
+ * cannot establish their readiness. Only the conventional local Linux socket qualifies.
+ */
+export async function assertLocalDockerBridgeReady(
+  client: Awaited<ReturnType<typeof getContainerRuntimeClient>>,
+  networkMode = "bridge",
+  deps: {
+    platform?: NodeJS.Platform;
+    insideContainer?: boolean;
+    inspectBridge?: () => Promise<{ Driver?: string; Options?: Record<string, string> }>;
+    checkInterface?: (name: string) => Promise<void>;
+    timeoutMs?: number;
+  } = {},
+): Promise<void> {
+  // docker-modem exposes the selected transport at runtime but omits it from its declarations.
+  const socket = (client.container.dockerode.modem as unknown as { socketPath?: unknown })?.socketPath;
+  if ((deps.platform ?? process.platform) !== "linux" || networkMode !== "bridge" ||
+      typeof socket !== "string" || !["/var/run/docker.sock", "/run/docker.sock"].includes(socket) ||
+      (deps.insideContainer ?? existsSync("/.dockerenv")) ||
+      !["localhost", "127.0.0.1", "::1"].includes(client.info.containerRuntime.host) ||
+      /desktop|rootless/i.test(client.info.containerRuntime.operatingSystem)) return;
+
+  const inspect = deps.inspectBridge ?? (() => client.network.getById("bridge").inspect());
+  const check = deps.checkInterface ?? ((name: string) => access(`/sys/class/net/${name}/bridge`));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      (async () => {
+        const network = await inspect();
+        if (network.Driver !== "bridge") throw new Error("default Docker network is not a Linux bridge");
+        const name = network.Options?.["com.docker.network.bridge.name"] ?? "docker0";
+        if (!/^[a-zA-Z0-9_.-]{1,15}$/.test(name)) throw new Error("invalid Docker bridge interface name");
+        try { await check(name); }
+        catch (cause) { throw new Error(`Docker default network references unavailable Linux bridge ${name}`, { cause }); }
+      })(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Docker bridge inspection timed out")), deps.timeoutMs ?? 5_000);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (cause) {
+    throw new Error(
+      `TEST SUBSTRATE NETWORK NOT READY: ${cause instanceof Error ? cause.message : String(cause)}. ` +
+      "No PostgreSQL container was started. Inspect docker network inspect bridge and ip link on the daemon host; " +
+      "coordinate through docker-data-root:main-server before shared Docker repair. " +
+      "Alternatively use the maintained private native PG runner: node scripts/with-test-pg.mjs -- npm run test:file -- <test paths> " +
+      "(PAPERCUSP_TEST_PG_ADMIN_URL). Integration assertions must still run.",
+      { cause },
+    );
+  } finally { if (timer) clearTimeout(timer); }
+}
 
 /**
  * Fail-fast breaker for a PERSISTENTLY-down shared substrate (EI-11530). The
@@ -443,6 +498,10 @@ export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
     return getContainerRuntimeClient();
   }
 
+  protected assertRuntimeReady(client: Awaited<ReturnType<typeof getContainerRuntimeClient>>): Promise<void> {
+    return assertLocalDockerBridgeReady(client, this.networkMode);
+  }
+
   protected override async containerCreated(id: string): Promise<void> {
     // This hook only runs for a NEW container, never a reused peer's cluster.
     this.ownedStartupId = id;
@@ -490,9 +549,10 @@ export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
 
   override async start(): Promise<StartedPostgreSqlContainer> {
     this.ownedStartupId = undefined;
+    const client = await this.runtimeClient();
+    await this.assertRuntimeReady(client);
     if (this.reuse && this.reuseGeneration && process.env.TESTCONTAINERS_REUSE_ENABLE !== "false") {
       const { label, generation } = this.reuseGeneration;
-      const client = await this.runtimeClient();
       // Ryuk deliberately does not own reused containers. Remove only stopped
       // generations that can no longer be selected by this family. Running
       // retired clusters may still serve peers and remain the host actor's lane.
