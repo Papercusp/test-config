@@ -20,6 +20,38 @@ afterEach(() => {
 });
 
 describe('full verifier source census', () => {
+  it('hashes the full archive with linear recorded-path lookup work', () => {
+    const root = archive();
+    for (let index = 0; index < 256; index++)
+      writeFileSync(join(root, `source-${index}.ts`), `export default ${index};`);
+    for (const path of ['packages/omp-plugin/dist/recorded.cjs',
+      'vendor/node_modules.pinned-deps-tmp.5/recorded.ts']) {
+      mkdirSync(dirname(join(root, path)), { recursive: true });
+      writeFileSync(join(root, path), 'recorded source');
+    }
+    const expected = verifierSourceFiles(root);
+    const paths = expected.map(file => file.path);
+    let pathReads = 0;
+    // Count provenance-list access instead of timing the filesystem. Rewalking
+    // this list for every entry makes large native archives quadratic.
+    const recordedPaths = new Proxy(paths, {
+      get(target, property, receiver) {
+        if (typeof property === 'string' && /^\d+$/.test(property)) pathReads++;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const generated = join(root, 'node_modules/ignored.cjs');
+    mkdirSync(dirname(generated));
+    writeFileSync(generated, 'separately verified dependency');
+    expect(verifierSourceFiles(root, { runtimeArtifacts: true, recordedPaths })).toEqual(expected);
+    expect(pathReads).toBeLessThanOrEqual(paths.length * 4);
+    writeFileSync(join(root, 'source-0.ts'), 'export default 9;');
+    const changed = verifierSourceFiles(root, { runtimeArtifacts: true, recordedPaths });
+    expect(changed.map(file => file.path)).toEqual(expected.map(file => file.path));
+    expect(changed.find(file => file.path === 'source-0.ts')?.sha256)
+      .not.toBe(expected.find(file => file.path === 'source-0.ts')?.sha256);
+  });
+
   it('rejects a cancelled census only after its actual worker exits', async () => {
     const root = archive();
     writeFileSync(join(root, 'source.ts'), 'export {};');
