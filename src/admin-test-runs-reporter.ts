@@ -2302,7 +2302,8 @@ export async function insertTestRunRowsWithSql(
   rows: readonly TestRunRow[],
   context: TestRunInsertContext,
   budget: Pick<ReturnType<typeof reporterWriteBudget>, 'insertTimeoutMs' | 'totalInsertMs'> = reporterWriteBudget(process.env),
-  onCaseOutcome?: (outcome: TestCaseInsertOutcome) => void,
+  onCaseOutcome: (outcome: TestCaseInsertOutcome) => void =
+    outcome => reportTestCaseInsertOutcome(context, outcome),
 ): Promise<TestRunReceipt[]> {
   const receipts: TestRunReceipt[] = [];
   const identifiedRows = receiptIdentifiedRows(rows);
@@ -2530,10 +2531,30 @@ const TEST_CASE_INSERT_COLUMNS = [
 export type TestCaseInsertOutcome = {
   /** Case rows the database acknowledged. */
   written: number;
-  /** Case rows not written (deadline, timeout, failure, or a ledger without migration 1478). */
+  /** Case rows not acknowledged; a timed-out statement may still commit. */
   unwritten: number;
   reason: string | null;
 };
+
+/** Keep incomplete secondary evidence visible in ordinary production runs too.
+ * Counts describe acknowledgements, never proof that a timed-out INSERT rolled
+ * back. Omit case titles and bound and redact the failure reason.
+ */
+function reportTestCaseInsertOutcome(context: TestRunInsertContext, outcome: TestCaseInsertOutcome): void {
+  if (outcome.unwritten === 0) return;
+  const bounded = (value: string | null) => value === null ? null : redactSensitiveText(value).slice(0, 200);
+  try {
+    process.stderr.write('[admin-test-runs] case-write ' + JSON.stringify({
+      schemaVersion: 1,
+      runGroupId: bounded(context.runGroupId),
+      harnessSlug: bounded(context.harnessSlug),
+      workspaceId: bounded(context.workspaceId),
+      acknowledgedCases: outcome.written,
+      unacknowledgedCases: outcome.unwritten,
+      reason: bounded(outcome.reason),
+    }) + '\n');
+  } catch { /* A diagnostic sink must never cost the file receipts. */ }
+}
 
 /** True when the ledger database predates migration 1478 (no test_case_runs table). */
 export function isMissingTestCaseRunsTable(error: unknown): boolean {
