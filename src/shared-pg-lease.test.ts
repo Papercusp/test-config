@@ -262,6 +262,70 @@ describe('same-process evidence ledger preflight', () => {
 });
 
 describe('shared PG lease (WI-10003715)', () => {
+  it('keeps the file-to-case writer alive after the reporter foreground flush expires', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let resolveFile!: (value: unknown) => void;
+    let enterFile!: () => void;
+    const enteredFile = new Promise<void>(resolve => { enterFile = resolve; });
+    const fileInsert = new Promise(resolve => { resolveFile = resolve; });
+    let ended = false;
+    const end = vi.fn(async () => { ended = true; });
+    const statements: string[] = [];
+    const sql = Object.assign((first: unknown) => {
+      if (Array.isArray(first) && !('raw' in first)) return {};
+      const statement = (first as TemplateStringsArray).join('?');
+      statements.push(statement);
+      if (ended) return Promise.reject(new Error('write CONNECTION_ENDED localhost:5432'));
+      if (statement.includes('harness_shared.test_runs')) { enterFile(); return fileInsert; }
+      return Promise.resolve([]);
+    }, { end }) as unknown as PgSql;
+    shared.promise = Promise.resolve({ sql });
+    let receipts: Awaited<ReturnType<typeof insertTestRunRowsWithSql>> | undefined;
+    let writing: Promise<void> | undefined;
+    let recordedPath: string | undefined;
+    const reporter = new AdminTestRunsReporter(
+      async () => ({ commit: 'c0ffee0000000000000000000000000000000000', porcelain: '' }),
+      undefined,
+      rows => writing = (async () => {
+        recordedPath = rows[0]?.filePath;
+        receipts = await insertTestRunRowsWithSql(sql, rows, {
+          branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: null,
+          harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null,
+        }, { insertTimeoutMs: 15_000, totalInsertMs: 25_000 });
+      })(),
+    );
+    const moduleId = fileURLToPath(import.meta.url);
+    let done: Promise<void> | undefined;
+    try {
+      await reporter.onInit({ config: { root: process.cwd() } } as never);
+      reporter.onTestModuleEnd({ moduleId, state: () => 'passed',
+        diagnostic: () => ({ duration: 1 }),
+        children: { allTests: () => [{ fullName: 'suite > exact case',
+          result: () => ({ state: 'passed' }), diagnostic: () => ({ duration: 1 }) }] },
+      } as unknown as TestModule);
+      done = reporter.onTestRunEnd();
+      await enteredFile;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(end).not.toHaveBeenCalled();
+      resolveFile([{ id: '903', file_path: recordedPath }]);
+      await vi.advanceTimersByTimeAsync(0);
+      await writing;
+      await done;
+      expect(statements).toHaveLength(2);
+      expect(statements[1]).toContain('harness_shared.test_case_runs');
+      expect(receipts).toMatchObject([{ outcome: 'inserted', id: '903',
+        caseInsertOutcome: { written: 1, unwritten: 0, reason: null } }]);
+      expect(end).toHaveBeenCalledOnce();
+    } finally {
+      resolveFile([]);
+      await vi.runAllTimersAsync();
+      await writing;
+      await done;
+      await reporter.onExit();
+      vi.useRealTimers();
+    }
+  });
+
   it('reports a pending bounded drain and preserves a query that settles during it', async () => {
     const { end } = installFakeClient();
     const release = retainSharedPg();

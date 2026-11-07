@@ -67,7 +67,7 @@ import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from './testcontainer-start-lock.ts';
-import { assertSharedTestPgStorageHeadroom, CappedLogPostgreSqlContainer, NON_DESTRUCTIVE_PG_HEALTHCHECK } from './pg-container.ts';
+import { assertSharedTestPgStorageHeadroom, CappedLogPostgreSqlContainer, NON_DESTRUCTIVE_PG_HEALTHCHECK, SHARED_TEST_PG_DURABILITY_OFF, TEST_PG_IMAGE, TEST_PG_INITDB_ARGS } from './pg-container.ts';
 import { assertPgReachable, probePgReachable, withPgStartupRetry } from './pg-reachability.ts';
 import { dropDatabaseWithLock, type DropDatabaseWithLockOptions } from './pg-migrate.ts';
 
@@ -94,6 +94,23 @@ export async function dropBaselineDatabase(
 export const BASELINE_SCHEMA_CONTAINER_START_LOCK = 'baseline-schema-container-start';
 export const BASELINE_SCHEMA_REUSE_GENERATION_LABEL = 'org.papercusp.baseline-schema.generation';
 const BASELINE_SCHEMA_REUSE_GENERATION_FILE = 'baseline-schema-reuse-generation';
+
+/** The baseline is disposable too; keep its startup policy aligned with shared test PG. */
+export function createBaselineSchemaContainer(generation: number): CappedLogPostgreSqlContainer {
+  return new CappedLogPostgreSqlContainer(TEST_PG_IMAGE)
+    .withDatabase('papercusp_it')
+    .withUsername('it_admin')
+    .withPassword('it_admin')
+    // Stock initdb sync and the temporary server's shutdown checkpoint can
+    // exhaust startup before the TCP postmaster runs (WI-6554700010046421).
+    .withEnvironment({ POSTGRES_INITDB_ARGS: TEST_PG_INITDB_ARGS })
+    .withCommand(['postgres', ...SHARED_TEST_PG_DURABILITY_OFF])
+    // Never run a child pg_isready inside the PID-1 postmaster: a failed
+    // child can restart crash recovery. Host SQL below owns real readiness.
+    .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
+    .withWaitStrategy(Wait.forListeningPorts())
+    .withReuseGeneration(BASELINE_SCHEMA_REUSE_GENERATION_LABEL, generation);
+}
 
 /** Read under BASELINE_SCHEMA_CONTAINER_START_LOCK; absent means the first generation. */
 export async function readBaselineReuseGeneration(root = testcontainerStartLockRoot()): Promise<number> {
@@ -308,7 +325,7 @@ function errorMessage(error: unknown): string {
  * process therefore names the exact outstanding phase after five seconds,
  * while the normal warm path stays quiet.
  */
-async function runBaselineSetupStage<T>(stage: string, action: () => Promise<T>): Promise<T> {
+export async function runBaselineSetupStage<T>(stage: string, action: () => Promise<T>): Promise<T> {
   const startedAt = Date.now();
   let reportedWaiting = false;
   const slowTimer = setTimeout(() => {
@@ -790,34 +807,8 @@ export default async function setup({ provide }: TestProject) {
       }
     };
   } else {
-    // WI-2942 (2026-07-05): pg16 -> pg18, to match the shipped/embedded operator
-    // (PostgreSQL 18.3) — see libs/test-config/src/pg-container.ts for the full
-    // rationale (PG16 silently allowed a DELETE PG18 rejects; WI-2914 shipped
-    // uncaught because CI tested the wrong major).
     const startBaselineContainer = (generation: number) =>
-      new CappedLogPostgreSqlContainer('pgvector/pgvector:pg18')
-        .withDatabase('papercusp_it')
-        .withUsername('it_admin')
-        .withPassword('it_admin')
-        // EI-21116464706451765 / EI-21340200136336953: the stock
-        // @testcontainers/postgresql healthcheck runs `pg_isready` INSIDE this
-        // PID-1-postmaster container; during crash recovery its nonzero exit
-        // makes Postgres kill every server process and restart recovery, and
-        // the stock 250ms interval then repeats that crash indefinitely. This
-        // container is `.withReuse()`d and therefore long-lived by design, so it
-        // was one of the worst places to leave the destructive default — a
-        // `docker inspect` on 2026-09-05 found this exact container (papercusp_it,
-        // created 08-24) still running `pg_isready` @250ms/1000-retries, eleven
-        // days after the fix landed at the sibling call site.
-        //
-        // `withHealthCheck` changes Docker's health command, not PostgreSqlContainer's
-        // default Wait.forAll([forHealthCheck, forListeningPorts]) strategy. Use
-        // a port-only wait so a stale/transient health bit cannot reject a reused
-        // candidate before the host-side SQL check below can validate it and
-        // rotate the reuse generation when it is not serving papercusp_it.
-        .withHealthCheck({ ...NON_DESTRUCTIVE_PG_HEALTHCHECK })
-        .withWaitStrategy(Wait.forListeningPorts())
-        .withReuseGeneration(BASELINE_SCHEMA_REUSE_GENERATION_LABEL, generation)
+      createBaselineSchemaContainer(generation)
         // Reuse the baseline container across Vitest processes. The previous
         // ephemeral container replayed ~476 migrations for every focused file;
         // under checkpoint concurrency that startup alone could consume the test's

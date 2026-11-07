@@ -3312,8 +3312,10 @@ export default class AdminTestRunsReporter implements Reporter {
         unwrittenReceipts(rows, 'timeout', 'finalization_deadline'));
       return;
     }
-    // Vitest's completion barrier tracks settlement; Node consumes the receipts.
-    const write = Promise.resolve().then(async () => { await this.writeRows(rows); });
+    // Retain the whole writer across the foreground timeout. Tracking individual
+    // statements leaves a zero-in-flight gap between file and case INSERTs where
+    // the final reporter release can close their shared client.
+    const write = trackSharedPgOperation(Promise.resolve().then(async () => { await this.writeRows(rows); }));
     this.pendingWrite = write;
     const settled = () => {
       if (this.pendingWrite === write) this.pendingWrite = null;
