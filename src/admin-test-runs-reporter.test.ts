@@ -214,7 +214,7 @@ const collectReceipts = (testModule: Parameters<typeof collectIsolatedRuntimeRec
 
 describe('framework SQL coverage case identities', () => {
   const execution = (toolName: string, callId: string) => ({ schemaVersion: 1, callId, workspaceId: 'ws', harness: 'repo',
-    scopeId: 'a'.repeat(64), toolName, startedAt: 1, endedAt: 2, outcome: 'ok', argsToken: 'b'.repeat(64),
+    scopeId: 'a'.repeat(64), toolName, contractRef: 'contract-v1', startedAt: 1, endedAt: 2, outcome: 'ok', argsToken: 'b'.repeat(64),
     resultToken: 'c'.repeat(64), sourceFingerprint: 'd'.repeat(64), buildSha: 'e'.repeat(40),
     artifactFingerprint: 'f'.repeat(64), environmentFingerprint: '1'.repeat(64) });
   const hint = () => ({ fixtureRef: 'fixture:jobs-v1', scopeId: 'a'.repeat(64), parserVersion: 'parser-v1',

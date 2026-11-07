@@ -132,7 +132,7 @@ describe('instrumented boundary custody', () => {
 
 describe('SQL coverage execution custody', () => {
   const execution = (toolName = 'dev:pg_query', callId = 'sql') => ({ schemaVersion: 1, callId,
-    workspaceId: 'ws', harness: 'repo', scopeId: 'a'.repeat(64), toolName, startedAt: 1, endedAt: 2,
+    workspaceId: 'ws', harness: 'repo', scopeId: 'a'.repeat(64), toolName, contractRef: 'contract-v1', startedAt: 1, endedAt: 2,
     outcome: 'ok', argsToken: 'b'.repeat(64), resultToken: 'c'.repeat(64), sourceFingerprint: 'd'.repeat(64),
     buildSha: 'e'.repeat(40), artifactFingerprint: 'f'.repeat(64), environmentFingerprint: '1'.repeat(64) });
   const observation = () => ({ caseKey: 'suite > exact fixture', occurrence: 1, fixtureRef: 'fixture:jobs-v1',
@@ -152,7 +152,7 @@ describe('SQL coverage execution custody', () => {
       { endedAt: 0 }, { startedAt: 1.5 }, { environmentFingerprint: undefined }])
       expect(parseSqlCoverageExecutionReceipt({ ...execution(), ...patch })).toBeUndefined();
     for (const patch of [{ sql: 'private SQL' }, { occurrence: 0 }, { fingerprint: 'plain SQL' },
-      { missingFeatures: ['limit'] }, { featuresToken: '' }, { scopeId: '4'.repeat(64) },
+      { missingFeatures: ['limit'] }, { featuresToken: '' }, { scopeId: '4'.repeat(64) }, { contractRef: 'forged-contract' },
       { toolExecution: execution('jobs:list', 'sql') },
       { toolExecution: { ...execution('jobs:list', 'tool'), workspaceId: 'foreign' } },
       { toolExecution: { ...execution('jobs:list', 'tool'), buildSha: '4'.repeat(40) } },

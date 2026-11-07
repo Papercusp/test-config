@@ -222,6 +222,7 @@ export interface SqlCoverageExecutionReceipt {
   harness: string;
   scopeId: string;
   toolName: string;
+  contractRef: string;
   startedAt: number;
   endedAt: number;
   outcome: 'ok';
@@ -254,14 +255,14 @@ const sqlCoverageIdentity = (value: unknown): value is string => typeof value ==
   && value.length > 0 && value.length <= 200 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
 
 export function parseSqlCoverageExecutionReceipt(value: unknown): SqlCoverageExecutionReceipt | undefined {
-  const keys = ['schemaVersion', 'callId', 'workspaceId', 'harness', 'scopeId', 'toolName', 'startedAt', 'endedAt',
+  const keys = ['schemaVersion', 'callId', 'workspaceId', 'harness', 'scopeId', 'toolName', 'contractRef', 'startedAt', 'endedAt',
     'outcome', 'argsToken', 'resultToken', 'sourceFingerprint', 'buildSha', 'artifactFingerprint', 'environmentFingerprint'];
   if (!isRecord(value) || Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))
     || value.schemaVersion !== 1 || value.outcome !== 'ok'
-    || !['callId', 'workspaceId', 'harness', 'toolName'].every(key => sqlCoverageIdentity(value[key]))
+    || !['callId', 'workspaceId', 'harness', 'toolName', 'contractRef'].every(key => sqlCoverageIdentity(value[key]))
     || !['scopeId', 'argsToken', 'resultToken', 'sourceFingerprint', 'artifactFingerprint', 'environmentFingerprint']
       .every(key => sqlCoverageDigest(value[key]))
-    || typeof value.buildSha !== 'string' || !/^[a-f0-9]{40,64}$/.test(value.buildSha)
+    || typeof value.buildSha !== 'string' || !/^[a-f0-9]{10,64}$/.test(value.buildSha)
     || !Number.isSafeInteger(value.startedAt) || !Number.isSafeInteger(value.endedAt)
     || (value.startedAt as number) <= 0 || (value.endedAt as number) < (value.startedAt as number)) return undefined;
   return value as unknown as SqlCoverageExecutionReceipt;
@@ -284,6 +285,7 @@ export function parseTestSqlCoverageObservations(value: unknown): TestSqlCoverag
     const sql = parseSqlCoverageExecutionReceipt(row.sqlExecution);
     const tool = parseSqlCoverageExecutionReceipt(row.toolExecution);
     if (!sql || !tool || sql.toolName !== 'dev:pg_query' || tool.toolName === sql.toolName || sql.callId === tool.callId
+      || tool.contractRef !== row.contractRef
       || sql.scopeId !== row.scopeId || tool.scopeId !== row.scopeId
       || sql.workspaceId !== tool.workspaceId || sql.harness !== tool.harness
       || sql.buildSha !== tool.buildSha || sql.artifactFingerprint !== tool.artifactFingerprint
