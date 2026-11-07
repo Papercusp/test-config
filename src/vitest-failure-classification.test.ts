@@ -49,6 +49,40 @@ describe('isVitestAssertionFailure', () => {
     ])).toBe(false);
   });
 
+  it.each(['resolves', 'rejects'] as const)(
+    'recognizes an actual %s value assertion after stack serialization',
+    async (matcher) => {
+      let failure: Error | undefined;
+      try {
+        if (matcher === 'resolves') {
+          await expect(Promise.resolve({ ok: true })).resolves.toMatchObject({ ok: false });
+        } else {
+          await expect(Promise.reject({ ok: true })).rejects.toMatchObject({ ok: false });
+        }
+      } catch (error) {
+        failure = error as Error;
+      }
+      expect(failure?.name).toBe('AssertionError');
+      const serialized = failure?.stack || failure?.message;
+      expect(serialized).toMatch(/^Error: expected /);
+      expect(isVitestAssertionFailure([serialized])).toBe(true);
+    },
+  );
+
+  it('rejects value-like errors without an immediate Vitest promise assertion origin', () => {
+    const header = 'Error: expected { ok: true } to match object { ok: false }';
+    const frame = '    at _Assertion.__VITEST_RESOLVES__ (file:///repo/node_modules/vitest/node_modules/@vitest/expect/dist/index.js:1710:17)';
+    expect(isVitestAssertionFailure([`${header}\n(14 matching properties omitted from actual)\n${frame}`])).toBe(true);
+    for (const message of [
+      header,
+      `${header}\n    at beforeAll (file:///repo/hooks.ts:4:3)\n${frame}`,
+      `${header}\n    at _Assertion.__VITEST_RESOLVES__ (file:///repo/domain.ts:4:3)`,
+      `Error: domain request failed\n${frame}`,
+      `TypeError: expected a Promise\n${frame}`,
+    ]) expect(isVitestAssertionFailure([message]), message).toBe(false);
+    expect(isVitestAssertionFailure([`${header}\n${frame}`, 'Error: afterAll failed'])).toBe(false);
+  });
+
   it('does not treat runtime exceptions or arbitrary failure text as assertion evidence', () => {
     expect(isVitestAssertionFailure([
       'TypeError: guard is not a function\n    at guard.test.ts:4:3',

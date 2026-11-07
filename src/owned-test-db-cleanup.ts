@@ -1,6 +1,6 @@
 /** Durable ownership for the maintained runner's test databases. No PG is started here. */
 import { appendFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DropDatabaseWithLockOptions, TestDbDropResult } from './pg-migrate.ts';
 
@@ -36,7 +36,12 @@ export function createOwnedTestDatabaseScope(env: NodeJS.ProcessEnv = process.en
   const parent = directory(env);
   if (!parent) return undefined;
   mkdirSync(parent, { recursive: true, mode: 0o700 });
-  return mkdtempSync(join(parent, 'private-pg-'));
+  const child = mkdtempSync(join(parent, 'private-pg-'));
+  // A nested router may intentionally use a distinct reporting group. Bind
+  // that identity in the parent's existing journal before the child can write
+  // any database records; its completion receipt cannot choose its own owner.
+  recordOwnedTestDbCleanupStage('*', 'scope-created', { scopePath: basename(child) }, env);
+  return child;
 }
 
 function registryPath(dir: string, name: string): string {
@@ -108,22 +113,41 @@ function observeNestedScopes(dir: string, runId: string, deadlineAtMs: number): 
       if (!entry.isDirectory()) throw new Error('private database scope is not an unlinked directory');
       if (Date.now() >= deadlineAtMs) throw new Error('nested scope observation exceeded cleanup deadline');
       const child = join(dir, entry.name);
+      let childRunId = runId;
+      const parentReceipt = join(dir, 'cleanup.jsonl');
+      try {
+        if (!lstatSync(parentReceipt).isFile()) throw new Error('scope ownership journal is not an unlinked regular file');
+        const owners = new Set<string>();
+        for (const line of readFileSync(parentReceipt, 'utf8').trim().split('\n').filter(Boolean)) {
+          const row = JSON.parse(line);
+          if (row.kind !== 'owned-test-db-cleanup' || row.stage !== 'scope-created' || row.scopePath !== entry.name) continue;
+          if (typeof row.runId !== 'string' || !row.runId.trim()) throw new Error('missing nested scope owner');
+          owners.add(row.runId);
+        }
+        if (owners.size > 1) throw new Error('ambiguous nested scope owner');
+        childRunId = owners.values().next().value ?? runId;
+      } catch (cause) {
+        // Older retained runs have no scope-creation records. Their existing
+        // strict same-group contract remains valid; never infer a foreign group
+        // from a child's final receipt or database records.
+        if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause;
+      }
       for (const file of readdirSync(child).filter(name => name.endsWith('.json')).sort()) {
-        const record = readOwnedDatabase(child, file, runId);
+        const record = readOwnedDatabase(child, file, childRunId);
         scope.databases.push({ name: record.name, outcome: record.outcome });
       }
       const receipt = join(child, 'cleanup.jsonl');
       if (!lstatSync(receipt).isFile()) throw new Error('cleanup receipt is not an unlinked regular file');
       const lines = readFileSync(receipt, 'utf8').trim().split('\n');
       const last = JSON.parse(lines.at(-1)!);
-      if (last.kind !== 'owned-test-db-cleanup' || last.runId !== runId || last.stage !== 'complete'
+      if (last.kind !== 'owned-test-db-cleanup' || last.runId !== childRunId || last.stage !== 'complete'
           || last.complete !== true || !Array.isArray(last.errors) || last.errors.length !== 0
           || !Array.isArray(last.databases) || last.databases.length !== scope.databases.length
           || !scope.databases.every(db => db.outcome === 'dropped'
             && last.databases.some((saved: { name?: string; outcome?: string }) => saved.name === db.name && saved.outcome === 'dropped'))) {
         throw new Error('nested owner has no matching confirmed database cleanup receipt');
       }
-      const nested = observeNestedScopes(child, runId, deadlineAtMs);
+      const nested = observeNestedScopes(child, childRunId, deadlineAtMs);
       if (nested.length) scope.scopes = nested;
       scope.complete = nested.every(item => item.complete);
     } catch (cause) {

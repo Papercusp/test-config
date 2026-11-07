@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { cleanupOwnedTestDatabases, createOwnedTestDatabaseScope, registerOwnedTestDatabase } from './owned-test-db-cleanup';
@@ -120,6 +120,49 @@ describe('maintained owned database cleanup', () => {
     const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop });
     expect(result).toMatchObject({ complete: false, scopes: [{ path: basename(childDir), complete: false,
       scopes: [{ path: basename(grandchildDir), complete: false }] }] });
+    expect(drop).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('observes distinct nested reporting groups with databases=%s', async databases => {
+    const { dir, env } = fixture();
+    const childDir = createOwnedTestDatabaseScope({ ...env, PAPERCUSP_TEST_RUN_GROUP: 'run-b' })!;
+    const grandchildDir = createOwnedTestDatabaseScope({ ...env, PAPERCUSP_TEST_OWNED_DB_DIR: childDir,
+      PAPERCUSP_TEST_RUN_GROUP: 'run-c' })!;
+    const drop = vi.fn(async () => 'dropped' as const);
+    for (const [scope, runId, port, name] of [
+      [childDir, 'run-b', 41236, 'org_abcdef012345'],
+      [grandchildDir, 'run-c', 41237, 'org_123456abcdef'],
+    ] as const) {
+      const adminUri = `postgres://private@localhost:${port}/postgres`;
+      if (databases) registerOwnedTestDatabase(name, adminUri,
+        { ...env, PAPERCUSP_TEST_OWNED_DB_DIR: scope, PAPERCUSP_TEST_RUN_GROUP: runId });
+      expect((await cleanupOwnedTestDatabases({ dir: scope, runId, adminUri,
+        deadlineAtMs: Date.now() + 1000, drop })).complete).toBe(true);
+    }
+    const originalChild = readFileSync(join(childDir, 'cleanup.jsonl'), 'utf8');
+    drop.mockClear();
+    const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop });
+    expect(result).toMatchObject({ complete: true, errors: [], scopes: [{ path: basename(childDir),
+      complete: true, errors: [], scopes: [{ path: basename(grandchildDir), complete: true, errors: [] }] }] });
+    expect(drop).not.toHaveBeenCalled();
+    expect(readFileSync(join(childDir, 'cleanup.jsonl'), 'utf8')).toBe(originalChild);
+  });
+
+  it('refuses ambiguous child ownership and unregistered foreign scopes', async () => {
+    const { dir, env } = fixture();
+    const childDir = createOwnedTestDatabaseScope({ ...env, PAPERCUSP_TEST_RUN_GROUP: 'run-b' })!;
+    const drop = vi.fn();
+    await cleanupOwnedTestDatabases({ dir: childDir, runId: 'run-b',
+      adminUri: 'postgres://private@localhost:41236/postgres', deadlineAtMs: Date.now() + 1000, drop });
+    const creation = readFileSync(join(dir, 'cleanup.jsonl'), 'utf8');
+    appendFileSync(join(dir, 'cleanup.jsonl'), creation.replaceAll('run-b', 'run-c'));
+    expect((await cleanupOwnedTestDatabases({ dir, runId: 'run-a',
+      deadlineAtMs: Date.now() + 1000, drop })).complete).toBe(false);
+    const unregistered = mkdtempSync(join(dir, 'private-pg-'));
+    await cleanupOwnedTestDatabases({ dir: unregistered, runId: 'run-foreign',
+      adminUri: 'postgres://private@localhost:41237/postgres', deadlineAtMs: Date.now() + 1000, drop });
+    const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop });
+    expect(result.scopes?.find(scope => scope.path === basename(unregistered))?.complete).toBe(false);
     expect(drop).not.toHaveBeenCalled();
   });
 
