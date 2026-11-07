@@ -2315,12 +2315,27 @@ export async function insertTestRunRowsWithSql(
   // Case rows ride behind their file rows: collected per inserted batch, written once
   // every file row has been attempted, inside whatever remains of the same deadline.
   const caseParents: Array<{ testRunId: string; cases: readonly TestCaseRecord[] }> = [];
-  const finish = async (): Promise<TestRunReceipt[]> => {
-    if (caseParents.length > 0) {
+  const expectedCases = identifiedRows.reduce((total, row) => total + (row.cases?.length ?? 0), 0);
+  const finish = async (skipReason?: string): Promise<TestRunReceipt[]> => {
+    if (expectedCases > 0) {
+      // A failed/unacknowledged file has no case parent, and a pending file
+      // statement must never gain queued case writes. Report that missing
+      // evidence through the same observer as attempted case INSERTs.
+      let outcome: TestCaseInsertOutcome = { written: 0, unwritten: expectedCases,
+        reason: skipReason ?? 'file_insert_unacknowledged' };
+      if (!skipReason && caseParents.length > 0) {
+        const parentCases = caseParents.reduce((total, parent) => total + parent.cases.length, 0);
+        try {
+          const inserted = await insertTestCaseRowsWithSql(sql, caseParents, {
+            deadline, insertTimeoutMs: budget.insertTimeoutMs,
+          });
+          outcome = { ...inserted, unwritten: inserted.unwritten + expectedCases - parentCases,
+            reason: inserted.reason ?? (parentCases < expectedCases ? 'file_insert_unacknowledged' : null) };
+        } catch (error) {
+          outcome.reason = receiptReason(error);
+        }
+      }
       try {
-        const outcome = await insertTestCaseRowsWithSql(sql, caseParents, {
-          deadline, insertTimeoutMs: budget.insertTimeoutMs,
-        });
         onCaseOutcome?.(outcome);
       } catch { /* swallow — D-007: case rows never cost the file rows */ }
     }
@@ -2464,7 +2479,8 @@ export async function insertTestRunRowsWithSql(
         ),
       );
       // A timed-out query may still be in flight; queueing case rows behind it would
-      // break the one-in-flight-query invariant above, so case rows are dropped here.
+      // break the one-in-flight-query invariant above. Account for omitted cases,
+      // including earlier acknowledged batches and later unattempted files.
       if (!failure && query) {
         // The wait expired, not the INSERT. Preserve its eventual RETURNING ids
         // without retrying the statement or extending the foreground budget.
@@ -2475,7 +2491,7 @@ export async function insertTestRunRowsWithSql(
           })),
         );
       }
-      return receipts;
+      return finish(failure ? 'file_insert_failed' : 'file_insert_timeout');
     }
     const written = attempt.readWritten();
     receipts.push(...insertedReceipts(sourceRows, written, insertDiagnostics));
@@ -2485,7 +2501,6 @@ export async function insertTestRunRowsWithSql(
     });
   }
   return finish();
-  return receipts;
 }
 
 /**
