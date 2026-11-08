@@ -398,7 +398,7 @@ describe('reporter ledger endpoint selection', () => {
 });
 
 describe('receipt-backed native archive reporter', () => {
-  it('distinguishes real Vitest fork-stop callback starvation from worker handles', async () => {
+  it('distinguishes real Vitest fork-stop callback starvation from worker handles, including ordinary Git interim provenance', async () => {
     const parent = mkdtempSync(join(tmpdir(), 'native-archive-stop-ipc-'));
     const root = join(parent, 'source');
     mkdirSync(root);
@@ -422,15 +422,60 @@ describe('receipt-backed native archive reporter', () => {
     // Run the real Vitest pool in an owned child. Only reporter-side Git is
     // slowed, identically in both modes; the passing test worker has no handles.
     writeFileSync(probePath, `
-      import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+      import { writeFileSync, mkdirSync, existsSync, unlinkSync, readFileSync } from 'node:fs';
       import { Writable } from 'node:stream';
       import { join } from 'node:path';
       const { createVitest, ForksPoolWorker } = await import(${JSON.stringify(pathToFileURL(require.resolve('vitest/node')).href)});
       const { readVerifierSourceReceiptSync } = await import(${JSON.stringify(new URL('./verifier-source.ts', import.meta.url).href)});
-      const { captureWorktreeSnapshot, setRunRoot } = await import(${JSON.stringify(new URL('./admin-test-runs-reporter.ts', import.meta.url).href)});
+      const { default: AdminTestRunsReporter, captureWorktreeSnapshot, setRunRoot,
+        reporterWriteBudget, appendTestRunReceipts, testRunReceiptBaseFor, TEST_RUN_RECEIPT_ENV
+      } = await import(${JSON.stringify(new URL('./admin-test-runs-reporter.ts', import.meta.url).href)});
       const [root, receiptPath, mode, parent] = process.argv.slice(2);
       const events = [];
       const logs = [];
+      const ordinary = mode === 'ordinary';
+      const ordinaryReceipt = join(parent, 'ordinary-receipts.jsonl');
+      let afterStarted;
+      const afterSnapshotStarted = new Promise(resolve => { afterStarted = resolve; });
+      const writes = [];
+      let activeWrites = 0, maxActiveWrites = 0;
+      let aborted = false, afterSnapshot, stopAt, exitAt, forkExitAt, flushAt, flushedAt;
+      if (ordinary) {
+        // This leg exercises ordinary Git and an expected assertion failure,
+        // independently of the archive verifier and mutation provenance path.
+        unlinkSync(join(root, '.verifier-source.json'));
+        writeFileSync(join(root, 'probe.test.ts'), 'test("expected failure", () => expect(false).toBe(true));\\n');
+        for (const key of Object.keys(process.env)) {
+          if (key.startsWith('PAPERCUSP_MUTATION_') || key.startsWith('VERIFY_TAURI_')) delete process.env[key];
+        }
+        process.env[TEST_RUN_RECEIPT_ENV] = ordinaryReceipt;
+        process.env.PAPERCUSP_TEST_RUN_GROUP = 'ordinary-git-stop-' + process.pid;
+        setRunRoot(root);
+      }
+      const ordinaryReporter = ordinary ? new AdminTestRunsReporter(async (phase, signal) => {
+        if (phase === 'after') {
+          events.push('interim-after-started');
+          afterStarted();
+        }
+        const snapshot = await captureWorktreeSnapshot(undefined, phase, signal);
+        if (phase !== 'after') return snapshot;
+        afterSnapshot = snapshot;
+        // Keep real asynchronous provenance outstanding across the real pool
+        // stop. The production close-safe budget must cancel this reader.
+        await new Promise(resolve => {
+          const abort = () => { aborted = true; events.push('snapshot-aborted'); resolve(); };
+          if (signal?.aborted) abort();
+          else signal?.addEventListener('abort', abort, { once: true });
+        });
+        return snapshot;
+      }, undefined, async rows => {
+        maxActiveWrites = Math.max(maxActiveWrites, ++activeWrites);
+        writes.push(...rows);
+        await new Promise(resolve => setImmediate(resolve));
+        appendTestRunReceipts(process.env, rows.map(row => ({ ...testRunReceiptBaseFor(row),
+          outcome: 'inserted', id: 'ordinary-git-stop-row' })));
+        activeWrites--;
+      }) : null;
       let notifyStop;
       const stopRequested = new Promise(resolve => { notifyStop = resolve; });
       const originalPath = process.env.PATH;
@@ -463,14 +508,35 @@ describe('receipt-backed native archive reporter', () => {
           const start = worker.start.bind(worker);
           worker.start = async () => { await start();
             process.env.STOP_IPC_PROBE_FORK_PID = String(worker._fork.pid);
+            if (ordinary) worker._fork.once('exit', () => {
+              forkExitAt = Date.now(); events.push('fork-exit-callback');
+            });
             worker.on('message', message => {
             if (message?.type === 'stopped') events.push('stopped-ipc');
           }); };
           const stop = worker.stop.bind(worker);
-          worker.stop = async () => { events.push('worker-stop'); await stop(); events.push('worker-exited'); };
+          worker.stop = async () => {
+            if (ordinary) await afterSnapshotStarted;
+            stopAt = Date.now();
+            events.push('worker-stop'); await stop();
+            exitAt = Date.now(); events.push('worker-exited');
+          };
           return worker;
         } },
-        reporters: [{ async onTestRunEnd(modules, errors, reason) {
+        reporters: ordinary ? [{
+          onInit: ctx => ordinaryReporter.onInit(ctx),
+          onTestModuleEnd: module => {
+            flushAt = Date.now();
+            ordinaryReporter.onTestModuleEnd(module);
+          },
+          async onTestRunEnd(modules, errors, reason) {
+            if (reason !== 'failed' || errors.length || modules.length !== 1) throw new Error('expected failure missing');
+            await afterSnapshotStarted;
+            await ordinaryReporter.onTestRunEnd(modules, errors);
+            flushedAt = Date.now(); events.push('reporter-flushed');
+          },
+          onExit: () => ordinaryReporter.onExit(),
+        }] : [{ async onTestRunEnd(modules, errors, reason) {
           if (reason !== 'passed' || errors.length || modules.length !== 1) throw new Error('tiny test did not pass');
           if (!events.includes('pool-created')) throw new Error('instrumented pool was not selected');
           // Vitest may enter its reporter before schedule() resumes. Synchronize
@@ -489,13 +555,17 @@ describe('receipt-backed native archive reporter', () => {
         } }],
       }, undefined, { stdout: stream, stderr: stream });
       try { await runner.start(); } finally { await runner.close(); }
+      if (ordinary) process.exitCode = 0; // The nested assertion failure is this leg's required input.
       console.log(JSON.stringify({ mode, events, snapshot, osExitObserved: existsSync(exitedPath),
+        ordinary: ordinary ? { afterSnapshot, aborted, writes, maxActiveWrites,
+          stopMs: exitAt - stopAt, forkExitMs: forkExitAt - stopAt, flushMs: flushedAt - flushAt,
+          budget: reporterWriteBudget(process.env), receipts: readFileSync(ordinaryReceipt, 'utf8') } : null,
         warning: logs.join('').includes('Timeout terminating receipt-forks worker'), logs: logs.join('') }));
     `);
     let verified = false;
     try {
       const results = [];
-      for (const mode of ['sync', 'async']) {
+      for (const mode of ['sync', 'async', 'ordinary']) {
         const { stdout } = await promisify(execFile)(process.execPath,
           ['--import', require.resolve('tsx'), probePath, root, receiptPath, mode, parent],
           { timeout: 20_000, maxBuffer: 1024 * 1024 }).catch(error => {
@@ -504,8 +574,8 @@ describe('receipt-backed native archive reporter', () => {
           });
         results.push(JSON.parse(stdout.trim().split('\n').at(-1)!));
       }
-      const [sync, async] = results;
-      for (const result of results) {
+      const [sync, async, ordinary] = results;
+      for (const result of [sync, async]) {
         expect(result.snapshot, JSON.stringify(result)).toEqual({ commit: sourceCommit, porcelain: '' });
         expect(result.events, JSON.stringify(result)).toContain('pool-created');
         expect(result.events, JSON.stringify(result)).toContain('worker-exited');
@@ -517,6 +587,25 @@ describe('receipt-backed native archive reporter', () => {
       expect(async.warning, JSON.stringify(async)).toBe(false);
       expect(async.events.indexOf('stopped-ipc'), JSON.stringify(async)).toBeLessThan(async.events.indexOf('snapshot-end'));
       expect(async.events.indexOf('worker-exited'), JSON.stringify(async)).toBeLessThan(async.events.indexOf('snapshot-end'));
+      expect(ordinary.warning, JSON.stringify(ordinary)).toBe(false);
+      expect(ordinary.ordinary.afterSnapshot, JSON.stringify(ordinary)).toMatchObject({ commit: sourceCommit,
+        porcelain: expect.stringContaining('probe.test.ts') });
+      expect(ordinary.ordinary.aborted, JSON.stringify(ordinary)).toBe(true);
+      expect(ordinary.ordinary.maxActiveWrites, JSON.stringify(ordinary)).toBe(1);
+      expect(ordinary.ordinary.writes, JSON.stringify(ordinary)).toEqual([expect.objectContaining({ status: 'fail',
+        commitSha: null, worktreeDirty: true, executionDetails: expect.objectContaining({
+          worktreeDirtyReason: 'provenance preparation exceeded its close-safe budget' }) })]);
+      expect(latestTestRunReceipts(ordinary.ordinary.receipts), JSON.stringify(ordinary)).toEqual([
+        expect.objectContaining({ status: 'fail', outcome: 'inserted', id: 'ordinary-git-stop-row' }),
+      ]);
+      expect(ordinary.ordinary.stopMs, JSON.stringify(ordinary)).toBeLessThan(300);
+      expect(ordinary.ordinary.forkExitMs, JSON.stringify(ordinary)).toBeLessThan(300);
+      expect(ordinary.ordinary.flushMs, JSON.stringify(ordinary)).toBeLessThan(ordinary.ordinary.budget.flushBudgetMs);
+      expect(ordinary.events.indexOf('interim-after-started')).toBeLessThan(ordinary.events.indexOf('stop-request'));
+      expect(ordinary.events.indexOf('worker-exited')).toBeLessThan(ordinary.events.indexOf('snapshot-aborted'));
+      expect(ordinary.events, JSON.stringify(ordinary)).toContain('fork-exit-callback');
+      expect(ordinary.events.indexOf('fork-exit-callback')).toBeLessThan(ordinary.events.indexOf('snapshot-aborted'));
+      expect(ordinary.events.indexOf('snapshot-aborted')).toBeLessThan(ordinary.events.indexOf('reporter-flushed'));
       verified = true;
     } finally {
       if (verified) rmSync(parent, { recursive: true, force: true });
