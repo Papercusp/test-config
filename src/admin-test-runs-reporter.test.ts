@@ -2602,6 +2602,61 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   });
 
+  it('keeps one receipt identity across the outer flush timeout and late SQL acknowledgement', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reporter-flush-receipt-identity-'));
+    const receiptPath = join(dir, 'receipts.jsonl');
+    const previous = process.env[TEST_RUN_RECEIPT_ENV];
+    process.env[TEST_RUN_RECEIPT_ENV] = receiptPath;
+    let release: () => void = () => undefined;
+    let writtenFile = '';
+    const statement = vi.fn(() => new Promise(resolve => {
+      release = () => resolve([{ id: 'late-file-row', file_path: writtenFile }]);
+    }));
+    const sql = ((strings: TemplateStringsArray | unknown[]) =>
+      Object.hasOwn(strings, 'raw') ? statement() : strings) as unknown as PgSql;
+    const flushMs = reporterWriteBudget(process.env).flushBudgetMs;
+    const writeRows = vi.fn(async (rows: readonly TestRunRow[]) => {
+      writtenFile = rows[0]!.filePath;
+      const receipts = await insertTestRunRowsWithSql(sql, rows, {
+        branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: 'late-group',
+        harnessSlug: 'test-config', workspaceId: null, loopLagP95Ms: null, rssMb: null,
+      }, { insertTimeoutMs: flushMs * 2, totalInsertMs: flushMs * 3 });
+      appendTestRunReceipts(process.env, receipts);
+    });
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }), undefined, writeRows);
+    await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+    vi.useFakeTimers();
+    try {
+      reporter.onTestModuleEnd({
+        moduleId: join(TEST_CONFIG_ROOT, 'src/slow-ledger.test.ts'), state: () => 'failed',
+        diagnostic: () => ({ duration: 1 }), errors: () => [], children: { allTests: () => [] },
+      } as never);
+      await vi.advanceTimersByTimeAsync(flushMs);
+      const timedOut = latestTestRunReceipts(readFileSync(receiptPath, 'utf8'));
+      expect(timedOut).toHaveLength(1);
+      expect(timedOut[0]).toMatchObject({ outcome: 'timeout', reason: `flush_budget_${flushMs}ms` });
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      const log = readFileSync(receiptPath, 'utf8');
+      const history = log.trim().split('\n').map(line => JSON.parse(line) as TestRunReceipt);
+      expect(history.map(receipt => receipt.receiptId)).toEqual([timedOut[0]!.receiptId, timedOut[0]!.receiptId]);
+      expect(latestTestRunReceipts(log, true)).toEqual([
+        expect.objectContaining({ receiptId: timedOut[0]!.receiptId, outcome: 'inserted', id: 'late-file-row' }),
+      ]);
+      expect(statement).toHaveBeenCalledTimes(1);
+      expect(writeRows).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+      await reporter.onTestRunEnd();
+      await reporter.onExit();
+      if (previous === undefined) delete process.env[TEST_RUN_RECEIPT_ENV];
+      else process.env[TEST_RUN_RECEIPT_ENV] = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('EI-26701962157024953: a timed-out interim writer never overlaps final persistence', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-timeout-'));
     const receiptPath = join(dir, 'receipts.jsonl');

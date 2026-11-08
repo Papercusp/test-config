@@ -2662,6 +2662,7 @@ export async function insertTestCaseRowsWithSql(
     const query = trackSharedPgOperation(Promise.resolve(sql`
       INSERT INTO harness_shared.test_case_runs
         ${sql(batch, ...TEST_CASE_INSERT_COLUMNS)}
+      ON CONFLICT (test_run_id, case_index) DO NOTHING
     `).then(
       () => undefined,
       (error) => { failure = error ?? new Error('insert_rejected'); throw failure; },
@@ -3350,6 +3351,9 @@ export default class AdminTestRunsReporter implements Reporter {
       controller.abort();
       rows = withoutProvenance('provenance preparation exceeded its close-safe budget');
     }
+    // The outer timeout and SQL writer observe ONE write. Assign its identity
+    // before they split, or two UUIDs make one late canonical row ambiguous.
+    rows = receiptIdentifiedRows(rows);
     if (finalProvenance) localDeadlineMs = Date.now() + writeBudgetMs;
     const remainingMs = Math.max(0, deadlineMs() - Date.now());
     if (remainingMs === 0) {

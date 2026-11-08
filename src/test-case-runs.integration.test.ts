@@ -25,7 +25,8 @@ import { createFreshTestDb, type MigratedTestDb } from './pg-migrate.ts';
 import type { TestProject } from 'vitest/node';
 import loadTimeoutHistory from './test-timeout-history-global-setup.ts';
 import { testTimingRuntimeIdentity, type TestTimeoutHistorySnapshot } from './test-timeout-runtime.ts';
-import { resolveTestRunWorkspaceId, resolveTestRunHarnessSlug } from './admin-test-runs-reporter.ts';
+import { resolveTestRunWorkspaceId, resolveTestRunHarnessSlug, insertTestCaseRowsWithSql,
+  type PgSql, type TestCaseRecord } from './admin-test-runs-reporter.ts';
 import { historicalTestTimeout } from './test-timeout-history.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -137,6 +138,23 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
     expect(rows, child.output.slice(-3000)).toHaveLength(1);
     return rows[0]!;
   }
+
+  it('replays case rows under their original parent without duplicates or replacing recorded evidence', async () => {
+    const parent = await fixtureRun();
+    const before = await sql<CaseRow[]>`SELECT case_index, case_key, occurrence, status, duration_ms, error_tail
+      FROM harness_shared.test_case_runs WHERE test_run_id = ${parent.id} ORDER BY case_index`;
+    expect(before).toHaveLength(5);
+    const cases: TestCaseRecord[] = before.map(row => ({
+      caseIndex: row.case_index, caseKey: row.case_key, occurrence: row.occurrence,
+      status: row.status as TestCaseRecord['status'], durationMs: row.duration_ms, errorTail: row.error_tail,
+    }));
+    const outcome = await insertTestCaseRowsWithSql(sql as unknown as PgSql,
+      [{ testRunId: parent.id, cases }], { deadline: Date.now() + 5_000, insertTimeoutMs: 5_000 });
+    expect(outcome).toEqual({ written: 5, unwritten: 0, reason: null });
+    const after = await sql<CaseRow[]>`SELECT case_index, case_key, occurrence, status, duration_ms, error_tail
+      FROM harness_shared.test_case_runs WHERE test_run_id = ${parent.id} ORDER BY case_index`;
+    expect(after).toEqual(before);
+  });
 
   it('the child run executed the fixture and failed only on its deliberate case', () => {
     // Exit 1 = a failing test; null would be a timeout and 2+ a config or startup error.
