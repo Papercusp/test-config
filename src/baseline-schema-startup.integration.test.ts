@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, it } from 'vitest';
+import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { getContainerRuntimeClient } from 'testcontainers';
 import postgres from 'postgres';
@@ -6,10 +6,44 @@ import { createBaselineSchemaContainer, runBaselineSetupStage } from './baseline
 
 let pg: StartedPostgreSqlContainer | undefined;
 let sql: ReturnType<typeof postgres> | undefined;
+const apiTimings: Array<{ stage: string; elapsedMs: number }> = [];
+const restoreApi: Array<() => void> = [];
+
+async function timedApi<T>(stage: string, action: () => Promise<T>): Promise<T> {
+  const startedAt = performance.now();
+  try {
+    return await runBaselineSetupStage(`regression-docker-${stage}`, action);
+  } finally {
+    const observation = { stage, elapsedMs: Math.round(performance.now() - startedAt) };
+    apiTimings.push(observation);
+    process.stderr.write(`TEST_PG_DOCKER_API ${JSON.stringify(observation)}\n`);
+  }
+}
+
+async function dispose() {
+  try {
+    await runBaselineSetupStage('regression-sql-close', async () => { await sql?.end({ timeout: 5 }); });
+    sql = undefined;
+  } finally {
+    await runBaselineSetupStage('regression-container-remove', async () => { await pg?.stop(); });
+    pg = undefined;
+  }
+}
 
 // Docker creation/start, SQL assertions and owned cleanup have separate budgets.
 // A single 120s case deadline could expire after PG was ready, hiding the phase.
 beforeAll(async () => {
+  const { container } = await getContainerRuntimeClient();
+  const create = container.create.bind(container);
+  const start = container.start.bind(container);
+  const stop = container.stop.bind(container);
+  const remove = container.remove.bind(container);
+  restoreApi.push(
+    vi.spyOn(container, 'create').mockImplementation(opts => timedApi('create', () => create(opts))).mockRestore,
+    vi.spyOn(container, 'start').mockImplementation(handle => timedApi('start', () => start(handle))).mockRestore,
+    vi.spyOn(container, 'stop').mockImplementation((handle, opts) => timedApi('stop', () => stop(handle, opts))).mockRestore,
+    vi.spyOn(container, 'remove').mockImplementation((handle, opts) => timedApi('remove', () => remove(handle, opts))).mockRestore,
+  );
   // Exercise the production builder without borrowing or stopping a reused peer.
   pg = await runBaselineSetupStage('regression-container-start', () => createBaselineSchemaContainer(0).start());
   sql = postgres(pg.getConnectionUri(), { max: 1, onnotice: () => {} });
@@ -17,9 +51,9 @@ beforeAll(async () => {
 
 afterAll(async () => {
   try {
-    await runBaselineSetupStage('regression-sql-close', async () => { await sql?.end({ timeout: 5 }); });
+    await dispose();
   } finally {
-    await runBaselineSetupStage('regression-container-remove', async () => { await pg?.stop(); });
+    for (const restore of restoreApi) restore();
   }
 }, 120_000);
 
@@ -46,4 +80,16 @@ it('starts the baseline PostgreSQL builder with disposable initialization and du
     const inspected = await runtime.container.inspect(runtime.container.getById(pg!.getId()));
     expect(inspected.Config.Env).toContain('POSTGRES_INITDB_ARGS=--no-sync');
   });
+}, 120_000);
+
+it('keeps owned Docker create, start, stop and removal below thirty seconds per API', async () => {
+  await dispose();
+  // SQL passing cannot conceal a slow overlay create/unmount (WI-6554700010046431).
+  for (const stage of ['create', 'start', 'stop', 'remove']) {
+    const observations = apiTimings.filter(entry => entry.stage === stage);
+    expect(observations.length, `Docker ${stage} must actually execute`).toBeGreaterThan(0);
+    for (const observation of observations) {
+      expect(observation.elapsedMs, `Docker ${stage} latency`).toBeLessThan(30_000);
+    }
+  }
 }, 120_000);

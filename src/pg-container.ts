@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
 import { SubstrateCircuitBreaker } from "./substrate-circuit-breaker.ts";
 import { tmpdirHasCriticalHeadroom, type TmpdirStatfs } from "./tmpdir-guard.ts";
+import { assertIsolatedTestDockerStorage } from "./test-docker-route.ts";
 import {
   probePgReachable,
   RETRYABLE_PG_STARTUP_MSG,
@@ -498,8 +499,10 @@ export class CappedLogPostgreSqlContainer extends PostgreSqlContainer {
     return getContainerRuntimeClient();
   }
 
-  protected assertRuntimeReady(client: Awaited<ReturnType<typeof getContainerRuntimeClient>>): Promise<void> {
-    return assertLocalDockerBridgeReady(client, this.networkMode);
+  protected async assertRuntimeReady(client: Awaited<ReturnType<typeof getContainerRuntimeClient>>): Promise<void> {
+    const storage = await assertIsolatedTestDockerStorage(() => client.container.dockerode.info());
+    if (storage) process.stderr.write(`TEST_DOCKER_STORAGE ${JSON.stringify(storage)}\n`);
+    await assertLocalDockerBridgeReady(client, this.networkMode);
   }
 
   protected override async containerCreated(id: string): Promise<void> {

@@ -17,6 +17,7 @@ import { resolveLaneInclude, type TestLane } from './lane-split.ts';
 // relocate Vitest's module-cache root. See that file's header for the ordering bug; the call below
 // is kept because it still governs every mkdtemp() a test performs at runtime.
 import { ensurePapercuspTmpdir } from './tmpdir-guard.ts';
+import { configureTestDockerHost } from './test-docker-route.ts';
 // gate-file-level-test-reuse-2026-09-27 P-008: per-file pass reuse (PC_TEST_REUSE_SKIP_LIST).
 import { resolvePartialResumeSkipExclude, resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
 import type { RecordedRuntimeEnvironment } from './execution-details.ts';
@@ -681,6 +682,9 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
   // Turn the silent "No test files found" footgun into an actionable error when
   // an integration/browser test is run by path under the unit config.
   if (layer === 'unit') guardLayeredTestPathUnderUnit();
+  // Select before testcontainers discovers/caches its client in globalSetup or
+  // a worker. This host's maintained isolated engine avoids root-FS writeback.
+  if (layer === 'integration') configureTestDockerHost();
   // EI-6802: on the shared dev box, Docker can leave testcontainers-ryuk
   // containers stuck in Created; subsequent testcontainers sessions then hang
   // before setup reaches user code. Integration helpers use reusable containers
