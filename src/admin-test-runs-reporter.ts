@@ -2517,6 +2517,15 @@ export async function insertTestRunRowsWithSql(
     const insertDiagnostics = attempt.readDiagnostics();
     if (!completed) {
       const replayable = Boolean(failure && isDefinitePreSubmitFailure(failure));
+      // Ordinary focused runs need no receipt sink. Preserve the same safe
+      // client observations in their retained output when the file write fails.
+      reportTestRunInsertFailure(context, {
+        outcome: failure ? 'failed' : 'timeout',
+        affectedFiles: sourceRows.length,
+        reason: failure ? receiptReason(failure) : `pg_insert_timeout_${timeoutMs}ms`,
+        replayable,
+        insertDiagnostics,
+      });
       receipts.push(
         ...(failure
           ? unwrittenReceipts(sourceRows, 'failed', receiptReason(failure), {
@@ -2605,6 +2614,30 @@ export type TestCaseInsertOutcome = {
   unwritten: number;
   reason: string | null;
 };
+
+/** Keep client progress visible when ordinary runs have no receipt sink.
+ * These observations do not prove server execution or rollback. The diagnostic
+ * excludes row content and the Query's connection/cancellation state.
+ */
+function reportTestRunInsertFailure(context: TestRunInsertContext, failure: {
+  outcome: 'failed' | 'timeout';
+  affectedFiles: number;
+  reason: string;
+  replayable: boolean;
+  insertDiagnostics?: TestRunInsertDiagnostics;
+}): void {
+  const bounded = (value: string | null) => value === null ? null : redactSensitiveText(value).slice(0, 200);
+  try {
+    process.stderr.write('[admin-test-runs] file-write ' + JSON.stringify({
+      schemaVersion: 1,
+      runGroupId: bounded(context.runGroupId),
+      harnessSlug: bounded(context.harnessSlug),
+      workspaceId: bounded(context.workspaceId),
+      ...failure,
+      reason: bounded(failure.reason),
+    }) + '\n');
+  } catch { /* A diagnostic sink must never change file receipts or submit another query. */ }
+}
 
 /** Keep incomplete secondary evidence visible in ordinary production runs too.
  * Counts describe acknowledgements, never proof that a timed-out INSERT rolled
