@@ -15,7 +15,7 @@ const key = Symbol.for('papercusp.process-termination-observer.v1');
  * cannot be caught. An opt-in callback can observe a direct self-kill request
  * before delegating the unchanged native call; it is never a terminal verdict.
  * @param {(termination: Termination) => void} callback
- * @param {{ beforeSelfKill?: (request: SelfKillRequest) => void }} [options]
+ * @param {{ beforeSelfKill?: (request: SelfKillRequest) => void, selfKillFailed?: () => void }} [options]
  * @returns {void}
  */
 export function observeProcessTermination(callback, options = {}) {
@@ -61,6 +61,7 @@ export function observeProcessTermination(callback, options = {}) {
   if (options.beforeSelfKill) {
     if (!state.selfKillCallbacks) {
       state.selfKillCallbacks = new Set();
+      state.selfKillFailureCallbacks = new Set();
       const originalKill = process.kill;
       let notifying = false;
       process.kill = function(pid, signal, ...args) {
@@ -73,9 +74,17 @@ export function observeProcessTermination(callback, options = {}) {
             }
           } finally { notifying = false; }
         }
-        return originalKill.call(this, pid, signal, ...args);
+        try { return originalKill.call(this, pid, signal, ...args); }
+        catch (error) {
+          if (pid === process.pid && (signal === 'SIGKILL' || signal === 9))
+            for (const failed of state.selfKillFailureCallbacks) {
+              try { failed(); } catch { /* Preserve the exact native exception. */ }
+            }
+          throw error;
+        }
       };
     }
     state.selfKillCallbacks.add(options.beforeSelfKill);
+    if (options.selfKillFailed) state.selfKillFailureCallbacks.add(options.selfKillFailed);
   }
 }
