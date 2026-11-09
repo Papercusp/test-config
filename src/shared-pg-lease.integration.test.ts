@@ -72,7 +72,7 @@ it('recovers an exact timed-out receipt through real PG array and bigint decodin
     wrongCommit: [], ambiguous: [] });
 }, 60_000);
 
-it.each(['pending', 'drained'] as const)('closes the parent cleanly with a %s leased real PG query', async mode => {
+it.each(['pending', 'drained', 'pre-client'] as const)('closes the parent cleanly with a %s leased real PG query', async mode => {
   const root = mkdtempSync(join(tmpdir(), 'shared-pg-parent-close-'));
   const require = createRequire(import.meta.url);
   const probe = join(root, 'probe.mjs');
@@ -109,6 +109,27 @@ it.each(['pending', 'drained'] as const)('closes the parent cleanly with a %s le
         if (reason !== 'passed' || errors.length || modules.length !== 1) throw new Error('probe did not pass');
         event('test-passed');
         const release = retainSharedPg();
+        if (mode === 'pre-client') {
+          let begin;
+          const ready = new Promise(resolve => { begin = resolve; });
+          operationPending = true;
+          const operation = trackSharedPgOperation(ready.then(async () => {
+            const handle = await tryGetPg();
+            if (!handle?.sql) throw new Error('delayed real PG client unavailable');
+            const rows = await handle.sql.unsafe('SELECT 73 AS proof');
+            if (rows[0].proof !== 73) throw new Error('delayed query did not complete');
+            operationPending = false;
+            event('query-settled');
+          }));
+          const closing = release().then(() => event('lease-released', { operationPending }));
+          // Give the old early-return path a full loop turn to settle before
+          // allowing metadata preparation to create the real client.
+          await new Promise(resolve => setTimeout(resolve, 50));
+          begin();
+          await operation;
+          await closing;
+          return;
+        }
         const handle = await tryGetPg();
         if (!handle?.sql) throw new Error('real PG client unavailable');
         const query = trackSharedPgOperation(handle.sql.unsafe(
@@ -165,7 +186,8 @@ it.each(['pending', 'drained'] as const)('closes the parent cleanly with a %s le
         await unlock;
         const records = result.stdout.trim().split('\n').map(line => JSON.parse(line));
         const events = records.map(record => record.kind);
-        expect(events, JSON.stringify(result)).toEqual(mode === 'pending'
+        expect(events, JSON.stringify(result)).toEqual(mode === 'pre-client'
+          ? ['test-passed', 'query-settled', 'lease-released', 'runner-closed'] : mode === 'pending'
           ? ['test-passed', 'query-pending', 'query-cancelled', 'lease-released', 'runner-closed']
           : ['test-passed', 'query-pending', 'query-settled', 'lease-released', 'runner-closed']);
         expect(result.stderr, JSON.stringify(result)).not.toContain('close timed out');

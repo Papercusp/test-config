@@ -382,6 +382,68 @@ describe('shared PG lease (WI-10003715)', () => {
     }
   });
 
+  it('drains a tracked writer before its delayed client exists and closes that client', async () => {
+    let start!: () => void;
+    const ready = new Promise<void>(resolve => { start = resolve; });
+    const release = retainSharedPg();
+    let client: ReturnType<typeof installFakeClient> | undefined;
+    const operation = trackSharedPgOperation((async () => {
+      await ready;
+      client = installFakeClient();
+      await chunkedWrite(1);
+    })());
+    let released = false;
+    const closing = release().then(() => { released = true; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(released).toBe(false);
+      start();
+      await operation;
+      await closing;
+      expect(client!.state.queries).toBe(1);
+      expect(client!.end).toHaveBeenCalledOnce();
+      expect(shared.promise).toBeUndefined();
+    } finally {
+      start();
+      await operation;
+      await closing;
+      await closeSharedPg();
+    }
+  });
+
+  it('refuses late client creation after a pre-client writer exhausts the drain', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let start!: () => void;
+    const ready = new Promise<void>(resolve => { start = resolve; });
+    const construct = vi.fn();
+    vi.doMock('postgres', () => ({ default: construct }));
+    const release = retainSharedPg();
+    const operation = trackSharedPgOperation(ready.then(() => tryGetPg()));
+    const closing = release();
+    try {
+      await vi.advanceTimersByTimeAsync(SHARED_PG_DRAIN_TIMEOUT_MS);
+      await closing;
+      start();
+      await expect(operation).resolves.toBeNull();
+      expect(construct).not.toHaveBeenCalled();
+      expect(shared.promise).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+      // A later run has its own authority to open a client.
+      const client = installFakeClient();
+      const nextRelease = retainSharedPg();
+      expect(await tryGetPg()).toEqual(await shared.promise);
+      await nextRelease();
+      expect(client.end).toHaveBeenCalledOnce();
+    } finally {
+      start();
+      await operation;
+      await closing;
+      await closeSharedPg();
+      vi.doUnmock('postgres');
+      vi.useRealTimers();
+    }
+  });
+
   it('reports a pending bounded drain and preserves a query that settles during it', async () => {
     const { end } = installFakeClient();
     const release = retainSharedPg();

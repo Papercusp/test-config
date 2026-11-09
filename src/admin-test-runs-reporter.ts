@@ -1541,6 +1541,8 @@ const sharedPg = pinModuleState('@papercusp/test-config.shared-pg', () => ({
   closeRequested: false,
   closePromise: undefined as Promise<void> | undefined,
   drainWaiters: new Set<() => void>(),
+  /** A writer may still be preparing metadata after the shutdown drain expires. */
+  clientCreationBlocked: false,
 }));
 
 // Reuse the client's existing two-second shutdown boundary for deferred work.
@@ -1565,6 +1567,9 @@ function validReporterPgPort(raw: string | undefined): number {
 
 export function tryGetPg(): Promise<PgHandle> {
   if (sharedPg.promise) return sharedPg.promise;
+  // Do not resurrect a client for a timed-out writer after the final lease's
+  // drain. A new reporter lease explicitly reopens client creation.
+  if (sharedPg.clientCreationBlocked && sharedPg.holders === 0) return Promise.resolve(null);
   sharedPg.setupFailure = undefined;
   sharedPg.promise = (async (): Promise<PgHandle> => {
     let phase: PgSetupFailure['phase'] = 'module-import';
@@ -1621,6 +1626,7 @@ export function tryGetPg(): Promise<PgHandle> {
  *  remains. WI-10003715. */
 export function retainSharedPg(): () => Promise<void> {
   sharedPg.holders += 1;
+  sharedPg.clientCreationBlocked = false;
   let released = false;
   return async () => {
     if (!released) {
@@ -1668,11 +1674,6 @@ export async function closeSharedPg(): Promise<void> {
     return;
   }
   sharedPg.closeRequested = true;
-  const p = sharedPg.promise;
-  if (!p) {
-    sharedPg.closeRequested = false;
-    return;
-  }
   const startedUnheld = sharedPg.holders === 0;
   const closing = (async () => {
     try {
@@ -1690,6 +1691,12 @@ export async function closeSharedPg(): Promise<void> {
       // A new run can retain the shared client while the old run drains.
       // Its live lease wins over the old shutdown request.
       if (startedUnheld && sharedPg.holders > 0) return;
+      // Tracked writers include metadata preparation before tryGetPg(). Read
+      // the client AFTER draining so a client created during that work is
+      // closed too. After the budget, late preparation must not reopen one.
+      sharedPg.clientCreationBlocked = sharedPg.inFlight > 0;
+      const p = sharedPg.promise;
+      if (!p) return;
       sharedPg.promise = undefined;
       sharedPg.setupFailure = undefined;
       const handle = await p;
@@ -1707,7 +1714,8 @@ export async function closeSharedPg(): Promise<void> {
   } finally {
     if (sharedPg.closePromise === closing) {
       sharedPg.closePromise = undefined;
-      sharedPg.closeRequested = false;
+      sharedPg.closeRequested = sharedPg.holders === 0 && sharedPg.inFlight > 0;
+      if (!sharedPg.closeRequested) sharedPg.clientCreationBlocked = false;
     }
   }
 }
