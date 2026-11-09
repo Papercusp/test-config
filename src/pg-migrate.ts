@@ -98,7 +98,7 @@ export async function withConnectRetry<T>(
   throw lastErr;
 }
 
-async function createFreshDb(name: string): Promise<{ url: string; name: string; adminUri: string }> {
+async function createFreshDb(name: string, locale?: string): Promise<{ url: string; name: string; adminUri: string }> {
   const adminUri = await getTestPg();
   // Pre-register the generated name so a forced exit during CREATE/provision
   // still leaves the supervisor an exact, owned, idempotent cleanup target.
@@ -106,7 +106,9 @@ async function createFreshDb(name: string): Promise<{ url: string; name: string;
   await withConnectRetry(async () => {
     const admin = postgres(adminUri, { max: 1, onnotice: () => {} });
     try {
-      await admin.unsafe(`CREATE DATABASE ${quoteIdentifier(name)}`);
+      const localeOptions = locale === undefined ? ''
+        : ` TEMPLATE template0 ENCODING 'UTF8' LOCALE ${quoteLiteral(locale)}`;
+      await admin.unsafe(`CREATE DATABASE ${quoteIdentifier(name)}${localeOptions}`);
     } finally {
       await admin.end({ timeout: 5 });
     }
@@ -650,6 +652,10 @@ async function applySqlFiles(url: string, paths: string[]): Promise<void> {
 export interface CreateFreshTestDbOptions {
   /** Default `it`; 1–50 lowercase ASCII letters/digits/_/-, starting with a letter. */
   prefix?: string;
+  /** Source database locale for exact snapshot replay, including generated
+   * text-search values. Creates from template0 before provision. Cannot be
+   * combined with a schema template whose locale is already fixed. */
+  locale?: string;
   /**
    * Materialize the schema into the fresh database. Receives the connection URL;
    * open your own client / run your own migrations inside. On throw, the fresh
@@ -1111,6 +1117,9 @@ function isMissingTemplate(e: unknown): boolean {
  * Call once per test file in `beforeAll`; `drop()` in `afterAll`. Requires Docker.
  */
 export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Promise<FreshTestDb> {
+  if (opts.locale !== undefined && (!/^[A-Za-z0-9_.@-]{1,128}$/.test(opts.locale) || opts.template)) {
+    throw new TypeError('createFreshTestDb: locale must be an explicit locale name and cannot accompany a schema template');
+  }
   const name = `${opts.prefix ?? 'it'}_${randomBytes(6).toString('hex')}`;
   // Validate before PG discovery or template provisioning, including when the
   // runner has no ownership directory configured.
@@ -1131,7 +1140,7 @@ export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Pr
     }
     return recordedFreshTestDb(created.url, created.name, created.adminUri);
   }
-  const { url, adminUri } = await createFreshDb(name);
+  const { url, adminUri } = await createFreshDb(name, opts.locale);
   if (opts.provision) {
     try {
       await opts.provision(url);

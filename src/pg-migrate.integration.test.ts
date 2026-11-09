@@ -88,6 +88,33 @@ async function adminClient(): Promise<postgres.Sql> {
   return sql;
 }
 
+it('creates the requested database locale before provision and drops the owned database', async () => {
+  const db = await createFreshTestDb({ prefix: 'localepin', locale: 'C', provision: async url => {
+    const sql = postgres(url, { max: 1 });
+    try {
+      const [row] = await sql`SELECT datctype, datcollate FROM pg_database WHERE datname = current_database()`;
+      expect(row).toMatchObject({ datctype: 'C', datcollate: 'C' });
+      await sql`CREATE TABLE locale_provisioned (value text)`;
+      await sql`INSERT INTO locale_provisioned VALUES ('é🧪 source')`;
+    } finally { await sql.end(); }
+  } });
+  try {
+    const sql = postgres(db.url, { max: 1 });
+    try { expect(await sql`SELECT value FROM locale_provisioned`).toEqual([{ value: 'é🧪 source' }]); }
+    finally { await sql.end(); }
+  } finally { expect(await db.dropWithResult()).toBe('dropped'); }
+  const admin = await adminClient();
+  expect(await admin`SELECT datname FROM pg_database WHERE datname = ${db.name}`).toEqual([]);
+});
+
+it('refuses invalid locale names and a locale combined with a schema template before provisioning', async () => {
+  const provision = vi.fn(async () => {});
+  await expect(createFreshTestDb({ locale: "C'; SELECT 1; --", provision })).rejects.toThrow(/locale/);
+  await expect(createFreshTestDb({ locale: '', provision })).rejects.toThrow(/locale/);
+  await expect(createFreshTestDb({ locale: 'C', template: { key: freshKey(), provision } })).rejects.toThrow(/schema template/);
+  expect(provision).not.toHaveBeenCalled();
+});
+
 it('retains the receipt filesystem error and confirms cleanup after registration fails', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pg-receipt-error-'));
   const blocked = join(dir, 'not-a-directory');
