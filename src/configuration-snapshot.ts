@@ -33,6 +33,73 @@ export interface ConfigurationSnapshot {
   fingerprint: string;
 }
 
+export const configurationReadLimits = Object.freeze({ reads: 512, keyLength: 256 });
+
+export interface ConfigurationReadObservation {
+  schemaVersion: 1;
+  scope: 'javascript-configuration-property-gets';
+  populationStatus: 'unknown';
+  limits: typeof configurationReadLimits;
+  reads: Array<{ key: string; sha256: string | null }>;
+  captureComplete: boolean;
+  activeAtTermination: boolean;
+}
+
+/** Observe JavaScript property gets, including unset values and mutations.
+ * Native getenv, descriptor access, and resolved configuration remain unknown.
+ * Bounds and observation failures never change a property's return or error.
+ */
+export function observeConfigurationReads(environment: Record<string, string | undefined>) {
+  const reads: ConfigurationReadObservation['reads'] = [];
+  let captureComplete = true, observing = true;
+  const observedEnvironment = new Proxy(environment, {
+    get(target, key, receiver) {
+      let value: unknown;
+      try { value = Reflect.get(target, key, receiver); }
+      catch (error) {
+        if (observing && typeof key === 'string' && CONFIGURATION_SNAPSHOT_ENV_KEY.test(key)) captureComplete = false;
+        throw error;
+      }
+      if (observing && typeof key === 'string' && CONFIGURATION_SNAPSHOT_ENV_KEY.test(key)) {
+        try {
+          if (key.length > configurationReadLimits.keyLength || reads.length >= configurationReadLimits.reads)
+            captureComplete = false;
+          else if (value === undefined || typeof value === 'string')
+            reads.push({ key, sha256: value === undefined ? null : sha256Hex(value) });
+          else captureComplete = false;
+        } catch { captureComplete = false; }
+      }
+      return value;
+    },
+  });
+  return { environment: observedEnvironment, finish(currentEnvironment: typeof environment): ConfigurationReadObservation {
+    observing = false;
+    return { schemaVersion: 1, scope: 'javascript-configuration-property-gets', populationStatus: 'unknown',
+      limits: { ...configurationReadLimits }, reads: reads.map(row => ({ ...row })), captureComplete,
+      activeAtTermination: currentEnvironment === observedEnvironment };
+  } };
+}
+
+/** Validate retained observations; an absent capture is never an empty one. */
+export function readConfigurationReadObservation(value: unknown): ConfigurationReadObservation | null {
+  if (!isPlainObject(value) || value.schemaVersion !== 1
+    || value.scope !== 'javascript-configuration-property-gets' || value.populationStatus !== 'unknown'
+    || !isPlainObject(value.limits) || value.limits.reads !== configurationReadLimits.reads
+    || value.limits.keyLength !== configurationReadLimits.keyLength
+    || typeof value.captureComplete !== 'boolean' || typeof value.activeAtTermination !== 'boolean'
+    || !Array.isArray(value.reads) || value.reads.length > configurationReadLimits.reads) return null;
+  const reads: ConfigurationReadObservation['reads'] = [];
+  for (const row of value.reads) {
+    if (!isPlainObject(row) || typeof row.key !== 'string' || row.key.length > configurationReadLimits.keyLength
+      || !CONFIGURATION_SNAPSHOT_ENV_KEY.test(row.key)
+      || !(row.sha256 === null || typeof row.sha256 === 'string' && /^[a-f0-9]{64}$/.test(row.sha256))) return null;
+    reads.push({ key: row.key, sha256: row.sha256 });
+  }
+  return { schemaVersion: 1, scope: value.scope, populationStatus: value.populationStatus,
+    limits: { ...configurationReadLimits }, reads, captureComplete: value.captureComplete,
+    activeAtTermination: value.activeAtTermination };
+}
+
 function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }

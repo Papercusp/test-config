@@ -4,6 +4,9 @@ import {
   captureConfigurationSnapshot,
   configurationSnapshotFingerprint,
   readConfigurationSnapshot,
+  observeConfigurationReads,
+  readConfigurationReadObservation,
+  configurationReadLimits,
 } from './configuration-snapshot';
 
 const sha = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
@@ -54,5 +57,80 @@ describe('configuration snapshot (SPEC-P-011-RUNNER-CAPTURE)', () => {
     expect(readConfigurationSnapshot({ ...snapshot, schemaVersion: 2 })).toBeNull();
     expect(readConfigurationSnapshot({ ...snapshot, flagEnv: { PAPERCUSP_FLAG_X: 1 } })).toBeNull();
     expect(readConfigurationSnapshot({ ...snapshot, flagEnv: { PAPERCUSP_FLAG_X: '1' } })).toBeNull();
+  });
+});
+
+describe('observed JavaScript configuration reads', () => {
+  it('retains consumed hashes in order, including mutation and unset values, without sampling unread keys', () => {
+    const original = { PAPERCUSP_TOKEN: 'secret-before', PAPERCUSP_UNREAD: 'unread-secret', UNRELATED: 'ignored' };
+    const observed = observeConfigurationReads(original);
+    expect(observed.environment.PAPERCUSP_TOKEN).toBe('secret-before');
+    observed.environment.PAPERCUSP_TOKEN = 'secret-after';
+    expect(observed.environment.PAPERCUSP_TOKEN).toBe('secret-after');
+    expect(observed.environment.PAPERCUSP_MISSING).toBeUndefined();
+    expect(observed.environment.UNRELATED).toBe('ignored');
+    const receipt = observed.finish(observed.environment);
+    expect(receipt).toMatchObject({ captureComplete: true, activeAtTermination: true, populationStatus: 'unknown',
+      reads: [{ key: 'PAPERCUSP_TOKEN', sha256: sha('secret-before') },
+        { key: 'PAPERCUSP_TOKEN', sha256: sha('secret-after') }, { key: 'PAPERCUSP_MISSING', sha256: null }] });
+    expect(JSON.stringify(receipt)).not.toMatch(/secret-before|secret-after|unread-secret|PAPERCUSP_UNREAD/);
+    expect(original.PAPERCUSP_TOKEN).toBe('secret-after');
+    expect(readConfigurationReadObservation(receipt)).toEqual(receipt);
+  });
+
+  it('forwards actual process environment reads, writes, deletion and enumeration', () => {
+    const original = process.env, key = 'PAPERCUSP_CONFIGURATION_READ_TEST', previous = original[key];
+    const observed = observeConfigurationReads(original);
+    let receipt: ReturnType<typeof observed.finish>;
+    try {
+      process.env = observed.environment;
+      process.env[key] = 'process-value';
+      const actual = process.env[key], present = key in process.env && Object.keys(process.env).includes(key);
+      delete process.env[key];
+      const absent = process.env[key];
+      receipt = observed.finish(process.env);
+      expect(actual).toBe('process-value'); expect(present).toBe(true); expect(absent).toBeUndefined();
+    } finally {
+      process.env = original;
+      if (previous === undefined) delete original[key]; else original[key] = previous;
+    }
+    expect(receipt!.reads.filter(row => row.key === key)).toEqual([
+      { key, sha256: sha('process-value') }, { key, sha256: null }]);
+    expect(receipt!.activeAtTermination).toBe(true);
+  });
+
+  it('marks bounded or replaced captures without changing reads or claiming closure', () => {
+    const observed = observeConfigurationReads({ PAPERCUSP_X: 'value' });
+    for (let i = 0; i <= configurationReadLimits.reads; i++) expect(observed.environment.PAPERCUSP_X).toBe('value');
+    const receipt = observed.finish({});
+    expect(receipt.reads).toHaveLength(configurationReadLimits.reads);
+    expect(receipt).toMatchObject({ captureComplete: false, activeAtTermination: false, populationStatus: 'unknown' });
+    expect(readConfigurationReadObservation(receipt)).toEqual(receipt);
+  });
+
+  it('preserves property errors and stops observing after finish', () => {
+    const failure = new Error('original getter');
+    const target = Object.defineProperty({}, 'PAPERCUSP_THROW', { get() { throw failure; } });
+    const observed = observeConfigurationReads(target);
+    expect(() => observed.environment.PAPERCUSP_THROW).toThrow(failure);
+    const first = observed.finish(observed.environment);
+    expect(first.captureComplete).toBe(false);
+    observed.environment.PAPERCUSP_LATER = 'later';
+    expect(observed.environment.PAPERCUSP_LATER).toBe('later');
+    expect(observed.finish(observed.environment).reads).toEqual(first.reads);
+  });
+
+  it('rejects malformed, unbounded and falsely complete-population receipts', () => {
+    const observed = observeConfigurationReads({ PAPERCUSP_X: 'value' });
+    void observed.environment.PAPERCUSP_X;
+    const receipt = observed.finish(observed.environment);
+    expect(readConfigurationReadObservation(receipt)).toEqual(receipt);
+    for (const invalid of [null, {}, { ...receipt, populationStatus: 'complete' },
+      { ...receipt, captureComplete: 'true' }, { ...receipt, activeAtTermination: 1 },
+      { ...receipt, limits: { ...receipt.limits, reads: 9999 } },
+      { ...receipt, reads: Array(513).fill(receipt.reads[0]) },
+      { ...receipt, reads: [{ key: 'UNRELATED', sha256: sha('value') }] },
+      { ...receipt, reads: [{ key: 'PAPERCUSP_X', sha256: 'raw-secret' }] }])
+      expect(readConfigurationReadObservation(invalid)).toBeNull();
   });
 });
