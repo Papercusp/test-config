@@ -17,6 +17,46 @@ const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=d
   Buffer.from(JSON.stringify(map)).toString('base64');
 
 describe('engine script execution observations', () => {
+  it('retains late nested ranges and complete names from an independently pinned script', () => {
+    const root = mkdtempSync(join(tmpdir(), 'engine-complete-ranges-'));
+    const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;
+    const path = join(root, 'pinned.mjs'), url = pathToFileURL(path).href;
+    const lastName = 'late_' + 'x'.repeat(300);
+    const source = Array.from({ length: 200 }, (_, index) =>
+      `function observed_${index}() { return ${index}; } observed_${index}();`).join('\n') +
+      `\nfunction ${lastName}() { return 7; } ${lastName}(); function untouched_suffix() { return 8; }`;
+    try {
+      writeFileSync(path, 'reporter-time disk bytes are not engine evidence');
+      const script = `import { Session } from 'node:inspector';
+        const { observeEngineScriptExecution } = await import(${JSON.stringify(capture)});
+        const observer = observeEngineScriptExecution('/unrelated-source-root', {
+          repositorySources: false, pinnedSources: [{ path: ${JSON.stringify(path)},
+            sha256: ${JSON.stringify(digest(source))}, byteLength: ${Buffer.byteLength(source)} }] });
+        const runtime = new Session(); runtime.connect();
+        const post = (method, params) => { let value, error;
+          runtime.post(method, params, (e, r) => { error = e; value = r; });
+          if (error) throw error; return value; };
+        post('Runtime.enable');
+        const { scriptId } = post('Runtime.compileScript', { expression: ${JSON.stringify(source)},
+          sourceURL: ${JSON.stringify(url)}, persistScript: true });
+        post('Runtime.runScript', { scriptId });
+        console.log(JSON.stringify(observer.snapshot())); observer.disconnect(); runtime.disconnect();`;
+      const env = { ...process.env }; delete env.NODE_OPTIONS;
+      for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
+      const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+        env, encoding: 'utf8', timeout: 10000,
+      }));
+      const observed = result.scripts.find((row: { path: string }) => row.path === path);
+      expect(observed).toMatchObject({ sourceTextSha256: digest(source), execution: 'observed',
+        coverageRangesComplete: true });
+      expect(observed.coverageRanges.length).toBeGreaterThan(128);
+      expect(observed.coverageRanges).toContainEqual(expect.objectContaining({ functionName: lastName, count: 1 }));
+      expect(observed.coverageRanges).toContainEqual(expect.objectContaining({ functionName: 'untouched_suffix', count: 0 }));
+      expect(result.reasons).not.toContain('engine-execution-range-limit');
+      expect(result.populationStatus).toBe('unknown');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('admits only independently pinned external engine text and keeps compilation distinct from execution', () => {
     const root = mkdtempSync(join(tmpdir(), 'engine-external-pin-'));
     const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;
