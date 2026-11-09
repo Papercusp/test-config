@@ -581,6 +581,42 @@ describe('original config load evidence', () => {
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
+  it.each(['SIGKILL', 9, 'observer-failure'] as const)(
+    'observes opt-in self-kill requests without changing the native outcome (%s)', mode => {
+      const dir = mkdtempSync(join(tmpdir(), 'termination-self-kill-'));
+      const path = join(dir, 'requests.jsonl');
+      const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
+      const signal = mode === 'observer-failure' ? 'SIGKILL' : mode;
+      try {
+        const source = `import { appendFileSync } from 'node:fs';
+          const first = await import(${JSON.stringify(helper)});
+          const duplicate = await import(${JSON.stringify(helper + '?self-kill-duplicate')});
+          const save = tag => request => appendFileSync(${JSON.stringify(path)}, JSON.stringify({tag, ...request}) + '\\n');
+          first.observeProcessTermination(save('ordinary'));
+          first.observeProcessTermination(() => {}, { beforeSelfKill: save('first') });
+          duplicate.observeProcessTermination(() => {}, { beforeSelfKill: save('duplicate') });
+          ${mode === 'observer-failure' ? "first.observeProcessTermination(() => {}, { beforeSelfKill() { throw new Error('fixture failure'); } });" : ''}
+          process.stdout.write('before kill');
+          process.kill(process.pid, ${JSON.stringify(signal)});`;
+        const observed = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+          env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
+        });
+        const native = spawnSync(process.execPath, ['--input-type=module', '-e',
+          `process.stdout.write('before kill'); process.kill(process.pid, ${JSON.stringify(signal)});`], {
+          env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
+        });
+        expect(observed.error).toBeUndefined();
+        expect(observed.status).toBe(native.status);
+        expect(observed.signal).toBe(native.signal);
+        expect(observed.signal).toBe('SIGKILL');
+        expect(observed.stdout).toBe(native.stdout);
+        expect(observed.stderr).toBe(native.stderr);
+        const rows = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(rows).toEqual(['first', 'duplicate'].map(tag => ({ tag, phase: 'self-kill-request',
+          exitCode: null, signal: 'SIGKILL', pid: rows[0].pid })));
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it('reports duplicate capture modules while sharing one hook and the loaded inputs', () => {
     const root = mkdtempSync(join(tmpdir(), 'duplicate-original-load-'));
     const capture = new URL('./executed-config-load-capture.ts', import.meta.url);

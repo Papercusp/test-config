@@ -7,15 +7,18 @@ const key = Symbol.for('papercusp.process-termination-observer.v1');
 
 /**
  * @typedef {{ phase: 'exit' | 'signal', exitCode: number | null, signal: 'SIGTERM' | 'SIGINT' | null }} Termination
+ * @typedef {{ phase: 'self-kill-request', exitCode: null, signal: 'SIGKILL', pid: number }} SelfKillRequest
  */
 
 /**
  * Observe synchronously without replacing application signal handlers. SIGKILL
- * cannot be observed; absence of a receipt must remain unknown to consumers.
+ * cannot be caught. An opt-in callback can observe a direct self-kill request
+ * before delegating the unchanged native call; it is never a terminal verdict.
  * @param {(termination: Termination) => void} callback
+ * @param {{ beforeSelfKill?: (request: SelfKillRequest) => void }} [options]
  * @returns {void}
  */
-export function observeProcessTermination(callback) {
+export function observeProcessTermination(callback, options = {}) {
   let state = process[key];
   if (!state) {
     state = { callbacks: new Set() };
@@ -55,4 +58,24 @@ export function observeProcessTermination(callback) {
     }
   }
   state.callbacks.add(callback);
+  if (options.beforeSelfKill) {
+    if (!state.selfKillCallbacks) {
+      state.selfKillCallbacks = new Set();
+      const originalKill = process.kill;
+      let notifying = false;
+      process.kill = function(pid, signal, ...args) {
+        if (!notifying && pid === process.pid && (signal === 'SIGKILL' || signal === 9)) {
+          notifying = true;
+          try {
+            for (const observe of state.selfKillCallbacks) {
+              try { observe({ phase: 'self-kill-request', exitCode: null, signal: 'SIGKILL', pid }); }
+              catch { /* A diagnostic must not prevent or replace the native kill. */ }
+            }
+          } finally { notifying = false; }
+        }
+        return originalKill.call(this, pid, signal, ...args);
+      };
+    }
+    state.selfKillCallbacks.add(options.beforeSelfKill);
+  }
 }

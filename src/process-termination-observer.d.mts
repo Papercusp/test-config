@@ -3,16 +3,27 @@
 // libs/test-config/src/process-termination-observer.mjs and regenerate.
 /**
  * @typedef {{ phase: 'exit' | 'signal', exitCode: number | null, signal: 'SIGTERM' | 'SIGINT' | null }} Termination
+ * @typedef {{ phase: 'self-kill-request', exitCode: null, signal: 'SIGKILL', pid: number }} SelfKillRequest
  */
 /**
  * Observe synchronously without replacing application signal handlers. SIGKILL
- * cannot be observed; absence of a receipt must remain unknown to consumers.
+ * cannot be caught. An opt-in callback can observe a direct self-kill request
+ * before delegating the unchanged native call; it is never a terminal verdict.
  * @param {(termination: Termination) => void} callback
+ * @param {{ beforeSelfKill?: (request: SelfKillRequest) => void }} [options]
  * @returns {void}
  */
-export function observeProcessTermination(callback: (termination: Termination) => void): void;
+export function observeProcessTermination(callback: (termination: Termination) => void, options?: {
+    beforeSelfKill?: (request: SelfKillRequest) => void;
+}): void;
 export type Termination = {
     phase: "exit" | "signal";
     exitCode: number | null;
     signal: "SIGTERM" | "SIGINT" | null;
+};
+export type SelfKillRequest = {
+    phase: "self-kill-request";
+    exitCode: null;
+    signal: "SIGKILL";
+    pid: number;
 };
