@@ -126,11 +126,13 @@ export function observeEngineScriptExecution(repoRoot: string,
           if (!Number.isSafeInteger(range.count) || range.count < 0 ||
               !Number.isSafeInteger(range.startOffset) || !Number.isSafeInteger(range.endOffset) ||
               range.startOffset < 0 || range.endOffset <= range.startOffset ||
-              range.endOffset > script.sourceTextLength!) continue;
-          if (pinnedOnly && retained.length >= 128) { coverageRangesComplete = false; continue; }
-          retained.push({ functionName: pinnedOnly ? fn.functionName.slice(0, 256) : fn.functionName, ...range });
+              range.endOffset > script.sourceTextLength!) { coverageRangesComplete = false; continue; }
+          // V8 already returned this complete population. Keep its late/nested
+          // ranges too; the native OUT writer retains oversized observations
+          // by digest instead of discarding the suffix of a pinned bundle.
+          retained.push({ functionName: fn.functionName, ...range });
         }
-        if (!coverageRangesComplete) reasons.add('engine-execution-range-limit');
+        if (!coverageRangesComplete) reasons.add('engine-execution-ranges-invalid');
         return { ...script, sourceTextSha256: sourceMatches ? script.sourceTextSha256 : null,
           execution: retained.some(range => range.count > 0) ? 'observed' as const : 'unknown' as const,
           // Offsets address engine UTF-16 source text. A positive outer range
