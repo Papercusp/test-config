@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import {
   captureConfigurationSnapshot,
@@ -97,6 +98,46 @@ describe('observed JavaScript configuration reads', () => {
     expect(receipt!.reads.filter(row => row.key === key)).toEqual([
       { key, sha256: sha('process-value') }, { key, sha256: null }]);
     expect(receipt!.activeAtTermination).toBe(true);
+  });
+
+  it('preserves native environment overwrites and coercion in a fresh Node process', () => {
+    // Vitest can replace process.env with a plain object. A private native
+    // child exercises the exotic Node setter that rejects a Proxy receiver.
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+      const { observeConfigurationReads } = await import(process.argv[1]);
+      const key = 'PAPERCUSP_CONFIGURATION_READ_NATIVE_TEST';
+      const observed = observeConfigurationReads(process.env);
+      process.env = observed.environment;
+      const before = process.env[key];
+      process.env[key] = 'after';
+      const after = process.env[key];
+      Reflect.set(process.env, key, 42);
+      const coerced = process.env[key];
+      process.env.PAPERCUSP_CONFIGURATION_CREATED = 'created';
+      const created = process.env.PAPERCUSP_CONFIGURATION_CREATED;
+      const enumerated = Object.keys(process.env).includes(key);
+      let descriptorError;
+      try { Object.defineProperty(process.env, key, { value: 'invalid' }); }
+      catch (error) { descriptorError = error.code; }
+      delete process.env[key];
+      const absent = process.env[key] === undefined;
+      console.log(JSON.stringify({ before, after, coerced, created, enumerated,
+        absent, descriptorError, receipt: observed.finish(process.env) }));
+    `, new URL('./configuration-snapshot.ts', import.meta.url).href], {
+      env: { PAPERCUSP_CONFIGURATION_READ_NATIVE_TEST: 'before' },
+      encoding: 'utf8', timeout: 10_000,
+    });
+    const result = JSON.parse(output);
+    expect(result).toMatchObject({ before: 'before', after: 'after', coerced: '42', created: 'created',
+      enumerated: true, absent: true, descriptorError: 'ERR_INVALID_OBJECT_DEFINE_PROPERTY',
+      receipt: { captureComplete: true, activeAtTermination: true, populationStatus: 'unknown' } });
+    expect(result.receipt.reads).toEqual([
+      { key: 'PAPERCUSP_CONFIGURATION_READ_NATIVE_TEST', sha256: sha('before') },
+      { key: 'PAPERCUSP_CONFIGURATION_READ_NATIVE_TEST', sha256: sha('after') },
+      { key: 'PAPERCUSP_CONFIGURATION_READ_NATIVE_TEST', sha256: sha('42') },
+      { key: 'PAPERCUSP_CONFIGURATION_CREATED', sha256: sha('created') },
+      { key: 'PAPERCUSP_CONFIGURATION_READ_NATIVE_TEST', sha256: null },
+    ]);
   });
 
   it('marks bounded or replaced captures without changing reads or claiming closure', () => {

@@ -53,6 +53,12 @@ export function observeConfigurationReads(environment: Record<string, string | u
   const reads: ConfigurationReadObservation['reads'] = [];
   let captureComplete = true, observing = true;
   const observedEnvironment = new Proxy(environment, {
+    set(target, key, value) {
+      // Native process.env rejects the partial descriptor produced when a
+      // Proxy is the receiver of an overwrite. Forward writes to the original
+      // environment so observation preserves its coercion and error behavior.
+      return Reflect.set(target, key, value, target);
+    },
     get(target, key, receiver) {
       let value: unknown;
       try { value = Reflect.get(target, key, receiver); }
