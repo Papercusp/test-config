@@ -617,6 +617,37 @@ describe('original config load evidence', () => {
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
+  it('preserves native kill arguments, receiver, return value and thrown error', () => {
+    const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
+    const source = `import assert from 'node:assert/strict';
+      const original = process.kill, receiver = {}, value = {}, failure = new Error('native failure');
+      const calls = [], requests = [];
+      process.kill = function(...args) {
+        calls.push({ receiver: this, args });
+        if (args[1] === 'invalid-signal') throw failure;
+        return value;
+      };
+      const { observeProcessTermination } = await import(${JSON.stringify(helper)});
+      observeProcessTermination(() => {}, { beforeSelfKill(request) { requests.push(request); throw new Error('diagnostic failure'); } });
+      assert.equal(process.kill.call(receiver, process.pid, 9, 'extra'), value);
+      assert.equal(process.kill.call(receiver, process.pid + 1, 'SIGKILL'), value);
+      assert.equal(process.kill.call(receiver, process.pid, 0), value);
+      assert.throws(() => process.kill.call(receiver, process.pid, 'invalid-signal'), error => error === failure);
+      assert.deepEqual(calls.map(call => call.args), [[process.pid, 9, 'extra'],
+        [process.pid + 1, 'SIGKILL'], [process.pid, 0], [process.pid, 'invalid-signal']]);
+      assert.ok(calls.every(call => call.receiver === receiver));
+      assert.deepEqual(requests, [{ phase: 'self-kill-request', exitCode: null, signal: 'SIGKILL', pid: process.pid }]);
+      process.kill = original;
+      process.stdout.write('native contract retained');`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+      env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('native contract retained');
+    expect(result.stderr).toBe('');
+  });
+
   it('reports duplicate capture modules while sharing one hook and the loaded inputs', () => {
     const root = mkdtempSync(join(tmpdir(), 'duplicate-original-load-'));
     const capture = new URL('./executed-config-load-capture.ts', import.meta.url);
