@@ -28,7 +28,7 @@
  * Fail-soft throughout (D-007, same contract as admin-test-runs-reporter.ts): nothing here can
  * change a test outcome, and every write is bounded by a timeout.
  */
-import type { Reporter, TestModule, TestRunEndReason, TestSpecification, Vitest } from 'vitest/node';
+import type { Reporter, TestCase, TestModule, TestRunEndReason, TestSpecification, Vitest } from 'vitest/node';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -47,6 +47,7 @@ import {
   computeWorktreeDirty,
   collectModuleExecution,
   collectTestCases,
+  RecordedPopulationCapture,
   retainSharedPg,
   trackSharedPgOperation,
   inferWorkspaceRoot,
@@ -55,6 +56,7 @@ import {
   type PgHandle,
   type WorktreeGitSnapshot,
 } from './admin-test-runs-reporter';
+import type { RecordedTestPopulation, PopulationCaptureStatus } from './execution-details';
 import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META, readExecutedSourceOriginals,
   type ExecutedOriginalSource } from './vitest-config';
 import { qualifyLoadedConfigSources, qualifyLoadedMainProcessSources } from './executed-config-load-capture.ts';
@@ -752,6 +754,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private skipped = 0;
   private flushed = false;
   private collectedSources = new WeakMap<TestModule, CollectedSourceEvidence>();
+  private populationCapture = new RecordedPopulationCapture(id => normalizeExecutedKey(id, this.repoRoot));
   // OUT diagnostics describe executions, including failed or incomplete ones.
   // They never enter the reusable-pass table or the selector's rows.
   private diagnostics: Array<{ testFile: string; state: string; sourceEvidence: ExecutedSourceEvidence;
@@ -767,6 +770,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     reason: TestRunEndReason | null; unhandledErrorCount: number | null;
     reportedModulePaths: Array<string | null> | null;
     modulePopulationMatched: boolean;
+    selectedPopulationMatched: boolean;
     selectedManifest: { sha256: string; specifications: Array<{
       testFile: string | null; projectName: string | null; pool: string;
       testNamePattern: string | null; testLines: number[] | null; testIds: string[] | null; testTagsFilter: string[] | null;
@@ -774,6 +778,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
     files: Array<{ testFile: string; state: string; observedAtMs: number;
       completionId: string;
       projectName: string | null;
+      populationCaptureStatus: PopulationCaptureStatus;
+      population?: RecordedTestPopulation;
       firstAttemptVerdict: 'pass' | 'fail' | 'unknown';
       proof: { inputs: InputsRecord | null; sourceEvidence: ExecutedSourceEvidence | null };
       execution: ReturnType<typeof collectModuleExecution>; cases: ReturnType<typeof collectTestCases> }>;
@@ -832,13 +838,15 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.skipped = 0;
     this.flushed = false;
     this.collectedSources = new WeakMap();
+    this.populationCapture = new RecordedPopulationCapture(id => normalizeExecutedKey(id, this.repoRoot));
     this.diagnostics = [];
     this.fileResults = [];
     this.nativeRun = this.armed.outPath ? {
       schemaVersion: 'native-vitest-run-v1', scope: 'vitest-reporter-callbacks',
       pid: process.pid, ppid: process.ppid, startedAtMs: Date.now(), finishedAtMs: null,
       terminalHook: null, reason: null, unhandledErrorCount: null,
-      reportedModulePaths: null, modulePopulationMatched: false, selectedManifest: null, files: [], gaps: [],
+      reportedModulePaths: null, modulePopulationMatched: false, selectedPopulationMatched: false,
+      selectedManifest: null, files: [], gaps: [],
     } : null;
   }
 
@@ -867,6 +875,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
   onTestModuleCollected(testModule: TestModule): void {
     // Fingerprinting has a cost. Only the existing optional diagnostic OUT channel requests it.
     if (!this.armed?.outPath) return;
+    this.populationCapture.collected(testModule);
     try {
       const imports = testModule.diagnostic().importDurations as Record<string, ImportDurationLike> | undefined;
       const reported = new Set(collectExecutedModules(imports, { repoRoot: this.repoRoot, testFile: testModule.moduleId }));
@@ -883,6 +892,10 @@ export default class ExecutedSourceMapReporter implements Reporter {
     } catch {
       this.collectedSources.set(testModule, { modules: new Map(), reasons: ['collection-graph-unreadable'] });
     }
+  }
+
+  onTestCaseReady(test: TestCase): void {
+    if (this.nativeRun) this.populationCapture.ready(test);
   }
 
   async onTestModuleEnd(testModule: TestModule): Promise<void> {
@@ -910,8 +923,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
         this.fileResults.push({ testFile: resultFile, verdict });
         if (this.nativeRun) {
           const execution = collectModuleExecution(testModule), cases = collectTestCases(testModule);
+          const population = this.populationCapture.completed(testModule);
           nativeFile = { testFile: resultFile, state, observedAtMs: Date.now(),
             completionId: randomUUID(), projectName: testModule.project.name ?? null,
+            populationCaptureStatus: execution?.collectionFailed ? 'collection-failed'
+              : this.populationCapture.status(testModule),
+            ...(population && execution && !execution.collectionFailed ? { population } : {}),
             firstAttemptVerdict: verdict, execution, cases,
             proof: { inputs, sourceEvidence: null } };
           this.nativeRun.files.push(nativeFile);
@@ -1213,6 +1230,15 @@ export default class ExecutedSourceMapReporter implements Reporter {
         this.nativeRun.modulePopulationMatched = reported !== null && reported.every(path => path !== null) &&
           JSON.stringify([...reported].sort()) ===
             JSON.stringify(this.nativeRun.files.map(file => file.testFile).sort());
+        const selected = this.nativeRun.selectedManifest?.specifications;
+        // Same-file runs in different projects are distinct. Compare multisets
+        // to the independently frozen selection, never just completed paths.
+        this.nativeRun.selectedPopulationMatched = !!selected?.length
+          && selected.every(spec => spec.testFile !== null && spec.projectName !== null)
+          && this.nativeRun.modulePopulationMatched
+          && this.nativeRun.files.every(file => file.populationCaptureStatus === 'captured' && !!file.population)
+          && JSON.stringify(selected.map(spec => JSON.stringify([spec.projectName, spec.testFile])).sort())
+            === JSON.stringify(this.nativeRun.files.map(file => JSON.stringify([file.projectName, file.testFile])).sort());
         if (!this.nativeRun.modulePopulationMatched) this.nativeRun.gaps.push('terminal-module-population-unmatched');
         if (!reason) this.nativeRun.gaps.push('run-end-reason-unobserved');
         if (!this.nativeRun.files.length) this.nativeRun.gaps.push('no-module-results');

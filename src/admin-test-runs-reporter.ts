@@ -2976,6 +2976,108 @@ export function normalizeRuntimeEnvironmentCaptureTimeout(value: unknown): numbe
   return Math.min(MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS, Math.max(1, Math.floor(value)));
 }
 
+/** One runner-event collector for ledger rows and native qualification receipts.
+ * Diagnostic case samples cannot establish this complete population.
+ */
+export class RecordedPopulationCapture {
+  private populations = new WeakMap<TestModule, {
+    identities: Map<string, RecordedPopulationIdentity>;
+    selected: Set<string>;
+    order: RecordedPopulationIdentity[];
+    invalid: boolean;
+  }>();
+  private statuses = new WeakMap<TestModule, PopulationCaptureStatus>();
+
+  private filePath: (moduleId: string) => string | null;
+
+  constructor(filePath: (moduleId: string) => string | null) {
+    this.filePath = filePath;
+  }
+
+  status(testModule: TestModule): PopulationCaptureStatus {
+    return this.statuses.get(testModule) ?? 'collection-unavailable';
+  }
+
+  collected(testModule: TestModule): void {
+    try {
+      this.populations.delete(testModule);
+      this.statuses.set(testModule, 'collection-unavailable');
+      if (typeof testModule.project?.name !== 'string') return;
+      const file = this.filePath(testModule.moduleId);
+      if (!file) return;
+      const identities = new Map<string, RecordedPopulationIdentity>();
+      const selected = new Set<string>();
+      const occurrences = new Map<string, number>();
+      for (const test of testModule.children.allTests()) {
+        if (typeof test.id !== 'string' || !test.id || identities.has(test.id)) {
+          this.statuses.set(testModule, 'invalid-identity');
+          return;
+        }
+        // result() may already be terminal when queued callbacks run.
+        const mode = test.options?.mode;
+        if (!['run', 'only', 'skip', 'todo'].includes(mode)) {
+          this.statuses.set(testModule, 'unknown-selection');
+          return;
+        }
+        const occurrence = (occurrences.get(test.fullName) ?? 0) + 1;
+        occurrences.set(test.fullName, occurrence);
+        identities.set(test.id, [testModule.project.name, file, test.fullName, occurrence, 'test']);
+        if (mode === 'run' || mode === 'only') selected.add(test.id);
+      }
+      this.populations.set(testModule, { identities, selected, order: [], invalid: false });
+      this.statuses.set(testModule, 'execution-incomplete');
+    } catch { /* Missing collection is explicitly unproven. */ }
+  }
+
+  ready(test: TestCase): void {
+    try {
+      const population = this.populations.get(test.module);
+      if (!population) return;
+      const identity = population.identities.get(test.id);
+      if (!identity || identity[2] !== test.fullName) {
+        population.invalid = true;
+        return;
+      }
+      // Vitest synthesizes ready/result events for statically skipped suites.
+      if (population.selected.has(test.id)) population.order.push(identity);
+    } catch { /* Missing ready evidence fails reconciliation at module end. */ }
+  }
+
+  completed(testModule: TestModule) {
+    try {
+      const population = this.populations.get(testModule);
+      if (!population) return undefined;
+      if (population.invalid || moduleStatus(testModule) === 'error') {
+        this.statuses.set(testModule, 'collection-changed');
+        return undefined;
+      }
+      const cases: RecordedPopulationCase[] = [];
+      const seen = new Set<string>();
+      for (const test of testModule.children.allTests()) {
+        const identity = population.identities.get(test.id);
+        const outcome = test.result().state;
+        if (!identity || seen.has(test.id) || identity[2] !== test.fullName
+          || !['passed', 'failed', 'skipped'].includes(outcome)) {
+          this.statuses.set(testModule, 'collection-changed');
+          return undefined;
+        }
+        seen.add(test.id);
+        cases.push({ identity, selected: population.selected.has(test.id),
+          outcome: outcome as RecordedPopulationCase['outcome'] });
+      }
+      if (seen.size !== population.identities.size) {
+        this.statuses.set(testModule, 'collection-changed');
+        return undefined;
+      }
+      const recorded = createRecordedTestPopulation(cases, population.order);
+      if (recorded) this.statuses.set(testModule, 'captured');
+      else if (new Set(population.order.map(identity => JSON.stringify(identity))).size === population.selected.size)
+        this.statuses.set(testModule, 'invalid-identity');
+      return recorded;
+    } catch { return undefined; }
+  }
+}
+
 export default class AdminTestRunsReporter implements Reporter {
   private pending: PendingTestRunRow[] = [];
   /** Captured in onInit, before Vitest starts executing test modules. */
@@ -3007,16 +3109,7 @@ export default class AdminTestRunsReporter implements Reporter {
   private mutationInvocation: MutationInvocationDescriptor | null = null;
   /** Only a validated mutant with a proven initial source can supply terminal mutation proof. */
   private terminalMutationProvenance = false;
-  /** Capture collection before diagnostic caps, and order from runner events.
-   * Missing hooks/identities never become an inferred complete population.
-   */
-  private populations = new WeakMap<TestModule, {
-    identities: Map<string, RecordedPopulationIdentity>;
-    selected: Set<string>;
-    order: RecordedPopulationIdentity[];
-    invalid: boolean;
-  }>();
-  private populationCaptureStatuses = new WeakMap<TestModule, PopulationCaptureStatus>();
+  private populationCapture = new RecordedPopulationCapture(toWorkspaceRel);
 
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
@@ -3161,83 +3254,11 @@ export default class AdminTestRunsReporter implements Reporter {
   }
 
   onTestModuleCollected(testModule: TestModule): void {
-    try {
-      this.populations.delete(testModule);
-      this.populationCaptureStatuses.set(testModule, 'collection-unavailable');
-      if (typeof testModule.project?.name !== 'string') return;
-      const file = toWorkspaceRel(testModule.moduleId);
-      const identities = new Map<string, RecordedPopulationIdentity>();
-      const selected = new Set<string>();
-      const occurrences = new Map<string, number>();
-      for (const test of testModule.children.allTests()) {
-        if (typeof test.id !== 'string' || !test.id || identities.has(test.id)) {
-          this.populationCaptureStatuses.set(testModule, 'invalid-identity');
-          return;
-        }
-        // result() is a mutable view and can already be terminal when queued
-        // reporter callbacks run. The runner's captured options hold selection.
-        const mode = test.options?.mode;
-        if (!['run', 'only', 'skip', 'todo'].includes(mode)) {
-          this.populationCaptureStatuses.set(testModule, 'unknown-selection');
-          return;
-        }
-        const occurrence = (occurrences.get(test.fullName) ?? 0) + 1;
-        occurrences.set(test.fullName, occurrence);
-        identities.set(test.id, [testModule.project.name, file, test.fullName, occurrence, 'test']);
-        if (mode === 'run' || mode === 'only') selected.add(test.id);
-      }
-      this.populations.set(testModule, { identities, selected, order: [], invalid: false });
-      this.populationCaptureStatuses.set(testModule, 'execution-incomplete');
-    } catch { /* Missing collection is explicitly unproven. */ }
+    this.populationCapture.collected(testModule);
   }
 
   onTestCaseReady(test: TestCase): void {
-    try {
-      const population = this.populations.get(test.module);
-      if (!population) return;
-      const identity = population.identities.get(test.id);
-      if (!identity || identity[2] !== test.fullName) {
-        population.invalid = true;
-        return;
-      }
-      // Vitest synthesizes ready/result events for statically skipped suites.
-      if (!population.selected.has(test.id)) return;
-      population.order.push(identity);
-    } catch { /* Missing ready evidence fails reconciliation at module end. */ }
-  }
-
-  private completedPopulation(testModule: TestModule) {
-    try {
-      const population = this.populations.get(testModule);
-      if (!population) return undefined;
-      if (population.invalid || moduleStatus(testModule) === 'error') {
-        this.populationCaptureStatuses.set(testModule, 'collection-changed');
-        return undefined;
-      }
-      const cases: RecordedPopulationCase[] = [];
-      const seen = new Set<string>();
-      for (const test of testModule.children.allTests()) {
-        const identity = population.identities.get(test.id);
-        const outcome = test.result().state;
-        if (!identity || seen.has(test.id) || identity[2] !== test.fullName
-          || !['passed', 'failed', 'skipped'].includes(outcome)) {
-          this.populationCaptureStatuses.set(testModule, 'collection-changed');
-          return undefined;
-        }
-        seen.add(test.id);
-        cases.push({ identity, selected: population.selected.has(test.id),
-          outcome: outcome as RecordedPopulationCase['outcome'] });
-      }
-      if (seen.size !== population.identities.size) {
-        this.populationCaptureStatuses.set(testModule, 'collection-changed');
-        return undefined;
-      }
-      const recorded = createRecordedTestPopulation(cases, population.order);
-      if (recorded) this.populationCaptureStatuses.set(testModule, 'captured');
-      else if (new Set(population.order.map(identity => JSON.stringify(identity))).size === population.selected.size)
-        this.populationCaptureStatuses.set(testModule, 'invalid-identity');
-      return recorded;
-    } catch { return undefined; }
+    this.populationCapture.ready(test);
   }
 
   /** Per-module hook — persist failures early; hold passes for the final snapshot. */
@@ -3262,7 +3283,7 @@ export default class AdminTestRunsReporter implements Reporter {
       // Retain details for the final merge/retry if this fail-soft write fails.
       writeFailureDetails(details);
 
-      const population = this.completedPopulation(testModule);
+      const population = this.populationCapture.completed(testModule);
       const counts = collectModuleExecution(testModule, this.preferredPassedCasePattern);
       const verifierSourceReason = unversionedVerifierSourceReason(testModule.moduleId);
       // Root and project configs may differ in a multi-project run. The module's
@@ -3274,7 +3295,7 @@ export default class AdminTestRunsReporter implements Reporter {
       const executionDetails = counts && this.executionContext
         ? { ...this.executionContext, testLayer, filePath, ...counts,
             populationCaptureStatus: counts.collectionFailed ? 'collection-failed' as const
-              : this.populationCaptureStatuses.get(testModule) ?? 'collection-unavailable',
+              : this.populationCapture.status(testModule),
             ...(population && !counts.collectionFailed ? { population } : {}) } : null;
       if (executionDetails) {
         const boundaryObservations = collectBoundaryObservations(testModule);

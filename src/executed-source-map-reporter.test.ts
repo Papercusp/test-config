@@ -15,7 +15,8 @@ import { executedSourceOriginalsPlugin } from './vitest-config';
 // @ts-expect-error the executable .mjs router has no declaration file
 import { perGroupVitestEnv } from '../../../scripts/test-files.mjs';
 
-import { inferWorkspaceRoot } from './admin-test-runs-reporter';
+import AdminTestRunsReporter, { inferWorkspaceRoot } from './admin-test-runs-reporter';
+import { parseRecordedTestPopulation } from './execution-details';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
   EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS,
@@ -651,6 +652,91 @@ describe('ExecutedSourceMapReporter', () => {
     function nativeOut() {
       return JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8')).nativeRun;
     }
+
+    function populationModule(count = 3) {
+      const mod = nativeModule(Array.from({ length: count }, () => 'passed'));
+      const tests = Array.from(mod.children.allTests()).map((test, index) => Object.assign(test, {
+        id: `case-${index}`, module: mod, options: { mode: 'run' },
+        fullName: index < 2 ? 'duplicate title' : `case ${index} ${'long title '.repeat(300)}`,
+      }));
+      Object.assign(mod, { project: { ...mod.project, name: 'population-project' },
+        children: { allTests: () => tests } });
+      return { mod, tests };
+    }
+
+    function selectPopulation(r: ExecutedSourceMapReporter, projectName = 'population-project', copies = 1) {
+      r.onTestRunStart(Array.from({ length: copies }, () => ({
+        moduleId: TEST_FILE, project: { name: projectName }, pool: 'forks',
+      })) as never);
+    }
+
+    it('binds the full uncapped ledger population to its original native manifest and completion receipt', async () => {
+      const { r, flushes } = reporter();
+      const { mod, tests } = populationModule(1_300);
+      const ledgerRows: Array<{ executionDetails?: unknown }> = [];
+      const ledger = new AdminTestRunsReporter(snapshot(clean), async row => { ledgerRows.push(row); });
+      await ledger.onInit({ config: {}, vite: { config: {} } } as never);
+      r.onInit({} as never);
+      selectPopulation(r);
+      ledger.onTestModuleCollected(mod);
+      r.onTestModuleCollected(mod);
+      // Actual event order, including a repeated attempt, is distinct from
+      // sorted population order and must survive both producer paths.
+      for (const test of [...tests].reverse().concat(tests[0]!)) {
+        ledger.onTestCaseReady(test as never);
+        r.onTestCaseReady(test as never);
+      }
+      ledger.onTestModuleEnd(mod);
+      await r.onTestModuleEnd(mod);
+      const checkpoint = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+      const original = checkpoint.nativeRun.files[0];
+      expect(original.populationCaptureStatus).toBe('captured');
+      expect(original.population).toBeDefined();
+      expect(parseRecordedTestPopulation(original.population)).toEqual(original.population);
+      expect(original.population.cases).toHaveLength(1_300);
+      expect(original.population.cases.filter((row: { identity: unknown[] }) => row.identity[2] === 'duplicate title')
+        .map((row: { identity: unknown[] }) => row.identity[3])).toEqual([1, 2]);
+      expect(original.population.cases.some((row: { identity: string[] }) => row.identity[2]!.length > 2_048)).toBe(true);
+      expect(original.population.executionOrder).toHaveLength(1_301);
+      expect(checkpoint.completionCheckpoint).toMatchObject({ runGroupId: 'grp-1',
+        qualificationAttemptId: 'frozen-qualification-attempt' });
+      expect(checkpoint.nativeRun.selectedPopulationMatched).toBe(false);
+      await ledger.onTestRunEnd();
+      const execution = ledgerRows[0]?.executionDetails as { population?: unknown };
+      expect(execution?.population).toEqual(original.population);
+      await r.onTestRunEnd([mod], [], 'passed');
+      expect(nativeOut().selectedPopulationMatched).toBe(true);
+      expect(nativeOut().files[0]).toEqual(original);
+      expect(flushes[0]!.rows[0]).not.toHaveProperty('population');
+      await ledger.onExit();
+    });
+
+    it.each(['no-collection', 'missing-ready', 'changed-title', 'unknown-selection', 'duplicate-id',
+      'missing-case', 'wrong-project', 'missing-module', 'unselected-module', 'exit-only'] as const)(
+      'keeps native population proof ineligible for %s', async damage => {
+        const { r } = reporter();
+        const { mod, tests } = populationModule();
+        r.onInit({} as never);
+        selectPopulation(r, damage === 'wrong-project' ? 'another-project' : 'population-project',
+          damage === 'missing-module' ? 2 : damage === 'unselected-module' ? 0 : 1);
+        if (damage === 'unknown-selection') Object.assign(tests[0]!.options, { mode: 'unknown' });
+        if (damage === 'duplicate-id') tests[1]!.id = tests[0]!.id;
+        if (damage !== 'no-collection') r.onTestModuleCollected(mod);
+        for (const test of damage === 'missing-ready' ? tests.slice(1) : tests) r.onTestCaseReady(test as never);
+        if (damage === 'changed-title') tests[0]!.fullName = 'changed after collection';
+        if (damage === 'missing-case') tests.pop();
+        await r.onTestModuleEnd(mod);
+        if (damage === 'exit-only') await r.onExit();
+        else await r.onTestRunEnd([mod], [], 'passed');
+        const out = nativeOut();
+        expect(out.selectedPopulationMatched).toBe(false);
+        const collectionIntact = ['wrong-project', 'missing-module', 'unselected-module', 'exit-only'].includes(damage);
+        if (collectionIntact) expect(out.files[0].populationCaptureStatus).toBe('captured');
+        else {
+          expect(out.files[0].populationCaptureStatus).not.toBe('captured');
+          expect(out.files[0]).not.toHaveProperty('population');
+        }
+      });
 
     it('saves passing, failing and infrastructure outcomes with their proofs before suite end', async () => {
       const { r, flushes } = reporter();
