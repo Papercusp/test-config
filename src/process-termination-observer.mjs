@@ -76,6 +76,10 @@ export function observeProcessTermination(callback, options = {}) {
       const killDelegate = originalDelegate && hasOwn(originalDelegate, 'value') ? originalDelegate.value : null;
       let notifying = false;
       process.kill = function(pid, signal, ...args) {
+        // Array spread can invoke an application-supplied iterator. Prepare
+        // the unchanged native arguments before entering the terminal callback,
+        // so delegation itself cannot re-enter application code through it.
+        const nativeArgs = [pid, signal, ...args];
         if (!notifying && pid === process.pid && (signal === 'SIGKILL' || signal === 9)) {
           notifying = true;
           try {
@@ -100,7 +104,7 @@ export function observeProcessTermination(callback, options = {}) {
         }
         // A function's .call property is mutable application state. Do not
         // invoke it after the boundary; delegate through the captured intrinsic.
-        try { return apply(originalKill, this, [pid, signal, ...args]); }
+        try { return apply(originalKill, this, nativeArgs); }
         catch (error) {
           if (pid === process.pid && (signal === 'SIGKILL' || signal === 9))
             for (const failed of state.selfKillFailureCallbacks) {

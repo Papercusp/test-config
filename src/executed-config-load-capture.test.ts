@@ -912,6 +912,35 @@ describe('original config load evidence', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it.each(['string', 'numeric'] as const)(
+    'self-kill boundary finishes mutable argument iteration before its terminal callback (%s)', mode => {
+      const dir = mkdtempSync(join(tmpdir(), 'termination-self-kill-arguments-'));
+      const path = join(dir, 'requests.jsonl');
+      const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
+      try {
+        const source = `import { appendFileSync } from 'node:fs';
+          const { observeProcessTermination } = await import(${JSON.stringify(helper)});
+          const record = tag => appendFileSync(${JSON.stringify(path)}, JSON.stringify(tag) + '\\n');
+          let terminal = false;
+          observeProcessTermination(() => {}, { beforeSelfKill() {
+            record('terminal'); terminal = true;
+          }, selfKillBoundary: true });
+          const iterator = Array.prototype[Symbol.iterator];
+          Array.prototype[Symbol.iterator] = function() {
+            if (terminal) record('application-iterator-after-terminal');
+            return Reflect.apply(iterator, this, []);
+          };
+          process.kill(process.pid, ${mode === 'string' ? "'SIGKILL'" : '9'}, 'extra');`;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+          env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.signal, result.stderr).toBe('SIGKILL');
+        expect(readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
+          .toEqual(['terminal']);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it.each(['value', 'accessor', 'accessor-with-inherited-value'] as const)(
     'self-kill boundary refuses a changed native kill delegate (%s)', mode => {
       const dir = mkdtempSync(join(tmpdir(), 'termination-self-kill-delegate-'));
