@@ -29,6 +29,9 @@ export interface RecordedTestPopulation {
   outcomesHash: string;
   executionOrderHash: string;
 }
+export const POPULATION_CAPTURE_STATUSES = ['captured', 'collection-unavailable', 'invalid-identity',
+  'unknown-selection', 'collection-changed', 'execution-incomplete', 'collection-failed'] as const;
+export type PopulationCaptureStatus = (typeof POPULATION_CAPTURE_STATUSES)[number];
 
 function populationIdentity(value: unknown): value is RecordedPopulationIdentity {
   return Array.isArray(value) && value.length === 5
@@ -464,6 +467,7 @@ export interface TestRunExecutionDetails {
   collectionFailed: boolean;
   /** Exact collection/selection/outcomes and observed order; legacy absence is unknown. */
   population?: RecordedTestPopulation;
+  populationCaptureStatus?: PopulationCaptureStatus;
   mutationPhase: string | null;
   /** The commit observed after the run; null means runtime identity is unproven. */
   commitSha: string | null;
@@ -707,7 +711,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -789,6 +793,9 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
     || (value.population !== undefined && !executionPopulationMatches(value))
+    || (value.populationCaptureStatus !== undefined && (
+      !POPULATION_CAPTURE_STATUSES.includes(value.populationCaptureStatus as PopulationCaptureStatus)
+      || (value.populationCaptureStatus === 'captured') !== (value.population !== undefined)))
     || (value.failedCaseTitles !== undefined && (
       !Array.isArray(value.failedCaseTitles)
       || value.failedCaseTitles.length > (value.failed as number)

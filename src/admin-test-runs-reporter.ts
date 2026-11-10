@@ -50,6 +50,7 @@ import {
   parseExecutionBoundaryReceipt, type TestBoundaryObservation,
   parseTestSqlCoverageObservations, type TestSqlCoverageObservation,
   createRecordedTestPopulation, type RecordedPopulationIdentity, type RecordedPopulationCase,
+  type PopulationCaptureStatus,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import {
@@ -3015,6 +3016,7 @@ export default class AdminTestRunsReporter implements Reporter {
     order: RecordedPopulationIdentity[];
     invalid: boolean;
   }>();
+  private populationCaptureStatuses = new WeakMap<TestModule, PopulationCaptureStatus>();
 
   constructor(
     readWorktreeSnapshotOrOptions?: WorktreeSnapshotReader | Record<string, unknown>,
@@ -3161,23 +3163,31 @@ export default class AdminTestRunsReporter implements Reporter {
   onTestModuleCollected(testModule: TestModule): void {
     try {
       this.populations.delete(testModule);
+      this.populationCaptureStatuses.set(testModule, 'collection-unavailable');
       if (typeof testModule.project?.name !== 'string') return;
       const file = toWorkspaceRel(testModule.moduleId);
       const identities = new Map<string, RecordedPopulationIdentity>();
       const selected = new Set<string>();
       const occurrences = new Map<string, number>();
       for (const test of testModule.children.allTests()) {
-        if (typeof test.id !== 'string' || !test.id || identities.has(test.id)) return;
+        if (typeof test.id !== 'string' || !test.id || identities.has(test.id)) {
+          this.populationCaptureStatuses.set(testModule, 'invalid-identity');
+          return;
+        }
         // result() is a mutable view and can already be terminal when queued
         // reporter callbacks run. The runner's captured options hold selection.
         const mode = test.options?.mode;
-        if (!['run', 'only', 'skip', 'todo'].includes(mode)) return;
+        if (!['run', 'only', 'skip', 'todo'].includes(mode)) {
+          this.populationCaptureStatuses.set(testModule, 'unknown-selection');
+          return;
+        }
         const occurrence = (occurrences.get(test.fullName) ?? 0) + 1;
         occurrences.set(test.fullName, occurrence);
         identities.set(test.id, [testModule.project.name, file, test.fullName, occurrence, 'test']);
         if (mode === 'run' || mode === 'only') selected.add(test.id);
       }
       this.populations.set(testModule, { identities, selected, order: [], invalid: false });
+      this.populationCaptureStatuses.set(testModule, 'execution-incomplete');
     } catch { /* Missing collection is explicitly unproven. */ }
   }
 
@@ -3199,20 +3209,34 @@ export default class AdminTestRunsReporter implements Reporter {
   private completedPopulation(testModule: TestModule) {
     try {
       const population = this.populations.get(testModule);
-      if (!population || population.invalid || moduleStatus(testModule) === 'error') return undefined;
+      if (!population) return undefined;
+      if (population.invalid || moduleStatus(testModule) === 'error') {
+        this.populationCaptureStatuses.set(testModule, 'collection-changed');
+        return undefined;
+      }
       const cases: RecordedPopulationCase[] = [];
       const seen = new Set<string>();
       for (const test of testModule.children.allTests()) {
         const identity = population.identities.get(test.id);
         const outcome = test.result().state;
         if (!identity || seen.has(test.id) || identity[2] !== test.fullName
-          || !['passed', 'failed', 'skipped'].includes(outcome)) return undefined;
+          || !['passed', 'failed', 'skipped'].includes(outcome)) {
+          this.populationCaptureStatuses.set(testModule, 'collection-changed');
+          return undefined;
+        }
         seen.add(test.id);
         cases.push({ identity, selected: population.selected.has(test.id),
           outcome: outcome as RecordedPopulationCase['outcome'] });
       }
-      if (seen.size !== population.identities.size) return undefined;
-      return createRecordedTestPopulation(cases, population.order);
+      if (seen.size !== population.identities.size) {
+        this.populationCaptureStatuses.set(testModule, 'collection-changed');
+        return undefined;
+      }
+      const recorded = createRecordedTestPopulation(cases, population.order);
+      if (recorded) this.populationCaptureStatuses.set(testModule, 'captured');
+      else if (new Set(population.order.map(identity => JSON.stringify(identity))).size === population.selected.size)
+        this.populationCaptureStatuses.set(testModule, 'invalid-identity');
+      return recorded;
     } catch { return undefined; }
   }
 
@@ -3249,6 +3273,8 @@ export default class AdminTestRunsReporter implements Reporter {
         : this.executionContext?.testLayer;
       const executionDetails = counts && this.executionContext
         ? { ...this.executionContext, testLayer, filePath, ...counts,
+            populationCaptureStatus: counts.collectionFailed ? 'collection-failed' as const
+              : this.populationCaptureStatuses.get(testModule) ?? 'collection-unavailable',
             ...(population && !counts.collectionFailed ? { population } : {}) } : null;
       if (executionDetails) {
         const boundaryObservations = collectBoundaryObservations(testModule);
