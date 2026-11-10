@@ -912,6 +912,28 @@ describe('original config load evidence', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it.each(['missing-callback', 'duplicate-boundary', 'legacy-dispatcher'] as const)(
+    'self-kill boundary rejects an unenforceable registration (%s)', mode => {
+      const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
+      const source = `import assert from 'node:assert/strict';
+        const key = Symbol.for('papercusp.process-termination-observer.v1');
+        ${mode === 'legacy-dispatcher' ? 'process[key] = { callbacks: new Set(), selfKillCallbacks: new Set(), selfKillFailureCallbacks: new Set() };' : ''}
+        const { observeProcessTermination } = await import(${JSON.stringify(helper)});
+        ${mode === 'duplicate-boundary' ? 'observeProcessTermination(() => {}, { beforeSelfKill() {}, selfKillBoundary: true });' : ''}
+        const before = process[key]?.callbacks.size ?? 0;
+        assert.throws(() => observeProcessTermination(() => {}, {
+          selfKillBoundary: true, ${mode === 'missing-callback' ? '' : 'beforeSelfKill() {},'}
+        }), /${mode === 'missing-callback' ? 'requires a beforeSelfKill callback' : mode === 'duplicate-boundary' ? 'already registered' : 'cannot enforce a terminal boundary'}/);
+        assert.equal(process[key]?.callbacks.size ?? 0, before);
+        process.stdout.write('invalid boundary refused');`;
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+        env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe('invalid boundary refused');
+    });
+
   it('preserves native kill arguments, receiver, return value and thrown error', () => {
     const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
     const source = `import assert from 'node:assert/strict';

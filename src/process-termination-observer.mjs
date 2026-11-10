@@ -62,7 +62,6 @@ export function observeProcessTermination(callback, options = {}) {
       process.prependListener(signal, observer);
     }
   }
-  state.callbacks.add(callback);
   if (options.beforeSelfKill) {
     if (!state.selfKillCallbacks) {
       state.selfKillCallbacks = new Set();
@@ -113,4 +112,5 @@ export function observeProcessTermination(callback, options = {}) {
     }
     if (options.selfKillFailed) state.selfKillFailureCallbacks.add(options.selfKillFailed);
   }
+  state.callbacks.add(callback);
 }
