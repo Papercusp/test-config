@@ -53,13 +53,16 @@ const preciseOwnership = pinModuleState<{
   owner: null, installed: false, failed: false, rawPost: null,
 }));
 
-/** Exclude mutations through the public JS Inspector transports. This is only
+/** Exclude mutations through public Inspector and native profiler helpers. This is only
  * one part of exclusivity: native/internal/pre-captured access still requires
  * the independent loaded-source audit. No claim about those paths is made. */
 function installPreciseCoverageOwnership(): void {
   if (preciseOwnership.failed) throw new Error('precise ownership installation previously failed');
   if (preciseOwnership.installed) return;
   const inspector = nodeModule.createRequire(import.meta.url)('node:inspector') as typeof import('node:inspector');
+  const require = nodeModule.createRequire(import.meta.url);
+  const nativeV8 = require('node:v8') as typeof import('node:v8');
+  const nativeConsole = require('node:console') as typeof import('node:console');
   const reject = (method: string): never => {
     preciseOwnership.owner?.rejected.push({ method, monotonicMs: performance.now() });
     throw new Error(`Inspector operation rejected by exclusive precise coverage epoch: ${method}`);
@@ -67,8 +70,10 @@ function installPreciseCoverageOwnership(): void {
   // Validate the whole write set before hardening any property. These guards
   // remain delegating when no qualification epoch owns the isolate.
   const targets = [
-    [Session.prototype, 'post'], [PromiseSession.prototype, 'post'],
-    [Session.prototype, 'connectToMainThread'], [inspector, 'open'],
+    [Session.prototype, 'post', 'post'], [PromiseSession.prototype, 'post', 'post'],
+    [Session.prototype, 'connectToMainThread', 'connectToMainThread'], [inspector, 'open', 'open'],
+    [nativeV8, 'takeCoverage', 'v8.takeCoverage'], [nativeV8, 'stopCoverage', 'v8.stopCoverage'],
+    [nativeConsole, 'profile', 'console.profile'], [nativeConsole, 'profileEnd', 'console.profileEnd'],
   ] as const;
   for (const [target, name] of targets) {
     const descriptor = Object.getOwnPropertyDescriptor(target, name);
@@ -77,7 +82,7 @@ function installPreciseCoverageOwnership(): void {
   }
   preciseOwnership.rawPost = Session.prototype.post;
   try {
-    for (const [target, name] of targets) {
+    for (const [target, name, operation] of targets) {
       const original = Object.getOwnPropertyDescriptor(target, name)!.value;
       Object.defineProperty(target, name, { configurable: false, writable: false,
         value: function(this: unknown, ...args: unknown[]) {
@@ -85,7 +90,7 @@ function installPreciseCoverageOwnership(): void {
           const method = typeof args[0] === 'string' ? args[0] : '<invalid-method>';
           if (owner && (name !== 'post' || owner.fenced ||
               method.startsWith('Profiler.') && method !== 'Profiler.getBestEffortCoverage'))
-            return reject(name === 'post' ? method : name);
+            return reject(name === 'post' ? method : operation);
           return Reflect.apply(original, this, args);
         } });
     }
@@ -299,14 +304,22 @@ export function observeEngineScriptExecution(repoRoot: string,
     } catch { reasons.add('engine-script-source-unavailable'); }
   });
   try {
-    session.connect(); connected = true;
-    post('Debugger.enable'); post('Profiler.enable');
     if (precise) {
+      // Node arms this native collector before any JS preload. Its session and
+      // retained original functions are outside the public Session guard.
+      if (process.env.NODE_V8_COVERAGE) {
+        reasons.add('engine-native-automatic-coverage');
+        throw new Error('native automatic coverage collector is already armed');
+      }
       if (inspectorUrl() !== undefined) {
         reasons.add('engine-external-inspector-endpoint');
         throw new Error('external Inspector endpoint is open');
       }
       if (preciseOwnership.owner) throw new Error('precise coverage epoch already owned');
+    }
+    session.connect(); connected = true;
+    post('Debugger.enable'); post('Profiler.enable');
+    if (precise) {
       installPreciseCoverageOwnership();
       owner = { fenced: false, rejected: [] }; preciseOwnership.owner = owner;
       post('Profiler.startPreciseCoverage', { callCount: true, detailed: true, allowTriggeredUpdates: false });
@@ -314,7 +327,7 @@ export function observeEngineScriptExecution(repoRoot: string,
     }
   } catch { reasons.add('engine-inspector-unavailable'); if (precise) precisePhase = 'invalid'; }
   const preciseStatus = () => ({ epoch: precise?.epoch ?? null, admission: precise?.admission ?? null,
-    phase: precisePhase, ownership: { scope: 'public-js-inspector-transports',
+    phase: precisePhase, ownership: { scope: 'public-js-inspector-and-native-profiler-transports',
       enforced: owner !== null && preciseOwnership.owner === owner && preciseOwnership.installed,
       rejected: owner?.rejected.map(row => ({ ...row })) ?? [],
       internalNativeAndPrecapturedAccess: 'unmeasured' },

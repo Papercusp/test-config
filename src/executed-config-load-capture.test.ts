@@ -133,6 +133,11 @@ describe('precise coverage epoch preparation', () => {
       const rejected = [];
       const attempt = (label, fn) => { try { fn(); rejected.push({ label, rejected: false }); }
         catch { rejected.push({ label, rejected: true }); } };
+      ${mode === 'native-public' ? `const v8 = await import('node:v8');
+        const nativeConsole = await import('node:console');
+        for (const [name, fn] of [['v8.takeCoverage', v8.takeCoverage], ['v8.stopCoverage', v8.stopCoverage],
+          ['console.profile', nativeConsole.profile], ['console.profileEnd', nativeConsole.profileEnd]])
+          attempt(name, () => fn('foreign-precise-owner'));` : ''}
       ${mode === 'foreign' ? `const other = new Session(); other.connect();
         for (const method of ['Profiler.startPreciseCoverage', 'Profiler.takePreciseCoverage',
           'Profiler.stopPreciseCoverage', 'Profiler.disable']) attempt(method, () => other.post(method));
@@ -157,6 +162,7 @@ describe('precise coverage epoch preparation', () => {
       observer.disconnect(); runtime.disconnect();`;
     const env = { ...process.env }; delete env.NODE_OPTIONS;
     for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
+    if (mode === 'native-auto-coverage') env.NODE_V8_COVERAGE = join(root, 'native-coverage');
     try {
       return JSON.parse(execFileSync(process.execPath, [...(mode === 'external-transport' ? ['--inspect=127.0.0.1:0'] : []),
         '--expose-gc', '--input-type=module', '--eval', script], {
@@ -184,6 +190,23 @@ describe('precise coverage epoch preparation', () => {
     expect(result.entered.state).toBe('entry');
     expect(result.dormant.state).toBe('zero');
     expect(result.terminal.runtimeQualification).toBe('unknown');
+  });
+  it('rejects public native coverage and console profiling helpers during an owned epoch', () => {
+    const result = run('native-public');
+    expect(result.rejected).toHaveLength(4);
+    expect(result.rejected.every((row: { rejected: boolean }) => row.rejected)).toBe(true);
+    expect(result.status.ownership.rejected.map((row: { method: string }) => row.method)).toEqual([
+      'v8.takeCoverage', 'v8.stopCoverage', 'console.profile', 'console.profileEnd']);
+    expect(result.entered.state).toBe('entry');
+    expect(result.dormant.state).toBe('zero');
+    expect(result.terminal.runtimeQualification).toBe('unknown');
+  });
+  it('refuses the native automatic coverage collector already armed before JS bootstrap', () => {
+    const result = run('native-auto-coverage');
+    expect(result.terminal).toBeNull();
+    expect(result.status).toMatchObject({ phase: 'invalid', runtimeQualification: 'unknown' });
+    expect(result.status.reasons).toContain('engine-native-automatic-coverage');
+    expect(result.status.commands).toEqual([]);
   });
   it('pre-arm compilation cannot become qualified merely because a later take sees its ranges', () => {
     const result = run('pre-arm');
@@ -234,8 +257,7 @@ describe('precise coverage epoch preparation', () => {
       expect(result.status.commands.some((row: { method: string }) =>
         row.method === 'Profiler.takePreciseCoverage')).toBe(false);
       if (mode === 'external-transport')
-        expect(result.status.commands.some((row: { method: string }) =>
-          row.method === 'Profiler.startPreciseCoverage')).toBe(false);
+        expect(result.status.commands).toEqual([]);
     });
 });
 
