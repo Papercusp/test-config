@@ -1649,12 +1649,42 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         detailsCommitSha: 'abc123',
         detailsHarnessSlug: 'papercusp',
         detailsWorkspaceId: 'workspace-a',
+        executionDetails: details,
       };
 
       it('restores the original ledger id from one exact same-run row', () => {
         expect(recoverTimedOutTestRunReceipts([receipt], [candidate], 'group-a')).toEqual([{
           ...base, outcome: 'inserted', id: '901',
         }]);
+      });
+
+      it.each([
+        undefined, null, 'json-string-scalar',
+        { ...details, passed: 2 }, { ...details, failed: 1 }, { ...details, skipped: 1 },
+        { ...details, collectionFailed: true }, { ...details, worktreeDirty: true },
+        { ...details, testNamePattern: 'different selection' },
+        { ...details, proofContext: { fingerprint: 'foreign original proof' } },
+      ])('refuses an original ledger row with different complete execution metadata: %j', executionDetails => {
+        expect(recoverTimedOutTestRunReceipts([receipt], [{ ...candidate, executionDetails }], 'group-a'))
+          .toEqual([]);
+      });
+
+      it('binds nested proof and population bytes while allowing JSONB object-key order', () => {
+        const executionDetails = { ...details, observation: { optional: undefined,
+          binary: 'before\0after', members: [{ title: 'one', outcome: 'passed' }, { title: 'two', outcome: 'skipped' }] } };
+        const original = { ...receipt, row: { ...receipt.row,
+          executionDetails: executionDetails as unknown as typeof details } };
+        const stored = { observation: { members: [{ outcome: 'passed', title: 'one' },
+          { outcome: 'skipped', title: 'two' }], binary: 'before\\0after' }, ...details };
+        const recovered = recoverTimedOutTestRunReceipts([original], [{ ...candidate, executionDetails: stored }], 'group-a');
+        expect(recovered).toHaveLength(1);
+        expect(recovered[0]!.id).toBe(candidate.id);
+        for (const observation of [
+          { ...stored.observation, members: [...stored.observation.members].reverse() },
+          { ...stored.observation, members: [{ title: 'one', outcome: 'failed' }, stored.observation.members[1]] },
+          { ...stored.observation, binary: 'changed' },
+        ]) expect(recoverTimedOutTestRunReceipts([original], [{ ...candidate,
+          executionDetails: { ...stored, observation } }], 'group-a')).toEqual([]);
       });
 
       it('recovers PostgreSQL bigint durations without weakening the run identity', () => {

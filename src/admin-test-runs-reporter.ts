@@ -2036,6 +2036,8 @@ export type TestRunReceiptReadbackCandidate = {
   detailsCommitSha: string | null;
   detailsHarnessSlug: string | null;
   detailsWorkspaceId: string | null;
+  /** Complete original JSONB, independent of the extracted identity labels. */
+  executionDetails: unknown;
 };
 
 const TEST_RUN_RECEIPT_READBACK_MAX_RECEIPTS = TEST_RUN_INSERT_BATCH_SIZE;
@@ -2045,6 +2047,21 @@ const TEST_RUN_RECEIPT_READBACK_TIMEOUT_MS = 2_000;
 function receiptTimestamp(value: unknown): string | null {
   const date = value instanceof Date ? value : typeof value === 'string' ? new Date(value) : null;
   return date && Number.isFinite(date.valueOf()) ? date.toISOString() : null;
+}
+
+/** Match the complete persisted observation, including uncapped populations,
+ * context, result counts and future fields. JSONB reorders object keys; arrays
+ * retain their order. Apply the writer's NUL encoding and JSON serialization
+ * before hashing, so omitted undefined properties do not invent a mismatch. */
+function receiptExecutionDetailsHash(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  try {
+    const persisted = JSON.parse(JSON.stringify(escapeLedgerNul(value)));
+    const canonical = JSON.stringify(persisted, (_key, entry) =>
+      entry && typeof entry === 'object' && !Array.isArray(entry)
+        ? Object.fromEntries(Object.keys(entry).sort().map(key => [key, entry[key]])) : entry);
+    return createHash('sha256').update(canonical).digest('hex');
+  } catch { return null; }
 }
 
 function matchesTestRunReceiptReadback(
@@ -2081,11 +2098,13 @@ function matchesTestRunReceiptReadback(
     || candidate.harnessSlug !== details.harnessSlug || candidate.detailsHarnessSlug !== details.harnessSlug
     || candidate.workspaceId !== details.workspaceId || candidate.detailsWorkspaceId !== details.workspaceId
     || candidate.isScratchConfig !== row.isScratchConfig || candidate.worktreeDirty !== row.worktreeDirty) return false;
-  return true;
+  const originalHash = receiptExecutionDetailsHash(details);
+  return originalHash !== null && originalHash === receiptExecutionDetailsHash(candidate.executionDetails);
 }
 
 /**
- * Recover only a timeout whose full run identity selects one and only one canonical row.
+ * Recover only a timeout whose full run identity and original execution metadata
+ * select one and only one canonical row.
  * One ledger row cannot satisfy two receipts, and an ambiguous/truncated read stays unmeasured.
  */
 export function recoverTimedOutTestRunReceipts(
@@ -2165,7 +2184,8 @@ export async function reconcileTimedOutTestRunReceipts(
           execution_details->>'filePath' AS "detailsFilePath",
           execution_details->>'commitSha' AS "detailsCommitSha",
           execution_details->>'harnessSlug' AS "detailsHarnessSlug",
-          execution_details->>'workspaceId' AS "detailsWorkspaceId"
+          execution_details->>'workspaceId' AS "detailsWorkspaceId",
+          execution_details AS "executionDetails"
         FROM harness_shared.test_runs
         WHERE run_group_id = ${runGroupId}
           AND file_path IN ${pg.sql(filePaths)}
