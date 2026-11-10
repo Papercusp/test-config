@@ -858,7 +858,8 @@ export async function captureWorktreeSnapshot(
   }
   const [commit, porcelain] = await Promise.all([
     runGitWithRetry(run, 'git rev-parse HEAD', root, failed),
-    runGitWithRetry(run, 'git status --porcelain --untracked-files=all', root, failed),
+    runGitWithRetry(run, 'git status --porcelain --untracked-files=all'
+      + (includeSubmodules ? ' --ignore-submodules=none' : ''), root, failed),
   ]);
   const snapshot = { commit, porcelain, ...(errors.length ? { provenanceError: errors.join('; ') } : {}) };
   if (!porcelain) return withSubmodules(snapshot);

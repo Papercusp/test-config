@@ -3914,12 +3914,14 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     const sha = 'a'.repeat(40), status = 'git submodule status --recursive';
     for (const [raw, expected] of [[`${sha} libs/a (heads/main)`, [['libs/a', sha]]], ['', []],
       [`-${sha} libs/a`, null], [`+${sha} libs/a`, null], [null, null]] as const) {
-      const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha], [STATUS]: [''], [status]: [raw, raw] });
+      const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha],
+        [`${STATUS} --ignore-submodules=none`]: [''], [status]: [raw, raw] });
       expect(await captureWorktreeSnapshot(run, undefined, undefined, true))
         .toEqual({ commit: sha, porcelain: '', submodules: expected });
       expect(calls.some(call => call.cmd === status)).toBe(true);
     }
-    const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha], [STATUS]: [' M source.ts'] });
+    const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha],
+      [`${STATUS} --ignore-submodules=none`]: [' M source.ts'] });
     expect(await captureWorktreeSnapshot(run, undefined, undefined, true)).toMatchObject({ submodules: null });
     expect(calls.some(call => call.cmd === status)).toBe(false);
   });
@@ -3934,7 +3936,8 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     try {
       git(root, 'init', '-q'); commit(root); setRunRoot(root);
       expect((await captureWorktreeSnapshot(undefined, undefined, undefined, true)).submodules).toEqual([]);
-      mkdirSync(sub, { recursive: true }); git(sub, 'init', '-q'); commit(sub);
+      mkdirSync(sub, { recursive: true }); git(sub, 'init', '-q');
+      writeFileSync(join(sub, 'source.js'), 'original'); git(sub, 'add', 'source.js'); commit(sub);
       const childSha = git(sub, 'rev-parse', 'HEAD');
       writeFileSync(join(root, '.gitmodules'), '[submodule "observed"]\n\tpath = libs/observed\n\turl = ./fixture\n');
       git(root, 'add', '.gitmodules');
@@ -3945,6 +3948,16 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
       const observed = await captureWorktreeSnapshot(undefined, undefined, undefined, true);
       expect(observed.submodules, JSON.stringify({ observed, git: git(root, 'submodule', 'status', '--recursive') }))
         .toEqual([['libs/observed', childSha]]);
+      git(root, 'config', 'submodule.observed.ignore', 'all');
+      writeFileSync(join(sub, 'source.js'), 'changed');
+      // Distinguish a misleading ordinary status from the armed producer's
+      // explicit census. The checkout SHA itself has not changed.
+      expect(git(root, 'status', '--porcelain', '--untracked-files=all')).toBe('');
+      expect(git(root, 'submodule', 'status', '--recursive')).toContain(childSha);
+      const hiddenDirt = await captureWorktreeSnapshot(undefined, undefined, undefined, true);
+      expect(hiddenDirt.porcelain).toContain('libs/observed');
+      expect(hiddenDirt.submodules).toBeNull();
+      writeFileSync(join(sub, 'source.js'), 'original');
       commit(sub);
       expect((await captureWorktreeSnapshot(undefined, undefined, undefined, true)).submodules).toBeNull();
       rmSync(sub, { recursive: true, force: true }); mkdirSync(sub);
