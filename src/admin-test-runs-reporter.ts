@@ -51,6 +51,8 @@ import {
   parseTestSqlCoverageObservations, type TestSqlCoverageObservation,
   createRecordedTestPopulation, type RecordedPopulationIdentity, type RecordedPopulationCase,
   type PopulationCaptureStatus,
+  TEST_RUN_READER_CONTRACT_ENV, TEST_RUN_READER_REFUSAL_PATH_ENV, TEST_RUN_READER_REFUSAL_MARKER,
+  testRunExecutionDetailsReaderMismatch,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, readWorkerTestConfiguration, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseSubmoduleCheckoutStatus,
@@ -3208,6 +3210,19 @@ export default class AdminTestRunsReporter implements Reporter {
   private pgLease: (() => Promise<void>) | null = null;
 
   async onInit(ctx: Vitest): Promise<void> {
+    // testing:run supplies its LOADED reader's envelope, including through
+    // detached replay. Refuse before leases, snapshots or test-module imports;
+    // running assertions cannot repair an incompatible evidence consumer.
+    const readerContract = process.env[TEST_RUN_READER_CONTRACT_ENV];
+    if (readerContract !== undefined) {
+      const mismatch = testRunExecutionDetailsReaderMismatch(readerContract);
+      if (mismatch) {
+        const refusalPath = process.env[TEST_RUN_READER_REFUSAL_PATH_ENV];
+        if (refusalPath) writeFileSync(refusalPath, JSON.stringify({ schemaVersion: 1,
+          readerContract, reason: mismatch }), { encoding: 'utf8', mode: 0o600 });
+        throw new Error(`${TEST_RUN_READER_REFUSAL_MARKER} ${mismatch}`);
+      }
+    }
     const runStartedAt = new Date().toISOString();
     // Select which actually passing identities occupy the existing bounded
     // evidence field, without filtering execution or changing skip counts.

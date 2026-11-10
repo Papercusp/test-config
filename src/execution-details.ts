@@ -860,6 +860,31 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules', 'workerTestConfiguration',
 ]);
 
+/** A rollout preflight only: this does not qualify any test result or relax parsing. */
+export const TEST_RUN_READER_CONTRACT_ENV = 'PAPERCUSP_TEST_RUN_READER_CONTRACT';
+export const TEST_RUN_READER_REFUSAL_PATH_ENV = 'PAPERCUSP_TEST_RUN_READER_REFUSAL_PATH';
+export const TEST_RUN_READER_REFUSAL_MARKER = 'TEST_FILE_READER_INCOMPATIBLE';
+export function testRunExecutionDetailsReaderContract(): string {
+  return JSON.stringify({ schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
+    fields: [...executionDetailsKeys].sort() });
+}
+
+/** The writer may use every declared field, so a reader must accept the whole
+ * field envelope before collection starts. A newer reader may accept more.
+ * Nested values still require the ordinary strict result parser afterward. */
+export function testRunExecutionDetailsReaderMismatch(encoded: string): string | undefined {
+  let reader: unknown;
+  try { reader = JSON.parse(encoded); } catch { return 'invalid-reader-contract'; }
+  if (!isRecord(reader) || Object.keys(reader).length !== 2
+    || reader.schemaVersion !== TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION
+    || !Array.isArray(reader.fields) || reader.fields.length > 256
+    || reader.fields.some(field => typeof field !== 'string' || !/^[A-Za-z][A-Za-z0-9]*$/.test(field))
+    || new Set(reader.fields).size !== reader.fields.length) return 'invalid-reader-contract';
+  const fields = reader.fields;
+  const missing = [...executionDetailsKeys].filter(field => !fields.includes(field)).sort();
+  return missing.length ? `reader-missing-fields:${missing.join(',')}` : undefined;
+}
+
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
   return value === 'captured' || value === 'not-configured' || value === 'unavailable'
     || value === 'invalid' || value === 'timed-out' || value === 'error';
