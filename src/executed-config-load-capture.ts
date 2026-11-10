@@ -88,7 +88,10 @@ function installPreciseCoverageOwnership(): void {
         value: function(this: unknown, ...args: unknown[]) {
           const owner = preciseOwnership.owner;
           const method = typeof args[0] === 'string' ? args[0] : '<invalid-method>';
-          if (owner && (name !== 'post' || owner.fenced ||
+          // NodeWorker wraps a second protocol command in a JSON message.
+          // Its outer method need not name Profiler at all; a foreign parent
+          // session can otherwise mutate a worker's coverage through the relay.
+          if (owner && (name !== 'post' || owner.fenced || method.startsWith('NodeWorker.') ||
               method.startsWith('Profiler.') && method !== 'Profiler.getBestEffortCoverage'))
             return reject(name === 'post' ? method : operation);
           return Reflect.apply(original, this, args);

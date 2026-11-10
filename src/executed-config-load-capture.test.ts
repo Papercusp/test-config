@@ -206,7 +206,7 @@ describe('precise coverage epoch preparation', () => {
       const root = mkdtempSync(join(tmpdir(), 'engine-worker-transport-'));
       const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;
       const path = join(root, 'pinned.mjs');
-      const source = 'function workerEntered() { return 7; } workerEntered();';
+      const source = 'export function workerEntered() { return 7; } workerEntered();';
       writeFileSync(path, source);
       const options = { repositorySources: false, pinnedSources: [{ path, sha256: digest(source),
         byteLength: Buffer.byteLength(source) }],
@@ -215,8 +215,11 @@ describe('precise coverage epoch preparation', () => {
         (async () => {
           const { observeEngineScriptExecution } = await import(${JSON.stringify(capture)});
           const observer = observeEngineScriptExecution('/unrelated', ${JSON.stringify(options)});
-          await import(${JSON.stringify(pathToFileURL(path).href)});
-          parentPort.once('message', () => {
+          const target = await import(${JSON.stringify(pathToFileURL(path).href)});
+          parentPort.on('message', message => {
+            if (message === 'enter') {
+              target.workerEntered(); parentPort.postMessage({ kind: 'entered' }); return;
+            }
             const terminal = observer.terminalPreciseSnapshot();
             parentPort.postMessage({ kind: 'finished', phase: terminal?.phase ?? null,
               runtimeQualification: terminal?.runtimeQualification ?? null });
@@ -261,12 +264,20 @@ describe('precise coverage epoch preparation', () => {
           observer = observeEngineScriptExecution('/unrelated', ${JSON.stringify({ ...options,
             preciseCoverage: { ...options.preciseCoverage, admission: 0 } })});
           let rejected = false;
-          try { await send('Profiler.takePreciseCoverage'); }
+          const coverageOptions = { callCount: true, detailed: true, allowTriggeredUpdates: false };
+          try { await send('Profiler.startPreciseCoverage', coverageOptions); }
           catch (error) { rejected = /exclusive precise coverage epoch/.test(String(error)); }
           const ownership = observer.preciseStatus().ownership;
           observer.disconnect();
-          // Delegation resumes outside the owning epoch and returns actual
-          // native coverage, including the worker target entered before it.
+          // Delegation resumes outside the owning epoch. Start the remote
+          // agent's own interval before asking it to take coverage, and enter
+          // the worker target within that interval as a positive control.
+          // An unowned parent still lies outside the child's JS guard; this
+          // control does not discharge the complete native/source audit.
+          await send('Profiler.startPreciseCoverage', coverageOptions);
+          const entry = once(worker, 'message'); worker.postMessage('enter');
+          const [enteredMessage] = await bounded(entry);
+          if (enteredMessage.kind !== 'entered') throw new Error(JSON.stringify(enteredMessage));
           const native = await send('Profiler.takePreciseCoverage');
           const entered = native.result.flatMap(row => row.functions)
             .some(fn => fn.functionName === 'workerEntered' && fn.ranges[0].count > 0);
