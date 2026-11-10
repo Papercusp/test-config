@@ -18,6 +18,8 @@
  */
 import { createHash } from 'node:crypto';
 
+const definePropertyIntrinsic = Object.defineProperty;
+
 /** Env vars whose (hashed) values are recorded. */
 export const CONFIGURATION_SNAPSHOT_ENV_KEY = /^(PAPERCUSP_[A-Z0-9_]+|PC_[A-Z0-9_]+|NODE_ENV)$/;
 
@@ -80,8 +82,17 @@ export function observeConfigurationReads(environment: Record<string, string | u
   });
   return { environment: observedEnvironment, finish(currentEnvironment: typeof environment): ConfigurationReadObservation {
     observing = false;
+    // This receipt can be published after the final coverage sample. Even a
+    // retained Array.map would consult an application's constructor/species.
+    // Copy own entries without method, species or inherited-setter dispatch.
+    const copied: ConfigurationReadObservation['reads'] = [];
+    for (let index = 0; index < reads.length; index++) {
+      const descriptor = { __proto__: null, configurable: true, enumerable: true,
+        writable: true, value: { ...reads[index] } };
+      definePropertyIntrinsic(copied, index, descriptor);
+    }
     return { schemaVersion: 1, scope: 'javascript-configuration-property-gets', populationStatus: 'unknown',
-      limits: { ...configurationReadLimits }, reads: reads.map(row => ({ ...row })), captureComplete,
+      limits: { ...configurationReadLimits }, reads: copied, captureComplete,
       activeAtTermination: currentEnvironment === observedEnvironment };
   } };
 }

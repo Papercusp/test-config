@@ -62,6 +62,37 @@ describe('configuration snapshot (SPEC-P-011-RUNNER-CAPTURE)', () => {
 });
 
 describe('observed JavaScript configuration reads', () => {
+  it('finishes without application array method, species or index callbacks', () => {
+    const source = new URL('./configuration-snapshot.ts', import.meta.url).href;
+    const script = `const { observeConfigurationReads } = await import(${JSON.stringify(source)});
+      const observer = observeConfigurationReads({ PAPERCUSP_TOKEN: 'private-value' });
+      void observer.environment.PAPERCUSP_TOKEN;
+      const defineOwn = Object.defineProperty, apply = Reflect.apply;
+      const map = Array.prototype.map, species = Object.getOwnPropertyDescriptor(Array, Symbol.species);
+      const index = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+      let callbacks = 0;
+      defineOwn(Array.prototype, 'map', { configurable: true, writable: true, value: function() {
+        callbacks++; return apply(map, this, arguments);
+      } });
+      defineOwn(Array, Symbol.species, { configurable: true, get() { callbacks++; return Array; } });
+      defineOwn(Array.prototype, '0', { configurable: true, set(value) {
+        callbacks++; defineOwn(this, '0', { configurable: true, enumerable: true, writable: true, value });
+      } });
+      const receipt = observer.finish(observer.environment);
+      defineOwn(Array.prototype, 'map', { configurable: true, writable: true, value: map });
+      defineOwn(Array, Symbol.species, species);
+      if (index) defineOwn(Array.prototype, '0', index); else delete Array.prototype[0];
+      console.log(JSON.stringify({ callbacks, receipt }));`;
+    const env = { ...process.env }; delete env.NODE_OPTIONS;
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+      env, encoding: 'utf8', timeout: 10000,
+    }));
+    expect(result.callbacks).toBe(0);
+    expect(result.receipt).toMatchObject({ captureComplete: true, activeAtTermination: true,
+      populationStatus: 'unknown', reads: [{ key: 'PAPERCUSP_TOKEN', sha256: sha('private-value') }] });
+    expect(JSON.stringify(result.receipt)).not.toContain('private-value');
+  });
+
   it('retains consumed hashes in order, including mutation and unset values, without sampling unread keys', () => {
     const original = { PAPERCUSP_TOKEN: 'secret-before', PAPERCUSP_UNREAD: 'unread-secret', UNRELATED: 'ignored' };
     const observed = observeConfigurationReads(original);
