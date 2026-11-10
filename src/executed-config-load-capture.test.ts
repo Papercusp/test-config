@@ -104,9 +104,10 @@ describe('precise coverage epoch preparation', () => {
       const savedOpen = open;
       const intrinsicApply = Reflect.apply, intrinsicNow = performance.now;
       let takeReturned = false, applicationClockAfterTake = 0, applicationApplyAfterTake = 0;
-      ${mode === 'terminal-intrinsics' ? `const originalPost = Session.prototype.post;
-        Session.prototype.post = function(method, ...args) {
-          const result = intrinsicApply(originalPost, this, [method, ...args]);
+      let applicationBuiltinAfterTake = 0;
+      ${mode.startsWith('terminal-') ? `const originalPost = Session.prototype.post;
+        Session.prototype.post = function(method) {
+          const result = intrinsicApply(originalPost, this, arguments);
           if (method === 'Profiler.takePreciseCoverage') takeReturned = true;
           return result;
         };` : ''}
@@ -165,7 +166,28 @@ describe('precise coverage epoch preparation', () => {
           if (takeReturned) applicationApplyAfterTake++;
           return intrinsicApply(intrinsicApply, Reflect, args);
         };` : ''}
+      ${mode === 'terminal-mutables' ? `const { createHash } = await import('node:crypto');
+        const hashPrototype = Object.getPrototypeOf(createHash('sha256'));
+        const mutations = [
+          [Array.prototype, 'map'], [Array.prototype, 'filter'], [Array.prototype, 'push'],
+          [Array.prototype, 'sort'], [Array.prototype, Symbol.iterator],
+          [Map.prototype, 'get'], [Map.prototype, 'values'], [Map.prototype, 'forEach'],
+          [Set.prototype, 'add'], [Set.prototype, 'forEach'], [Set.prototype, Symbol.iterator],
+          [Array, 'isArray'], [Number, 'isFinite'], [Buffer, 'byteLength'],
+          [hashPrototype, 'update'], [hashPrototype, 'digest'],
+        ];
+        for (let i = 0; i < mutations.length; i++) {
+          const row = mutations[i], descriptor = Object.getOwnPropertyDescriptor(row[0], row[1]);
+          row[2] = descriptor;
+          Object.defineProperty(row[0], row[1], { ...descriptor, value: function() {
+            if (takeReturned) applicationBuiltinAfterTake++;
+            return intrinsicApply(descriptor.value, this, arguments);
+          } });
+        }` : ''}
       const terminal = observer.terminalPreciseSnapshot();
+      ${mode === 'terminal-mutables' ? `for (let i = 0; i < mutations.length; i++) {
+        const row = mutations[i]; Object.defineProperty(row[0], row[1], row[2]);
+      }` : ''}
       ${mode === 'terminal-intrinsics' ? `Reflect.apply = intrinsicApply;
         Object.defineProperty(performance, 'now', {
           configurable: true, writable: true, value: intrinsicNow });` : ''}
@@ -178,6 +200,7 @@ describe('precise coverage epoch preparation', () => {
       const classify = name => observed ? classifyEngineCoverageTargets(observed, {
         sourceTextSha256: ${JSON.stringify(digest(source))}, sourceTextLength: source.length, targets: [target(name)] }) : null;
       console.log(JSON.stringify({ terminal, duplicate, rejected, applicationClockAfterTake, applicationApplyAfterTake,
+        applicationBuiltinAfterTake,
         dormant: classify('dormant'),
         entered: classify('entered'), status: observer.preciseStatus() }));
       observer.disconnect(); runtime.disconnect();`;
@@ -219,6 +242,13 @@ describe('precise coverage epoch preparation', () => {
     expect(result.dormant.state).toBe('zero');
     expect(result.applicationClockAfterTake).toBe(0);
     expect(result.applicationApplyAfterTake).toBe(0);
+  });
+  it('terminal capture does not enter replaced collection, validation or hash methods after the native take', () => {
+    const result = run('terminal-mutables');
+    expect(result.terminal).toMatchObject({ phase: 'taken', runtimeQualification: 'unknown' });
+    expect(result.entered.state).toBe('entry');
+    expect(result.dormant.state).toBe('zero');
+    expect(result.applicationBuiltinAfterTake).toBe(0);
   });
   it('rejects public native coverage and console profiling helpers during an owned epoch', () => {
     const result = run('native-public');

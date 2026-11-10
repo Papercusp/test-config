@@ -22,11 +22,36 @@ interface Capture {
 }
 const shared = pinModuleState<{ capture: Capture | null }>(
   '@papercusp/test-config.original-config-loads', () => ({ capture: null }));
-const hash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 // Terminal evidence must not dispatch through properties the application can
-// replace during its epoch. This closes these two callback paths only; source
-// eligibility and the rest of the synchronous suffix still require auditing.
+// replace during its epoch. Retain the observer's collection, validation and
+// hash operations too. This is not a substitute for loaded-source eligibility
+// or the caller's audited publication/hold suffix.
 const applyIntrinsic = Reflect.apply;
+const createHashIntrinsic = createHash;
+const hashPrototype = Object.getPrototypeOf(createHashIntrinsic('sha256'));
+const hashUpdateIntrinsic = hashPrototype.update;
+const hashDigestIntrinsic = hashPrototype.digest;
+const arrayIsArrayIntrinsic = Array.isArray;
+const numberIsFiniteIntrinsic = Number.isFinite;
+const arraySortIntrinsic = Array.prototype.sort;
+const mapForEachIntrinsic = Map.prototype.forEach;
+const setForEachIntrinsic = Set.prototype.forEach;
+const setAddIntrinsic = Set.prototype.add;
+const hash = (bytes: string | Buffer): string => {
+  const instance = createHashIntrinsic('sha256');
+  applyIntrinsic(hashUpdateIntrinsic, instance, [bytes]);
+  return applyIntrinsic(hashDigestIntrinsic, instance, ['hex']);
+};
+const copyRows = <T extends object>(rows: T[]): T[] => {
+  const result: T[] = [];
+  for (let i = 0; i < rows.length; i++) result[i] = { ...rows[i] };
+  return result;
+};
+const reasonRows = (reasons: Set<string>): string[] => {
+  const rows: string[] = [];
+  applyIntrinsic(setForEachIntrinsic, reasons, [(reason: string) => { rows[rows.length] = reason; }]);
+  return applyIntrinsic(arraySortIntrinsic, rows, []);
+};
 const monotonicClock = performance;
 const monotonicClockNow = monotonicClock.now;
 const monotonicNow = (): number => applyIntrinsic(monotonicClockNow, monotonicClock, []);
@@ -246,9 +271,12 @@ export function observeEngineScriptExecution(repoRoot: string,
       !pinnedOnly || pins.length === 0)) throw new Error('Invalid precise coverage enrollment');
   const session = new Session();
   const reasons = new Set<string>();
-  const scripts = new Map<string, { scriptId: string; url: string; path: string;
+  // The terminal path uses the captured Set method, including its error path.
+  const addReason = (reason: string): void => { applyIntrinsic(setAddIntrinsic, reasons, [reason]); };
+  type Script = { scriptId: string; url: string; path: string;
     sourceTextSha256: string | null; sourceTextLength: number | null;
-    independentPin?: SourcePin; compiledBeforePreciseArm?: boolean }>();
+    independentPin?: SourcePin; compiledBeforePreciseArm?: boolean };
+  const scripts = new Map<string, Script>();
   let pinnedBytes = 0;
   let connected = false;
   let precisePhase: 'unarmed' | 'armed' | 'taken' | 'invalid' = 'unarmed';
@@ -261,7 +289,7 @@ export function observeEngineScriptExecution(repoRoot: string,
     let failure: Error | null = null;
     const command = { method, startedMs: monotonicNow(), endedMs: null as number | null,
       status: 'pending' as 'pending' | 'complete' | 'failed' };
-    if (precise) commands.push(command);
+    if (precise) commands[commands.length] = command;
     const transport = owner && preciseOwnership.owner === owner ? preciseOwnership.rawPost! : session.post;
     try {
       applyIntrinsic(transport, session, [method, params, (error: Error | null, response: unknown) => {
@@ -339,10 +367,10 @@ export function observeEngineScriptExecution(repoRoot: string,
   const preciseStatus = () => ({ epoch: precise?.epoch ?? null, admission: precise?.admission ?? null,
     phase: precisePhase, ownership: { scope: 'public-js-inspector-and-native-profiler-transports',
       enforced: owner !== null && preciseOwnership.owner === owner && preciseOwnership.installed,
-      rejected: owner?.rejected.map(row => ({ ...row })) ?? [],
+      rejected: owner ? copyRows(owner.rejected) : [],
       internalNativeAndPrecapturedAccess: 'unmeasured' },
     fence: owner?.fenced ? 'terminal-entered-suffix-unverified' : 'not-entered',
-    commands: commands.map(row => ({ ...row })), reasons: [...reasons].sort(),
+    commands: copyRows(commands), reasons: reasonRows(reasons),
     runtimeQualification: 'unknown' as const });
   return {
     preciseStatus,
@@ -352,34 +380,39 @@ export function observeEngineScriptExecution(repoRoot: string,
      * There is deliberately no caller-supplied `exclusive:true` shortcut. */
     terminalPreciseSnapshot() {
       if (!precise || !owner || preciseOwnership.owner !== owner || precisePhase !== 'armed') {
-        reasons.add('engine-precise-terminal-out-of-order'); precisePhase = 'invalid'; return null;
+        addReason('engine-precise-terminal-out-of-order'); precisePhase = 'invalid'; return null;
       }
       owner.fenced = true;
       try {
         if (inspectorUrl() !== undefined) {
-          reasons.add('engine-external-inspector-endpoint');
+          addReason('engine-external-inspector-endpoint');
           throw new Error('external Inspector endpoint opened during the epoch');
         }
         const raw = post<{ result: Array<{ scriptId: string; url: string;
           functions: EngineFunctionCoverage[] }>; timestamp: number }>('Profiler.takePreciseCoverage');
         precisePhase = 'taken';
-        if (!Array.isArray(raw.result) || !Number.isFinite(raw.timestamp)) throw new Error('partial precise response');
-        const observed = [...scripts.values()].map(script => {
-          const matches = raw.result.filter(row => row.scriptId === script.scriptId && row.url === script.url);
+        if (!arrayIsArrayIntrinsic(raw.result) || !numberIsFiniteIntrinsic(raw.timestamp)) throw new Error('partial precise response');
+        const observed: Array<Script & { functions: EngineFunctionCoverage[] }> = [];
+        applyIntrinsic(mapForEachIntrinsic, scripts, [(script: Script) => {
+          const matches: typeof raw.result = [];
+          for (let i = 0; i < raw.result.length; i++) {
+            const row = raw.result[i];
+            if (row.scriptId === script.scriptId && row.url === script.url) matches[matches.length] = row;
+          }
           const source = post<{ scriptSource: string }>('Debugger.getScriptSource', { scriptId: script.scriptId });
           const sourceMatches = typeof source.scriptSource === 'string' && script.sourceTextSha256 !== null &&
             hash(source.scriptSource) === script.sourceTextSha256;
-          if (!sourceMatches) reasons.add('engine-script-source-changed');
-          if (matches.length !== 1 || !Array.isArray(matches[0].functions))
-            reasons.add('engine-precise-script-response-incomplete');
-          return { ...script, sourceTextSha256: sourceMatches ? script.sourceTextSha256 : null,
-            functions: matches.length === 1 && Array.isArray(matches[0].functions) ? matches[0].functions : [] };
-        });
+          if (!sourceMatches) addReason('engine-script-source-changed');
+          if (matches.length !== 1 || !arrayIsArrayIntrinsic(matches[0].functions))
+            addReason('engine-precise-script-response-incomplete');
+          observed[observed.length] = { ...script, sourceTextSha256: sourceMatches ? script.sourceTextSha256 : null,
+            functions: matches.length === 1 && arrayIsArrayIntrinsic(matches[0].functions) ? matches[0].functions : [] };
+        }]);
         return { schemaVersion: 'node-engine-precise-terminal-v1', ...preciseStatus(),
           basis: 'one-start-one-terminal-precise-response', offsetUnits: 'utf16-code-units',
           raw, scripts: observed };
       } catch {
-        precisePhase = 'invalid'; reasons.add('engine-precise-terminal-response-unavailable'); return null;
+        precisePhase = 'invalid'; addReason('engine-precise-terminal-response-unavailable'); return null;
       }
     },
     snapshot() {
