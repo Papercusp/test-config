@@ -10,12 +10,16 @@
  * cannot be caught. An opt-in callback can observe a direct self-kill request
  * before delegating the unchanged native call; it is never a terminal verdict.
  * @param {(termination: Termination) => void} callback
- * @param {{ beforeSelfKill?: (request: SelfKillRequest) => void, selfKillFailed?: () => void }} [options]
+ * A selfKillBoundary callback runs after all ordinary self-kill observers,
+ * immediately before native delegation. Only one boundary may be registered.
+ * This ordering alone does not prove native identity or a held execution fence.
+ * @param {{ beforeSelfKill?: (request: SelfKillRequest) => void, selfKillFailed?: () => void, selfKillBoundary?: boolean }} [options]
  * @returns {void}
  */
 export function observeProcessTermination(callback: (termination: Termination) => void, options?: {
     beforeSelfKill?: (request: SelfKillRequest) => void;
     selfKillFailed?: () => void;
+    selfKillBoundary?: boolean;
 }): void;
 export type Termination = {
     phase: "exit" | "signal";

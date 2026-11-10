@@ -15,10 +15,15 @@ const key = Symbol.for('papercusp.process-termination-observer.v1');
  * cannot be caught. An opt-in callback can observe a direct self-kill request
  * before delegating the unchanged native call; it is never a terminal verdict.
  * @param {(termination: Termination) => void} callback
- * @param {{ beforeSelfKill?: (request: SelfKillRequest) => void, selfKillFailed?: () => void }} [options]
+ * A selfKillBoundary callback runs after all ordinary self-kill observers,
+ * immediately before native delegation. Only one boundary may be registered.
+ * This ordering alone does not prove native identity or a held execution fence.
+ * @param {{ beforeSelfKill?: (request: SelfKillRequest) => void, selfKillFailed?: () => void, selfKillBoundary?: boolean }} [options]
  * @returns {void}
  */
 export function observeProcessTermination(callback, options = {}) {
+  if (options.selfKillBoundary && typeof options.beforeSelfKill !== 'function')
+    throw new TypeError('A self-kill boundary requires a beforeSelfKill callback');
   let state = process[key];
   if (!state) {
     state = { callbacks: new Set() };
@@ -62,19 +67,31 @@ export function observeProcessTermination(callback, options = {}) {
     if (!state.selfKillCallbacks) {
       state.selfKillCallbacks = new Set();
       state.selfKillFailureCallbacks = new Set();
+      state.selfKillBoundary = null;
+      state.selfKillDispatchVersion = 2;
       const originalKill = process.kill;
+      const apply = Reflect.apply;
       let notifying = false;
       process.kill = function(pid, signal, ...args) {
         if (!notifying && pid === process.pid && (signal === 'SIGKILL' || signal === 9)) {
           notifying = true;
           try {
+            const boundary = state.selfKillBoundary;
             for (const observe of state.selfKillCallbacks) {
               try { observe({ phase: 'self-kill-request', exitCode: null, signal: 'SIGKILL', pid }); }
               catch { /* A diagnostic must not prevent or replace the native kill. */ }
             }
+            // Never return to another observer after the terminal snapshot.
+            // In particular the boundary is independent of registration order.
+            if (boundary) {
+              try { boundary({ phase: 'self-kill-request', exitCode: null, signal: 'SIGKILL', pid }); }
+              catch { /* The independently observed native result remains required. */ }
+            }
           } finally { notifying = false; }
         }
-        try { return originalKill.call(this, pid, signal, ...args); }
+        // A function's .call property is mutable application state. Do not
+        // invoke it after the boundary; delegate through the captured intrinsic.
+        try { return apply(originalKill, this, [pid, signal, ...args]); }
         catch (error) {
           if (pid === process.pid && (signal === 'SIGKILL' || signal === 9))
             for (const failed of state.selfKillFailureCallbacks) {
@@ -84,7 +101,16 @@ export function observeProcessTermination(callback, options = {}) {
         }
       };
     }
-    state.selfKillCallbacks.add(options.beforeSelfKill);
+    if (options.selfKillBoundary) {
+      if (state.selfKillDispatchVersion !== 2)
+        throw new Error('The existing self-kill dispatcher cannot enforce a terminal boundary');
+      if (state.selfKillBoundary && state.selfKillBoundary !== options.beforeSelfKill)
+        throw new Error('A self-kill boundary is already registered');
+      state.selfKillBoundary = options.beforeSelfKill;
+      state.selfKillCallbacks.delete(options.beforeSelfKill);
+    } else if (state.selfKillBoundary !== options.beforeSelfKill) {
+      state.selfKillCallbacks.add(options.beforeSelfKill);
+    }
     if (options.selfKillFailed) state.selfKillFailureCallbacks.add(options.selfKillFailed);
   }
 }

@@ -862,6 +862,56 @@ describe('original config load evidence', () => {
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
+  it.each(['first', 'last'] as const)('self-kill boundary runs after every ordinary observer (%s)', order => {
+    const dir = mkdtempSync(join(tmpdir(), 'termination-self-kill-boundary-'));
+    const path = join(dir, 'requests.jsonl');
+    const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
+    try {
+      const source = `import { appendFileSync } from 'node:fs';
+        const first = await import(${JSON.stringify(helper)});
+        const duplicate = await import(${JSON.stringify(helper + '?boundary-duplicate')});
+        const save = tag => () => appendFileSync(${JSON.stringify(path)}, JSON.stringify(tag) + '\\n');
+        const boundary = () => first.observeProcessTermination(() => {}, {
+          beforeSelfKill: save('terminal'), selfKillBoundary: true,
+        });
+        ${order === 'first' ? 'boundary();' : ''}
+        first.observeProcessTermination(() => {}, { beforeSelfKill: save('ordinary-first') });
+        duplicate.observeProcessTermination(() => {}, { beforeSelfKill: save('ordinary-duplicate') });
+        ${order === 'last' ? 'boundary();' : ''}
+        process.kill(process.pid, 'SIGKILL');`;
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+        env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.signal, result.stderr).toBe('SIGKILL');
+      expect(readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
+        .toEqual(['ordinary-first', 'ordinary-duplicate', 'terminal']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('self-kill boundary delegates without invoking a mutable native function call property', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'termination-self-kill-call-'));
+    const path = join(dir, 'requests.jsonl');
+    const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
+    try {
+      const source = `import { appendFileSync } from 'node:fs';
+        const nativeKill = process.kill;
+        const { observeProcessTermination } = await import(${JSON.stringify(helper)});
+        const record = tag => appendFileSync(${JSON.stringify(path)}, JSON.stringify(tag) + '\\n');
+        observeProcessTermination(() => {}, { beforeSelfKill() { record('terminal'); }, selfKillBoundary: true });
+        nativeKill.call = function(...args) {
+          record('after-terminal-call-property'); return Reflect.apply(nativeKill, args[0], args.slice(1));
+        };
+        process.kill(process.pid, 'SIGKILL');`;
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+        env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.signal, result.stderr).toBe('SIGKILL');
+      expect(readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual(['terminal']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('preserves native kill arguments, receiver, return value and thrown error', () => {
     const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
     const source = `import assert from 'node:assert/strict';
