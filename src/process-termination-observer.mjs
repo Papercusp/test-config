@@ -70,6 +70,10 @@ export function observeProcessTermination(callback, options = {}) {
       state.selfKillDispatchVersion = 2;
       const originalKill = process.kill;
       const apply = Reflect.apply;
+      const ownDescriptor = Object.getOwnPropertyDescriptor;
+      const hasOwn = Object.hasOwn;
+      const originalDelegate = ownDescriptor(process, '_kill');
+      const killDelegate = originalDelegate && hasOwn(originalDelegate, 'value') ? originalDelegate.value : null;
       let notifying = false;
       process.kill = function(pid, signal, ...args) {
         if (!notifying && pid === process.pid && (signal === 'SIGKILL' || signal === 9)) {
@@ -82,7 +86,13 @@ export function observeProcessTermination(callback, options = {}) {
             }
             // Never return to another observer after the terminal snapshot.
             // In particular the boundary is independent of registration order.
-            if (boundary) {
+            // Node's public kill function itself calls process._kill. Inspect
+            // its data descriptor AFTER ordinary observers, without invoking
+            // an accessor. Drift withholds the terminal callback/END while
+            // preserving the application's actual native-call semantics.
+            const delegate = boundary ? ownDescriptor(process, '_kill') : null;
+            if (boundary && typeof killDelegate === 'function' && delegate &&
+                hasOwn(delegate, 'value') && delegate.value === killDelegate) {
               try { boundary({ phase: 'self-kill-request', exitCode: null, signal: 'SIGKILL', pid }); }
               catch { /* The independently observed native result remains required. */ }
             }

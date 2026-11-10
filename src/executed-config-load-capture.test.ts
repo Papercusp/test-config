@@ -912,6 +912,35 @@ describe('original config load evidence', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it.each(['value', 'accessor', 'accessor-with-inherited-value'] as const)(
+    'self-kill boundary refuses a changed native kill delegate (%s)', mode => {
+      const dir = mkdtempSync(join(tmpdir(), 'termination-self-kill-delegate-'));
+      const path = join(dir, 'requests.jsonl');
+      const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
+      try {
+        const source = `import { appendFileSync } from 'node:fs';
+          const nativeDelegate = process._kill;
+          const { observeProcessTermination } = await import(${JSON.stringify(helper)});
+          const record = tag => appendFileSync(${JSON.stringify(path)}, JSON.stringify(tag) + '\\n');
+          observeProcessTermination(() => {}, { beforeSelfKill() { record('terminal'); }, selfKillBoundary: true });
+          observeProcessTermination(() => {}, { beforeSelfKill() {
+            ${mode === 'value' ? `process._kill = function(...args) {
+              record('native-delegate'); return Reflect.apply(nativeDelegate, this, args);
+            };` : `Object.defineProperty(process, '_kill', { configurable: true,
+              get() { record('native-delegate'); return nativeDelegate; } });
+              ${mode === 'accessor-with-inherited-value' ? "Object.defineProperty(Object.prototype, 'value', { value: nativeDelegate, configurable: true });" : ''}`}
+          } });
+          process.kill(process.pid, 'SIGKILL');`;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+          env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.signal, result.stderr).toBe('SIGKILL');
+        expect(readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
+          .toEqual(['native-delegate']);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it.each(['missing-callback', 'duplicate-boundary', 'legacy-dispatcher'] as const)(
     'self-kill boundary rejects an unenforceable registration (%s)', mode => {
       const helper = new URL('./process-termination-observer.mjs', import.meta.url).href;
