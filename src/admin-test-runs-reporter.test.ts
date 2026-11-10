@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { defaultEvidenceRoot } from '@papercusp/verification-harness';
-import { MAX_RECORDED_CASE_TITLE_CHARS, MAX_RECORDED_PASSED_CASES } from './execution-details.ts';
+import { MAX_RECORDED_CASE_TITLE_CHARS, MAX_RECORDED_PASSED_CASES, parseRecordedTestPopulation } from './execution-details.ts';
 import { redactSensitiveText } from './sensitive-text.ts';
 import AdminTestRunsReporter, {
   nativeTestRunAttribution,
@@ -992,6 +992,60 @@ describe('runtime environment recorded around execution', () => {
     expect(normalizeRuntimeEnvironmentCaptureTimeout(MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS + 1))
       .toBe(MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS);
   });
+});
+
+describe('actual reporter population capture', () => {
+  async function record(count: number, defect?: 'missing-ready' | 'missing-collection' | 'changed-collection' | 'unknown-ready') {
+    const rows: TestRunRow[] = [];
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
+      async row => { rows.push(row); });
+    await reporter.onInit({ config: { root: TEST_CONFIG_ROOT,
+      configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } as never);
+    let collected = true;
+    const tests = Array.from({ length: count + 1 }, (_, index) => ({
+      id: `case-${index}`, fullName: index < 2 ? 'suite > duplicate' : `suite > \u03bb-${index}`,
+      get module() { return module; },
+      result: () => ({ state: index === count ? 'skipped' : collected ? 'pending' : 'passed' }),
+    }));
+    const module = {
+      project: { name: 'unit', config: { provide: { papercuspTestLayer: 'unit' } } },
+      moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
+      state: () => 'passed', diagnostic: () => ({ duration: 0 }), errors: () => [],
+      children: { allTests: () => tests },
+    };
+    if (defect !== 'missing-collection') reporter.onTestModuleCollected(module as never);
+    // These events deliberately differ from collection order.
+    for (const test of tests.slice(0, defect === 'missing-ready' ? count - 1 : count).reverse())
+      reporter.onTestCaseReady(test as never);
+    if (defect === 'unknown-ready') reporter.onTestCaseReady({ ...tests[0], id: 'outside' } as never);
+    collected = false;
+    if (defect === 'changed-collection') tests.pop();
+    reporter.onTestModuleEnd(module as never);
+    await reporter.onTestRunEnd();
+    return rows[0].executionDetails!;
+  }
+
+  it('persists every original collected outcome before diagnostic sampling, including duplicate occurrences', async () => {
+    const count = MAX_RECORDED_PASSED_CASES + 17;
+    const execution = await record(count);
+    expect(execution.passedCaseTitlesTruncated).toBe(true);
+    expect(execution.passedCaseTitles).toHaveLength(MAX_RECORDED_PASSED_CASES);
+    const population = parseRecordedTestPopulation(execution.population)!;
+    expect(population).toBeDefined();
+    expect(population.cases).toHaveLength(count + 1);
+    expect(population.cases.filter(row => row.identity[2] === 'suite > duplicate').map(row => row.identity[3]))
+      .toEqual([1, 2]);
+    expect(population.cases.filter(row => row.selected)).toHaveLength(count);
+    expect(population.executionOrder[0][2]).toBe(`suite > \u03bb-${count - 1}`);
+    expect(population.cases.find(row => !row.selected)?.outcome).toBe('skipped');
+  });
+
+  it.each(['missing-ready', 'missing-collection', 'changed-collection', 'unknown-ready'] as const)
+    ('leaves incomplete %s evidence unproven without losing ordinary diagnostics', async defect => {
+      const execution = await record(3, defect);
+      expect(execution.passed).toBe(3);
+      expect(execution.population).toBeUndefined();
+    });
 });
 
 describe('durable module execution measurement', () => {

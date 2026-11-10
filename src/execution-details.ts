@@ -8,6 +8,106 @@
  * the reporter.
  */
 import { parseMutationDescriptor, type MutationDescriptor } from './mutation-descriptor.ts';
+import { createHash } from 'node:crypto';
+
+/** Complete runner collection, independent of bounded human-readable samples.
+ * Reuse additionally needs the original run/fence, process/reset receipts and
+ * complete relevant input identities; this field proves population integrity.
+ */
+export type RecordedPopulationIdentity = [project: string, file: string, title: string, occurrence: number, leg: string];
+export interface RecordedPopulationCase {
+  identity: RecordedPopulationIdentity;
+  selected: boolean;
+  outcome: 'passed' | 'failed' | 'skipped';
+}
+export interface RecordedTestPopulation {
+  schemaVersion: 'population-v1';
+  cases: RecordedPopulationCase[];
+  executionOrder: RecordedPopulationIdentity[];
+  populationHash: string;
+  selectionHash: string;
+  outcomesHash: string;
+  executionOrderHash: string;
+}
+
+function populationIdentity(value: unknown): value is RecordedPopulationIdentity {
+  return Array.isArray(value) && value.length === 5
+    && typeof value[0] === 'string' && value[0].trim() === value[0] && !/[\u0000-\u001f\u007f]/.test(value[0])
+    && typeof value[1] === 'string' && value[1].length > 0 && !/[\\\u0000-\u001f\u007f]/.test(value[1])
+    && !value[1].split('/').some(part => !part || part === '.' || part === '..') && !/^[A-Za-z]:/.test(value[1])
+    && isRecordedCaseIdentity(value[2]) && Number.isSafeInteger(value[3]) && value[3] > 0
+    && typeof value[4] === 'string' && value[4].length > 0 && value[4].trim() === value[4]
+    && !/[\u0000-\u001f\u007f]/.test(value[4]);
+}
+
+function comparePopulationIdentity(a: RecordedPopulationIdentity, b: RecordedPopulationIdentity): number {
+  for (const index of [0, 1, 2, 4] as const) {
+    if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+  }
+  return a[3] - b[3];
+}
+
+function populationDigest(kind: string, value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(['population-v1', kind, value]), 'utf8').digest('hex');
+}
+
+/** No sample/cap is accepted. Unreadable identities or incomplete execution
+ * yield no population proof; the ordinary diagnostic row may still persist.
+ */
+export function createRecordedTestPopulation(
+  cases: readonly RecordedPopulationCase[], executionOrder: readonly RecordedPopulationIdentity[],
+): RecordedTestPopulation | undefined {
+  if (!Array.isArray(cases) || cases.length === 0 || !Array.isArray(executionOrder)) return undefined;
+  if (cases.some(row => !isRecord(row) || Object.keys(row).length !== 3
+    || !populationIdentity(row.identity) || typeof row.selected !== 'boolean'
+    || !['passed', 'failed', 'skipped'].includes(row.outcome)
+    || (!row.selected && row.outcome !== 'skipped'))) return undefined;
+  const sorted = cases.map(row => ({ identity: [...row.identity] as RecordedPopulationIdentity,
+    selected: row.selected, outcome: row.outcome }))
+    .sort((a, b) => comparePopulationIdentity(a.identity, b.identity));
+  const occurrences = new Map<string, number>();
+  const selected = new Set<string>();
+  for (const row of sorted) {
+    const [project, file, title, occurrence, leg] = row.identity;
+    const key = JSON.stringify([project, file, title, leg]);
+    const expected = (occurrences.get(key) ?? 0) + 1;
+    if (occurrence !== expected) return undefined;
+    occurrences.set(key, expected);
+    if (row.selected) selected.add(JSON.stringify(row.identity));
+  }
+  const observed = new Set<string>();
+  for (const identity of executionOrder) {
+    if (!populationIdentity(identity) || !selected.has(JSON.stringify(identity))) return undefined;
+    observed.add(JSON.stringify(identity));
+  }
+  if (observed.size !== selected.size) return undefined;
+  const order = executionOrder.map(identity => [...identity] as RecordedPopulationIdentity);
+  return { schemaVersion: 'population-v1', cases: sorted, executionOrder: order,
+    populationHash: populationDigest('population', sorted.map(row => row.identity)),
+    selectionHash: populationDigest('selection', sorted.filter(row => row.selected).map(row => row.identity)),
+    outcomesHash: populationDigest('outcomes', sorted.map(row => [row.identity, row.selected, row.outcome])),
+    executionOrderHash: populationDigest('execution-order', order) };
+}
+
+/** Recompute from persisted rows; supplied digests never establish integrity. */
+export function parseRecordedTestPopulation(value: unknown): RecordedTestPopulation | undefined {
+  if (!isRecord(value) || Object.keys(value).length !== 7 || value.schemaVersion !== 'population-v1'
+    || !Array.isArray(value.cases) || !Array.isArray(value.executionOrder)) return undefined;
+  const rebuilt = createRecordedTestPopulation(value.cases, value.executionOrder);
+  if (!rebuilt || ['populationHash', 'selectionHash', 'outcomesHash', 'executionOrderHash']
+    .some(key => value[key] !== rebuilt[key as keyof RecordedTestPopulation])
+    || JSON.stringify(value.cases.map(row => row.identity)) !== JSON.stringify(rebuilt.cases.map(row => row.identity))) return undefined;
+  return rebuilt;
+}
+
+function executionPopulationMatches(value: Record<string, unknown>): boolean {
+  const population = parseRecordedTestPopulation(value.population);
+  return !!population && value.collectionFailed === false
+    && population.cases.every(row => row.identity[1] === value.filePath)
+    && population.cases.filter(row => row.outcome === 'passed').length === value.passed
+    && population.cases.filter(row => row.outcome === 'failed').length === value.failed
+    && population.cases.filter(row => row.outcome === 'skipped').length === value.skipped;
+}
 
 export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
 
@@ -362,6 +462,8 @@ export interface TestRunExecutionDetails {
   passedCaseTitlesTruncated?: true;
   skipped: number;
   collectionFailed: boolean;
+  /** Exact collection/selection/outcomes and observed order; legacy absence is unknown. */
+  population?: RecordedTestPopulation;
   mutationPhase: string | null;
   /** The commit observed after the run; null means runtime identity is unproven. */
   commitSha: string | null;
@@ -605,7 +707,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations',
+  'sqlCoverageObservations', 'population',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -686,6 +788,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.llmBlockCustody !== undefined && !parseRecordedLlmBlockCustody(value.llmBlockCustody))
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
+    || (value.population !== undefined && !executionPopulationMatches(value))
     || (value.failedCaseTitles !== undefined && (
       !Array.isArray(value.failedCaseTitles)
       || value.failedCaseTitles.length > (value.failed as number)

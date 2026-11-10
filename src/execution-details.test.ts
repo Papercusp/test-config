@@ -16,6 +16,10 @@ import {
   isRecordedCaseTitle,
   registeredVitestFileLayer,
   stableRecordedRuntimeEnvironment,
+  createRecordedTestPopulation,
+  parseRecordedTestPopulation,
+  type RecordedPopulationIdentity,
+  type RecordedPopulationCase,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
 
@@ -31,6 +35,61 @@ describe('registered per-file Vitest projects', () => {
       config: 'vitest.pty-process.integration.config.ts',
     });
     expect(registeredVitestFileLayer(path)).toBe('integration');
+  });
+});
+
+describe('population-v1 complete execution identity', () => {
+  const identity = (title: string, occurrence = 1): RecordedPopulationIdentity =>
+    ['unit', 'libs/x/src/a.test.ts', title, occurrence, 'test'];
+  const a = identity('suite > duplicate');
+  const b = identity('suite > duplicate', 2);
+  const cases: RecordedPopulationCase[] = [
+    { identity: a, selected: true, outcome: 'passed' },
+    { identity: b, selected: true, outcome: 'failed' },
+  ];
+
+  it('keeps duplicate occurrences, full Unicode titles and an uncapped population', () => {
+    const rows: RecordedPopulationCase[] = [...cases, ...Array.from({ length: MAX_RECORDED_PASSED_CASES + 20 },
+      (_, i) => ({ identity: identity(`suite > \u03bb-${i}`), selected: true, outcome: 'passed' as const }))];
+    const population = createRecordedTestPopulation(rows, rows.map(row => row.identity))!;
+    expect(population.cases).toHaveLength(rows.length);
+    expect(parseRecordedTestPopulation(population)).toEqual(population);
+    // jsonb may reorder object keys; array/identity order remains canonical.
+    const reordered = { ...population, cases: population.cases.map(row =>
+      ({ outcome: row.outcome, selected: row.selected, identity: row.identity })) };
+    expect(parseRecordedTestPopulation(reordered)).toEqual(population);
+    expect(parseTestRunExecutionDetails(details({ population, passed: rows.length - 1, failed: 1 })))
+      .toMatchObject({ population });
+  });
+
+  it('separates collection, selection, outcomes and observed execution order', () => {
+    const baseline = createRecordedTestPopulation(cases, [a, b])!;
+    const reordered = createRecordedTestPopulation([...cases].reverse(), [b, a])!;
+    expect(reordered.populationHash).toBe(baseline.populationHash);
+    expect(reordered.outcomesHash).toBe(baseline.outcomesHash);
+    expect(reordered.executionOrderHash).not.toBe(baseline.executionOrderHash);
+    const changed = createRecordedTestPopulation([cases[0], { ...cases[1], outcome: 'passed' }], [a, b])!;
+    expect(changed.populationHash).toBe(baseline.populationHash);
+    expect(changed.outcomesHash).not.toBe(baseline.outcomesHash);
+    const selected = createRecordedTestPopulation([cases[0], { ...cases[1], selected: false, outcome: 'skipped' }], [a])!;
+    expect(selected.populationHash).toBe(baseline.populationHash);
+    expect(selected.selectionHash).not.toBe(baseline.selectionHash);
+  });
+
+  it('rejects sampled, tampered, duplicate, incomplete and wrong-file records while retaining legacy rows', () => {
+    const population = createRecordedTestPopulation(cases, [a, b])!;
+    expect(parseRecordedTestPopulation({ ...population, cases: population.cases.slice(1) })).toBeUndefined();
+    expect(parseRecordedTestPopulation({ ...population, outcomesHash: '0'.repeat(64) })).toBeUndefined();
+    expect(parseRecordedTestPopulation({ ...population, complete: true })).toBeUndefined();
+    expect(createRecordedTestPopulation([cases[0], cases[0]], [a])).toBeUndefined();
+    expect(createRecordedTestPopulation(cases, [a])).toBeUndefined();
+    expect(createRecordedTestPopulation(cases, [a, b, identity('uncollected')])).toBeUndefined();
+    expect(createRecordedTestPopulation([{ ...cases[0], identity: identity('gap', 2) }], [identity('gap', 2)]))
+      .toBeUndefined();
+    expect(parseTestRunExecutionDetails(details({ population, passed: 1, failed: 1 }))).toBeDefined();
+    for (const overrides of [{ passed: 2 }, { collectionFailed: true }, { filePath: 'other.test.ts' }])
+      expect(parseTestRunExecutionDetails(details({ population, passed: 1, failed: 1, ...overrides }))).toBeUndefined();
+    expect(parseTestRunExecutionDetails(details())).toBeDefined();
   });
 });
 
