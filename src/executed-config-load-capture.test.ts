@@ -101,6 +101,7 @@ describe('precise coverage epoch preparation', () => {
     const enrollment = { epoch: '5a0abff0-f7d4-484a-8891-bbcebf05d205', admission: 0 };
     const script = `import { Session, open } from 'node:inspector';
       import { Session as PromiseSession } from 'node:inspector/promises';
+      const savedOpen = open;
       const fault = ${JSON.stringify(/^(start|take)-(pending|failed|partial)$/.test(mode) ? mode : null)};
       if (fault) {
         const original = Session.prototype.post;
@@ -141,6 +142,7 @@ describe('precise coverage epoch preparation', () => {
         attempt('open', () => open(0));
         other.disconnect(); promiseOther.disconnect();` : ''}
       ${mode === 'passive' ? 'observer.snapshot(); observer.snapshot();' : ''}
+      ${mode === 'precaptured-open' ? "savedOpen(0, '127.0.0.1');" : ''}
       const terminal = observer.terminalPreciseSnapshot();
       ${mode === 'post-fence' ? "attempt('Runtime.evaluate-after-fence', () => post('Runtime.evaluate', { expression: 'entered()' }));" : ''}
       const duplicate = ${mode === 'duplicate' ? 'observer.terminalPreciseSnapshot()' : 'undefined'};
@@ -156,7 +158,8 @@ describe('precise coverage epoch preparation', () => {
     const env = { ...process.env }; delete env.NODE_OPTIONS;
     for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
     try {
-      return JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '--eval', script], {
+      return JSON.parse(execFileSync(process.execPath, [...(mode === 'external-transport' ? ['--inspect=127.0.0.1:0'] : []),
+        '--expose-gc', '--input-type=module', '--eval', script], {
         env, encoding: 'utf8', timeout: 10000,
       }));
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -221,6 +224,18 @@ describe('precise coverage epoch preparation', () => {
       if (mode.startsWith('start'))
         expect(result.status.commands.some((row: { method: string }) =>
           row.method === 'Profiler.takePreciseCoverage')).toBe(false);
+    });
+  it.each(['external-transport', 'precaptured-open'])(
+    'refuses an actual Inspector endpoint before arming or terminal take (%s)', mode => {
+      const result = run(mode);
+      expect(result.terminal).toBeNull();
+      expect(result.status).toMatchObject({ phase: 'invalid', runtimeQualification: 'unknown' });
+      expect(result.status.reasons).toContain('engine-external-inspector-endpoint');
+      expect(result.status.commands.some((row: { method: string }) =>
+        row.method === 'Profiler.takePreciseCoverage')).toBe(false);
+      if (mode === 'external-transport')
+        expect(result.status.commands.some((row: { method: string }) =>
+          row.method === 'Profiler.startPreciseCoverage')).toBe(false);
     });
 });
 

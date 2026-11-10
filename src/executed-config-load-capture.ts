@@ -2,7 +2,7 @@
  * Loaded with Node --import BEFORE Vite evaluates configs. Reporter-time disk
  * reads cannot recover these bytes. This never authorizes reusable test passes. */
 import { createHash } from 'node:crypto';
-import { Session } from 'node:inspector';
+import { Session, url as inspectorUrl } from 'node:inspector';
 import { Session as PromiseSession } from 'node:inspector/promises';
 import { mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import * as nodeModule from 'node:module';
@@ -216,8 +216,9 @@ export function validateSourcePins(pins: unknown): SourcePin[] {
 /** Engine source text and execution ranges share a V8 script id. Neither a
  * scriptParsed event nor getScriptSource alone establishes execution. Best
  * effort coverage supplies positive observations only: GC can erase counters,
- * so an absent/zero count stays unknown. No precise coverage, pauses or code
- * rewriting are used, and this diagnostic never authorizes reusable passes. */
+ * so an absent/zero count stays unknown. The cooperative opt-in uses one precise
+ * interval and retains its unqualified raw response separately. Neither path
+ * authorizes reusable passes or full runtime admission. */
 export function observeEngineScriptExecution(repoRoot: string,
   options: { pinnedSources?: SourcePin[]; repositorySources?: boolean;
     preciseCoverage?: PreciseCoverageEnrollment } = {}) {
@@ -301,6 +302,10 @@ export function observeEngineScriptExecution(repoRoot: string,
     session.connect(); connected = true;
     post('Debugger.enable'); post('Profiler.enable');
     if (precise) {
+      if (inspectorUrl() !== undefined) {
+        reasons.add('engine-external-inspector-endpoint');
+        throw new Error('external Inspector endpoint is open');
+      }
       if (preciseOwnership.owner) throw new Error('precise coverage epoch already owned');
       installPreciseCoverageOwnership();
       owner = { fenced: false, rejected: [] }; preciseOwnership.owner = owner;
@@ -328,6 +333,10 @@ export function observeEngineScriptExecution(repoRoot: string,
       }
       owner.fenced = true;
       try {
+        if (inspectorUrl() !== undefined) {
+          reasons.add('engine-external-inspector-endpoint');
+          throw new Error('external Inspector endpoint opened during the epoch');
+        }
         const raw = post<{ result: Array<{ scriptId: string; url: string;
           functions: EngineFunctionCoverage[] }>; timestamp: number }>('Profiler.takePreciseCoverage');
         precisePhase = 'taken';
