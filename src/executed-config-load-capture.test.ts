@@ -7,7 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { configBundleSources, qualifyLoadedConfigSources, qualifyLoadedMainProcessSources,
-  writeExecutedCaptureDiagnostic } from './executed-config-load-capture.ts';
+  writeExecutedCaptureDiagnostic, classifyEngineCoverageTargets } from './executed-config-load-capture.ts';
 
 const digest = (text: string): string => createHash('sha256').update(text).digest('hex');
 const prefix = (path: string): string => `const __vite_injected_original_dirname = ${JSON.stringify(dirname(path))};` +
@@ -15,6 +15,186 @@ const prefix = (path: string): string => `const __vite_injected_original_dirname
   `const __vite_injected_original_import_meta_url = ${JSON.stringify(pathToFileURL(path).href)};`;
 const bundle = (map: unknown): string => '// loaded code\n//# sourceMappingURL=data:application/json;base64,' +
   Buffer.from(JSON.stringify(map)).toString('base64');
+
+describe('exact nested engine target coverage', () => {
+  const fixture = () => {
+    const root = { startOffset: 10, endOffset: 100 };
+    const block = { startOffset: 30, endOffset: 80 };
+    const observation = { sourceTextSha256: digest('pinned source'), sourceTextLength: 200,
+      functions: [{ functionName: 'target', isBlockCoverage: true,
+        ranges: [{ ...root, count: 0 }, { ...block, count: 0 }] }] };
+    const expected = { sourceTextSha256: observation.sourceTextSha256, sourceTextLength: 200,
+      targets: [{ functionName: 'target', functionRoot: root, ranges: [block] }] };
+    return { observation, expected };
+  };
+  it('requires exact structural zero and leaves runtime qualification unknown', () => {
+    const f = fixture();
+    expect(classifyEngineCoverageTargets(f.observation, f.expected)).toMatchObject({
+      state: 'zero', observedEntry: false, reasons: [], runtimeQualification: 'unknown' });
+    // A positive enclosing range is not a positive descendant of the target.
+    f.observation.functions[0].ranges[0].count = 1;
+    expect(classifyEngineCoverageTargets(f.observation, f.expected).state).toBe('zero');
+  });
+  it.each(['exact', 'block-descendant', 'nested-function'] as const)(
+    'retains positive entry despite an enclosing zero: %s', mode => {
+      const f = fixture();
+      if (mode === 'exact') f.observation.functions[0].ranges[1].count = 1;
+      if (mode === 'block-descendant') f.observation.functions[0].ranges.push({ startOffset: 40, endOffset: 50, count: 1 });
+      if (mode === 'nested-function') f.observation.functions.push({ functionName: 'nested', isBlockCoverage: false,
+        ranges: [{ startOffset: 40, endOffset: 50, count: 1 }] });
+      expect(classifyEngineCoverageTargets(f.observation, f.expected)).toMatchObject({ state: 'entry', observedEntry: true });
+    });
+  it.each(['absent-script', 'absent-function', 'absent-range', 'containing-range', 'spanning-range',
+    'source-sha', 'source-length', 'wrong-root', 'wrong-name', 'uncalibrated-targets'] as const)(
+    'never infers zero for missing or mismatched structure: %s', mode => {
+      const f = fixture();
+      if (mode === 'absent-script') f.observation.functions = [];
+      if (mode === 'absent-function') f.observation.functions[0].functionName = 'different';
+      if (mode === 'absent-range') f.observation.functions[0].ranges.pop();
+      if (mode === 'containing-range') f.expected.targets[0].ranges = [{ startOffset: 35, endOffset: 70 }];
+      if (mode === 'spanning-range') f.expected.targets[0].ranges = [{ startOffset: 20, endOffset: 85 }];
+      if (mode === 'source-sha') f.observation.sourceTextSha256 = digest('other bytes at same URL');
+      if (mode === 'source-length') f.observation.sourceTextLength++;
+      if (mode === 'wrong-root') f.expected.targets[0].functionRoot = { startOffset: 0, endOffset: 100 };
+      if (mode === 'wrong-name') f.expected.targets[0].functionName = 'other';
+      if (mode === 'uncalibrated-targets') f.expected.targets = [];
+      expect(classifyEngineCoverageTargets(f.observation, f.expected).state).toBe('unknown');
+    });
+  it.each(['crossing-blocks', 'crossing-functions', 'duplicate-root', 'duplicate-block', 'negative-count',
+    'fractional-count', 'out-of-source', 'out-of-root', 'unordered-blocks', 'duplicate-target'] as const)(
+    'refuses malformed or ambiguous range trees: %s', mode => {
+      const f = fixture(), fn = f.observation.functions[0];
+      if (mode === 'crossing-blocks') fn.ranges.push({ startOffset: 60, endOffset: 90, count: 0 });
+      if (mode === 'crossing-functions') f.observation.functions.push({ functionName: 'crossing', isBlockCoverage: false,
+        ranges: [{ startOffset: 50, endOffset: 150, count: 0 }] });
+      if (mode === 'duplicate-root') f.observation.functions.push(structuredClone(fn));
+      if (mode === 'duplicate-block') fn.ranges.push({ ...fn.ranges[1] });
+      if (mode === 'negative-count') fn.ranges[1].count = -1;
+      if (mode === 'fractional-count') fn.ranges[1].count = 0.5;
+      if (mode === 'out-of-source') fn.ranges[0].endOffset = 201;
+      if (mode === 'out-of-root') fn.ranges[1].endOffset = 110;
+      if (mode === 'unordered-blocks') fn.ranges.push({ startOffset: 20, endOffset: 25, count: 0 });
+      if (mode === 'duplicate-target') f.expected.targets.push(structuredClone(f.expected.targets[0]));
+      expect(classifyEngineCoverageTargets(f.observation, f.expected).state).toBe('unknown');
+    });
+  it('discloses known entry while a second missing target keeps the population unknown', () => {
+    const f = fixture(); f.observation.functions[0].ranges[1].count = 1;
+    f.expected.targets.push({ functionName: 'missing', functionRoot: { startOffset: 120, endOffset: 140 },
+      ranges: [{ startOffset: 120, endOffset: 140 }] });
+    expect(classifyEngineCoverageTargets(f.observation, f.expected)).toMatchObject({ state: 'unknown', observedEntry: true });
+  });
+  it.each([null, {}, { functionName: 'target', ranges: [null], isBlockCoverage: true },
+    { functionName: 'target', ranges: [], isBlockCoverage: true }])(
+    'malformed protocol function data stays unknown without throwing: %j', malformed => {
+      const f = fixture();
+      f.observation.functions = [malformed] as unknown as typeof f.observation.functions;
+      expect(classifyEngineCoverageTargets(f.observation, f.expected).state).toBe('unknown');
+    });
+});
+
+describe('precise coverage epoch preparation', () => {
+  const run = (mode: string) => {
+    const root = mkdtempSync(join(tmpdir(), 'engine-precise-epoch-'));
+    const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;
+    const path = join(root, 'pinned.mjs');
+    const source = 'function dormant() { return 7; } function entered() { return 8; } entered();';
+    const enrollment = { epoch: '5a0abff0-f7d4-484a-8891-bbcebf05d205', admission: 0 };
+    const script = `import { Session, open } from 'node:inspector';
+      import { Session as PromiseSession } from 'node:inspector/promises';
+      const { observeEngineScriptExecution, classifyEngineCoverageTargets } = await import(${JSON.stringify(capture)});
+      const source = ${JSON.stringify(source)}, path = ${JSON.stringify(path)}, url = ${JSON.stringify(pathToFileURL(path).href)};
+      const runtime = new Session(); runtime.connect();
+      const post = (method, params = {}) => { let done = false, error, value;
+        runtime.post(method, params, (e, r) => { done = true; error = e; value = r; });
+        if (!done || error) throw error ?? new Error('pending fixture request'); return value; };
+      post('Runtime.enable');
+      const compile = () => post('Runtime.compileScript', { expression: source, sourceURL: url, persistScript: true }).scriptId;
+      let scriptId = ${mode === 'pre-arm' ? 'compile()' : 'null'};
+      const observer = observeEngineScriptExecution('/unrelated', { repositorySources: false,
+        pinnedSources: [{ path, sha256: ${JSON.stringify(digest(source))}, byteLength: Buffer.byteLength(source) }],
+        preciseCoverage: ${JSON.stringify(enrollment)} });
+      if (!scriptId) scriptId = compile();
+      post('Runtime.runScript', { scriptId });
+      post('Runtime.evaluate', { expression: 'globalThis.gc()' });
+      const rejected = [];
+      const attempt = (label, fn) => { try { fn(); rejected.push({ label, rejected: false }); }
+        catch { rejected.push({ label, rejected: true }); } };
+      ${mode === 'foreign' ? `const other = new Session(); other.connect();
+        for (const method of ['Profiler.startPreciseCoverage', 'Profiler.takePreciseCoverage',
+          'Profiler.stopPreciseCoverage', 'Profiler.disable']) attempt(method, () => other.post(method));
+        const promiseOther = new PromiseSession(); promiseOther.connect();
+        try { await promiseOther.post('Profiler.takePreciseCoverage'); rejected.push({ label: 'promise', rejected: false }); }
+        catch { rejected.push({ label: 'promise', rejected: true }); }
+        attempt('open', () => open(0));
+        other.disconnect(); promiseOther.disconnect();` : ''}
+      ${mode === 'passive' ? 'observer.snapshot(); observer.snapshot();' : ''}
+      const terminal = observer.terminalPreciseSnapshot();
+      ${mode === 'post-fence' ? "attempt('Runtime.evaluate-after-fence', () => post('Runtime.evaluate', { expression: 'entered()' }));" : ''}
+      const duplicate = ${mode === 'duplicate' ? 'observer.terminalPreciseSnapshot()' : 'undefined'};
+      const observed = terminal?.scripts.find(row => row.scriptId === scriptId);
+      const target = name => { const startOffset = source.indexOf('function ' + name);
+        const endOffset = source.indexOf('}', startOffset) + 1;
+        return { functionName: name, functionRoot: { startOffset, endOffset }, ranges: [{ startOffset, endOffset }] }; };
+      const classify = name => observed ? classifyEngineCoverageTargets(observed, {
+        sourceTextSha256: ${JSON.stringify(digest(source))}, sourceTextLength: source.length, targets: [target(name)] }) : null;
+      console.log(JSON.stringify({ terminal, duplicate, rejected, dormant: classify('dormant'),
+        entered: classify('entered'), status: observer.preciseStatus() }));
+      observer.disconnect(); runtime.disconnect();`;
+    const env = { ...process.env }; delete env.NODE_OPTIONS;
+    for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
+    try {
+      return JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '--eval', script], {
+        env, encoding: 'utf8', timeout: 10000,
+      }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+  it('retains an executed target through explicit GC and a dormant exact zero without claiming runtime admission', () => {
+    const result = run('gc');
+    expect(result.terminal).toMatchObject({ phase: 'taken', runtimeQualification: 'unknown',
+      basis: 'one-start-one-terminal-precise-response', ownership: { enforced: true,
+        internalNativeAndPrecapturedAccess: 'unmeasured' }, fence: 'terminal-entered-suffix-unverified' });
+    expect(result.entered).toMatchObject({ state: 'entry', observedEntry: true });
+    expect(result.dormant).toMatchObject({ state: 'zero', runtimeQualification: 'unknown' });
+    expect(result.terminal.scripts[0].compiledBeforePreciseArm).toBe(false);
+    expect(result.status.commands.filter((row: { method: string }) => row.method === 'Profiler.startPreciseCoverage')).toHaveLength(1);
+    expect(result.status.commands.filter((row: { method: string }) => row.method === 'Profiler.takePreciseCoverage')).toHaveLength(1);
+    expect(result.status.commands.every((row: { status: string }) => row.status === 'complete')).toBe(true);
+  });
+  it('rejects actual competing callback/promise Session mutations and opening a foreign transport', () => {
+    const result = run('foreign');
+    expect(result.rejected).toHaveLength(6);
+    expect(result.rejected.every((row: { rejected: boolean }) => row.rejected)).toBe(true);
+    expect(result.status.ownership.rejected).toHaveLength(6);
+    expect(result.entered.state).toBe('entry');
+    expect(result.dormant.state).toBe('zero');
+    expect(result.terminal.runtimeQualification).toBe('unknown');
+  });
+  it('pre-arm compilation cannot become qualified merely because a later take sees its ranges', () => {
+    const result = run('pre-arm');
+    expect(result.terminal.reasons).toContain('engine-target-before-precise-arm');
+    expect(result.terminal.scripts[0].compiledBeforePreciseArm).toBe(true);
+    expect(result.terminal.runtimeQualification).toBe('unknown');
+  });
+  it('refuses a duplicate take instead of resetting and accumulating another interval', () => {
+    const result = run('duplicate');
+    expect(result.duplicate).toBeNull();
+    expect(result.status).toMatchObject({ phase: 'invalid' });
+    expect(result.status.reasons).toContain('engine-precise-terminal-out-of-order');
+    expect(result.status.commands.filter((row: { method: string }) => row.method === 'Profiler.takePreciseCoverage')).toHaveLength(1);
+  });
+  it('passive snapshots leave the single precise take and its retained counters intact', () => {
+    const result = run('passive');
+    expect(result.status.commands.filter((row: { method: string }) => row.method === 'Profiler.getBestEffortCoverage')).toHaveLength(2);
+    expect(result.status.commands.filter((row: { method: string }) => row.method === 'Profiler.takePreciseCoverage')).toHaveLength(1);
+    expect(result.entered.state).toBe('entry');
+  });
+  it('blocks foreign Inspector target dispatch after terminal entry without claiming an audited application suffix', () => {
+    const result = run('post-fence');
+    expect(result.rejected).toEqual([{ label: 'Runtime.evaluate-after-fence', rejected: true }]);
+    expect(result.status.fence).toBe('terminal-entered-suffix-unverified');
+    expect(result.status.runtimeQualification).toBe('unknown');
+  });
+});
 
 describe('engine script execution observations', () => {
   it('retains late nested ranges and complete names from an independently pinned script', () => {
