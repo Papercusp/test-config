@@ -995,7 +995,7 @@ describe('runtime environment recorded around execution', () => {
 });
 
 describe('actual reporter population capture', () => {
-  async function record(count: number, defect?: 'missing-ready' | 'missing-collection' | 'changed-collection' | 'unknown-ready' | 'terminal-at-collection') {
+  async function record(count: number, defect?: 'missing-ready' | 'missing-collection' | 'changed-collection' | 'unknown-ready' | 'terminal-at-collection' | 'long-title') {
     const rows: TestRunRow[] = [];
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
       async row => { rows.push(row); });
@@ -1008,6 +1008,7 @@ describe('actual reporter population capture', () => {
       get module() { return module; },
       result: () => ({ state: index === count ? 'skipped' : collected && defect !== 'terminal-at-collection' ? 'pending' : 'passed' }),
     }));
+    if (defect === 'long-title') tests[0].fullName = 'suite > ' + 'parameter'.repeat(1_000);
     const module = {
       project: { name: 'unit', config: { provide: { papercuspTestLayer: 'unit' } } },
       moduleId: join(TEST_CONFIG_ROOT, 'src/admin-test-runs-reporter.test.ts'),
@@ -1046,6 +1047,14 @@ describe('actual reporter population capture', () => {
     const execution = await record(3, 'terminal-at-collection');
     expect(execution.population?.cases.filter(row => row.selected)).toHaveLength(3);
     expect(execution.population?.executionOrder).toHaveLength(3);
+  });
+
+  it('retains long original titles which the legacy diagnostic and case tables cannot represent completely', async () => {
+    const execution = await record(3, 'long-title');
+    expect(execution.passedCaseTitlesTruncated).toBe(true);
+    expect(execution.populationCaptureStatus).toBe('captured');
+    expect(execution.population?.cases.some(row => row.identity[2] === 'suite > ' + 'parameter'.repeat(1_000)))
+      .toBe(true);
   });
 
   it.each(['missing-ready', 'missing-collection', 'changed-collection', 'unknown-ready'] as const)

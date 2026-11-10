@@ -38,7 +38,12 @@ function populationIdentity(value: unknown): value is RecordedPopulationIdentity
     && typeof value[0] === 'string' && value[0].trim() === value[0] && !/[\u0000-\u001f\u007f]/.test(value[0])
     && typeof value[1] === 'string' && value[1].length > 0 && !/[\\\u0000-\u001f\u007f]/.test(value[1])
     && !value[1].split('/').some(part => !part || part === '.' || part === '..') && !/^[A-Za-z]:/.test(value[1])
-    && isRecordedCaseIdentity(value[2]) && Number.isSafeInteger(value[3]) && value[3] > 0
+    // Complete identities are not diagnostic titles: never apply their length
+    // cap here. Preserve exact whitespace/control escapes JSONB can represent;
+    // NUL and lone surrogates cannot roundtrip through PostgreSQL JSONB.
+    && typeof value[2] === 'string' && value[2].trim().length > 0
+    && !/\u0000|[\uD800-\uDFFF]/u.test(value[2])
+    && Number.isSafeInteger(value[3]) && value[3] > 0
     && typeof value[4] === 'string' && value[4].length > 0 && value[4].trim() === value[4]
     && !/[\u0000-\u001f\u007f]/.test(value[4]);
 }
@@ -61,10 +66,12 @@ export function createRecordedTestPopulation(
   cases: readonly RecordedPopulationCase[], executionOrder: readonly RecordedPopulationIdentity[],
 ): RecordedTestPopulation | undefined {
   if (!Array.isArray(cases) || cases.length === 0 || !Array.isArray(executionOrder)) return undefined;
-  if (cases.some(row => !isRecord(row) || Object.keys(row).length !== 3
-    || !populationIdentity(row.identity) || typeof row.selected !== 'boolean'
-    || typeof row.outcome !== 'string' || !['passed', 'failed', 'skipped'].includes(row.outcome)
-    || (!row.selected && row.outcome !== 'skipped'))) return undefined;
+  for (const row of cases) {
+    if (!isRecord(row) || Object.keys(row).length !== 3
+      || !populationIdentity(row.identity) || typeof row.selected !== 'boolean'
+      || typeof row.outcome !== 'string' || !['passed', 'failed', 'skipped'].includes(row.outcome)
+      || (!row.selected && row.outcome !== 'skipped')) return undefined;
+  }
   const sorted = cases.map(row => ({ identity: [...row.identity] as RecordedPopulationIdentity,
     selected: row.selected, outcome: row.outcome }))
     .sort((a, b) => comparePopulationIdentity(a.identity, b.identity));
