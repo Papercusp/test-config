@@ -238,7 +238,7 @@ describe('precise coverage epoch preparation', () => {
         try {
           const attached = once(session, 'NodeWorker.attachedToWorker');
           await bounded(post('NodeWorker.enable', { waitForDebuggerOnStart: false }));
-          worker = new Worker(${JSON.stringify(workerSource)}, { eval: true });
+          worker = new Worker(${JSON.stringify(workerSource)}, { eval: true, execArgv: ['--input-type=commonjs'] });
           const [[ready], [attachment]] = await bounded(Promise.all([once(worker, 'message'), attached]));
           if (ready.kind !== 'ready') throw new Error(JSON.stringify(ready));
           const pending = new Map(); let nextId = 0;
