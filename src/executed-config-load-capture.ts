@@ -1,7 +1,7 @@
 /** Original config inputs for the existing executed-source diagnostic OUT channel.
  * Loaded with Node --import BEFORE Vite evaluates configs. Reporter-time disk
  * reads cannot recover these bytes. This never authorizes reusable test passes. */
-import { createHash } from 'node:crypto';
+import { hash as cryptoHash } from 'node:crypto';
 import { Session, url as inspectorUrl } from 'node:inspector';
 import { Session as PromiseSession } from 'node:inspector/promises';
 import { mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
@@ -28,21 +28,16 @@ const shared = pinModuleState<{ capture: Capture | null }>(
 // or the caller's audited publication/hold suffix.
 const applyIntrinsic = Reflect.apply;
 const definePropertyIntrinsic = Object.defineProperty;
-const createHashIntrinsic = createHash;
-const hashPrototype = Object.getPrototypeOf(createHashIntrinsic('sha256'));
-const hashUpdateIntrinsic = hashPrototype.update;
-const hashDigestIntrinsic = hashPrototype.digest;
+const oneShotHashIntrinsic = cryptoHash;
 const arrayIsArrayIntrinsic = Array.isArray;
 const numberIsFiniteIntrinsic = Number.isFinite;
 const arraySortIntrinsic = Array.prototype.sort;
 const mapForEachIntrinsic = Map.prototype.forEach;
 const setForEachIntrinsic = Set.prototype.forEach;
 const setAddIntrinsic = Set.prototype.add;
-const hash = (bytes: string | Buffer): string => {
-  const instance = createHashIntrinsic('sha256');
-  applyIntrinsic(hashUpdateIntrinsic, instance, [bytes]);
-  return applyIntrinsic(hashDigestIntrinsic, instance, ['hex']);
-};
+// Hash's constructor/copy can invoke inherited symbol setters even when its
+// methods are retained. The public one-shot API avoids those JS allocations.
+const hash = (bytes: string | Buffer): string => oneShotHashIntrinsic('sha256', bytes, 'hex');
 const copyRows = <T extends object>(rows: T[]): T[] => {
   const result: T[] = [];
   for (let i = 0; i < rows.length; i++) appendOwn(result, { ...rows[i] });
