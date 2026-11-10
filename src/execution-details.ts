@@ -18,6 +18,56 @@ export interface RecordedWorkerRuntime {
   after: RuntimeProofIdentity | null;
 }
 
+export type RecordedSubmoduleCheckout = [path: string, commitSha: string];
+export interface RecordedSourceSubmodules {
+  schemaVersion: 'submodule-checkouts-v1';
+  before: RecordedSubmoduleCheckout[] | null;
+  after: RecordedSubmoduleCheckout[] | null;
+}
+
+function readSubmoduleCheckouts(value: unknown): RecordedSubmoduleCheckout[] | undefined {
+  if (!Array.isArray(value) || value.length > 50_000) return undefined;
+  const seen = new Set<string>();
+  const result: RecordedSubmoduleCheckout[] = [];
+  for (const row of value) {
+    if (!Array.isArray(row) || row.length !== 2 || typeof row[0] !== 'string'
+      || !/^[A-Za-z0-9_@.+/-]+$/.test(row[0]) || row[0].startsWith('/')
+      || row[0].split('/').some(part => !part || part === '.' || part === '..')
+      || typeof row[1] !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(row[1])
+      || seen.has(row[0])) return undefined;
+    seen.add(row[0]);
+    result.push([row[0], row[1]]);
+  }
+  return result.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+}
+
+/** Git's recursive materialization observation. Uninitialized, conflicted or
+ * differently checked-out gitlinks never prove an empty census. The Git runner
+ * trims stdout, including the first row's ordinary space prefix. Ambiguous path
+ * or description syntax remains unqualified.
+ */
+export function parseSubmoduleCheckoutStatus(value: unknown): RecordedSubmoduleCheckout[] | null {
+  if (typeof value !== 'string') return null;
+  if (value === '') return [];
+  const rows: RecordedSubmoduleCheckout[] = [];
+  for (const line of value.trimEnd().split('\n')) {
+    const match = /^ ?([a-f0-9]{40}|[a-f0-9]{64}) ([A-Za-z0-9_@.+/-]+)(?: \([^\r\n]*\))?$/.exec(line);
+    if (!match) return null;
+    rows.push([match[2]!, match[1]!]);
+  }
+  return readSubmoduleCheckouts(rows) ?? null;
+}
+
+export function parseRecordedSourceSubmodules(value: unknown): RecordedSourceSubmodules | undefined {
+  if (!isRecord(value) || Object.keys(value).length !== 3
+    || value.schemaVersion !== 'submodule-checkouts-v1'
+    || !Object.hasOwn(value, 'before') || !Object.hasOwn(value, 'after')) return undefined;
+  const before = value.before === null ? null : readSubmoduleCheckouts(value.before);
+  const after = value.after === null ? null : readSubmoduleCheckouts(value.after);
+  return before === undefined || after === undefined ? undefined
+    : { schemaVersion: 'submodule-checkouts-v1', before, after };
+}
+
 /** Validate the retained worker measurements without substituting this reader's
  * interpreter or install. Null is a measured inability to obtain a qualified pin. */
 export function parseRecordedWorkerRuntime(value: unknown): RecordedWorkerRuntime | undefined {
@@ -28,14 +78,15 @@ export function parseRecordedWorkerRuntime(value: unknown): RecordedWorkerRuntim
   return value as unknown as RecordedWorkerRuntime;
 }
 
-/** Inputs actually measured by both reporters today. A stable enclosing commit
- * does not measure submodule materialization, runtime capabilities, schemas,
+/** Inputs actually measured by both reporters today. Submodule materialization
+ * needs its own stable recursive census. A commit does not measure capabilities, schemas,
  * fixtures, generated assets or the selection graph. Keep those unknown until
  * their own producers supply evidence; this partial context never enables reuse.
  * Outcomes are results, not inputs, and deliberately do not enter this digest.
  */
 export function captureRecordedProofContext(input: {
   commitSha: unknown; worktreeDirty: unknown; population?: unknown; workerRuntime?: unknown;
+  sourceSubmodules?: unknown;
 }): ProofContextIdentity {
   const components = Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, null])) as
     ProofContextIdentity['components'];
@@ -44,6 +95,10 @@ export function captureRecordedProofContext(input: {
   if (input.worktreeDirty === false && typeof input.commitSha === 'string'
     && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.commitSha))
     components.source = digest('source', input.commitSha);
+  const submodules = parseRecordedSourceSubmodules(input.sourceSubmodules);
+  if (components.source && submodules?.before !== null && submodules?.before !== undefined
+    && submodules.after !== null && JSON.stringify(submodules.before) === JSON.stringify(submodules.after))
+    components.submodules = digest('submodules', submodules.before);
   const population = parseRecordedTestPopulation(input.population);
   if (population) components.population = digest('population', [population.populationHash,
     population.selectionHash, population.executionOrderHash]);
@@ -58,7 +113,8 @@ export function captureRecordedProofContext(input: {
 function recordedProofContextMatches(value: Record<string, unknown>): boolean {
   const context = readProofContextIdentity(value.proofContext);
   const measured = captureRecordedProofContext({ commitSha: value.commitSha,
-    worktreeDirty: value.worktreeDirty, population: value.population, workerRuntime: value.workerRuntime });
+    worktreeDirty: value.worktreeDirty, population: value.population, workerRuntime: value.workerRuntime,
+    sourceSubmodules: value.sourceSubmodules });
   return context !== null && PROOF_CONTEXT_COMPONENTS.every(key => context.components[key] === measured.components[key]);
 }
 
@@ -550,6 +606,8 @@ export interface TestRunExecutionDetails {
   proofContext?: ProofContextIdentity;
   /** Original per-file worker measurements, independent of the reporter process. */
   workerRuntime?: RecordedWorkerRuntime;
+  /** Original before/after recursive checkout census; null is unqualified. */
+  sourceSubmodules?: RecordedSourceSubmodules;
   mutationPhase: string | null;
   /** The commit observed after the run; null means runtime identity is unproven. */
   commitSha: string | null;
@@ -793,7 +851,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -877,6 +935,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.population !== undefined && !executionPopulationMatches(value))
     || (value.proofContext !== undefined && !recordedProofContextMatches(value))
     || (value.workerRuntime !== undefined && !parseRecordedWorkerRuntime(value.workerRuntime))
+    || (value.sourceSubmodules !== undefined && !parseRecordedSourceSubmodules(value.sourceSubmodules))
     || (value.populationCaptureStatus !== undefined && (
       !POPULATION_CAPTURE_STATUSES.includes(value.populationCaptureStatus as PopulationCaptureStatus)
       || (value.populationCaptureStatus === 'captured') !== (value.population !== undefined)))

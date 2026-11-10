@@ -15,7 +15,7 @@ import { executedSourceOriginalsPlugin } from './vitest-config';
 // @ts-expect-error the executable .mjs router has no declaration file
 import { perGroupVitestEnv } from '../../../scripts/test-files.mjs';
 
-import AdminTestRunsReporter, { inferWorkspaceRoot } from './admin-test-runs-reporter';
+import AdminTestRunsReporter, { inferWorkspaceRoot, type WorktreeGitSnapshot } from './admin-test-runs-reporter';
 import { parseRecordedTestPopulation, parseTestRunExecutionDetails } from './execution-details';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
@@ -333,7 +333,7 @@ describe('ExecutedSourceMapReporter', () => {
 
   const clean = { commit: 'c0ffee0000000000000000000000000000000000', porcelain: '' };
   const GIT_DIR = '/fake/install/.git';
-  const snapshot = (s: { commit: string | null; porcelain: string | null }) => async () => s;
+  const snapshot = (s: WorktreeGitSnapshot) => async () => s;
 
   function fakeModule(o: { state?: string; isolate?: boolean | undefined; imports?: Record<string, { external?: boolean }> | 'throw'; moduleId?: string; workerImports?: boolean }): TestModule {
     if (o.workerImports) {
@@ -678,10 +678,11 @@ describe('ExecutedSourceMapReporter', () => {
       process.env[PC_EXECUTED_INPUTS_DIR_ENV] = tmp;
       const path = inputsFilePath(tmp, TEST_FILE);
       writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime }));
-      const { r } = reporter();
+      const source = { ...clean, submodules: [['libs/observed', 'a'.repeat(40)]] as [string, string][] };
+      const { r } = reporter(snapshot(source));
       const { mod, tests } = populationModule();
       const rows: Array<{ executionDetails?: unknown }> = [];
-      const ledger = new AdminTestRunsReporter(snapshot(clean), async row => { rows.push(row); });
+      const ledger = new AdminTestRunsReporter(snapshot(source), async row => { rows.push(row); });
       await ledger.onInit({} as never);
       r.onInit({} as never);
       selectPopulation(r);
@@ -699,6 +700,9 @@ describe('ExecutedSourceMapReporter', () => {
       expect(details?.workerRuntime).toEqual(runtime);
       expect(details?.proofContext).toEqual(original.proofContext);
       expect(details?.proofContext?.components.dependencies).toMatch(/^[a-f0-9]{64}$/);
+      expect(details?.sourceSubmodules).toEqual(original.sourceSubmodules);
+      expect(details?.proofContext?.components.submodules).toMatch(/^[a-f0-9]{64}$/);
+      expect(nativeOut().files[0].sourceSubmodules).toEqual(original.sourceSubmodules);
       expect(details?.proofContext?.components.runtimeCapabilities).toBeNull();
       await ledger.onExit();
     });

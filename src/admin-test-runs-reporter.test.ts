@@ -3910,6 +3910,48 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     return { run, calls };
   };
 
+  it('measures recursive materialization only for an armed clean source snapshot, retaining unreadable and changed observations as null', async () => {
+    const sha = 'a'.repeat(40), status = 'git submodule status --recursive';
+    for (const [raw, expected] of [[`${sha} libs/a (heads/main)`, [['libs/a', sha]]], ['', []],
+      [`-${sha} libs/a`, null], [`+${sha} libs/a`, null], [null, null]] as const) {
+      const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha], [STATUS]: [''], [status]: [raw, raw] });
+      expect(await captureWorktreeSnapshot(run, undefined, undefined, true))
+        .toEqual({ commit: sha, porcelain: '', submodules: expected });
+      expect(calls.some(call => call.cmd === status)).toBe(true);
+    }
+    const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha], [STATUS]: [' M source.ts'] });
+    expect(await captureWorktreeSnapshot(run, undefined, undefined, true)).toMatchObject({ submodules: null });
+    expect(calls.some(call => call.cmd === status)).toBe(false);
+  });
+
+  it('observes real Git checkouts, distinguishes an empty census and refuses an uninitialized submodule', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-submodule-checkouts-'));
+    const sub = join(root, 'libs', 'observed');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args,
+      { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const commit = (cwd: string) => git(cwd, '-c', 'user.name=Reporter fixture',
+      '-c', 'user.email=reporter@example.test', 'commit', '--allow-empty', '-qm', 'fixture');
+    try {
+      git(root, 'init', '-q'); commit(root); setRunRoot(root);
+      expect((await captureWorktreeSnapshot(undefined, undefined, undefined, true)).submodules).toEqual([]);
+      mkdirSync(sub, { recursive: true }); git(sub, 'init', '-q'); commit(sub);
+      const childSha = git(sub, 'rev-parse', 'HEAD');
+      writeFileSync(join(root, '.gitmodules'), '[submodule "observed"]\n\tpath = libs/observed\n\turl = ./fixture\n');
+      git(root, 'add', '.gitmodules');
+      git(root, 'update-index', '--add', '--cacheinfo', `160000,${childSha},libs/observed`); commit(root);
+      // A hand-added gitlink also needs Git's local submodule registration.
+      // Retain the direct Git observation in any failure diagnostic.
+      git(root, 'submodule', 'init');
+      const observed = await captureWorktreeSnapshot(undefined, undefined, undefined, true);
+      expect(observed.submodules, JSON.stringify({ observed, git: git(root, 'submodule', 'status', '--recursive') }))
+        .toEqual([['libs/observed', childSha]]);
+      commit(sub);
+      expect((await captureWorktreeSnapshot(undefined, undefined, undefined, true)).submodules).toBeNull();
+      rmSync(sub, { recursive: true, force: true }); mkdirSync(sub);
+      expect((await captureWorktreeSnapshot(undefined, undefined, undefined, true)).submodules).toBeNull();
+    } finally { setRunRoot(null); rmSync(root, { recursive: true, force: true }); }
+  });
+
   function preparedRootReceiptFixture() {
     const parent = mkdtempSync(join(tmpdir(), 'prepared-root-receipt-'));
     const root = join(parent, 'source');

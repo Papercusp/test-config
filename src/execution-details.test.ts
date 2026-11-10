@@ -20,6 +20,8 @@ import {
   parseRecordedTestPopulation,
   captureRecordedProofContext,
   parseRecordedWorkerRuntime,
+  parseRecordedSourceSubmodules,
+  parseSubmoduleCheckoutStatus,
   type RecordedPopulationIdentity,
   type RecordedPopulationCase,
   type TestRunExecutionDetails,
@@ -33,6 +35,43 @@ describe('original result proof-context capture', () => {
   const runtime = { name: 'node', version: '25.1.0', executable: '/runtime/node', platform: 'linux', arch: 'x64',
     binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
     configurationSha256: '4'.repeat(64) };
+
+  it('binds the complete stable recursive submodule checkout census and rejects a retained context after replacement', () => {
+    const sourceSubmodules = { schemaVersion: 'submodule-checkouts-v1' as const,
+      before: [['libs/z', '1'.repeat(40)], ['libs/a', '2'.repeat(40)]],
+      after: [['libs/a', '2'.repeat(40)], ['libs/z', '1'.repeat(40)]] };
+    const proofContext = captureRecordedProofContext({ ...input, sourceSubmodules });
+    expect(proofContext.components.submodules).toMatch(/^[a-f0-9]{64}$/);
+    const row = details({ ...input, passed: 1, sourceSubmodules: parseRecordedSourceSubmodules(sourceSubmodules), proofContext });
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify(row)))?.proofContext).toEqual(proofContext);
+    for (const changed of [undefined, { ...sourceSubmodules, before: null },
+      { ...sourceSubmodules, after: [['libs/a', 'f'.repeat(40)], ['libs/z', '1'.repeat(40)]] },
+      { ...sourceSubmodules, before: [], after: [] }])
+      expect(parseTestRunExecutionDetails({ ...row, sourceSubmodules: changed })).toBeUndefined();
+    expect(captureRecordedProofContext({ ...input, worktreeDirty: true, sourceSubmodules }).components.submodules).toBeNull();
+    expect(captureRecordedProofContext({ ...input,
+      sourceSubmodules: { ...sourceSubmodules, before: null } }).components.submodules).toBeNull();
+    const empty = captureRecordedProofContext({ ...input,
+      sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1', before: [], after: [] } });
+    expect(empty.components.submodules).toMatch(/^[a-f0-9]{64}$/);
+    expect(empty.components.submodules).not.toBe(proofContext.components.submodules);
+    expect(proofContextImpact({ before: proofContext, after: proofContext })).toMatchObject({ status: 'unknown' });
+  });
+
+  it('parses actual recursive Git status without turning uninitialized, changed or unreadable entries into an empty census', () => {
+    const sha = 'a'.repeat(40);
+    expect(parseSubmoduleCheckoutStatus(`${sha} libs/a (heads/main)\n ${sha} libs/a/nested (v1)`))
+      .toEqual([['libs/a', sha], ['libs/a/nested', sha]]);
+    expect(parseSubmoduleCheckoutStatus('')).toEqual([]);
+    for (const raw of [null, undefined, ' ', `-${sha} libs/a`, `+${sha} libs/a`, `U${sha} libs/a`,
+      `${sha} libs/a\n ${sha} libs/a`, `${sha} ../escape`, `${sha} /absolute`, `${sha} libs/a with spaces (main)`,
+      `${sha} libs/a\ntruncated`, `${sha} libs//a`])
+      expect(parseSubmoduleCheckoutStatus(raw), String(raw)).toBeNull();
+    for (const damaged of [null, {}, { schemaVersion: 'submodule-checkouts-v1', before: [], after: [], extra: true },
+      { schemaVersion: 'submodule-checkouts-v1', before: [['libs/a', sha], ['libs/a', sha]], after: [] },
+      { schemaVersion: 'submodule-checkouts-v1', before: [], after: [['libs/a', 'short-sha']] }])
+      expect(parseRecordedSourceSubmodules(damaged)).toBeUndefined();
+  });
 
   it('retains qualified dependency inputs from the original worker without granting capability or complete-context credit', () => {
     const workerRuntime = { before: runtime, after: { ...runtime } };

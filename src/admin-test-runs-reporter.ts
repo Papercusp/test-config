@@ -53,7 +53,8 @@ import {
   type PopulationCaptureStatus,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './configuration-snapshot.ts';
-import { captureRecordedProofContext, parseRecordedWorkerRuntime } from './execution-details.ts';
+import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseSubmoduleCheckoutStatus,
+  type RecordedSubmoduleCheckout, type RecordedSourceSubmodules } from './execution-details.ts';
 import { readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture.ts';
 import {
   mutationDescriptorForRow, readMutationInvocationDescriptor, type MutationInvocationDescriptor,
@@ -554,6 +555,7 @@ export interface WorktreeGitSnapshot {
   commit: string | null;
   porcelain: string | null;
   provenanceError?: string;
+  submodules?: RecordedSubmoduleCheckout[] | null;
 }
 
 /**
@@ -822,8 +824,19 @@ export async function captureWorktreeSnapshot(
   run: WorktreeGitRunner = runGit,
   phase?: WorktreeSnapshotPhase,
   signal?: AbortSignal,
+  includeSubmodules = false,
 ): Promise<WorktreeGitSnapshot> {
   const root = resolveWorktreeSnapshotRoot();
+  const withSubmodules = async (snapshot: WorktreeGitSnapshot): Promise<WorktreeGitSnapshot> => {
+    if (!includeSubmodules) return snapshot;
+    // Dirty source cannot qualify this context. Avoid a recursive Git command
+    // on ordinary shared-tree runs, and never infer a census from HEAD alone.
+    if (describeWorktreeDirt(snapshot, snapshot) !== null) return { ...snapshot, submodules: null };
+    signal?.throwIfAborted();
+    const observed = await runGitWithRetry(run, 'git submodule status --recursive', root);
+    signal?.throwIfAborted();
+    return { ...snapshot, submodules: parseSubmoduleCheckoutStatus(observed) };
+  };
   if (existsSync(join(root, '.verifier-source.json'))) {
     try {
       const mutation = mutationSubjectForVerifierSource(root);
@@ -841,16 +854,16 @@ export async function captureWorktreeSnapshot(
   const failed = (diagnostic: string) => errors.push(diagnostic);
   if (phase === 'before') {
     const prepared = await consumePreparedRootSnapshot(root, run, failed);
-    if (prepared) return prepared;
+    if (prepared) return withSubmodules(prepared);
   }
   const [commit, porcelain] = await Promise.all([
     runGitWithRetry(run, 'git rev-parse HEAD', root, failed),
     runGitWithRetry(run, 'git status --porcelain --untracked-files=all', root, failed),
   ]);
   const snapshot = { commit, porcelain, ...(errors.length ? { provenanceError: errors.join('; ') } : {}) };
-  if (!porcelain) return snapshot;
+  if (!porcelain) return withSubmodules(snapshot);
   const exemption = await resolveProbeSubjectExemption(root, run);
-  return { ...snapshot, porcelain: exemption ? exemptProbeSubject(porcelain, exemption) : porcelain };
+  return withSubmodules({ ...snapshot, porcelain: exemption ? exemptProbeSubject(porcelain, exemption) : porcelain });
 }
 
 export function mutationSubjectForVerifierSource(root: string): VerifierSourceMutation | undefined {
@@ -3125,7 +3138,8 @@ export default class AdminTestRunsReporter implements Reporter {
     // snapshot/writer seams.
     const snapshotReader: WorktreeSnapshotReader = typeof readWorktreeSnapshotOrOptions === 'function'
       ? readWorktreeSnapshotOrOptions
-      : (phase, signal) => captureWorktreeSnapshot(runGit, phase, signal);
+      : (phase, signal) => captureWorktreeSnapshot(runGit, phase, signal,
+        Boolean(process.env[PC_EXECUTED_INPUTS_DIR_ENV] || process.env.PC_EXECUTED_SOURCE_MAP_OUT));
     // Snapshot collection starts before any tests run. Handle synchronous
     // throws and rejected promises immediately and retain dirty provenance.
     this.readWorktreeSnapshot = async (phase?: WorktreeSnapshotPhase, signal?: AbortSignal) => {
@@ -3423,6 +3437,7 @@ export default class AdminTestRunsReporter implements Reporter {
     let worktreeDirty = true;
     let dirtReason: string | null = 'snapshot not taken';
     let commitSha: string | null = null;
+    let sourceSubmodules: RecordedSourceSubmodules = { schemaVersion: 'submodule-checkouts-v1', before: null, after: null };
     try {
       const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot('before');
       signal.throwIfAborted();
@@ -3430,6 +3445,8 @@ export default class AdminTestRunsReporter implements Reporter {
       dirtReason = describeWorktreeDirt(before, after);
       worktreeDirty = dirtReason !== null;
       commitSha = after.commit;
+      sourceSubmodules = { schemaVersion: 'submodule-checkouts-v1',
+        before: before.submodules ?? null, after: after.submodules ?? null };
     } catch (err) {
       // D-007: missing proof of stability is dirty, never a false clean.
       worktreeDirty = true;
@@ -3461,8 +3478,8 @@ export default class AdminTestRunsReporter implements Reporter {
       worktreeDirty,
       commitSha,
       executionDetails: row.executionDetails
-        ? { ...row.executionDetails, worktreeDirty, commitSha,
-          proofContext: captureRecordedProofContext({ ...row.executionDetails, worktreeDirty, commitSha }),
+        ? { ...row.executionDetails, worktreeDirty, commitSha, sourceSubmodules,
+          proofContext: captureRecordedProofContext({ ...row.executionDetails, worktreeDirty, commitSha, sourceSubmodules }),
           ...(worktreeDirty && dirtReason ? { worktreeDirtyReason: dirtReason } : {}),
           runtimeEnvironmentAfterCaptureStatus: runtimeEnvironmentAfter.status,
           ...(runtimeEnvironmentAfter.status === 'captured'

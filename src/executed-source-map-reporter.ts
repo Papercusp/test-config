@@ -56,7 +56,7 @@ import {
   type PgHandle,
   type WorktreeGitSnapshot,
 } from './admin-test-runs-reporter';
-import type { RecordedTestPopulation, PopulationCaptureStatus } from './execution-details';
+import type { RecordedTestPopulation, PopulationCaptureStatus, RecordedSourceSubmodules } from './execution-details';
 import { captureRecordedProofContext } from './execution-details';
 import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META, readExecutedSourceOriginals,
   type ExecutedOriginalSource } from './vitest-config';
@@ -802,7 +802,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
   ) {
     // Vitest constructs reporters with its options object; the unit suite injects seams.
     const snapshotReader =
-      typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions : captureWorktreeSnapshot;
+      typeof readWorktreeSnapshotOrOptions === 'function' ? readWorktreeSnapshotOrOptions
+        : () => captureWorktreeSnapshot(undefined, undefined, undefined, true);
     this.readWorktreeSnapshot = () => observeReporterStage('executed-source', 'source-snapshot', snapshotReader);
     // A flush timeout releases the reporter lease, but the default writer can
     // still be between SQL chunks. Keep the whole write alive until settlement.
@@ -1057,8 +1058,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
         worktreeDirty: before === null || computeWorktreeDirty(before, after),
       };
       const nativeRun = { ...checkpoint.nativeRun, files: checkpoint.nativeRun.files.map(file => ({ ...file,
+        sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1' as const,
+          before: before?.submodules ?? null, after: after.submodules ?? null },
         proofContext: captureRecordedProofContext({ commitSha: checkpoint.recordedSha,
-          worktreeDirty: checkpoint.worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime }),
+          worktreeDirty: checkpoint.worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime,
+          sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1',
+            before: before?.submodules ?? null, after: after.submodules ?? null } }),
       })) };
       await observeReporterStage('executed-source', 'completion-snapshot', async () => {
         await this.writeSnapshot(armed.outPath!, { ...checkpoint, nativeRun });
@@ -1089,11 +1094,14 @@ export default class ExecutedSourceMapReporter implements Reporter {
     }
     let worktreeDirty = true;
     let recordedSha: string | null = null;
+    let sourceSubmodules: RecordedSourceSubmodules = { schemaVersion: 'submodule-checkouts-v1', before: null, after: null };
     try {
       const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot();
       const after = await this.readWorktreeSnapshot();
       worktreeDirty = computeWorktreeDirty(before, after);
       recordedSha = after.commit;
+      sourceSubmodules = { schemaVersion: 'submodule-checkouts-v1',
+        before: before.submodules ?? null, after: after.submodules ?? null };
     } catch {
       worktreeDirty = true; // no proof of stability is dirty, never a false clean
     }
@@ -1112,8 +1120,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
             skipped: this.skipped, rows, diagnostics: this.diagnostics,
             ...(this.nativeRun ? { nativeRun: { ...this.nativeRun,
               files: this.nativeRun.files.map(file => ({ ...file,
+                sourceSubmodules,
                 proofContext: captureRecordedProofContext({ commitSha: recordedSha,
-                  worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime }),
+                  worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime, sourceSubmodules }),
               })) } } : {}),
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
             configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
