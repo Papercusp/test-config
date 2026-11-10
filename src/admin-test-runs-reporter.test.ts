@@ -995,7 +995,7 @@ describe('runtime environment recorded around execution', () => {
 });
 
 describe('actual reporter population capture', () => {
-  async function record(count: number, defect?: 'missing-ready' | 'missing-collection' | 'changed-collection' | 'unknown-ready') {
+  async function record(count: number, defect?: 'missing-ready' | 'missing-collection' | 'changed-collection' | 'unknown-ready' | 'terminal-at-collection') {
     const rows: TestRunRow[] = [];
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
       async row => { rows.push(row); });
@@ -1004,8 +1004,9 @@ describe('actual reporter population capture', () => {
     let collected = true;
     const tests = Array.from({ length: count + 1 }, (_, index) => ({
       id: `case-${index}`, fullName: index < 2 ? 'suite > duplicate' : `suite > \u03bb-${index}`,
+      options: { mode: index === count ? 'skip' : 'run' },
       get module() { return module; },
-      result: () => ({ state: index === count ? 'skipped' : collected ? 'pending' : 'passed' }),
+      result: () => ({ state: index === count ? 'skipped' : collected && defect !== 'terminal-at-collection' ? 'pending' : 'passed' }),
     }));
     const module = {
       project: { name: 'unit', config: { provide: { papercuspTestLayer: 'unit' } } },
@@ -1017,6 +1018,7 @@ describe('actual reporter population capture', () => {
     // These events deliberately differ from collection order.
     for (const test of tests.slice(0, defect === 'missing-ready' ? count - 1 : count).reverse())
       reporter.onTestCaseReady(test as never);
+    reporter.onTestCaseReady(tests[count] as never); // synthetic skipped-suite event
     if (defect === 'unknown-ready') reporter.onTestCaseReady({ ...tests[0], id: 'outside' } as never);
     collected = false;
     if (defect === 'changed-collection') tests.pop();
@@ -1038,6 +1040,12 @@ describe('actual reporter population capture', () => {
     expect(population.cases.filter(row => row.selected)).toHaveLength(count);
     expect(population.executionOrder[0][2]).toBe(`suite > \u03bb-${count - 1}`);
     expect(population.cases.find(row => !row.selected)?.outcome).toBe('skipped');
+  });
+
+  it('uses original runner selection when a fast case is already terminal at collection delivery', async () => {
+    const execution = await record(3, 'terminal-at-collection');
+    expect(execution.population?.cases.filter(row => row.selected)).toHaveLength(3);
+    expect(execution.population?.executionOrder).toHaveLength(3);
   });
 
   it.each(['missing-ready', 'missing-collection', 'changed-collection', 'unknown-ready'] as const)

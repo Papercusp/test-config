@@ -3168,12 +3168,14 @@ export default class AdminTestRunsReporter implements Reporter {
       const occurrences = new Map<string, number>();
       for (const test of testModule.children.allTests()) {
         if (typeof test.id !== 'string' || !test.id || identities.has(test.id)) return;
-        const state = test.result().state;
-        if (state !== 'pending' && state !== 'skipped') return;
+        // result() is a mutable view and can already be terminal when queued
+        // reporter callbacks run. The runner's captured options hold selection.
+        const mode = test.options?.mode;
+        if (!['run', 'only', 'skip', 'todo'].includes(mode)) return;
         const occurrence = (occurrences.get(test.fullName) ?? 0) + 1;
         occurrences.set(test.fullName, occurrence);
         identities.set(test.id, [testModule.project.name, file, test.fullName, occurrence, 'test']);
-        if (state === 'pending') selected.add(test.id);
+        if (mode === 'run' || mode === 'only') selected.add(test.id);
       }
       this.populations.set(testModule, { identities, selected, order: [], invalid: false });
     } catch { /* Missing collection is explicitly unproven. */ }
@@ -3184,10 +3186,12 @@ export default class AdminTestRunsReporter implements Reporter {
       const population = this.populations.get(test.module);
       if (!population) return;
       const identity = population.identities.get(test.id);
-      if (!identity || !population.selected.has(test.id) || identity[2] !== test.fullName) {
+      if (!identity || identity[2] !== test.fullName) {
         population.invalid = true;
         return;
       }
+      // Vitest synthesizes ready/result events for statically skipped suites.
+      if (!population.selected.has(test.id)) return;
       population.order.push(identity);
     } catch { /* Missing ready evidence fails reconciliation at module end. */ }
   }
