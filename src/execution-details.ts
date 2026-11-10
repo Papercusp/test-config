@@ -7,7 +7,7 @@
  * those two paths on the same contract without pulling operator-only code into
  * the reporter.
  */
-import { parseMutationDescriptor, type MutationDescriptor } from './mutation-descriptor.ts';
+import { parseMutationDescriptor, type MutationDescriptor } from '@papercusp/test-config/mutation-descriptor';
 import { createHash } from 'node:crypto';
 
 /** Complete runner collection, independent of bounded human-readable samples.
@@ -117,6 +117,25 @@ function executionPopulationMatches(value: Record<string, unknown>): boolean {
     && population.cases.filter(row => row.outcome === 'passed').length === value.passed
     && population.cases.filter(row => row.outcome === 'failed').length === value.failed
     && population.cases.filter(row => row.outcome === 'skipped').length === value.skipped;
+}
+
+/** Join native population to independent selection and uncapped counts.
+ * Population integrity alone grants no execution or reuse authority.
+ */
+export function parseRecordedNativePopulation(
+  file: unknown, specification: { testFile: string; projectName: string | null },
+): RecordedTestPopulation | undefined {
+  if (!isRecord(file) || file.populationCaptureStatus !== 'captured'
+    || file.testFile !== specification.testFile || file.projectName !== specification.projectName
+    || !isRecord(file.execution) || file.execution.collectionFailed !== false) return undefined;
+  const population = parseRecordedTestPopulation(file.population);
+  if (!population || !population.cases.every(row => row.identity[0] === (specification.projectName ?? '')
+    && row.identity[1] === specification.testFile && row.identity[4] === 'test')) return undefined;
+  for (const outcome of ['passed', 'failed', 'skipped'] as const) {
+    if (!Number.isSafeInteger(file.execution[outcome])
+      || file.execution[outcome] !== population.cases.filter(row => row.outcome === outcome).length) return undefined;
+  }
+  return population;
 }
 
 export const TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION = 1 as const;
