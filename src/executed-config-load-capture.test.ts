@@ -201,6 +201,95 @@ describe('precise coverage epoch preparation', () => {
     expect(result.dormant.state).toBe('zero');
     expect(result.terminal.runtimeQualification).toBe('unknown');
   });
+  it.each(['callback', 'promise'] as const)(
+    'rejects competing native worker Inspector transports during an owned epoch (%s)', transport => {
+      const root = mkdtempSync(join(tmpdir(), 'engine-worker-transport-'));
+      const capture = new URL('./executed-config-load-capture.ts', import.meta.url).href;
+      const path = join(root, 'pinned.mjs');
+      const source = 'function workerEntered() { return 7; } workerEntered();';
+      writeFileSync(path, source);
+      const options = { repositorySources: false, pinnedSources: [{ path, sha256: digest(source),
+        byteLength: Buffer.byteLength(source) }],
+        preciseCoverage: { epoch: '5a0abff0-f7d4-484a-8891-bbcebf05d205', admission: 1 } };
+      const workerSource = `const { parentPort } = require('node:worker_threads');
+        (async () => {
+          const { observeEngineScriptExecution } = await import(${JSON.stringify(capture)});
+          const observer = observeEngineScriptExecution('/unrelated', ${JSON.stringify(options)});
+          await import(${JSON.stringify(pathToFileURL(path).href)});
+          parentPort.once('message', () => {
+            const terminal = observer.terminalPreciseSnapshot();
+            parentPort.postMessage({ kind: 'finished', phase: terminal?.phase ?? null,
+              runtimeQualification: terminal?.runtimeQualification ?? null });
+            observer.disconnect(); parentPort.close();
+          });
+          parentPort.postMessage({ kind: 'ready' });
+        })().catch(error => { parentPort.postMessage({ error: String(error) }); parentPort.close(); });`;
+      const script = `import { Worker } from 'node:worker_threads';
+        import { once } from 'node:events';
+        import { Session } from 'node:inspector${transport === 'promise' ? '/promises' : ''}';
+        const { observeEngineScriptExecution } = await import(${JSON.stringify(capture)});
+        const session = new Session(); session.connect();
+        const post = ${transport === 'promise' ?
+          '(method, params) => session.post(method, params)' :
+          '(method, params) => new Promise((resolve, reject) => session.post(method, params, (error, value) => error ? reject(error) : resolve(value)))'};
+        let timer, worker, observer;
+        const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('native worker transport timeout')), 7000); });
+        const bounded = promise => Promise.race([promise, deadline]);
+        try {
+          const attached = once(session, 'NodeWorker.attachedToWorker');
+          await bounded(post('NodeWorker.enable', { waitForDebuggerOnStart: false }));
+          worker = new Worker(${JSON.stringify(workerSource)}, { eval: true });
+          const [[ready], [attachment]] = await bounded(Promise.all([once(worker, 'message'), attached]));
+          if (ready.kind !== 'ready') throw new Error(JSON.stringify(ready));
+          const pending = new Map(); let nextId = 0;
+          session.on('NodeWorker.receivedMessageFromWorker', ({ params }) => {
+            const message = JSON.parse(params.message), request = pending.get(message.id);
+            if (!request) return;
+            pending.delete(message.id);
+            if (message.error) request.reject(new Error(message.error.message));
+            else request.resolve(message.result);
+          });
+          const send = (method, params = {}) => bounded(new Promise((resolve, reject) => {
+            const id = ++nextId; pending.set(id, { resolve, reject });
+            Promise.resolve().then(() => post('NodeWorker.sendMessageToWorker', {
+              sessionId: attachment.params.sessionId, message: JSON.stringify({ id, method, params }),
+            })).catch(error => { pending.delete(id); reject(error); });
+          }));
+          // First prove this exact native worker transport accepts protocol
+          // commands; an unsupported-method error cannot masquerade as a guard.
+          await send('Profiler.enable');
+          observer = observeEngineScriptExecution('/unrelated', ${JSON.stringify({ ...options,
+            preciseCoverage: { ...options.preciseCoverage, admission: 0 } })});
+          let rejected = false;
+          try { await send('Profiler.takePreciseCoverage'); }
+          catch (error) { rejected = /exclusive precise coverage epoch/.test(String(error)); }
+          const ownership = observer.preciseStatus().ownership;
+          observer.disconnect();
+          // Delegation resumes outside the owning epoch and returns actual
+          // native coverage, including the worker target entered before it.
+          const native = await send('Profiler.takePreciseCoverage');
+          const entered = native.result.flatMap(row => row.functions)
+            .some(fn => fn.functionName === 'workerEntered' && fn.ranges[0].count > 0);
+          const finished = once(worker, 'message'); worker.postMessage('finish');
+          const [terminal] = await bounded(finished);
+          console.log(JSON.stringify({ rejected, ownership, nativeResponse: Array.isArray(native.result), entered, terminal }));
+        } finally {
+          clearTimeout(timer); observer?.disconnect(); session.disconnect();
+          if (worker) await worker.terminate();
+        }`;
+      const env = { ...process.env }; delete env.NODE_OPTIONS;
+      for (const key of Object.keys(env)) if (/^PC_/.test(key)) delete env[key];
+      try {
+        const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+          env, encoding: 'utf8', timeout: 10000,
+        }));
+        expect(result.rejected).toBe(true);
+        expect(result.ownership.rejected.map((row: { method: string }) => row.method))
+          .toEqual(['NodeWorker.sendMessageToWorker']);
+        expect(result).toMatchObject({ nativeResponse: true, entered: true,
+          terminal: { kind: 'finished', phase: 'taken', runtimeQualification: 'unknown' } });
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
   it('refuses the native automatic coverage collector already armed before JS bootstrap', () => {
     const result = run('native-auto-coverage');
     expect(result.terminal).toBeNull();
