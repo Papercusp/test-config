@@ -190,7 +190,19 @@ describe('precise coverage epoch preparation', () => {
           if (takeReturned) applicationBuiltinAfterTake++;
           defineOwn(this, '0', { configurable: true, enumerable: true, writable: true, value });
         } });` : ''}
+      ${mode.startsWith('terminal-inspector-') ? `const protocolTarget = ${mode === 'terminal-inspector-emit' ? "(await import('node:events')).EventEmitter.prototype" : 'Object.prototype'};
+        const protocolKey = ${JSON.stringify(mode === 'terminal-inspector-error' ? 'error' : mode === 'terminal-inspector-emit' ? 'emit' : 'toJSON')};
+        const protocolDescriptor = Object.getOwnPropertyDescriptor(protocolTarget, protocolKey);
+        const protocolDefine = Object.defineProperty;
+        protocolDefine(protocolTarget, protocolKey, ${mode === 'terminal-inspector-error' ? `{ configurable: true, get() {
+          if (takeReturned) applicationBuiltinAfterTake++; return undefined;
+        } }` : `{ configurable: true, writable: true, value: function() {
+          if (takeReturned) applicationBuiltinAfterTake++;
+          ${mode === 'terminal-inspector-emit' ? 'return intrinsicApply(protocolDescriptor.value, this, arguments);' : 'return this;'}
+        } }`});` : ''}
       const terminal = observer.terminalPreciseSnapshot();
+      ${mode.startsWith('terminal-inspector-') ? `if (protocolDescriptor) protocolDefine(protocolTarget, protocolKey, protocolDescriptor);
+        else delete protocolTarget[protocolKey];` : ''}
       ${mode === 'terminal-index-setters' ? `if (previousIndex) defineOwn(Array.prototype, '0', previousIndex);
         else delete Array.prototype[0];` : ''}
       ${mode === 'terminal-mutables' ? `for (let i = 0; i < mutations.length; i++) {
@@ -265,6 +277,16 @@ describe('precise coverage epoch preparation', () => {
     expect(result.dormant.state).toBe('zero');
     expect(result.applicationBuiltinAfterTake).toBe(0);
   });
+  it.each(['toJSON', 'error', 'emit'])(
+    'terminal capture rejects changed Inspector protocol prototypes before taking coverage (%s)', field => {
+      const result = run('terminal-inspector-' + field);
+      expect(result.terminal).toBeNull();
+      expect(result.status.phase).toBe('invalid');
+      expect(result.status.reasons).toContain('engine-inspector-prototype-drift');
+      expect(result.status.commands.filter((row: { method: string }) => row.method === 'Profiler.takePreciseCoverage'))
+        .toHaveLength(0);
+      expect(result.applicationBuiltinAfterTake).toBe(0);
+    });
   it('rejects public native coverage and console profiling helpers during an owned epoch', () => {
     const result = run('native-public');
     expect(result.rejected).toHaveLength(4);

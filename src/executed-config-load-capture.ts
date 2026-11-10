@@ -28,6 +28,10 @@ const shared = pinModuleState<{ capture: Capture | null }>(
 // or the caller's audited publication/hold suffix.
 const applyIntrinsic = Reflect.apply;
 const definePropertyIntrinsic = Object.defineProperty;
+const descriptorIntrinsic = Object.getOwnPropertyDescriptor;
+const prototypeIntrinsic = Object.getPrototypeOf;
+const ownKeysIntrinsic = Reflect.ownKeys;
+const hasOwnIntrinsic = Object.hasOwn;
 const oneShotHashIntrinsic = cryptoHash;
 const arrayIsArrayIntrinsic = Array.isArray;
 const numberIsFiniteIntrinsic = Number.isFinite;
@@ -284,6 +288,33 @@ export function observeEngineScriptExecution(repoRoot: string,
   let connected = false;
   let precisePhase: 'unarmed' | 'armed' | 'taken' | 'invalid' = 'unarmed';
   let owner: PreciseOwner | null = null;
+  // Node's public Inspector post still serializes ordinary objects, reads an
+  // absent response.error and emits through mutable EventEmitter prototypes.
+  // Retaining post alone does not exclude those application dispatch paths.
+  // Snapshot the enrolled prototype chain after installing our own guards;
+  // any later drift withholds the take instead of emitting a terminal receipt.
+  const protocolPrototypes: Array<{ prototype: object; keys: Array<string | symbol>;
+    descriptors: PropertyDescriptor[] }> = [];
+  const protocolPrototypesMatch = (): boolean => {
+    if (!protocolPrototypes.length || prototypeIntrinsic(session) !== protocolPrototypes[0].prototype) return false;
+    for (let index = 0; index < protocolPrototypes.length; index++) {
+      const row = protocolPrototypes[index];
+      const next = index + 1 < protocolPrototypes.length ? protocolPrototypes[index + 1].prototype : null;
+      if (prototypeIntrinsic(row.prototype) !== next) return false;
+      const keys = ownKeysIntrinsic(row.prototype);
+      if (keys.length !== row.keys.length) return false;
+      for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+        if (keys[keyIndex] !== row.keys[keyIndex]) return false;
+        const actual = descriptorIntrinsic(row.prototype, keys[keyIndex]);
+        const expected = row.descriptors[keyIndex];
+        if (!actual || actual.enumerable !== expected.enumerable || actual.configurable !== expected.configurable ||
+            hasOwnIntrinsic(actual, 'value') !== hasOwnIntrinsic(expected, 'value')) return false;
+        if (hasOwnIntrinsic(expected, 'value') ? actual.value !== expected.value || actual.writable !== expected.writable :
+            actual.get !== expected.get || actual.set !== expected.set) return false;
+      }
+    }
+    return true;
+  };
   const commands: Array<{ method: string; startedMs: number; endedMs: number | null;
     status: 'pending' | 'complete' | 'failed' }> = [];
   const post = <T>(method: string, params: Record<string, unknown> = {}): T => {
@@ -363,6 +394,12 @@ export function observeEngineScriptExecution(repoRoot: string,
     if (precise) {
       installPreciseCoverageOwnership();
       owner = { fenced: false, rejected: [] }; preciseOwnership.owner = owner;
+      for (let prototype = prototypeIntrinsic(session); prototype !== null; prototype = prototypeIntrinsic(prototype)) {
+        const keys = ownKeysIntrinsic(prototype), descriptors: PropertyDescriptor[] = [];
+        for (let index = 0; index < keys.length; index++)
+          appendOwn(descriptors, descriptorIntrinsic(prototype, keys[index])!);
+        appendOwn(protocolPrototypes, { prototype, keys, descriptors });
+      }
       post('Profiler.startPreciseCoverage', { callCount: true, detailed: true, allowTriggeredUpdates: false });
       precisePhase = 'armed';
     }
@@ -390,6 +427,10 @@ export function observeEngineScriptExecution(repoRoot: string,
         if (inspectorUrl() !== undefined) {
           addReason('engine-external-inspector-endpoint');
           throw new Error('external Inspector endpoint opened during the epoch');
+        }
+        if (!protocolPrototypesMatch()) {
+          addReason('engine-inspector-prototype-drift');
+          throw new Error('Inspector protocol prototypes changed during the epoch');
         }
         const raw = post<{ result: Array<{ scriptId: string; url: string;
           functions: EngineFunctionCoverage[] }>; timestamp: number }>('Profiler.takePreciseCoverage');
