@@ -101,6 +101,19 @@ describe('precise coverage epoch preparation', () => {
     const enrollment = { epoch: '5a0abff0-f7d4-484a-8891-bbcebf05d205', admission: 0 };
     const script = `import { Session, open } from 'node:inspector';
       import { Session as PromiseSession } from 'node:inspector/promises';
+      const fault = ${JSON.stringify(/^(start|take)-(pending|failed|partial)$/.test(mode) ? mode : null)};
+      if (fault) {
+        const original = Session.prototype.post;
+        Session.prototype.post = function(method, ...args) {
+          const [phase, kind] = fault.split('-');
+          if (method !== 'Profiler.' + phase + 'PreciseCoverage')
+            return Reflect.apply(original, this, [method, ...args]);
+          const callback = args.at(-1);
+          if (kind === 'pending') return;
+          callback(kind === 'failed' ? new Error('controlled protocol failure') : null,
+            kind === 'partial' ? { result: [] } : undefined);
+        };
+      }
       const { observeEngineScriptExecution, classifyEngineCoverageTargets } = await import(${JSON.stringify(capture)});
       const source = ${JSON.stringify(source)}, path = ${JSON.stringify(path)}, url = ${JSON.stringify(pathToFileURL(path).href)};
       const runtime = new Session(); runtime.connect();
@@ -194,6 +207,21 @@ describe('precise coverage epoch preparation', () => {
     expect(result.status.fence).toBe('terminal-entered-suffix-unverified');
     expect(result.status.runtimeQualification).toBe('unknown');
   });
+  it.each(['start-pending', 'start-failed', 'take-pending', 'take-failed', 'take-partial'])(
+    'never returns a terminal receipt for an incomplete protocol response (%s)', mode => {
+      const result = run(mode);
+      expect(result.terminal).toBeNull();
+      expect(result.status).toMatchObject({ phase: 'invalid', runtimeQualification: 'unknown' });
+      const method = 'Profiler.' + mode.split('-')[0] + 'PreciseCoverage';
+      const commands = result.status.commands.filter((row: { method: string }) => row.method === method);
+      expect(commands).toHaveLength(1);
+      expect(commands[0].status).toBe(mode.endsWith('partial') ? 'complete' : mode.split('-')[1]);
+      expect(result.status.reasons).toContain(mode.startsWith('start')
+        ? 'engine-inspector-unavailable' : 'engine-precise-terminal-response-unavailable');
+      if (mode.startsWith('start'))
+        expect(result.status.commands.some((row: { method: string }) =>
+          row.method === 'Profiler.takePreciseCoverage')).toBe(false);
+    });
 });
 
 describe('engine script execution observations', () => {
