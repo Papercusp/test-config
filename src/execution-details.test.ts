@@ -20,6 +20,8 @@ import {
   parseRecordedTestPopulation,
   captureRecordedProofContext,
   parseRecordedWorkerRuntime,
+  parseRecordedWorkerExecution,
+  stableRecordedWorkerExecution,
   parseRecordedSourceSubmodules,
   parseSubmoduleCheckoutStatus,
   type RecordedPopulationIdentity,
@@ -27,6 +29,54 @@ import {
   type TestRunExecutionDetails,
 } from './execution-details.ts';
 import { createProofContextIdentity, proofContextImpact, PROOF_CONTEXT_COMPONENTS } from './configuration-snapshot.ts';
+import { captureCurrentWorkerProcessIdentity } from './runtime-proof.ts';
+
+describe('original worker process custody', () => {
+  const processIdentity = { pid: 123, threadId: 0, bootId: '01234567-89ab-cdef-0123-456789abcdef', startTicks: '456' };
+  const execution = () => ({ schemaVersion: 'worker-execution-v1' as const,
+    captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: '/repo/a.test.ts',
+    before: processIdentity, after: { ...processIdentity } });
+
+  it('retains the actual kernel incarnation independently of input equivalence or fixture reset', () => {
+    const current = captureCurrentWorkerProcessIdentity();
+    if (process.platform === 'linux') {
+      expect(current).toMatchObject({ pid: process.pid, threadId: expect.any(Number),
+        bootId: expect.stringMatching(/^[a-f0-9-]{36}$/), startTicks: expect.stringMatching(/^\d+$/) });
+      expect(captureCurrentWorkerProcessIdentity()).toEqual(current);
+    } else expect(current).toBeNull();
+    const original = execution();
+    const reverse = { ...original, after: Object.fromEntries(Object.entries(processIdentity).reverse()) };
+    expect(stableRecordedWorkerExecution(reverse)).toEqual(original);
+    expect(parseTestRunExecutionDetails(details({ root: '/repo', filePath: 'a.test.ts', workerExecution: original }))
+      ?.workerExecution).toEqual(original);
+    expect(parseTestRunExecutionDetails(details({ root: '/other', filePath: 'a.test.ts', workerExecution: original })))
+      .toBeUndefined();
+    expect(captureRecordedProofContext({ commitSha: 'a'.repeat(40), worktreeDirty: false,
+      workerExecution: original } as never).components.runtimeCapabilities).toBeNull();
+    expect(original).not.toHaveProperty('fixtureReset');
+  });
+
+  it.each([{ pid: 124 }, { threadId: 1 }, { bootId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' },
+    { startTicks: '457' }])('rejects a different terminal worker incarnation: %j', changed => {
+    const value = { ...execution(), after: { ...processIdentity, ...changed } };
+    expect(parseRecordedWorkerExecution(value)).toEqual(value);
+    expect(stableRecordedWorkerExecution(value)).toBeUndefined();
+  });
+
+  it('keeps missing observations unknown and rejects malformed or invented reset assertions', () => {
+    for (const value of [undefined, {}, { ...execution(), testFile: 'a.test.ts' },
+      { ...execution(), captureId: 'diagnostic-only' }, { ...execution(), fixtureReset: true },
+      { ...execution(), before: { ...processIdentity, pid: 0 } },
+      { ...execution(), after: { ...processIdentity, threadId: -1 } },
+      { ...execution(), after: { ...processIdentity, bootId: 'host-label' } },
+      { ...execution(), before: { ...processIdentity, startTicks: '1.1' } }])
+      expect(parseRecordedWorkerExecution(value)).toBeUndefined();
+    for (const value of [{ ...execution(), before: null }, { ...execution(), after: null }]) {
+      expect(parseRecordedWorkerExecution(value)).toEqual(value);
+      expect(stableRecordedWorkerExecution(value)).toBeUndefined();
+    }
+  });
+});
 
 describe('original result proof-context capture', () => {
   const identity: RecordedPopulationIdentity = ['unit', 'libs/x/src/a.test.ts', 'case', 1, 'test'];

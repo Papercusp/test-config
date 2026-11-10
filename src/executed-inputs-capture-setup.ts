@@ -8,6 +8,7 @@
 import * as childProcess from 'node:child_process';
 import * as fs from 'node:fs';
 import { writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import * as net from 'node:net';
@@ -32,6 +33,8 @@ if (dir) {
     // Measure before installing fs capture: runtime hashing is recorder overhead,
     // not a test input. The final measurement follows endFile for the same reason.
     const root = inferWorkspaceRoot();
+    const captureId = randomUUID();
+    const processBefore = runtimeProof.captureCurrentWorkerProcessIdentity();
     const runtimeBefore = runtimeProof.captureCurrentRuntimeProofIdentity?.({ root }) ?? null;
     const workerState = () => (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__;
     const configurationBefore = captureWorkerTestConfiguration(workerState());
@@ -68,6 +71,9 @@ if (dir) {
           after: runtimeProof.captureCurrentRuntimeProofIdentity?.({ root }) ?? null };
         if (record) record.testConfiguration = { schemaVersion: 'vitest-worker-configuration-v1',
           before: configurationBefore, after: captureWorkerTestConfiguration(workerState()) };
+        if (record && filepath) record.workerExecution = { schemaVersion: 'worker-execution-v1',
+          captureId, testFile: filepath, before: processBefore,
+          after: runtimeProof.captureCurrentWorkerProcessIdentity() };
         if (record) record.moduleImports = captureModuleImports(
           (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__,
         );

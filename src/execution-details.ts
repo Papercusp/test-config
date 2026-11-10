@@ -9,7 +9,8 @@
  */
 import { parseMutationDescriptor, type MutationDescriptor } from '@papercusp/test-config/mutation-descriptor';
 import { createHash } from 'node:crypto';
-import { runtimeProofFingerprint, type RuntimeProofIdentity } from '@papercusp/test-config/runtime-proof';
+import { runtimeProofFingerprint, type RuntimeProofIdentity, type WorkerProcessIdentity } from '@papercusp/test-config/runtime-proof';
+import { isAbsolute, resolve } from 'node:path';
 import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
   readWorkerTestConfiguration, type RecordedWorkerTestConfiguration,
   type ProofContextIdentity } from '@papercusp/test-config/configuration-snapshot';
@@ -17,6 +18,44 @@ import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COM
 export interface RecordedWorkerRuntime {
   before: RuntimeProofIdentity | null;
   after: RuntimeProofIdentity | null;
+}
+
+/** Observed worker custody, kept separate from input equivalence. A fresh
+ * capture ID does not prove a fresh process, isolation or disposable fixtures. */
+export interface RecordedWorkerExecution {
+  schemaVersion: 'worker-execution-v1';
+  captureId: string;
+  testFile: string;
+  before: WorkerProcessIdentity | null;
+  after: WorkerProcessIdentity | null;
+}
+
+export function parseRecordedWorkerExecution(value: unknown): RecordedWorkerExecution | undefined {
+  if (!isRecord(value) || Object.keys(value).length !== 5 || value.schemaVersion !== 'worker-execution-v1'
+    || typeof value.captureId !== 'string'
+    || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value.captureId)
+    || typeof value.testFile !== 'string' || !isAbsolute(value.testFile)
+    || value.testFile.includes('\u0000') || !Object.hasOwn(value, 'before') || !Object.hasOwn(value, 'after')) return undefined;
+  const processIdentity = (identity: unknown): WorkerProcessIdentity | null | undefined => {
+    if (identity === null) return null;
+    if (!isRecord(identity) || Object.keys(identity).length !== 4
+      || !Number.isSafeInteger(identity.pid) || (identity.pid as number) <= 0
+      || !Number.isSafeInteger(identity.threadId) || (identity.threadId as number) < 0
+      || typeof identity.bootId !== 'string'
+      || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(identity.bootId)
+      || typeof identity.startTicks !== 'string' || !/^\d+$/.test(identity.startTicks)) return undefined;
+    return { pid: identity.pid as number, threadId: identity.threadId as number,
+      bootId: identity.bootId, startTicks: identity.startTicks };
+  };
+  const before = processIdentity(value.before), after = processIdentity(value.after);
+  return before === undefined || after === undefined ? undefined
+    : { schemaVersion: 'worker-execution-v1', captureId: value.captureId, testFile: value.testFile, before, after };
+}
+
+export function stableRecordedWorkerExecution(value: unknown): RecordedWorkerExecution | undefined {
+  const execution = parseRecordedWorkerExecution(value);
+  return execution?.before && execution.after
+    && JSON.stringify(execution.before) === JSON.stringify(execution.after) ? execution : undefined;
 }
 
 export type RecordedSubmoduleCheckout = [path: string, commitSha: string];
@@ -612,6 +651,7 @@ export interface TestRunExecutionDetails {
   /** Original per-file worker measurements, independent of the reporter process. */
   workerRuntime?: RecordedWorkerRuntime;
   workerTestConfiguration?: RecordedWorkerTestConfiguration;
+  workerExecution?: RecordedWorkerExecution;
   /** Original before/after recursive checkout census; null is unqualified. */
   sourceSubmodules?: RecordedSourceSubmodules;
   mutationPhase: string | null;
@@ -857,7 +897,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules', 'workerTestConfiguration',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules', 'workerTestConfiguration', 'workerExecution',
 ]);
 
 /** A rollout preflight only: this does not qualify any test result or relax parsing. */
@@ -967,6 +1007,8 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.proofContext !== undefined && !recordedProofContextMatches(value))
     || (value.workerRuntime !== undefined && !parseRecordedWorkerRuntime(value.workerRuntime))
     || (value.workerTestConfiguration !== undefined && !readWorkerTestConfiguration(value.workerTestConfiguration))
+    || (value.workerExecution !== undefined && parseRecordedWorkerExecution(value.workerExecution)?.testFile
+      !== resolve(value.root as string, value.filePath as string))
     || (value.sourceSubmodules !== undefined && !parseRecordedSourceSubmodules(value.sourceSubmodules))
     || (value.populationCaptureStatus !== undefined && (
       !POPULATION_CAPTURE_STATUSES.includes(value.populationCaptureStatus as PopulationCaptureStatus)

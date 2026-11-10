@@ -677,9 +677,13 @@ describe('ExecutedSourceMapReporter', () => {
       const runtime = { before: worker, after: worker };
       const testConfiguration = { schemaVersion: 'vitest-worker-configuration-v1',
         before: '5'.repeat(64), after: '5'.repeat(64) };
+      const processIdentity = { pid: 123, threadId: 0, bootId: '01234567-89ab-cdef-0123-456789abcdef', startTicks: '456' };
+      const workerExecution = { schemaVersion: 'worker-execution-v1',
+        captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: TEST_FILE,
+        before: processIdentity, after: processIdentity };
       process.env[PC_EXECUTED_INPUTS_DIR_ENV] = tmp;
       const path = inputsFilePath(tmp, TEST_FILE);
-      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime, testConfiguration }));
+      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime, testConfiguration, workerExecution }));
       const source = { ...clean, submodules: [['libs/observed', 'a'.repeat(40)]] as [string, string][] };
       const { r } = reporter(snapshot(source));
       const { mod, tests } = populationModule();
@@ -701,6 +705,8 @@ describe('ExecutedSourceMapReporter', () => {
       const details = parseTestRunExecutionDetails(rows[0]?.executionDetails);
       expect(details?.workerRuntime).toEqual(runtime);
       expect(details?.workerTestConfiguration).toEqual(testConfiguration);
+      expect(details?.workerExecution).toEqual(workerExecution);
+      expect(original.proof.inputs.workerExecution).toEqual(workerExecution);
       expect(details?.proofContext?.components.testConfiguration).toMatch(/^[a-f0-9]{64}$/);
       expect(original.proof.inputs.testConfiguration).toEqual(testConfiguration);
       expect(details?.proofContext).toEqual(original.proofContext);

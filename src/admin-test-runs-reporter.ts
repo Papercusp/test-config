@@ -55,7 +55,7 @@ import {
   testRunExecutionDetailsReaderMismatch,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, readWorkerTestConfiguration, type ConfigurationSnapshot } from './configuration-snapshot.ts';
-import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseSubmoduleCheckoutStatus,
+import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseRecordedWorkerExecution, parseSubmoduleCheckoutStatus,
   type RecordedSubmoduleCheckout, type RecordedSourceSubmodules } from './execution-details.ts';
 import { readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture.ts';
 import {
@@ -3356,6 +3356,8 @@ export default class AdminTestRunsReporter implements Reporter {
         if (workerRuntime) Object.assign(executionDetails, { workerRuntime });
         const workerTestConfiguration = readWorkerTestConfiguration(inputs?.testConfiguration);
         if (workerTestConfiguration) Object.assign(executionDetails, { workerTestConfiguration });
+        const workerExecution = parseRecordedWorkerExecution(inputs?.workerExecution);
+        if (workerExecution) Object.assign(executionDetails, { workerExecution });
         const boundaryObservations = collectBoundaryObservations(testModule);
         if (boundaryObservations) Object.assign(executionDetails, { boundaryObservations });
         const sqlCoverageObservations = collectSqlCoverageObservations(testModule);
