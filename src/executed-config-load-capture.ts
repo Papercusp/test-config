@@ -3,6 +3,7 @@
  * reads cannot recover these bytes. This never authorizes reusable test passes. */
 import { createHash } from 'node:crypto';
 import { Session } from 'node:inspector';
+import { Session as PromiseSession } from 'node:inspector/promises';
 import { mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import * as nodeModule from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -27,6 +28,180 @@ export const nativeSourceRetentionLimits = Object.freeze({ sourceBytes: 16 * 102
   processBytes: 64 * 1024 ** 2, pinnedSourceBytes: 128 * 1024 ** 2,
   pinnedProcessBytes: 256 * 1024 ** 2, pins: 4 });
 interface SourcePin { path: string; sha256: string; byteLength: number }
+export interface EngineCoverageRange { startOffset: number; endOffset: number; count: number }
+export interface EngineFunctionCoverage {
+  functionName: string;
+  isBlockCoverage: boolean;
+  ranges: EngineCoverageRange[];
+}
+export interface EngineCoverageTarget {
+  functionName: string;
+  functionRoot: { startOffset: number; endOffset: number };
+  ranges: Array<{ startOffset: number; endOffset: number }>;
+}
+interface PreciseCoverageEnrollment { epoch: string; admission: number }
+interface PreciseOwner {
+  fenced: boolean;
+  rejected: Array<{ method: string; monotonicMs: number }>;
+}
+const preciseOwnership = pinModuleState<{
+  owner: PreciseOwner | null;
+  installed: boolean;
+  failed: boolean;
+  rawPost: typeof Session.prototype.post | null;
+}>('@papercusp/test-config.precise-coverage-owner', () => ({
+  owner: null, installed: false, failed: false, rawPost: null,
+}));
+
+/** Exclude mutations through the public JS Inspector transports. This is only
+ * one part of exclusivity: native/internal/pre-captured access still requires
+ * the independent loaded-source audit. No claim about those paths is made. */
+function installPreciseCoverageOwnership(): void {
+  if (preciseOwnership.failed) throw new Error('precise ownership installation previously failed');
+  if (preciseOwnership.installed) return;
+  const inspector = nodeModule.createRequire(import.meta.url)('node:inspector') as typeof import('node:inspector');
+  const reject = (method: string): never => {
+    preciseOwnership.owner?.rejected.push({ method, monotonicMs: performance.now() });
+    throw new Error(`Inspector operation rejected by exclusive precise coverage epoch: ${method}`);
+  };
+  // Validate the whole write set before hardening any property. These guards
+  // remain delegating when no qualification epoch owns the isolate.
+  const targets = [
+    [Session.prototype, 'post'], [PromiseSession.prototype, 'post'],
+    [Session.prototype, 'connectToMainThread'], [inspector, 'open'],
+  ] as const;
+  for (const [target, name] of targets) {
+    const descriptor = Object.getOwnPropertyDescriptor(target, name);
+    if (!descriptor?.configurable || typeof descriptor.value !== 'function')
+      throw new Error(`unavailable Inspector ownership boundary: ${name}`);
+  }
+  preciseOwnership.rawPost = Session.prototype.post;
+  try {
+    for (const [target, name] of targets) {
+      const original = Object.getOwnPropertyDescriptor(target, name)!.value;
+      Object.defineProperty(target, name, { configurable: false, writable: false,
+        value: function(this: unknown, ...args: unknown[]) {
+          const owner = preciseOwnership.owner;
+          const method = typeof args[0] === 'string' ? args[0] : '<invalid-method>';
+          if (owner && (name !== 'post' || owner.fenced ||
+              method.startsWith('Profiler.') && method !== 'Profiler.getBestEffortCoverage'))
+            return reject(name === 'post' ? method : name);
+          return Reflect.apply(original, this, args);
+        } });
+    }
+    nodeModule.syncBuiltinESMExports();
+    preciseOwnership.installed = true;
+  } catch (error) { preciseOwnership.failed = true; throw error; }
+}
+
+/** Arithmetic for ONE already-bound precise response, never runtime admission.
+ * `zero` describes this response only. Its caller still owes pre-compilation
+ * arming, exclusive epoch ownership, the held execution fence, source/epoch/
+ * isolate binding and the complete independently audited target population.
+ * In particular this helper MUST NOT turn best-effort zero into non-entry. */
+export function classifyEngineCoverageTargets(observation: {
+  sourceTextSha256: string | null;
+  sourceTextLength: number | null;
+  functions: EngineFunctionCoverage[];
+}, expected: { sourceTextSha256: string; sourceTextLength: number; targets: EngineCoverageTarget[] }) {
+  const reasons = new Set<string>();
+  const spanKey = (range: { startOffset: number; endOffset: number }) =>
+    `${range.startOffset}:${range.endOffset}`;
+  const validSpan = (range: { startOffset: number; endOffset: number }) => range &&
+    Number.isSafeInteger(range.startOffset) && Number.isSafeInteger(range.endOffset) &&
+    range.startOffset >= 0 && range.endOffset > range.startOffset &&
+    range.endOffset <= expected.sourceTextLength;
+  const within = (inner: { startOffset: number; endOffset: number },
+    outer: { startOffset: number; endOffset: number }) =>
+    inner.startOffset >= outer.startOffset && inner.endOffset <= outer.endOffset;
+  const crosses = (a: { startOffset: number; endOffset: number },
+    b: { startOffset: number; endOffset: number }) =>
+    a.startOffset < b.startOffset && b.startOffset < a.endOffset && a.endOffset < b.endOffset ||
+    b.startOffset < a.startOffset && a.startOffset < b.endOffset && b.endOffset < a.endOffset;
+  const result = (state: 'entry' | 'zero' | 'unknown', observedEntry = false) => ({
+    scope: 'one-source-bound-coverage-response' as const, state, observedEntry,
+    reasons: [...reasons].sort(),
+    // No caller can mistake correct interval arithmetic for method acceptance.
+    runtimeQualification: 'unknown' as const,
+  });
+  if (!expected || !observation || !/^[a-f0-9]{64}$/.test(expected.sourceTextSha256) ||
+      !Number.isSafeInteger(expected.sourceTextLength) || expected.sourceTextLength < 1 ||
+      observation.sourceTextSha256 !== expected.sourceTextSha256 ||
+      observation.sourceTextLength !== expected.sourceTextLength) {
+    reasons.add('source-identity-mismatch'); return result('unknown');
+  }
+  if (!Array.isArray(observation.functions) || !Array.isArray(expected.targets) ||
+      expected.targets.length === 0) {
+    reasons.add('missing-function-or-target-population'); return result('unknown');
+  }
+  const roots = new Set<string>();
+  for (const fn of observation.functions) {
+    if (!fn || typeof fn.functionName !== 'string' || typeof fn.isBlockCoverage !== 'boolean' ||
+        !Array.isArray(fn.ranges) || fn.ranges.length === 0) {
+      reasons.add('malformed-function-tree'); continue;
+    }
+    const root = fn.ranges[0], seen = new Set<string>(), ancestors: EngineCoverageRange[] = [];
+    if (!validSpan(root)) { reasons.add('malformed-function-root'); continue; }
+    if (roots.has(spanKey(root))) reasons.add('ambiguous-function-root');
+    if (!fn.isBlockCoverage && fn.ranges.length !== 1) reasons.add('malformed-function-tree');
+    roots.add(spanKey(root));
+    let previousStart = -1;
+    for (const range of fn.ranges) {
+      if (!validSpan(range) || !Number.isSafeInteger(range.count) || range.count < 0 ||
+          !within(range, root) || seen.has(spanKey(range)) || range.startOffset < previousStart) {
+        reasons.add('malformed-function-tree'); continue;
+      }
+      while (ancestors.length && range.startOffset >= ancestors[ancestors.length - 1].endOffset)
+        ancestors.pop();
+      if (ancestors.length && !within(range, ancestors[ancestors.length - 1]))
+        reasons.add('crossing-block-ranges');
+      ancestors.push(range); seen.add(spanKey(range)); previousStart = range.startOffset;
+    }
+  }
+  // Function roots are independently nested too. An outer function's positive
+  // count does not imply entry to a nested function, but a crossing root cannot
+  // be a calibrated tree. Keep this linear after sorting, not an all-pairs scan.
+  const functionRoots = observation.functions.filter(fn => Array.isArray(fn?.ranges) && fn.ranges.length)
+    .map(fn => fn.ranges[0]).filter(validSpan)
+    .sort((a, b) => a.startOffset - b.startOffset || b.endOffset - a.endOffset);
+  const ancestors: EngineCoverageRange[] = [];
+  for (const root of functionRoots) {
+    while (ancestors.length && root.startOffset >= ancestors[ancestors.length - 1].endOffset)
+      ancestors.pop();
+    if (ancestors.length && crosses(root, ancestors[ancestors.length - 1]))
+      reasons.add('crossing-function-roots');
+    ancestors.push(root);
+  }
+  if (reasons.size) return result('unknown');
+  let observedEntry = false;
+  const targetIds = new Set<string>();
+  for (const target of expected.targets) {
+    if (!target || typeof target.functionName !== 'string' || !validSpan(target.functionRoot) ||
+        !Array.isArray(target.ranges) || target.ranges.length === 0) {
+      reasons.add('malformed-target-population'); continue;
+    }
+    const targetId = `${target.functionName}:${spanKey(target.functionRoot)}`;
+    if (targetIds.has(targetId)) reasons.add('duplicate-target-function');
+    targetIds.add(targetId);
+    const matches = observation.functions.filter(fn => fn.functionName === target.functionName &&
+      spanKey(fn.ranges[0]) === spanKey(target.functionRoot));
+    if (matches.length !== 1) { reasons.add('missing-or-ambiguous-target-function'); continue; }
+    const fn = matches[0], seen = new Set<string>();
+    for (const targetRange of target.ranges) {
+      if (!validSpan(targetRange) || !within(targetRange, target.functionRoot) || seen.has(spanKey(targetRange))) {
+        reasons.add('malformed-target-population'); continue;
+      }
+      seen.add(spanKey(targetRange));
+      // Equality is deliberate: neither containment nor a spanning zero counts.
+      const exact = fn.ranges.find(range => spanKey(range) === spanKey(targetRange));
+      if (!exact) { reasons.add('missing-exact-target-range'); continue; }
+      if (exact.count > 0 || observation.functions.some(row => row.ranges.some(range =>
+        within(range, targetRange) && range.count > 0))) observedEntry = true;
+    }
+  }
+  return result(reasons.size ? 'unknown' : observedEntry ? 'entry' : 'zero', observedEntry);
+}
+
 export function validateSourcePins(pins: unknown): SourcePin[] {
   if (!Array.isArray(pins) || pins.length > nativeSourceRetentionLimits.pins ||
       new Set(pins.map(pin => pin?.path)).size !== pins.length || pins.some(pin =>
@@ -44,23 +219,43 @@ export function validateSourcePins(pins: unknown): SourcePin[] {
  * so an absent/zero count stays unknown. No precise coverage, pauses or code
  * rewriting are used, and this diagnostic never authorizes reusable passes. */
 export function observeEngineScriptExecution(repoRoot: string,
-  options: { pinnedSources?: SourcePin[]; repositorySources?: boolean } = {}) {
+  options: { pinnedSources?: SourcePin[]; repositorySources?: boolean;
+    preciseCoverage?: PreciseCoverageEnrollment } = {}) {
   const pins = validateSourcePins(options.pinnedSources ?? []);
   const pinnedOnly = options.repositorySources === false;
+  const precise = options.preciseCoverage;
+  if (precise && (Object.keys(precise).sort().join() !== 'admission,epoch' ||
+      typeof precise.epoch !== 'string' || !/^[a-f0-9-]{36}$/.test(precise.epoch) ||
+      !Number.isSafeInteger(precise.admission) || precise.admission < 0 || precise.admission >= 256 ||
+      !pinnedOnly || pins.length === 0)) throw new Error('Invalid precise coverage enrollment');
   const session = new Session();
   const reasons = new Set<string>();
   const scripts = new Map<string, { scriptId: string; url: string; path: string;
     sourceTextSha256: string | null; sourceTextLength: number | null;
-    independentPin?: SourcePin }>();
+    independentPin?: SourcePin; compiledBeforePreciseArm?: boolean }>();
   let pinnedBytes = 0;
   let connected = false;
+  let precisePhase: 'unarmed' | 'armed' | 'taken' | 'invalid' = 'unarmed';
+  let owner: PreciseOwner | null = null;
+  const commands: Array<{ method: string; startedMs: number; endedMs: number | null;
+    status: 'pending' | 'complete' | 'failed' }> = [];
   const post = <T>(method: string, params: Record<string, unknown> = {}): T => {
     let done = false;
     let result: unknown;
     let failure: Error | null = null;
-    session.post(method, params, (error, response) => { done = true; failure = error; result = response; });
+    const command = { method, startedMs: performance.now(), endedMs: null as number | null,
+      status: 'pending' as 'pending' | 'complete' | 'failed' };
+    if (precise) commands.push(command);
+    const transport = owner && preciseOwnership.owner === owner ? preciseOwnership.rawPost! : session.post;
+    try {
+      Reflect.apply(transport, session, [method, params, (error: Error | null, response: unknown) => {
+        done = true; failure = error; result = response;
+      }]);
+    } catch (error) { command.status = 'failed'; command.endedMs = performance.now(); throw error; }
     // Exit/signal observers must finish synchronously. Never attest a pending
     // protocol request; its eventual callback cannot repair an emitted receipt.
+    command.endedMs = performance.now();
+    command.status = !done ? 'pending' : failure ? 'failed' : 'complete';
     if (!done) throw new Error(`pending inspector request: ${method}`);
     if (failure) throw failure;
     return result as T;
@@ -70,6 +265,8 @@ export function observeEngineScriptExecution(repoRoot: string,
       const absolute = params.url.startsWith('file:') ? fileURLToPath(params.url) : params.url;
       if (!isAbsolute(absolute)) return;
       const pin = pins.find(pin => pathToFileURL(pin.path).href === params.url);
+      if (pin && precise && precisePhase !== 'armed')
+        reasons.add(precisePhase === 'taken' ? 'engine-target-after-terminal-take' : 'engine-target-before-precise-arm');
       const rel = relative(repoRoot, absolute).split(/[\\/]/).join('/');
       if (!pin && (pinnedOnly || !rel || isAbsolute(rel) || rel === '..' || rel.startsWith('../') ||
           rel.split('/').includes('node_modules'))) return;
@@ -96,14 +293,63 @@ export function observeEngineScriptExecution(repoRoot: string,
       scripts.set(params.scriptId, { scriptId: params.scriptId, url: params.url, path,
         sourceTextSha256: changed || !pinMatches ? null : sourceTextSha256,
         sourceTextLength: changed || !pinMatches ? null : scriptSource.length,
-        ...(pin ? { independentPin: { ...pin } } : {}) });
+        ...(pin ? { independentPin: { ...pin } } : {}),
+        ...(precise ? { compiledBeforePreciseArm: precisePhase !== 'armed' } : {}) });
     } catch { reasons.add('engine-script-source-unavailable'); }
   });
   try {
     session.connect(); connected = true;
     post('Debugger.enable'); post('Profiler.enable');
-  } catch { reasons.add('engine-inspector-unavailable'); }
+    if (precise) {
+      if (preciseOwnership.owner) throw new Error('precise coverage epoch already owned');
+      installPreciseCoverageOwnership();
+      owner = { fenced: false, rejected: [] }; preciseOwnership.owner = owner;
+      post('Profiler.startPreciseCoverage', { callCount: true, detailed: true, allowTriggeredUpdates: false });
+      precisePhase = 'armed';
+    }
+  } catch { reasons.add('engine-inspector-unavailable'); if (precise) precisePhase = 'invalid'; }
+  const preciseStatus = () => ({ epoch: precise?.epoch ?? null, admission: precise?.admission ?? null,
+    phase: precisePhase, ownership: { scope: 'public-js-inspector-transports',
+      enforced: owner !== null && preciseOwnership.owner === owner && preciseOwnership.installed,
+      rejected: owner?.rejected.map(row => ({ ...row })) ?? [],
+      internalNativeAndPrecapturedAccess: 'unmeasured' },
+    fence: owner?.fenced ? 'terminal-entered-suffix-unverified' : 'not-entered',
+    commands: commands.map(row => ({ ...row })), reasons: [...reasons].sort(),
+    runtimeQualification: 'unknown' as const });
   return {
+    preciseStatus,
+    /** The returned raw response is preparation, not a non-entry receipt. Its
+     * caller must durably publish it before END, retain the audited synchronous
+     * suffix/hold through parent K, and bind complete source/epoch ownership.
+     * There is deliberately no caller-supplied `exclusive:true` shortcut. */
+    terminalPreciseSnapshot() {
+      if (!precise || !owner || preciseOwnership.owner !== owner || precisePhase !== 'armed') {
+        reasons.add('engine-precise-terminal-out-of-order'); precisePhase = 'invalid'; return null;
+      }
+      owner.fenced = true;
+      try {
+        const raw = post<{ result: Array<{ scriptId: string; url: string;
+          functions: EngineFunctionCoverage[] }>; timestamp: number }>('Profiler.takePreciseCoverage');
+        precisePhase = 'taken';
+        if (!Array.isArray(raw.result) || !Number.isFinite(raw.timestamp)) throw new Error('partial precise response');
+        const observed = [...scripts.values()].map(script => {
+          const matches = raw.result.filter(row => row.scriptId === script.scriptId && row.url === script.url);
+          const source = post<{ scriptSource: string }>('Debugger.getScriptSource', { scriptId: script.scriptId });
+          const sourceMatches = typeof source.scriptSource === 'string' && script.sourceTextSha256 !== null &&
+            hash(source.scriptSource) === script.sourceTextSha256;
+          if (!sourceMatches) reasons.add('engine-script-source-changed');
+          if (matches.length !== 1 || !Array.isArray(matches[0].functions))
+            reasons.add('engine-precise-script-response-incomplete');
+          return { ...script, sourceTextSha256: sourceMatches ? script.sourceTextSha256 : null,
+            functions: matches.length === 1 && Array.isArray(matches[0].functions) ? matches[0].functions : [] };
+        });
+        return { schemaVersion: 'node-engine-precise-terminal-v1', ...preciseStatus(),
+          basis: 'one-start-one-terminal-precise-response', offsetUnits: 'utf16-code-units',
+          raw, scripts: observed };
+      } catch {
+        precisePhase = 'invalid'; reasons.add('engine-precise-terminal-response-unavailable'); return null;
+      }
+    },
     snapshot() {
       type Coverage = { scriptId: string; url: string; functions: Array<{ functionName: string;
         ranges: Array<{ startOffset: number; endOffset: number; count: number }> }> };
@@ -148,7 +394,11 @@ export function observeEngineScriptExecution(repoRoot: string,
           'engine-url-original-source-association-unmeasured', 'node-external-native-runtime-unmeasured',
           'node-process-descendant-population-unmeasured', 'node-loader-chain-not-closed'] };
     },
-    disconnect() { if (connected) { session.disconnect(); connected = false; } },
+    disconnect() {
+      if (precise) { precisePhase = 'invalid'; reasons.add('engine-precise-disconnected'); }
+      if (owner && preciseOwnership.owner === owner) preciseOwnership.owner = null;
+      if (connected) { session.disconnect(); connected = false; }
+    },
   };
 }
 
