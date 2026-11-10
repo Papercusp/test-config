@@ -76,6 +76,24 @@ describe('population-v1 complete execution identity', () => {
     expect(selected.selectionHash).not.toBe(baseline.selectionHash);
   });
 
+  it('roundtrips full parameterized titles beyond diagnostic caps and refuses unrepresentable or sparse identities', () => {
+    const long = identity(`suite > ${'parameter'.repeat(1_000)} \n\t\u001b \ud83d\udc3e`);
+    const row: RecordedPopulationCase = { identity: long, selected: true, outcome: 'passed' };
+    const population = createRecordedTestPopulation([row], [long])!;
+    expect(population, 'complete population must retain the original long case title').toBeDefined();
+    expect(population.cases[0].identity[2]).toBe(long[2]);
+    expect(parseRecordedTestPopulation(JSON.parse(JSON.stringify(population)))).toEqual(population);
+    expect(parseTestRunExecutionDetails(details({ passed: 1, population, populationCaptureStatus: 'captured' })))
+      .toBeDefined();
+    expect(parseTestRunExecutionDetails(details({ populationCaptureStatus: 'captured' }))).toBeUndefined();
+    expect(parseTestRunExecutionDetails(details({ populationCaptureStatus: 'invented' }))).toBeUndefined();
+    for (const title of ['a\u0000b', 'a\ud800b', 'a\udc00b']) {
+      const id = identity(title);
+      expect(createRecordedTestPopulation([{ ...row, identity: id }], [id])).toBeUndefined();
+    }
+    expect(createRecordedTestPopulation(new Array(1), [])).toBeUndefined();
+  });
+
   it('rejects sampled, tampered, duplicate, incomplete and wrong-file records while retaining legacy rows', () => {
     const population = createRecordedTestPopulation(cases, [a, b])!;
     expect(parseRecordedTestPopulation({ ...population, cases: population.cases.slice(1) })).toBeUndefined();
