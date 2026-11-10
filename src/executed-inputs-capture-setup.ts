@@ -14,6 +14,7 @@ import * as net from 'node:net';
 import * as workerThreads from 'node:worker_threads';
 import { afterAll, expect } from 'vitest';
 import * as runtimeProof from './runtime-proof.ts';
+import { captureWorkerTestConfiguration } from './configuration-snapshot.ts';
 import { inferWorkspaceRoot } from './admin-test-runs-reporter';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,
@@ -32,6 +33,8 @@ if (dir) {
     // not a test input. The final measurement follows endFile for the same reason.
     const root = inferWorkspaceRoot();
     const runtimeBefore = runtimeProof.captureCurrentRuntimeProofIdentity?.({ root }) ?? null;
+    const workerState = () => (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__;
+    const configurationBefore = captureWorkerTestConfiguration(workerState());
     // `import * as` yields the ESM namespace (read-only); the CJS module objects are what
     // callers and syncBuiltinESMExports see, so patch those.
     const cjs = (ns: object) => ((ns as { default?: object }).default ?? ns) as Record<string, unknown>;
@@ -63,6 +66,8 @@ if (dir) {
         const record = endFile(filepath ?? '');
         if (record) record.runtime = { before: runtimeBefore,
           after: runtimeProof.captureCurrentRuntimeProofIdentity?.({ root }) ?? null };
+        if (record) record.testConfiguration = { schemaVersion: 'vitest-worker-configuration-v1',
+          before: configurationBefore, after: captureWorkerTestConfiguration(workerState()) };
         if (record) record.moduleImports = captureModuleImports(
           (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__,
         );

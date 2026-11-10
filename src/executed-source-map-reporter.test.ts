@@ -675,9 +675,11 @@ describe('ExecutedSourceMapReporter', () => {
         binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
         configurationSha256: '4'.repeat(64) };
       const runtime = { before: worker, after: worker };
+      const testConfiguration = { schemaVersion: 'vitest-worker-configuration-v1',
+        before: '5'.repeat(64), after: '5'.repeat(64) };
       process.env[PC_EXECUTED_INPUTS_DIR_ENV] = tmp;
       const path = inputsFilePath(tmp, TEST_FILE);
-      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime }));
+      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime, testConfiguration }));
       const source = { ...clean, submodules: [['libs/observed', 'a'.repeat(40)]] as [string, string][] };
       const { r } = reporter(snapshot(source));
       const { mod, tests } = populationModule();
@@ -698,6 +700,9 @@ describe('ExecutedSourceMapReporter', () => {
       await ledger.onTestRunEnd();
       const details = parseTestRunExecutionDetails(rows[0]?.executionDetails);
       expect(details?.workerRuntime).toEqual(runtime);
+      expect(details?.workerTestConfiguration).toEqual(testConfiguration);
+      expect(details?.proofContext?.components.testConfiguration).toMatch(/^[a-f0-9]{64}$/);
+      expect(original.proof.inputs.testConfiguration).toEqual(testConfiguration);
       expect(details?.proofContext).toEqual(original.proofContext);
       expect(details?.proofContext?.components.dependencies).toMatch(/^[a-f0-9]{64}$/);
       expect(details?.sourceSubmodules).toEqual(original.sourceSubmodules);

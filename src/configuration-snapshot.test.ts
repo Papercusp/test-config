@@ -10,7 +10,61 @@ import {
   observeConfigurationReads,
   readConfigurationReadObservation,
   configurationReadLimits,
+  captureWorkerTestConfiguration, readWorkerTestConfiguration,
 } from './configuration-snapshot';
+
+describe('original worker resolved test configuration', () => {
+  const config = () => ({ root: '/repo', pool: 'forks', isolate: true, setupFiles: ['setup.ts'],
+    sequence: { seed: 42, shuffle: false }, testNamePattern: /case/iu,
+    env: { API_TOKEN: 'private-value' }, optional: undefined,
+    snapshotOptions: { updateSnapshot: 'none' }, snapshotEnvironment: undefined });
+
+  it('hashes actual resolved options deterministically without publishing values or calling toJSON', () => {
+    const original = config();
+    const hash = captureWorkerTestConfiguration({ config: original });
+    expect(hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(captureWorkerTestConfiguration({ config: Object.fromEntries(Object.entries(original).reverse()) })).toBe(hash);
+    // Vitest installs this implementation after collection. It is not a
+    // serialized option; the separate behavior identity is still owed.
+    expect(captureWorkerTestConfiguration({ config: { ...original, snapshotOptions: {
+      ...original.snapshotOptions, snapshotEnvironment: new (class RuntimeEnvironment {})() } } })).toBe(hash);
+    const receipt = { schemaVersion: 'vitest-worker-configuration-v1', before: hash, after: hash };
+    expect(readWorkerTestConfiguration(JSON.parse(JSON.stringify(receipt)))).toEqual(receipt);
+    expect(JSON.stringify(receipt)).not.toContain('private-value');
+  });
+
+  it.each([
+    { isolate: false }, { setupFiles: ['other.ts'] }, { sequence: { seed: 43, shuffle: false } },
+    { testNamePattern: /case/i }, { snapshotEnvironment: 'custom-snapshot-environment' },
+    { env: { API_TOKEN: 'changed-private-value' } }, { optional: null }, { optional: '' },
+    { optional: [] }, { optional: {} },
+  ])('changes identity when a resolved input changes: %j', changed => {
+    expect(captureWorkerTestConfiguration({ config: { ...config(), ...changed } }))
+      .not.toBe(captureWorkerTestConfiguration({ config: config() }));
+  });
+
+  it('refuses unmeasured, unsupported, cyclic, bounded or accessor inputs without invoking application code', () => {
+    let called = false;
+    const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
+    const accessor = Object.defineProperty({}, 'secret', { enumerable: true, get() { called = true; return 'value'; } });
+    for (const configValue of [undefined, {}, { ...config(), method() { called = true; } },
+      { ...config(), value: cyclic }, { ...config(), value: accessor },
+      { ...config(), value: Symbol('option') }, { ...config(), value: new Date() },
+      { ...config(), value: 'x'.repeat(1_048_577) }, { ...config(), value: Array(10_001).fill(0) },
+      { ...config(), toJSON() { called = true; return {}; } }])
+      expect(captureWorkerTestConfiguration({ config: configValue })).toBeNull();
+    expect(captureWorkerTestConfiguration({ get config() { called = true; return config(); } })).toBeNull();
+    expect(captureWorkerTestConfiguration({ config: Object.defineProperty(config(), 'root', {
+      get() { called = true; return '/repo'; } }) })).toBeNull();
+    expect(called).toBe(false);
+    for (const value of [undefined, {}, { schemaVersion: 'wrong', before: null, after: null },
+      { schemaVersion: 'vitest-worker-configuration-v1', before: 'diagnostic', after: null },
+      { schemaVersion: 'vitest-worker-configuration-v1', before: null, after: null, extra: true }])
+      expect(readWorkerTestConfiguration(value)).toBeNull();
+    expect(readWorkerTestConfiguration({ schemaVersion: 'vitest-worker-configuration-v1', before: null, after: null }))
+      .not.toBeNull();
+  });
+});
 
 describe('complete proof context and proportional reach', () => {
   const components = () => Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, sha(key)])) as ProofContextIdentity['components'];

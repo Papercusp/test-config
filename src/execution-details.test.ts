@@ -36,6 +36,27 @@ describe('original result proof-context capture', () => {
     binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
     configurationSha256: '4'.repeat(64) };
 
+  it('binds stable original worker test options and rejects missing, changed or transplanted observations', () => {
+    const workerTestConfiguration = { schemaVersion: 'vitest-worker-configuration-v1' as const,
+      before: '1'.repeat(64), after: '1'.repeat(64) };
+    const proofContext = captureRecordedProofContext({ ...input, workerTestConfiguration });
+    expect(proofContext.components.testConfiguration).toMatch(/^[a-f0-9]{64}$/);
+    expect(proofContext.components.compilerConfiguration).toBeNull();
+    expect(proofContext.components.behavior).toBeNull();
+    const row = details({ ...input, passed: 1, workerTestConfiguration, proofContext });
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify(row)))?.workerTestConfiguration)
+      .toEqual(workerTestConfiguration);
+    for (const damaged of [undefined, null, {}, { ...workerTestConfiguration, before: null },
+      { ...workerTestConfiguration, after: '2'.repeat(64) }, { ...workerTestConfiguration, extra: true }]) {
+      expect(captureRecordedProofContext({ ...input, workerTestConfiguration: damaged }).components.testConfiguration).toBeNull();
+      expect(parseTestRunExecutionDetails({ ...row, workerTestConfiguration: damaged })).toBeUndefined();
+    }
+    const changed = { ...workerTestConfiguration, before: '2'.repeat(64), after: '2'.repeat(64) };
+    expect(captureRecordedProofContext({ ...input, workerTestConfiguration: changed }).components.testConfiguration)
+      .not.toBe(proofContext.components.testConfiguration);
+    expect(parseTestRunExecutionDetails({ ...row, workerTestConfiguration: changed })).toBeUndefined();
+  });
+
   it('binds the complete stable recursive submodule checkout census and rejects a retained context after replacement', () => {
     const sourceSubmodules = { schemaVersion: 'submodule-checkouts-v1' as const,
       before: [['libs/z', '1'.repeat(40)], ['libs/a', '2'.repeat(40)]],

@@ -1062,6 +1062,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
           before: before?.submodules ?? null, after: after.submodules ?? null },
         proofContext: captureRecordedProofContext({ commitSha: checkpoint.recordedSha,
           worktreeDirty: checkpoint.worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime,
+          workerTestConfiguration: file.proof.inputs?.testConfiguration,
           sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1',
             before: before?.submodules ?? null, after: after.submodules ?? null } }),
       })) };
@@ -1122,7 +1123,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
               files: this.nativeRun.files.map(file => ({ ...file,
                 sourceSubmodules,
                 proofContext: captureRecordedProofContext({ commitSha: recordedSha,
-                  worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime, sourceSubmodules }),
+                  worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime, sourceSubmodules,
+                  workerTestConfiguration: file.proof.inputs?.testConfiguration }),
               })) } } : {}),
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
             configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),

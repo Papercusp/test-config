@@ -95,6 +95,7 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
         nativeRun: { files: Array<{ proof: { inputs: {
           runtime?: { before: { name: string; executable: string } | null;
             after: { name: string; executable: string } | null };
+          testConfiguration?: { schemaVersion: string; before: string | null; after: string | null };
         } | null } }> };
         rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[];
           executedModules?: string[]; moduleEvaluations?: { basis: string; reasons: string[];
@@ -110,6 +111,11 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       // The setup's afterAll wrote the file's inputs record and the reporter consumed it.
       expect(map.rows[0]?.inputsCaptured).toBe(true);
       const runtime = map.nativeRun.files[0]?.proof.inputs?.runtime;
+      const options = map.nativeRun.files[0]?.proof.inputs?.testConfiguration;
+      expect(options, 'original worker options must survive the actual handoff').toMatchObject({
+        schemaVersion: 'vitest-worker-configuration-v1', before: expect.stringMatching(/^[a-f0-9]{64}$/),
+        after: expect.stringMatching(/^[a-f0-9]{64}$/) });
+      expect(options!.after).toBe(options!.before);
       expect(runtime).toHaveProperty('before');
       expect(runtime).toHaveProperty('after');
       if (!runtime?.before || !runtime.after) {

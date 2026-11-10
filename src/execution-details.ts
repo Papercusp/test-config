@@ -11,6 +11,7 @@ import { parseMutationDescriptor, type MutationDescriptor } from '@papercusp/tes
 import { createHash } from 'node:crypto';
 import { runtimeProofFingerprint, type RuntimeProofIdentity } from '@papercusp/test-config/runtime-proof';
 import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
+  readWorkerTestConfiguration, type RecordedWorkerTestConfiguration,
   type ProofContextIdentity } from '@papercusp/test-config/configuration-snapshot';
 
 export interface RecordedWorkerRuntime {
@@ -87,6 +88,7 @@ export function parseRecordedWorkerRuntime(value: unknown): RecordedWorkerRuntim
 export function captureRecordedProofContext(input: {
   commitSha: unknown; worktreeDirty: unknown; population?: unknown; workerRuntime?: unknown;
   sourceSubmodules?: unknown;
+  workerTestConfiguration?: unknown;
 }): ProofContextIdentity {
   const components = Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, null])) as
     ProofContextIdentity['components'];
@@ -107,6 +109,9 @@ export function captureRecordedProofContext(input: {
   if (before && before === after && worker?.before)
     components.dependencies = digest('dependencies', [worker.before.lockfileSha256,
       worker.before.nativeDependencyGeneration]);
+  const configuration = readWorkerTestConfiguration(input.workerTestConfiguration);
+  if (configuration?.before && configuration.before === configuration.after)
+    components.testConfiguration = digest('testConfiguration', configuration.before);
   return createProofContextIdentity(components)!;
 }
 
@@ -114,7 +119,7 @@ function recordedProofContextMatches(value: Record<string, unknown>): boolean {
   const context = readProofContextIdentity(value.proofContext);
   const measured = captureRecordedProofContext({ commitSha: value.commitSha,
     worktreeDirty: value.worktreeDirty, population: value.population, workerRuntime: value.workerRuntime,
-    sourceSubmodules: value.sourceSubmodules });
+    sourceSubmodules: value.sourceSubmodules, workerTestConfiguration: value.workerTestConfiguration });
   return context !== null && PROOF_CONTEXT_COMPONENTS.every(key => context.components[key] === measured.components[key]);
 }
 
@@ -606,6 +611,7 @@ export interface TestRunExecutionDetails {
   proofContext?: ProofContextIdentity;
   /** Original per-file worker measurements, independent of the reporter process. */
   workerRuntime?: RecordedWorkerRuntime;
+  workerTestConfiguration?: RecordedWorkerTestConfiguration;
   /** Original before/after recursive checkout census; null is unqualified. */
   sourceSubmodules?: RecordedSourceSubmodules;
   mutationPhase: string | null;
@@ -851,7 +857,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules', 'workerTestConfiguration',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -935,6 +941,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.population !== undefined && !executionPopulationMatches(value))
     || (value.proofContext !== undefined && !recordedProofContextMatches(value))
     || (value.workerRuntime !== undefined && !parseRecordedWorkerRuntime(value.workerRuntime))
+    || (value.workerTestConfiguration !== undefined && !readWorkerTestConfiguration(value.workerTestConfiguration))
     || (value.sourceSubmodules !== undefined && !parseRecordedSourceSubmodules(value.sourceSubmodules))
     || (value.populationCaptureStatus !== undefined && (
       !POPULATION_CAPTURE_STATUSES.includes(value.populationCaptureStatus as PopulationCaptureStatus)

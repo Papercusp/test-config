@@ -35,6 +35,84 @@ export interface ConfigurationSnapshot {
   fingerprint: string;
 }
 
+/** Resolved options in the original Vitest worker. Only digests leave it:
+ * options can contain credentials in env/defines. This measures test options,
+ * not compiler inputs or the implementations of the runtime they configure. */
+export interface RecordedWorkerTestConfiguration {
+  schemaVersion: 'vitest-worker-configuration-v1';
+  before: string | null;
+  after: string | null;
+}
+
+export function readWorkerTestConfiguration(value: unknown): RecordedWorkerTestConfiguration | null {
+  if (!isPlainObject(value) || !exactKeys(value, ['schemaVersion', 'before', 'after'])
+    || value.schemaVersion !== 'vitest-worker-configuration-v1'
+    || [value.before, value.after].some(hash => hash !== null && !proofHash(hash))) return null;
+  return { schemaVersion: value.schemaVersion, before: value.before as string | null,
+    after: value.after as string | null };
+}
+
+/** Hash the entire serialized worker configuration with explicit type tags.
+ * Unsupported objects, functions, accessors, symbols and cycles stay unknown;
+ * never invoke application toJSON or silently omit an input.
+ * Vitest adds snapshotOptions.snapshotEnvironment as a runtime implementation.
+ * Its selector stays in config.snapshotEnvironment; implementation identity is
+ * owed separately by behavior, which this capture never supplies. */
+export function captureWorkerTestConfiguration(workerState: unknown): string | null {
+  try {
+    if (!isPlainObject(workerState)) return null;
+    const property = Object.getOwnPropertyDescriptor(workerState, 'config');
+    const config = property && 'value' in property ? property.value : null;
+    if (!isPlainObject(config)) return null;
+    const field = (key: string) => Object.getOwnPropertyDescriptor(config, key)?.value;
+    if (typeof field('root') !== 'string' || !field('root')
+      || typeof field('isolate') !== 'boolean' || typeof field('pool') !== 'string'
+      || !Array.isArray(field('setupFiles'))) return null;
+    const active = new Set<object>();
+    let nodes = 0;
+    let textSize = 0;
+    const encode = (value: unknown, path: string[], depth: number): unknown => {
+      if (++nodes > 10_000 || depth > 32) throw new Error('configuration bound');
+      if (value === null) return ['null'];
+      switch (typeof value) {
+        case 'undefined': return ['undefined'];
+        case 'boolean': return ['boolean', value];
+        case 'string':
+          textSize += value.length;
+          if (value.length > 1_048_576 || textSize > 2_097_152) throw new Error('configuration string bound');
+          return ['string', value];
+        case 'number': return ['number', Number.isNaN(value) ? 'NaN' : Object.is(value, -0) ? '-0' : String(value)];
+        case 'object': break;
+        default: throw new Error('unsupported configuration value');
+      }
+      const object = value as object;
+      if (active.has(object)) throw new Error('cyclic configuration');
+      const prototype = Object.getPrototypeOf(object);
+      const keys = Reflect.ownKeys(object);
+      if (keys.some(key => typeof key !== 'string')) throw new Error('symbol configuration key');
+      if (prototype === RegExp.prototype && keys.length === 1 && keys[0] === 'lastIndex')
+        return ['regexp', RegExp.prototype.toString.call(object),
+          encode(Object.getOwnPropertyDescriptor(object, 'lastIndex')!.value, path, depth + 1)];
+      const array = Array.isArray(object);
+      if (!array && prototype !== Object.prototype && prototype !== null)
+        throw new Error('unsupported configuration object');
+      active.add(object);
+      const entries: unknown[] = [];
+      for (const key of (keys as string[]).sort()) {
+        textSize += key.length;
+        if (textSize > 2_097_152) throw new Error('configuration key bound');
+        if (path.length === 1 && path[0] === 'snapshotOptions' && key === 'snapshotEnvironment') continue;
+        const descriptor = Object.getOwnPropertyDescriptor(object, key)!;
+        if (!('value' in descriptor)) throw new Error('configuration accessor');
+        entries.push([key, encode(descriptor.value, [...path, key], depth + 1)]);
+      }
+      active.delete(object);
+      return [array ? 'array' : 'object', entries];
+    };
+    return sha256Hex(JSON.stringify(['vitest-worker-configuration-v1', encode(config, [], 0)]));
+  } catch { return null; }
+}
+
 /** One field on existing qualification/repair/results, not another proof store.
  * Digests identify measured inputs; they never grant execution or reuse authority.
  * Null is an explicit missing measurement, including a relevant unknown graph.

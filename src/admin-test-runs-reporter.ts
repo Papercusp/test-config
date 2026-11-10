@@ -52,7 +52,7 @@ import {
   createRecordedTestPopulation, type RecordedPopulationIdentity, type RecordedPopulationCase,
   type PopulationCaptureStatus,
 } from './execution-details.ts';
-import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './configuration-snapshot.ts';
+import { captureConfigurationSnapshot, readWorkerTestConfiguration, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseSubmoduleCheckoutStatus,
   type RecordedSubmoduleCheckout, type RecordedSourceSubmodules } from './execution-details.ts';
 import { readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture.ts';
@@ -3315,9 +3315,12 @@ export default class AdminTestRunsReporter implements Reporter {
               : this.populationCapture.status(testModule),
             ...(population && !counts.collectionFailed ? { population } : {}) } : null;
       if (executionDetails) {
+        const inputs = readInputsRecord(process.env[PC_EXECUTED_INPUTS_DIR_ENV], testModule.moduleId);
         const workerRuntime = parseRecordedWorkerRuntime(
-          readInputsRecord(process.env[PC_EXECUTED_INPUTS_DIR_ENV], testModule.moduleId)?.runtime);
+          inputs?.runtime);
         if (workerRuntime) Object.assign(executionDetails, { workerRuntime });
+        const workerTestConfiguration = readWorkerTestConfiguration(inputs?.testConfiguration);
+        if (workerTestConfiguration) Object.assign(executionDetails, { workerTestConfiguration });
         const boundaryObservations = collectBoundaryObservations(testModule);
         if (boundaryObservations) Object.assign(executionDetails, { boundaryObservations });
         const sqlCoverageObservations = collectSqlCoverageObservations(testModule);
