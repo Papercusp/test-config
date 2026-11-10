@@ -18,10 +18,56 @@ import {
   stableRecordedRuntimeEnvironment,
   createRecordedTestPopulation,
   parseRecordedTestPopulation,
+  captureRecordedProofContext,
   type RecordedPopulationIdentity,
   type RecordedPopulationCase,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
+import { createProofContextIdentity, proofContextImpact } from './configuration-snapshot.ts';
+
+describe('original result proof-context capture', () => {
+  const identity: RecordedPopulationIdentity = ['unit', 'libs/x/src/a.test.ts', 'case', 1, 'test'];
+  const population = createRecordedTestPopulation([{ identity, selected: true, outcome: 'passed' }], [identity])!;
+  const input = { commitSha: 'a'.repeat(40), worktreeDirty: false, population };
+
+  it('binds the actual source and complete population while preserving every unmeasured input', () => {
+    const proofContext = captureRecordedProofContext(input);
+    expect(proofContext.components.source).toMatch(/^[a-f0-9]{64}$/);
+    expect(proofContext.components.population).toMatch(/^[a-f0-9]{64}$/);
+    const { source, population: measuredPopulation, ...unknown } = proofContext.components;
+    expect(Object.values(unknown)).toEqual(Array(10).fill(null));
+    expect(proofContextImpact({ before: proofContext, after: proofContext })).toEqual({
+      status: 'unknown', reason: 'proof-context-incomplete' });
+    const row = details({ ...input, passed: 1, proofContext });
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify(row)))?.proofContext).toEqual(proofContext);
+    expect(parseTestRunExecutionDetails({ ...row, commitSha: 'b'.repeat(40) })).toBeUndefined();
+    expect(parseTestRunExecutionDetails({ ...row, worktreeDirty: true })).toBeUndefined();
+    const tampered = createProofContextIdentity({ ...proofContext.components, population: 'f'.repeat(64) })!;
+    expect(parseTestRunExecutionDetails({ ...row, proofContext: tampered })).toBeUndefined();
+  });
+
+  it('keeps dirty, missing and malformed source and population measurements unknown', () => {
+    for (const damaged of [{ ...input, worktreeDirty: true }, { ...input, commitSha: null },
+      { ...input, commitSha: 'diagnostic-only' }])
+      expect(captureRecordedProofContext(damaged).components.source).toBeNull();
+    for (const damaged of [undefined, null, { ...population, populationHash: 'f'.repeat(64) }])
+      expect(captureRecordedProofContext({ ...input, population: damaged }).components.population).toBeNull();
+  });
+
+  it('separates outcome changes from population, selection and observed order changes', () => {
+    const before = captureRecordedProofContext(input);
+    const failed = createRecordedTestPopulation([{ identity, selected: true, outcome: 'failed' }], [identity])!;
+    expect(captureRecordedProofContext({ ...input, population: failed })).toEqual(before);
+    const unselected = createRecordedTestPopulation([{ identity, selected: false, outcome: 'skipped' }], [])!;
+    expect(captureRecordedProofContext({ ...input, population: unselected }).components.population)
+      .not.toBe(before.components.population);
+    const repeated = createRecordedTestPopulation(population.cases, [identity, identity])!;
+    expect(captureRecordedProofContext({ ...input, population: repeated }).components.population)
+      .not.toBe(before.components.population);
+    expect(captureRecordedProofContext({ ...input, commitSha: 'b'.repeat(40) }).components.source)
+      .not.toBe(before.components.source);
+  });
+});
 
 describe('registered per-file Vitest projects', () => {
   it('keeps the DB-free PTY process fixture classified as integration', () => {

@@ -57,6 +57,7 @@ import {
   type WorktreeGitSnapshot,
 } from './admin-test-runs-reporter';
 import type { RecordedTestPopulation, PopulationCaptureStatus } from './execution-details';
+import { captureRecordedProofContext } from './execution-details';
 import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META, readExecutedSourceOriginals,
   type ExecutedOriginalSource } from './vitest-config';
 import { qualifyLoadedConfigSources, qualifyLoadedMainProcessSources } from './executed-config-load-capture.ts';
@@ -1056,8 +1057,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
         recordedGitDir: this.resolveGitDir(this.repoRoot),
         worktreeDirty: before === null || computeWorktreeDirty(before, after),
       };
+      const nativeRun = { ...checkpoint.nativeRun, files: checkpoint.nativeRun.files.map(file => ({ ...file,
+        proofContext: captureRecordedProofContext({ commitSha: checkpoint.recordedSha,
+          worktreeDirty: checkpoint.worktreeDirty, population: file.population }),
+      })) };
       await observeReporterStage('executed-source', 'completion-snapshot', async () => {
-        await this.writeSnapshot(armed.outPath!, checkpoint);
+        await this.writeSnapshot(armed.outPath!, { ...checkpoint, nativeRun });
       });
       const completionIds = payload.nativeRun.files.map(file => file.completionId)
         .filter(completionId => !this.acknowledgedCompletionIds.has(completionId));
@@ -1105,7 +1110,11 @@ export default class ExecutedSourceMapReporter implements Reporter {
               noPersist: this.armed.noPersist,
             },
             skipped: this.skipped, rows, diagnostics: this.diagnostics,
-            ...(this.nativeRun ? { nativeRun: this.nativeRun } : {}),
+            ...(this.nativeRun ? { nativeRun: { ...this.nativeRun,
+              files: this.nativeRun.files.map(file => ({ ...file,
+                proofContext: captureRecordedProofContext({ commitSha: recordedSha,
+                  worktreeDirty, population: file.population }),
+              })) } } : {}),
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
             configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
             mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot, this.configEntries) },

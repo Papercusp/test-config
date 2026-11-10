@@ -9,6 +9,38 @@
  */
 import { parseMutationDescriptor, type MutationDescriptor } from '@papercusp/test-config/mutation-descriptor';
 import { createHash } from 'node:crypto';
+import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
+  type ProofContextIdentity } from '@papercusp/test-config/configuration-snapshot';
+
+/** Inputs actually measured by both reporters today. A stable enclosing commit
+ * does not measure submodule materialization, runtime capabilities, schemas,
+ * fixtures, generated assets or the selection graph. Keep those unknown until
+ * their own producers supply evidence; this partial context never enables reuse.
+ * Outcomes are results, not inputs, and deliberately do not enter this digest.
+ */
+export function captureRecordedProofContext(input: {
+  commitSha: unknown; worktreeDirty: unknown; population?: unknown;
+}): ProofContextIdentity {
+  const components = Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, null])) as
+    ProofContextIdentity['components'];
+  const digest = (kind: string, value: unknown) => createHash('sha256')
+    .update(JSON.stringify(['recorded-proof-context-v1', kind, value])).digest('hex');
+  if (input.worktreeDirty === false && typeof input.commitSha === 'string'
+    && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.commitSha))
+    components.source = digest('source', input.commitSha);
+  const population = parseRecordedTestPopulation(input.population);
+  if (population) components.population = digest('population', [population.populationHash,
+    population.selectionHash, population.executionOrderHash]);
+  return createProofContextIdentity(components)!;
+}
+
+function recordedProofContextMatches(value: Record<string, unknown>): boolean {
+  const context = readProofContextIdentity(value.proofContext);
+  const measured = captureRecordedProofContext({ commitSha: value.commitSha,
+    worktreeDirty: value.worktreeDirty, population: value.population });
+  return context !== null && context.components.source === measured.components.source
+    && context.components.population === measured.components.population;
+}
 
 /** Complete runner collection, independent of bounded human-readable samples.
  * Reuse additionally needs the original run/fence, process/reset receipts and
@@ -494,6 +526,8 @@ export interface TestRunExecutionDetails {
   /** Exact collection/selection/outcomes and observed order; legacy absence is unknown. */
   population?: RecordedTestPopulation;
   populationCaptureStatus?: PopulationCaptureStatus;
+  /** Reporter-measured context on this original result. Null components remain unknown. */
+  proofContext?: ProofContextIdentity;
   mutationPhase: string | null;
   /** The commit observed after the run; null means runtime identity is unproven. */
   commitSha: string | null;
@@ -737,7 +771,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population', 'populationCaptureStatus',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -819,6 +853,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || !isNonNegativeSafeInteger(value.passed) || !isNonNegativeSafeInteger(value.failed)
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
     || (value.population !== undefined && !executionPopulationMatches(value))
+    || (value.proofContext !== undefined && !recordedProofContextMatches(value))
     || (value.populationCaptureStatus !== undefined && (
       !POPULATION_CAPTURE_STATUSES.includes(value.populationCaptureStatus as PopulationCaptureStatus)
       || (value.populationCaptureStatus === 'captured') !== (value.population !== undefined)))

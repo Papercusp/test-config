@@ -702,8 +702,9 @@ describe('ExecutedSourceMapReporter', () => {
         qualificationAttemptId: 'frozen-qualification-attempt' });
       expect(checkpoint.nativeRun.selectedPopulationMatched).toBe(false);
       await ledger.onTestRunEnd();
-      const execution = ledgerRows[0]?.executionDetails as { population?: unknown };
+      const execution = ledgerRows[0]?.executionDetails as { population?: unknown; proofContext?: unknown };
       expect(execution?.population).toEqual(original.population);
+      expect(execution?.proofContext).toEqual(original.proofContext);
       await r.onTestRunEnd([mod], [], 'passed');
       expect(nativeOut().selectedPopulationMatched).toBe(true);
       expect(nativeOut().files[0]).toEqual(original);

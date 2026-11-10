@@ -3230,6 +3230,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(persisted[0].commitSha).toBe('abc');
     expect(persisted[0].executionDetails).toBeTruthy();
     expect(persisted[0].executionDetails).not.toHaveProperty('worktreeDirtyReason');
+    expect(persisted[0].executionDetails?.proofContext).toMatchObject({ schemaVersion: 'proof-context-v1',
+      components: { source: null, population: null, dependencies: null, runtimeCapabilities: null } });
   });
 
   it('does not attribute a nested unversioned verifier source archive to a clean enclosing checkout', async () => {
