@@ -35,6 +35,93 @@ export interface ConfigurationSnapshot {
   fingerprint: string;
 }
 
+/** One field on existing qualification/repair/results, not another proof store.
+ * Digests identify measured inputs; they never grant execution or reuse authority.
+ * Null is an explicit missing measurement, including a relevant unknown graph.
+ */
+export const PROOF_CONTEXT_COMPONENTS = ['source', 'submodules', 'dependencies',
+  'compilerConfiguration', 'testConfiguration', 'runtimeCapabilities', 'generatedAssets',
+  'schema', 'fixtures', 'behavior', 'selectionGraph', 'population'] as const;
+export type ProofContextComponent = (typeof PROOF_CONTEXT_COMPONENTS)[number];
+export interface ProofContextIdentity {
+  schemaVersion: 'proof-context-v1';
+  components: Record<ProofContextComponent, string | null>;
+  fingerprint: string;
+}
+export interface ProofContextReach {
+  schemaVersion: 'reach-v1';
+  component: ProofContextComponent;
+  before: string;
+  after: string;
+  /** Versioned complete OLD and NEW graph/consumer censuses, not a radius label. */
+  provenance: { version: string; before: string; after: string; complete: true };
+  tests: string[];
+  legs: string[];
+}
+export interface ProofContextComparison {
+  before: unknown;
+  after: unknown;
+  reach?: unknown;
+}
+
+const proofHash = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) =>
+  Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+
+/** Canonical across JSONB key order. Unknown inputs remain in the identity as null. */
+export function createProofContextIdentity(
+  components: Record<ProofContextComponent, string | null>,
+): ProofContextIdentity | null {
+  if (!isPlainObject(components) || !exactKeys(components, PROOF_CONTEXT_COMPONENTS)
+    || PROOF_CONTEXT_COMPONENTS.some(key => components[key] !== null && !proofHash(components[key]))) return null;
+  const entries = PROOF_CONTEXT_COMPONENTS.map(key => [key, components[key]] as const);
+  return { schemaVersion: 'proof-context-v1', components: Object.fromEntries(entries) as ProofContextIdentity['components'],
+    fingerprint: `sha256-proof-context-v1:${sha256Hex(JSON.stringify(['proof-context-v1', entries]))}` };
+}
+
+/** Recompute persisted identity; a hash or a truthy completeness label is insufficient. */
+export function readProofContextIdentity(value: unknown): ProofContextIdentity | null {
+  if (!isPlainObject(value) || !exactKeys(value, ['schemaVersion', 'components', 'fingerprint'])
+    || value.schemaVersion !== 'proof-context-v1' || !isPlainObject(value.components)) return null;
+  const rebuilt = createProofContextIdentity(value.components as ProofContextIdentity['components']);
+  return rebuilt && rebuilt.fingerprint === value.fingerprint ? rebuilt : null;
+}
+
+/** Producers obtain reach provenance from actual old/new graph/consumer censuses.
+ * This parser cannot mint it from source drift or a caller's radius label.
+ */
+export function proofContextImpact(value: ProofContextComparison | null | undefined):
+  { status: 'known'; tests: string[]; legs: string[]; changed: ProofContextComponent[] }
+  | { status: 'unknown'; reason: string } {
+  const before = readProofContextIdentity(value?.before), after = readProofContextIdentity(value?.after);
+  if (!before || !after) return { status: 'unknown', reason: 'proof-context-unmeasured' };
+  if (PROOF_CONTEXT_COMPONENTS.some(key => before.components[key] === null || after.components[key] === null))
+    return { status: 'unknown', reason: 'proof-context-incomplete' };
+  const changed = PROOF_CONTEXT_COMPONENTS.filter(key => before.components[key] !== after.components[key]);
+  if (!changed.length) return { status: 'known', tests: [], legs: [], changed };
+  if (!Array.isArray(value?.reach) || value.reach.length !== changed.length)
+    return { status: 'unknown', reason: 'proof-context-reach-incomplete' };
+  const seen = new Set<string>(), tests = new Set<string>(), legs = new Set<string>();
+  const ids = (items: unknown): items is string[] => Array.isArray(items)
+    && items.every(id => typeof id === 'string' && id.trim().length > 0 && id.trim() === id)
+    && new Set(items).size === items.length;
+  for (const row of value.reach) {
+    if (!isPlainObject(row) || !exactKeys(row, ['schemaVersion', 'component', 'before', 'after', 'provenance', 'tests', 'legs'])
+      || row.schemaVersion !== 'reach-v1' || !changed.includes(row.component as ProofContextComponent)
+      || seen.has(row.component as string) || row.before !== before.components[row.component as ProofContextComponent]
+      || row.after !== after.components[row.component as ProofContextComponent]
+      || !isPlainObject(row.provenance) || !exactKeys(row.provenance, ['version', 'before', 'after', 'complete'])
+      || typeof row.provenance.version !== 'string' || !row.provenance.version.trim()
+      || row.provenance.complete !== true || !proofHash(row.provenance.before) || !proofHash(row.provenance.after)
+      || !ids(row.tests) || !ids(row.legs)) return { status: 'unknown', reason: 'proof-context-reach-invalid' };
+    seen.add(row.component as string);
+    for (const id of row.tests) tests.add(id);
+    for (const id of row.legs) legs.add(id);
+  }
+  if ([...tests].some(id => legs.has(id))) return { status: 'unknown', reason: 'proof-context-reach-ambiguous' };
+  return { status: 'known', tests: [...tests].sort(), legs: [...legs].sort(), changed };
+}
+
 export const configurationReadLimits = Object.freeze({ reads: 512, keyLength: 256 });
 
 export interface ConfigurationReadObservation {

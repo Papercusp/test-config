@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import {
+  PROOF_CONTEXT_COMPONENTS, createProofContextIdentity, readProofContextIdentity, proofContextImpact,
+  type ProofContextIdentity, type ProofContextReach,
   captureConfigurationSnapshot,
   configurationSnapshotFingerprint,
   readConfigurationSnapshot,
@@ -9,6 +11,57 @@ import {
   readConfigurationReadObservation,
   configurationReadLimits,
 } from './configuration-snapshot';
+
+describe('complete proof context and proportional reach', () => {
+  const components = () => Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, sha(key)])) as ProofContextIdentity['components'];
+  const context = () => createProofContextIdentity(components())!;
+  const reach = (before: ProofContextIdentity, after: ProofContextIdentity, component: ProofContextReach['component']): ProofContextReach => ({
+    schemaVersion: 'reach-v1', component, before: before.components[component]!, after: after.components[component]!,
+    provenance: { version: 'selected-consumers-v1', before: sha('old graph'), after: sha('new graph'), complete: true },
+    tests: ['pkg/affected.test.ts'], legs: ['lint:affected'],
+  });
+
+  it('roundtrips JSONB ordering, rejects tampering, and treats equal known inputs as reusable without a reach query', () => {
+    const before = context();
+    const after = { ...before, components: Object.fromEntries(Object.entries(before.components).reverse()) };
+    expect(readProofContextIdentity(JSON.parse(JSON.stringify(after)))).toEqual(before);
+    expect(proofContextImpact({ before, after })).toEqual({ status: 'known', changed: [], tests: [], legs: [] });
+    expect(readProofContextIdentity({ ...before, components: { ...before.components, behavior: sha('changed') } })).toBeNull();
+    expect(readProofContextIdentity({ ...before, extra: true })).toBeNull();
+    expect(createProofContextIdentity({ ...before.components, schema: 'not a hash' })).toBeNull();
+  });
+
+  it.each(PROOF_CONTEXT_COMPONENTS)('refuses an unknown %s even when the two identities compare equal', component => {
+    const partial = createProofContextIdentity({ ...components(), [component]: null });
+    expect(readProofContextIdentity(partial)).not.toBeNull();
+    expect(proofContextImpact({ before: partial, after: partial })).toEqual({ status: 'unknown', reason: 'proof-context-incomplete' });
+    const missing = { ...components() };
+    delete (missing as Partial<typeof missing>)[component];
+    expect(createProofContextIdentity(missing)).toBeNull();
+  });
+
+  it.each(PROOF_CONTEXT_COMPONENTS)('binds changed %s to exact old/new complete reach', component => {
+    const before = context(), after = createProofContextIdentity({ ...components(), [component]: sha('changed') })!;
+    const row = reach(before, after, component);
+    expect(proofContextImpact({ before, after, reach: [row] })).toEqual({ status: 'known', changed: [component],
+      tests: ['pkg/affected.test.ts'], legs: ['lint:affected'] });
+    for (const rows of [undefined, [], [row, row], [{ ...row, before: sha('unrelated') }],
+      [{ ...row, provenance: { ...row.provenance, complete: false } }],
+      [{ ...row, provenance: { ...row.provenance, after: null } }],
+      [{ ...row, tests: ['pkg/affected.test.ts', 'pkg/affected.test.ts'] }],
+      [{ ...row, legs: row.tests }]]) {
+      expect(proofContextImpact({ before, after, reach: rows }).status).toBe('unknown');
+    }
+  });
+
+  it('refuses absent identities and duplicate reach that would hide another changed component', () => {
+    expect(proofContextImpact(undefined).status).toBe('unknown');
+    const before = context(), after = createProofContextIdentity({ ...components(), schema: sha('new schema'), behavior: sha('new behavior') })!;
+    const row = reach(before, after, 'schema');
+    expect(proofContextImpact({ before, after, reach: [row, row] }).status).toBe('unknown');
+    expect(proofContextImpact({ before, after, reach: [row, reach(before, after, 'behavior')] }).status).toBe('known');
+  });
+});
 
 const sha = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
 
