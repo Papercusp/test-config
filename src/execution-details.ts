@@ -9,8 +9,24 @@
  */
 import { parseMutationDescriptor, type MutationDescriptor } from '@papercusp/test-config/mutation-descriptor';
 import { createHash } from 'node:crypto';
+import { runtimeProofFingerprint, type RuntimeProofIdentity } from '@papercusp/test-config/runtime-proof';
 import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
   type ProofContextIdentity } from '@papercusp/test-config/configuration-snapshot';
+
+export interface RecordedWorkerRuntime {
+  before: RuntimeProofIdentity | null;
+  after: RuntimeProofIdentity | null;
+}
+
+/** Validate the retained worker measurements without substituting this reader's
+ * interpreter or install. Null is a measured inability to obtain a qualified pin. */
+export function parseRecordedWorkerRuntime(value: unknown): RecordedWorkerRuntime | undefined {
+  if (!isRecord(value) || Object.keys(value).length !== 2
+    || !Object.hasOwn(value, 'before') || !Object.hasOwn(value, 'after')
+    || [value.before, value.after].some(identity => identity !== null && !runtimeProofFingerprint(identity)))
+    return undefined;
+  return value as unknown as RecordedWorkerRuntime;
+}
 
 /** Inputs actually measured by both reporters today. A stable enclosing commit
  * does not measure submodule materialization, runtime capabilities, schemas,
@@ -19,7 +35,7 @@ import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COM
  * Outcomes are results, not inputs, and deliberately do not enter this digest.
  */
 export function captureRecordedProofContext(input: {
-  commitSha: unknown; worktreeDirty: unknown; population?: unknown;
+  commitSha: unknown; worktreeDirty: unknown; population?: unknown; workerRuntime?: unknown;
 }): ProofContextIdentity {
   const components = Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, null])) as
     ProofContextIdentity['components'];
@@ -31,15 +47,19 @@ export function captureRecordedProofContext(input: {
   const population = parseRecordedTestPopulation(input.population);
   if (population) components.population = digest('population', [population.populationHash,
     population.selectionHash, population.executionOrderHash]);
+  const worker = parseRecordedWorkerRuntime(input.workerRuntime);
+  const before = runtimeProofFingerprint(worker?.before), after = runtimeProofFingerprint(worker?.after);
+  if (before && before === after && worker?.before)
+    components.dependencies = digest('dependencies', [worker.before.lockfileSha256,
+      worker.before.nativeDependencyGeneration]);
   return createProofContextIdentity(components)!;
 }
 
 function recordedProofContextMatches(value: Record<string, unknown>): boolean {
   const context = readProofContextIdentity(value.proofContext);
   const measured = captureRecordedProofContext({ commitSha: value.commitSha,
-    worktreeDirty: value.worktreeDirty, population: value.population });
-  return context !== null && context.components.source === measured.components.source
-    && context.components.population === measured.components.population;
+    worktreeDirty: value.worktreeDirty, population: value.population, workerRuntime: value.workerRuntime });
+  return context !== null && PROOF_CONTEXT_COMPONENTS.every(key => context.components[key] === measured.components[key]);
 }
 
 /** Complete runner collection, independent of bounded human-readable samples.
@@ -528,6 +548,8 @@ export interface TestRunExecutionDetails {
   populationCaptureStatus?: PopulationCaptureStatus;
   /** Reporter-measured context on this original result. Null components remain unknown. */
   proofContext?: ProofContextIdentity;
+  /** Original per-file worker measurements, independent of the reporter process. */
+  workerRuntime?: RecordedWorkerRuntime;
   mutationPhase: string | null;
   /** The commit observed after the run; null means runtime identity is unproven. */
   commitSha: string | null;
@@ -771,7 +793,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime',
 ]);
 
 function isRuntimeEnvironmentCaptureStatus(value: unknown): value is RuntimeEnvironmentCaptureStatus {
@@ -854,6 +876,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || !isNonNegativeSafeInteger(value.skipped) || typeof value.collectionFailed !== 'boolean'
     || (value.population !== undefined && !executionPopulationMatches(value))
     || (value.proofContext !== undefined && !recordedProofContextMatches(value))
+    || (value.workerRuntime !== undefined && !parseRecordedWorkerRuntime(value.workerRuntime))
     || (value.populationCaptureStatus !== undefined && (
       !POPULATION_CAPTURE_STATUSES.includes(value.populationCaptureStatus as PopulationCaptureStatus)
       || (value.populationCaptureStatus === 'captured') !== (value.population !== undefined)))

@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { defaultEvidenceRoot } from '@papercusp/verification-harness';
 import { MAX_RECORDED_CASE_TITLE_CHARS, MAX_RECORDED_PASSED_CASES, parseRecordedTestPopulation } from './execution-details.ts';
+import { inputsFilePath } from './executed-inputs-capture.ts';
 import { redactSensitiveText } from './sensitive-text.ts';
 import AdminTestRunsReporter, {
   nativeTestRunAttribution,
@@ -3232,6 +3233,38 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(persisted[0].executionDetails).not.toHaveProperty('worktreeDirtyReason');
     expect(persisted[0].executionDetails?.proofContext).toMatchObject({ schemaVersion: 'proof-context-v1',
       components: { source: null, population: null, dependencies: null, runtimeCapabilities: null } });
+  });
+
+  it('persists original worker dependency evidence independently of the reporter runtime', async () => {
+    const inputDir = mkdtempSync(join(tmpdir(), 'worker-runtime-result-'));
+    const saved = process.env.PC_EXECUTED_INPUTS_DIR;
+    const file = join(process.cwd(), 'src/admin-test-runs-reporter.test.ts');
+    const worker = { name: 'bun', version: '1.3.5', executable: '/qualified/bun', platform: 'linux', arch: 'arm64',
+      binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
+      configurationSha256: '4'.repeat(64) };
+    const runtime = { before: worker, after: worker };
+    const rows: TestRunRow[] = [];
+    try {
+      process.env.PC_EXECUTED_INPUTS_DIR = inputDir;
+      writeFileSync(inputsFilePath(inputDir, file), JSON.stringify({ testFile: file, reads: [], opaque: [], runtime }));
+      const reporter = new AdminTestRunsReporter(async () => ({ commit: 'a'.repeat(40), porcelain: '' }),
+        async row => { rows.push(row); });
+      await reporter.onInit({} as never);
+      const test = { fullName: 'worker control', result: () => ({ state: 'passed' }) };
+      const module = { moduleId: file, state: () => 'passed', diagnostic: () => ({ duration: 1 }),
+        errors: () => [], children: { allTests: () => [test] } } as never;
+      reporter.onTestModuleEnd(module);
+      await reporter.onTestRunEnd();
+      expect(rows).toHaveLength(1);
+      const details = parseTestRunExecutionDetails(rows[0]!.executionDetails);
+      expect(details?.workerRuntime).toEqual(runtime);
+      expect(details?.proofContext?.components.dependencies).toMatch(/^[a-f0-9]{64}$/);
+      expect(details?.proofContext?.components.runtimeCapabilities).toBeNull();
+    } finally {
+      if (saved === undefined) delete process.env.PC_EXECUTED_INPUTS_DIR;
+      else process.env.PC_EXECUTED_INPUTS_DIR = saved;
+      rmSync(inputDir, { recursive: true, force: true });
+    }
   });
 
   it('does not attribute a nested unversioned verifier source archive to a clean enclosing checkout', async () => {

@@ -33,7 +33,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { open, rename, rm } from 'node:fs/promises';
-import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
+import { inputsFilePath, readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { classifyReadPaths, normalizeExecutedKey } from './executed-read-paths';
 export { classifyReadPaths, normalizeExecutedKey } from './executed-read-paths';
@@ -199,17 +199,7 @@ function listTrackedFiles(repoRoot: string): string[] | null {
   }
 }
 
-/** Read the worker's inputs record for one test file; null when absent or unreadable. */
-export function readInputsRecord(dir: string | null | undefined, testFileAbs: string): InputsRecord | null {
-  if (!dir) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(inputsFilePath(dir, testFileAbs), 'utf8')) as InputsRecord;
-    if (!parsed || !Array.isArray(parsed.reads) || !Array.isArray(parsed.opaque)) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
+export { readInputsRecord } from './executed-inputs-capture.ts';
 
 export type ExecutedSourceRowWriter = (flush: ExecutedSourceFlush) => Promise<void>;
 export type WorktreeSnapshotReader = () => Promise<WorktreeGitSnapshot>;
@@ -787,13 +777,21 @@ export default class ExecutedSourceMapReporter implements Reporter {
     gaps: string[];
   } | null = null;
 
+  private completedInputs = new Set<string>();
+
   private discardInputs(moduleId: string): void {
+    // Reporter callbacks run concurrently. Retain the sidecar until the run's
+    // final hooks, after the original-result reporter has read the same bytes.
+    this.completedInputs.add(moduleId);
+  }
+
+  private discardCompletedInputs(): void {
     if (!this.inputsDir) return;
-    try {
-      rmSync(inputsFilePath(this.inputsDir, moduleId), { force: true });
-    } catch {
-      /* a leftover hand-off file is harmless */
+    for (const moduleId of this.completedInputs) {
+      try { rmSync(inputsFilePath(this.inputsDir, moduleId), { force: true }); }
+      catch { /* a leftover hand-off file is harmless */ }
     }
+    this.completedInputs.clear();
   }
 
   constructor(
@@ -834,6 +832,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.worktreeBefore = this.readWorktreeSnapshot();
     this.checkpointWrites = Promise.resolve();
     this.acknowledgedCompletionIds.clear();
+    this.completedInputs.clear();
     this.pending = [];
     this.retired = [];
     this.skipped = 0;
@@ -1059,7 +1058,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
       };
       const nativeRun = { ...checkpoint.nativeRun, files: checkpoint.nativeRun.files.map(file => ({ ...file,
         proofContext: captureRecordedProofContext({ commitSha: checkpoint.recordedSha,
-          worktreeDirty: checkpoint.worktreeDirty, population: file.population }),
+          worktreeDirty: checkpoint.worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime }),
       })) };
       await observeReporterStage('executed-source', 'completion-snapshot', async () => {
         await this.writeSnapshot(armed.outPath!, { ...checkpoint, nativeRun });
@@ -1078,6 +1077,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private async flushPending(): Promise<void> {
     if (!this.armed || this.flushed) return;
     this.flushed = true;
+    this.discardCompletedInputs();
     await observeReporterStage('executed-source', 'completion-checkpoints', () => this.checkpointWrites);
     const rows = this.pending.splice(0);
     if (executedSourceRunnerIdentity() !== this.completionContext.runnerIdentity)
@@ -1113,7 +1113,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
             ...(this.nativeRun ? { nativeRun: { ...this.nativeRun,
               files: this.nativeRun.files.map(file => ({ ...file,
                 proofContext: captureRecordedProofContext({ commitSha: recordedSha,
-                  worktreeDirty, population: file.population }),
+                  worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime }),
               })) } } : {}),
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
             configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),

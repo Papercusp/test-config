@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFile, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -16,7 +16,7 @@ import { executedSourceOriginalsPlugin } from './vitest-config';
 import { perGroupVitestEnv } from '../../../scripts/test-files.mjs';
 
 import AdminTestRunsReporter, { inferWorkspaceRoot } from './admin-test-runs-reporter';
-import { parseRecordedTestPopulation } from './execution-details';
+import { parseRecordedTestPopulation, parseTestRunExecutionDetails } from './execution-details';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
   EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS,
@@ -669,6 +669,39 @@ describe('ExecutedSourceMapReporter', () => {
         moduleId: TEST_FILE, project: { name: projectName }, pool: 'forks',
       })) as never);
     }
+
+    it.each(['native-first', 'ledger-first'])('retains the same worker dependency measurement for %s callback order', async order => {
+      const worker = { name: 'node', version: '25.1.0', executable: '/qualified/node', platform: 'linux', arch: 'x64',
+        binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
+        configurationSha256: '4'.repeat(64) };
+      const runtime = { before: worker, after: worker };
+      process.env[PC_EXECUTED_INPUTS_DIR_ENV] = tmp;
+      const path = inputsFilePath(tmp, TEST_FILE);
+      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime }));
+      const { r } = reporter();
+      const { mod, tests } = populationModule();
+      const rows: Array<{ executionDetails?: unknown }> = [];
+      const ledger = new AdminTestRunsReporter(snapshot(clean), async row => { rows.push(row); });
+      await ledger.onInit({} as never);
+      r.onInit({} as never);
+      selectPopulation(r);
+      ledger.onTestModuleCollected(mod);
+      r.onTestModuleCollected(mod);
+      for (const test of tests) { ledger.onTestCaseReady(test as never); r.onTestCaseReady(test as never); }
+      if (order === 'native-first') { await r.onTestModuleEnd(mod); ledger.onTestModuleEnd(mod); }
+      else { ledger.onTestModuleEnd(mod); await r.onTestModuleEnd(mod); }
+      expect(existsSync(path)).toBe(true);
+      const original = nativeOut().files[0];
+      await r.onTestRunEnd([mod], [], 'passed');
+      expect(existsSync(path)).toBe(false);
+      await ledger.onTestRunEnd();
+      const details = parseTestRunExecutionDetails(rows[0]?.executionDetails);
+      expect(details?.workerRuntime).toEqual(runtime);
+      expect(details?.proofContext).toEqual(original.proofContext);
+      expect(details?.proofContext?.components.dependencies).toMatch(/^[a-f0-9]{64}$/);
+      expect(details?.proofContext?.components.runtimeCapabilities).toBeNull();
+      await ledger.onExit();
+    });
 
     it('binds the full uncapped ledger population to its original native manifest and completion receipt', async () => {
       const { r, flushes } = reporter();

@@ -53,7 +53,8 @@ import {
   type PopulationCaptureStatus,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, type ConfigurationSnapshot } from './configuration-snapshot.ts';
-import { captureRecordedProofContext } from './execution-details.ts';
+import { captureRecordedProofContext, parseRecordedWorkerRuntime } from './execution-details.ts';
+import { readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture.ts';
 import {
   mutationDescriptorForRow, readMutationInvocationDescriptor, type MutationInvocationDescriptor,
 } from './mutation-descriptor.ts';
@@ -3299,6 +3300,9 @@ export default class AdminTestRunsReporter implements Reporter {
               : this.populationCapture.status(testModule),
             ...(population && !counts.collectionFailed ? { population } : {}) } : null;
       if (executionDetails) {
+        const workerRuntime = parseRecordedWorkerRuntime(
+          readInputsRecord(process.env[PC_EXECUTED_INPUTS_DIR_ENV], testModule.moduleId)?.runtime);
+        if (workerRuntime) Object.assign(executionDetails, { workerRuntime });
         const boundaryObservations = collectBoundaryObservations(testModule);
         if (boundaryObservations) Object.assign(executionDetails, { boundaryObservations });
         const sqlCoverageObservations = collectSqlCoverageObservations(testModule);

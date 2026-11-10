@@ -45,6 +45,19 @@ export interface InputsRecord {
   moduleEvaluations?: ModuleEvaluationObservation;
 }
 
+/** Shared by the original-result and native reporters. Neither reader consumes
+ * the handoff: all reporters must see the same worker observation. */
+export function readInputsRecord(dir: string | null | undefined, testFileAbs: string): InputsRecord | null {
+  if (!dir) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(inputsFilePath(dir, testFileAbs), 'utf8')) as InputsRecord;
+    if (!parsed || parsed.testFile !== testFileAbs || !Array.isArray(parsed.reads)
+      || !parsed.reads.every(path => typeof path === 'string') || !Array.isArray(parsed.opaque)
+      || !parsed.opaque.every(reason => typeof reason === 'string')) return null;
+    return parsed;
+  } catch { return null; }
+}
+
 export interface ModuleEvaluationObservation {
   schemaVersion: 'vitest-evaluator-inputs-v1';
   scope: 'vitest-inlined-evaluator-inputs';

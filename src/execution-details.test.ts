@@ -19,16 +19,55 @@ import {
   createRecordedTestPopulation,
   parseRecordedTestPopulation,
   captureRecordedProofContext,
+  parseRecordedWorkerRuntime,
   type RecordedPopulationIdentity,
   type RecordedPopulationCase,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
-import { createProofContextIdentity, proofContextImpact } from './configuration-snapshot.ts';
+import { createProofContextIdentity, proofContextImpact, PROOF_CONTEXT_COMPONENTS } from './configuration-snapshot.ts';
 
 describe('original result proof-context capture', () => {
   const identity: RecordedPopulationIdentity = ['unit', 'libs/x/src/a.test.ts', 'case', 1, 'test'];
   const population = createRecordedTestPopulation([{ identity, selected: true, outcome: 'passed' }], [identity])!;
   const input = { commitSha: 'a'.repeat(40), worktreeDirty: false, population };
+  const runtime = { name: 'node', version: '25.1.0', executable: '/runtime/node', platform: 'linux', arch: 'x64',
+    binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
+    configurationSha256: '4'.repeat(64) };
+
+  it('retains qualified dependency inputs from the original worker without granting capability or complete-context credit', () => {
+    const workerRuntime = { before: runtime, after: { ...runtime } };
+    const proofContext = captureRecordedProofContext({ ...input, workerRuntime });
+    expect(proofContext.components.dependencies).toMatch(/^[a-f0-9]{64}$/);
+    expect(proofContext.components.runtimeCapabilities).toBeNull();
+    expect(proofContextImpact({ before: proofContext, after: proofContext })).toMatchObject({ status: 'unknown' });
+    const row = details({ ...input, passed: 1, workerRuntime, proofContext });
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify(row)))?.workerRuntime).toEqual(workerRuntime);
+    for (const field of ['lockfileSha256', 'nativeDependencyGeneration'] as const) {
+      const changed = { ...runtime, [field]: 'f'.repeat(64) };
+      expect(captureRecordedProofContext({ ...input, workerRuntime: { before: changed, after: changed } })
+        .components.dependencies).not.toBe(proofContext.components.dependencies);
+      expect(parseTestRunExecutionDetails({ ...row, workerRuntime: { before: changed, after: changed } })).toBeUndefined();
+    }
+    expect(parseTestRunExecutionDetails({ ...row, workerRuntime: undefined })).toBeUndefined();
+  });
+
+  it('never substitutes missing, malformed or changed worker identities with the reporter install', () => {
+    for (const workerRuntime of [undefined, null, {}, { before: null, after: null },
+      { before: runtime, after: null }, { before: runtime, after: { ...runtime, binarySha256: 'f'.repeat(64) } },
+      { before: runtime, after: { ...runtime, nativeDependencyGeneration: '' } },
+      { before: runtime, after: runtime, extra: true }])
+      expect(captureRecordedProofContext({ ...input, workerRuntime }).components.dependencies).toBeNull();
+    expect(parseRecordedWorkerRuntime({ before: null, after: null })).toEqual({ before: null, after: null });
+    expect(parseRecordedWorkerRuntime({ before: runtime, after: { ...runtime, platform: null } })).toBeUndefined();
+  });
+
+  it.each(PROOF_CONTEXT_COMPONENTS)('rejects a canonical but unmeasured/transplanted %s component', component => {
+    const workerRuntime = { before: runtime, after: runtime };
+    const proofContext = captureRecordedProofContext({ ...input, workerRuntime });
+    const forged = createProofContextIdentity({ ...proofContext.components, [component]: 'f'.repeat(64) });
+    expect(parseTestRunExecutionDetails(details({ ...input, passed: 1, workerRuntime, proofContext: forged })))
+      .toBeUndefined();
+  });
 
   it('binds the actual source and complete population while preserving every unmeasured input', () => {
     const proofContext = captureRecordedProofContext(input);
