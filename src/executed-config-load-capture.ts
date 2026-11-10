@@ -23,6 +23,13 @@ interface Capture {
 const shared = pinModuleState<{ capture: Capture | null }>(
   '@papercusp/test-config.original-config-loads', () => ({ capture: null }));
 const hash = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
+// Terminal evidence must not dispatch through properties the application can
+// replace during its epoch. This closes these two callback paths only; source
+// eligibility and the rest of the synchronous suffix still require auditing.
+const applyIntrinsic = Reflect.apply;
+const monotonicClock = performance;
+const monotonicClockNow = monotonicClock.now;
+const monotonicNow = (): number => applyIntrinsic(monotonicClockNow, monotonicClock, []);
 
 export const nativeSourceRetentionLimits = Object.freeze({ sourceBytes: 16 * 1024 ** 2,
   processBytes: 64 * 1024 ** 2, pinnedSourceBytes: 128 * 1024 ** 2,
@@ -64,7 +71,7 @@ function installPreciseCoverageOwnership(): void {
   const nativeV8 = require('node:v8') as typeof import('node:v8');
   const nativeConsole = require('node:console') as typeof import('node:console');
   const reject = (method: string): never => {
-    preciseOwnership.owner?.rejected.push({ method, monotonicMs: performance.now() });
+    preciseOwnership.owner?.rejected.push({ method, monotonicMs: monotonicNow() });
     throw new Error(`Inspector operation rejected by exclusive precise coverage epoch: ${method}`);
   };
   // Validate the whole write set before hardening any property. These guards
@@ -94,7 +101,7 @@ function installPreciseCoverageOwnership(): void {
           if (owner && (name !== 'post' || owner.fenced || method.startsWith('NodeWorker.') ||
               method.startsWith('Profiler.') && method !== 'Profiler.getBestEffortCoverage'))
             return reject(name === 'post' ? method : operation);
-          return Reflect.apply(original, this, args);
+          return applyIntrinsic(original, this, args);
         } });
     }
     nodeModule.syncBuiltinESMExports();
@@ -252,18 +259,18 @@ export function observeEngineScriptExecution(repoRoot: string,
     let done = false;
     let result: unknown;
     let failure: Error | null = null;
-    const command = { method, startedMs: performance.now(), endedMs: null as number | null,
+    const command = { method, startedMs: monotonicNow(), endedMs: null as number | null,
       status: 'pending' as 'pending' | 'complete' | 'failed' };
     if (precise) commands.push(command);
     const transport = owner && preciseOwnership.owner === owner ? preciseOwnership.rawPost! : session.post;
     try {
-      Reflect.apply(transport, session, [method, params, (error: Error | null, response: unknown) => {
+      applyIntrinsic(transport, session, [method, params, (error: Error | null, response: unknown) => {
         done = true; failure = error; result = response;
       }]);
-    } catch (error) { command.status = 'failed'; command.endedMs = performance.now(); throw error; }
+    } catch (error) { command.status = 'failed'; command.endedMs = monotonicNow(); throw error; }
     // Exit/signal observers must finish synchronously. Never attest a pending
     // protocol request; its eventual callback cannot repair an emitted receipt.
-    command.endedMs = performance.now();
+    command.endedMs = monotonicNow();
     command.status = !done ? 'pending' : failure ? 'failed' : 'complete';
     if (!done) throw new Error(`pending inspector request: ${method}`);
     if (failure) throw failure;

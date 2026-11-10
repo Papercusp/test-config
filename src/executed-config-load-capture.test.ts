@@ -102,6 +102,14 @@ describe('precise coverage epoch preparation', () => {
     const script = `import { Session, open } from 'node:inspector';
       import { Session as PromiseSession } from 'node:inspector/promises';
       const savedOpen = open;
+      const intrinsicApply = Reflect.apply, intrinsicNow = performance.now;
+      let takeReturned = false, applicationClockAfterTake = 0, applicationApplyAfterTake = 0;
+      ${mode === 'terminal-intrinsics' ? `const originalPost = Session.prototype.post;
+        Session.prototype.post = function(method, ...args) {
+          const result = intrinsicApply(originalPost, this, [method, ...args]);
+          if (method === 'Profiler.takePreciseCoverage') takeReturned = true;
+          return result;
+        };` : ''}
       const fault = ${JSON.stringify(/^(start|take)-(pending|failed|partial)$/.test(mode) ? mode : null)};
       if (fault) {
         const original = Session.prototype.post;
@@ -148,7 +156,19 @@ describe('precise coverage epoch preparation', () => {
         other.disconnect(); promiseOther.disconnect();` : ''}
       ${mode === 'passive' ? 'observer.snapshot(); observer.snapshot();' : ''}
       ${mode === 'precaptured-open' ? "savedOpen(0, '127.0.0.1');" : ''}
+      ${mode === 'terminal-intrinsics' ? `Object.defineProperty(performance, 'now', {
+        configurable: true, writable: true, value() {
+          if (takeReturned) applicationClockAfterTake++;
+          return intrinsicApply(intrinsicNow, performance, []);
+        } });
+        Reflect.apply = function(...args) {
+          if (takeReturned) applicationApplyAfterTake++;
+          return intrinsicApply(intrinsicApply, Reflect, args);
+        };` : ''}
       const terminal = observer.terminalPreciseSnapshot();
+      ${mode === 'terminal-intrinsics' ? `Reflect.apply = intrinsicApply;
+        Object.defineProperty(performance, 'now', {
+          configurable: true, writable: true, value: intrinsicNow });` : ''}
       ${mode === 'post-fence' ? "attempt('Runtime.evaluate-after-fence', () => post('Runtime.evaluate', { expression: 'entered()' }));" : ''}
       const duplicate = ${mode === 'duplicate' ? 'observer.terminalPreciseSnapshot()' : 'undefined'};
       const observed = terminal?.scripts.find(row => row.scriptId === scriptId);
@@ -157,7 +177,8 @@ describe('precise coverage epoch preparation', () => {
         return { functionName: name, functionRoot: { startOffset, endOffset }, ranges: [{ startOffset, endOffset }] }; };
       const classify = name => observed ? classifyEngineCoverageTargets(observed, {
         sourceTextSha256: ${JSON.stringify(digest(source))}, sourceTextLength: source.length, targets: [target(name)] }) : null;
-      console.log(JSON.stringify({ terminal, duplicate, rejected, dormant: classify('dormant'),
+      console.log(JSON.stringify({ terminal, duplicate, rejected, applicationClockAfterTake, applicationApplyAfterTake,
+        dormant: classify('dormant'),
         entered: classify('entered'), status: observer.preciseStatus() }));
       observer.disconnect(); runtime.disconnect();`;
     const env = { ...process.env }; delete env.NODE_OPTIONS;
@@ -190,6 +211,14 @@ describe('precise coverage epoch preparation', () => {
     expect(result.entered.state).toBe('entry');
     expect(result.dormant.state).toBe('zero');
     expect(result.terminal.runtimeQualification).toBe('unknown');
+  });
+  it('terminal capture does not enter mutable clock or apply callbacks after the native take', () => {
+    const result = run('terminal-intrinsics');
+    expect(result.terminal).toMatchObject({ phase: 'taken', runtimeQualification: 'unknown' });
+    expect(result.entered.state).toBe('entry');
+    expect(result.dormant.state).toBe('zero');
+    expect(result.applicationClockAfterTake).toBe(0);
+    expect(result.applicationApplyAfterTake).toBe(0);
   });
   it('rejects public native coverage and console profiling helpers during an owned epoch', () => {
     const result = run('native-public');
