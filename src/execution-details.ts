@@ -60,7 +60,7 @@ export function createRecordedTestPopulation(
   if (!Array.isArray(cases) || cases.length === 0 || !Array.isArray(executionOrder)) return undefined;
   if (cases.some(row => !isRecord(row) || Object.keys(row).length !== 3
     || !populationIdentity(row.identity) || typeof row.selected !== 'boolean'
-    || !['passed', 'failed', 'skipped'].includes(row.outcome)
+    || typeof row.outcome !== 'string' || !['passed', 'failed', 'skipped'].includes(row.outcome)
     || (!row.selected && row.outcome !== 'skipped'))) return undefined;
   const sorted = cases.map(row => ({ identity: [...row.identity] as RecordedPopulationIdentity,
     selected: row.selected, outcome: row.outcome }))
