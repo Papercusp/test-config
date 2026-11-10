@@ -184,7 +184,15 @@ describe('precise coverage epoch preparation', () => {
             return intrinsicApply(descriptor.value, this, arguments);
           } });
         }` : ''}
+      ${mode === 'terminal-index-setters' ? `const defineOwn = Object.defineProperty;
+        const previousIndex = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+        defineOwn(Array.prototype, '0', { configurable: true, set(value) {
+          if (takeReturned) applicationBuiltinAfterTake++;
+          defineOwn(this, '0', { configurable: true, enumerable: true, writable: true, value });
+        } });` : ''}
       const terminal = observer.terminalPreciseSnapshot();
+      ${mode === 'terminal-index-setters' ? `if (previousIndex) defineOwn(Array.prototype, '0', previousIndex);
+        else delete Array.prototype[0];` : ''}
       ${mode === 'terminal-mutables' ? `for (let i = 0; i < mutations.length; i++) {
         const row = mutations[i]; Object.defineProperty(row[0], row[1], row[2]);
       }` : ''}
@@ -245,6 +253,13 @@ describe('precise coverage epoch preparation', () => {
   });
   it('terminal capture does not enter replaced collection, validation or hash methods after the native take', () => {
     const result = run('terminal-mutables');
+    expect(result.terminal).toMatchObject({ phase: 'taken', runtimeQualification: 'unknown' });
+    expect(result.entered.state).toBe('entry');
+    expect(result.dormant.state).toBe('zero');
+    expect(result.applicationBuiltinAfterTake).toBe(0);
+  });
+  it('terminal capture does not enter inherited array index setters after the native take', () => {
+    const result = run('terminal-index-setters');
     expect(result.terminal).toMatchObject({ phase: 'taken', runtimeQualification: 'unknown' });
     expect(result.entered.state).toBe('entry');
     expect(result.dormant.state).toBe('zero');

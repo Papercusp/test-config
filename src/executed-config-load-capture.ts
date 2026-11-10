@@ -27,6 +27,7 @@ const shared = pinModuleState<{ capture: Capture | null }>(
 // hash operations too. This is not a substitute for loaded-source eligibility
 // or the caller's audited publication/hold suffix.
 const applyIntrinsic = Reflect.apply;
+const definePropertyIntrinsic = Object.defineProperty;
 const createHashIntrinsic = createHash;
 const hashPrototype = Object.getPrototypeOf(createHashIntrinsic('sha256'));
 const hashUpdateIntrinsic = hashPrototype.update;
@@ -44,12 +45,19 @@ const hash = (bytes: string | Buffer): string => {
 };
 const copyRows = <T extends object>(rows: T[]): T[] => {
   const result: T[] = [];
-  for (let i = 0; i < rows.length; i++) result[i] = { ...rows[i] };
+  for (let i = 0; i < rows.length; i++) appendOwn(result, { ...rows[i] });
   return result;
+};
+// Indexed assignment still walks an application's Array.prototype setters.
+// Define a dense own property using an observer-owned, null-prototype
+// descriptor; descriptor conversion must not consult inherited get/set fields.
+const appendOwn = <T>(rows: T[], value: T): void => {
+  const descriptor = { __proto__: null, configurable: true, enumerable: true, writable: true, value };
+  definePropertyIntrinsic(rows, rows.length, descriptor);
 };
 const reasonRows = (reasons: Set<string>): string[] => {
   const rows: string[] = [];
-  applyIntrinsic(setForEachIntrinsic, reasons, [(reason: string) => { rows[rows.length] = reason; }]);
+  applyIntrinsic(setForEachIntrinsic, reasons, [(reason: string) => { appendOwn(rows, reason); }]);
   return applyIntrinsic(arraySortIntrinsic, rows, []);
 };
 const monotonicClock = performance;
@@ -289,7 +297,7 @@ export function observeEngineScriptExecution(repoRoot: string,
     let failure: Error | null = null;
     const command = { method, startedMs: monotonicNow(), endedMs: null as number | null,
       status: 'pending' as 'pending' | 'complete' | 'failed' };
-    if (precise) commands[commands.length] = command;
+    if (precise) appendOwn(commands, command);
     const transport = owner && preciseOwnership.owner === owner ? preciseOwnership.rawPost! : session.post;
     try {
       applyIntrinsic(transport, session, [method, params, (error: Error | null, response: unknown) => {
@@ -397,7 +405,7 @@ export function observeEngineScriptExecution(repoRoot: string,
           const matches: typeof raw.result = [];
           for (let i = 0; i < raw.result.length; i++) {
             const row = raw.result[i];
-            if (row.scriptId === script.scriptId && row.url === script.url) matches[matches.length] = row;
+            if (row.scriptId === script.scriptId && row.url === script.url) appendOwn(matches, row);
           }
           const source = post<{ scriptSource: string }>('Debugger.getScriptSource', { scriptId: script.scriptId });
           const sourceMatches = typeof source.scriptSource === 'string' && script.sourceTextSha256 !== null &&
@@ -405,8 +413,8 @@ export function observeEngineScriptExecution(repoRoot: string,
           if (!sourceMatches) addReason('engine-script-source-changed');
           if (matches.length !== 1 || !arrayIsArrayIntrinsic(matches[0].functions))
             addReason('engine-precise-script-response-incomplete');
-          observed[observed.length] = { ...script, sourceTextSha256: sourceMatches ? script.sourceTextSha256 : null,
-            functions: matches.length === 1 && arrayIsArrayIntrinsic(matches[0].functions) ? matches[0].functions : [] };
+          appendOwn(observed, { ...script, sourceTextSha256: sourceMatches ? script.sourceTextSha256 : null,
+            functions: matches.length === 1 && arrayIsArrayIntrinsic(matches[0].functions) ? matches[0].functions : [] });
         }]);
         return { schemaVersion: 'node-engine-precise-terminal-v1', ...preciseStatus(),
           basis: 'one-start-one-terminal-precise-response', offsetUnits: 'utf16-code-units',
