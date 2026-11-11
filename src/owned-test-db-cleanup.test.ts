@@ -109,6 +109,23 @@ describe('maintained owned database cleanup', () => {
     expect(drop).not.toHaveBeenCalled();
   });
 
+  it.each([true, false])('observes a dedicated-cluster drop inside a private owner only when confirmed=%s', async confirmed => {
+    const { dir, env } = fixture();
+    const childDir = createOwnedTestDatabaseScope(env)!;
+    const childEnv = { ...env, PAPERCUSP_TEST_OWNED_DB_DIR: childDir };
+    const record = registerOwnedTestDatabase('org_abcdef012345', 'postgres://private@localhost:41237/postgres', childEnv);
+    if (confirmed) record('dropped');
+    const drop = vi.fn();
+    const child = await cleanupOwnedTestDatabases({ dir: childDir, runId: 'run-a',
+      adminUri: 'postgres://private@localhost:41236/postgres', deadlineAtMs: Date.now() + 1000, drop });
+    expect(child.complete).toBe(confirmed);
+    expect(child.errors).toEqual(confirmed ? [] : ['org_abcdef012345.json: database endpoint does not match the owned server']);
+    const result = await cleanupOwnedTestDatabases({ dir, runId: 'run-a', deadlineAtMs: Date.now() + 1000, drop });
+    expect(result).toMatchObject({ complete: confirmed, scopes: [{ path: basename(childDir), complete: confirmed,
+      databases: [{ name: 'org_abcdef012345', outcome: confirmed ? 'dropped' : 'owned' }] }] });
+    expect(drop).not.toHaveBeenCalled();
+  });
+
   it('aggregates a failed grandchild while endpoint-pinned owners remain isolated', async () => {
     const { dir, env } = fixture();
     const childDir = createOwnedTestDatabaseScope(env)!;

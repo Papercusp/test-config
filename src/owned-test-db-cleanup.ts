@@ -181,7 +181,9 @@ export async function cleanupOwnedTestDatabases(options: {
     let record: OwnedTestDatabase;
     try {
       record = readOwnedDatabase(options.dir, file, options.runId);
-      if (options.adminUri) {
+      // Pin every new DROP to this owner. A same-run record already confirmed
+      // dropped by a nested dedicated cluster needs no endpoint connection.
+      if (options.adminUri && record.outcome !== 'dropped') {
         const expected = new URL(options.adminUri);
         const actual = new URL(record.adminUri);
         if (actual.protocol !== expected.protocol || actual.hostname !== expected.hostname ||
