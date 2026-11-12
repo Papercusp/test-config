@@ -20,6 +20,7 @@ import {
   parseRecordedTestPopulation,
   captureRecordedProofContext,
   parseRecordedWorkerRuntime,
+  parseRecordedWorkerCompilerInputs,
   parseRecordedWorkerExecution,
   stableRecordedWorkerExecution,
   parseRecordedWorkerDatabaseReset,
@@ -38,6 +39,26 @@ describe('original worker process custody', () => {
   const execution = () => ({ schemaVersion: 'worker-execution-v1' as const,
     captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: '/repo/a.test.ts',
     before: processIdentity, after: { ...processIdentity } });
+
+  it('retains partial compiler inputs without upgrading compiler identity or accepting foreign custody', () => {
+    const workerExecution = execution();
+    const workerCompilerInputs = { schemaVersion: 'worker-compiler-inputs-v1' as const,
+      scope: 'vitest-inlined-vm-calls' as const, populationStatus: 'unknown' as const,
+      captureId: workerExecution.captureId, testFile: workerExecution.testFile,
+      inputSha256: '1'.repeat(64), vmCallCount: 2,
+      missing: ['transform-pipeline-unobserved', 'vm-options-partially-observed'] };
+    const row = details({ root: '/repo', filePath: 'a.test.ts', workerExecution, workerCompilerInputs });
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify(row)))?.workerCompilerInputs).toEqual(workerCompilerInputs);
+    expect(captureRecordedProofContext({ ...row, workerCompilerInputs } as never).components.compilerConfiguration).toBeNull();
+    for (const patch of [{ populationStatus: 'complete' }, { complete: true }, { missing: [] },
+      { vmCallCount: -1 }, { vmCallCount: 0 }, { inputSha256: null }])
+      expect(parseRecordedWorkerCompilerInputs({ ...workerCompilerInputs, ...patch })).toBeUndefined();
+    for (const patch of [{ captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }, { testFile: '/repo/other.test.ts' }])
+      expect(parseTestRunExecutionDetails({ ...row, workerCompilerInputs: { ...workerCompilerInputs, ...patch } })).toBeUndefined();
+    expect(parseTestRunExecutionDetails({ ...row, workerExecution: undefined })).toBeUndefined();
+    expect(parseRecordedWorkerCompilerInputs({ ...workerCompilerInputs, inputSha256: null, vmCallCount: 0,
+      missing: [...workerCompilerInputs.missing, 'vm-calls-unobserved'] })).toBeDefined();
+  });
 
   it('binds confirmed database reset to the original file, run and stable worker without claiming fixture identity', () => {
     const worker = execution();

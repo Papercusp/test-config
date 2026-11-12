@@ -28,6 +28,7 @@ import { pinModuleState } from '@papercusp/module-singleton';
 export const PC_EXECUTED_INPUTS_DIR_ENV = 'PC_EXECUTED_INPUTS_DIR';
 
 export interface InputsRecord {
+  compilerInputs?: import('./execution-details.ts').RecordedWorkerCompilerInputs;
   workerDatabaseReset?: import('./execution-details.ts').RecordedWorkerDatabaseReset;
   workerExecution?: import('./execution-details.ts').RecordedWorkerExecution;
   testConfiguration?: import('./configuration-snapshot.ts').RecordedWorkerTestConfiguration;
@@ -73,6 +74,22 @@ export interface ModuleEvaluationObservation {
   /** Evaluator calls only: Node may return cached exports or a Vitest stub. */
   externalCalls?: Array<{ id: string }>;
   reasons: string[];
+}
+
+/** Summarize actual compiler calls. Artifact paths are transport, not inputs.
+ * An empty/unavailable seam never becomes a complete compiler census. */
+export function captureWorkerCompilerInputs(observation: ModuleEvaluationObservation | undefined,
+  captureId: string, testFile: string): import('./execution-details.ts').RecordedWorkerCompilerInputs | undefined {
+  if (!observation) return undefined;
+  const calls = observation.vmInputs ?? [];
+  const missing = new Set([...observation.reasons, 'transform-pipeline-unobserved', 'vm-options-partially-observed']);
+  if (!calls.length) missing.add('vm-calls-unobserved');
+  const inputs = calls.map(row => [row.inputIndex, row.id, row.api, row.filename,
+    row.lineOffset ?? null, row.columnOffset ?? null, row.sha256, row.byteLength]);
+  return { schemaVersion: 'worker-compiler-inputs-v1', scope: 'vitest-inlined-vm-calls', populationStatus: 'unknown',
+    captureId, testFile: resolve(testFile), inputSha256: calls.length
+      ? createHash('sha256').update(JSON.stringify(['worker-compiler-inputs-v1', inputs])).digest('hex') : null,
+    vmCallCount: calls.length, missing: [...missing].sort() };
 }
 
 /** Observe the live worker's complete execution map at teardown, including body imports.

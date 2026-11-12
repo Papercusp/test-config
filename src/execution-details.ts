@@ -20,6 +20,40 @@ export interface RecordedWorkerRuntime {
   after: RuntimeProofIdentity | null;
 }
 
+/** Original VM calls, not a complete compiler configuration. Full inputs stay
+ * in the native artifact; this bounded receipt binds their ordered digest to
+ * the worker/file which actually compiled them. */
+export interface RecordedWorkerCompilerInputs {
+  schemaVersion: 'worker-compiler-inputs-v1';
+  scope: 'vitest-inlined-vm-calls';
+  populationStatus: 'unknown';
+  captureId: string;
+  testFile: string;
+  inputSha256: string | null;
+  vmCallCount: number;
+  missing: string[];
+}
+
+export function parseRecordedWorkerCompilerInputs(value: unknown): RecordedWorkerCompilerInputs | undefined {
+  if (!isRecord(value) || Object.keys(value).length !== 8
+    || !['schemaVersion', 'scope', 'populationStatus', 'captureId', 'testFile', 'inputSha256', 'vmCallCount', 'missing']
+      .every(key => Object.hasOwn(value, key))
+    || value.schemaVersion !== 'worker-compiler-inputs-v1' || value.scope !== 'vitest-inlined-vm-calls'
+    || value.populationStatus !== 'unknown'
+    || typeof value.captureId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.captureId)
+    || typeof value.testFile !== 'string' || !isAbsolute(value.testFile) || value.testFile.includes('\u0000')
+    || !Number.isSafeInteger(value.vmCallCount) || (value.vmCallCount as number) < 0 || (value.vmCallCount as number) > 100_000
+    || (value.vmCallCount === 0 ? value.inputSha256 !== null
+      : typeof value.inputSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.inputSha256))
+    || !Array.isArray(value.missing) || value.missing.length > 64
+    || !value.missing.every(reason => typeof reason === 'string' && /^[a-z][a-z0-9-]{0,127}$/.test(reason))
+    || new Set(value.missing).size !== value.missing.length
+    || !value.missing.includes('transform-pipeline-unobserved')
+    || !value.missing.includes('vm-options-partially-observed')
+    || (value.vmCallCount === 0 && !value.missing.includes('vm-calls-unobserved'))) return undefined;
+  return value as unknown as RecordedWorkerCompilerInputs;
+}
+
 /** Observed worker custody, kept separate from input equivalence. A fresh
  * capture ID does not prove a fresh process, isolation or disposable fixtures. */
 export interface RecordedWorkerExecution {
@@ -704,6 +738,7 @@ export interface TestRunExecutionDetails {
   proofContext?: ProofContextIdentity;
   /** Original per-file worker measurements, independent of the reporter process. */
   workerRuntime?: RecordedWorkerRuntime;
+  workerCompilerInputs?: RecordedWorkerCompilerInputs;
   workerTestConfiguration?: RecordedWorkerTestConfiguration;
   workerExecution?: RecordedWorkerExecution;
   workerDatabaseReset?: RecordedWorkerDatabaseReset;
@@ -952,7 +987,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules', 'workerTestConfiguration', 'workerExecution', 'workerDatabaseReset',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'workerCompilerInputs', 'sourceSubmodules', 'workerTestConfiguration', 'workerExecution', 'workerDatabaseReset',
 ]);
 
 /** A rollout preflight only: this does not qualify any test result or relax parsing. */
@@ -1061,6 +1096,9 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.population !== undefined && !executionPopulationMatches(value))
     || (value.proofContext !== undefined && !recordedProofContextMatches(value))
     || (value.workerRuntime !== undefined && !parseRecordedWorkerRuntime(value.workerRuntime))
+    || (value.workerCompilerInputs !== undefined && (!parseRecordedWorkerCompilerInputs(value.workerCompilerInputs)
+      || (value.workerCompilerInputs as RecordedWorkerCompilerInputs).testFile !== resolve(value.root as string, value.filePath as string)
+      || (value.workerCompilerInputs as RecordedWorkerCompilerInputs).captureId !== parseRecordedWorkerExecution(value.workerExecution)?.captureId))
     || (value.workerTestConfiguration !== undefined && !readWorkerTestConfiguration(value.workerTestConfiguration))
     || (value.workerExecution !== undefined && parseRecordedWorkerExecution(value.workerExecution)?.testFile
       !== resolve(value.root as string, value.filePath as string))

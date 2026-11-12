@@ -11,6 +11,7 @@ import {
   beginFile,
   beginDatabaseResetCapture,
   captureModuleImports,
+  captureWorkerCompilerInputs,
   currentRecorder,
   endFile,
   installCapture,
@@ -176,6 +177,15 @@ describe('prospective evaluator inputs', () => {
       }
       expect(observation?.reasons).not.toContain('evaluator-wrapper-unobserved');
       expect(observation?.reasons).toContain('pre-setup-evaluations-unobserved');
+      const receipt = captureWorkerCompilerInputs(observation, '12345678-9abc-def0-1234-56789abcdef0', '/repo/test.ts')!;
+      expect(receipt).toMatchObject({ scope: 'vitest-inlined-vm-calls', populationStatus: 'unknown',
+        vmCallCount: 2, inputSha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+      expect(receipt.missing).toContain('transform-pipeline-unobserved');
+      expect(receipt.missing).toContain('vm-options-partially-observed');
+      const moved = { ...observation!, vmInputs: observation!.vmInputs!.map(row => ({ ...row, codeRef: '/moved/artifact.js' })) };
+      expect(captureWorkerCompilerInputs(moved, receipt.captureId, receipt.testFile)?.inputSha256).toBe(receipt.inputSha256);
+      const changed = { ...observation!, vmInputs: observation!.vmInputs!.map(row => ({ ...row, columnOffset: -30 })) };
+      expect(captureWorkerCompilerInputs(changed, receipt.captureId, receipt.testFile)?.inputSha256).not.toBe(receipt.inputSha256);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -189,6 +199,10 @@ describe('prospective evaluator inputs', () => {
     const observation = endFile('/repo/test.ts')?.moduleEvaluations;
     expect(observation?.vmInputs).toEqual([]);
     expect(observation?.reasons).toContain('evaluator-wrapper-unobserved');
+    const missing = captureWorkerCompilerInputs(observation, '12345678-9abc-def0-1234-56789abcdef0', '/repo/test.ts');
+    expect(missing).toMatchObject({ vmCallCount: 0, inputSha256: null, populationStatus: 'unknown' });
+    expect(missing?.missing).toContain('vm-calls-unobserved');
+    expect(captureWorkerCompilerInputs(undefined, '12345678-9abc-def0-1234-56789abcdef0', '/repo/test.ts')).toBeUndefined();
   });
 
   it('records external evaluator call IDs without claiming loader bytes or changing results', () => {

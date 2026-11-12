@@ -21,6 +21,7 @@ import {
   PC_EXECUTED_INPUTS_DIR_ENV,
   beginFile,
   captureModuleImports,
+  captureWorkerCompilerInputs,
   endFile,
   inputsFilePath,
   installCapture,
@@ -74,6 +75,7 @@ if (dir) {
         if (record && filepath) record.workerExecution = { schemaVersion: 'worker-execution-v1',
           captureId, testFile: filepath, before: processBefore,
           after: runtimeProof.captureCurrentWorkerProcessIdentity() };
+        if (record && filepath) record.compilerInputs = captureWorkerCompilerInputs(record.moduleEvaluations, captureId, filepath);
         if (record) record.moduleImports = captureModuleImports(
           (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__,
         );
