@@ -14,7 +14,8 @@ function interrupt(phase: string): void {
 export default class CrashReporter extends ExecutedSourceMapReporter {
   override async onInit(ctx: Vitest): Promise<void> {
     const phase = process.env.PC_COMPLETION_CRASH_WINDOW;
-    if (phase !== 'before-first-snapshot' && phase !== 'after-first-bank' && phase !== 'primary-yield') {
+    if (phase !== 'before-first-snapshot' && phase !== 'after-first-bank' && phase !== 'primary-yield'
+      && phase !== 'registered-complete') {
       super.onInit(ctx);
       return;
     }

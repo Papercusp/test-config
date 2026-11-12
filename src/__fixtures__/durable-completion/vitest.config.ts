@@ -13,6 +13,10 @@ const config = defineVitestConfig({
 });
 
 config.test = { ...config.test, name: 'durable-completion-fixture', fileParallelism: false, maxWorkers: 1,
-  reporters: [fileURLToPath(new URL('./crash-reporter.fixture.ts', import.meta.url))] };
+  reporters: [
+    ...(process.env.PC_COMPLETION_RECORD_ORIGINALS === '1'
+      ? [fileURLToPath(new URL('../../admin-test-runs-reporter.ts', import.meta.url))] : []),
+    fileURLToPath(new URL('./crash-reporter.fixture.ts', import.meta.url)),
+  ] };
 
 export default config;
