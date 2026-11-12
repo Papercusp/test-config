@@ -10,8 +10,8 @@ const RECEIPTS = Symbol.for('@papercusp/test-config.applied-compiler-inputs-v1')
 const FUNCTIONS = ['loadTsconfigJsonForFile', 'parse', 'parseExtends', 'parseFile',
   'resolveSolutionTSConfig', 'transform', 'transformWithEsbuild'];
 const GAPS = ['plugin-private-inputs-unobserved', 'cached-module-test-custody-unobserved',
-  'transitive-compiler-implementation-unobserved', 'tsconfig-resolution-search-unobserved',
-  'compiler-outcome-unobserved'];
+  'transitive-compiler-implementation-unobserved', 'tsconfig-resolution-search-unobserved'];
+const OUTCOME_GAP = 'compiler-outcome-unobserved';
 const MAX_CALLS = 256;
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 const digest = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -32,6 +32,9 @@ export interface AppliedCompilerCall {
     functionHashes: ReadonlyArray<Readonly<{ name: string; sha256: string }>> }> | null;
   /** Hash of measured call inputs only; operational capture/process IDs are separate. */
   inputSha256: string | null;
+  /** Optional for legacy/inflight observations. Bound to the original call. */
+  outcome?: Readonly<{ status: 'success'; callBinding: string; resultSha256: string | null }
+    | { status: 'failure'; callBinding: string; errorSha256: string | null }>;
 }
 
 export interface AppliedCompilerReceipt {
@@ -53,6 +56,10 @@ function callHash(call: Omit<AppliedCompilerCall, 'inputSha256'>): string | null
     call.tsconfigStatus, call.tsconfigInputs, call.implementation], 'vite-applied-esbuild-call-v1');
 }
 
+function callBinding(captureId: string, call: AppliedCompilerCall): string {
+  return sha(JSON.stringify(['vite-esbuild-settlement-v1', captureId, call.sequence, call.moduleId, call.inputSha256]));
+}
+
 /** Strict JSON transport parser. A digest of a bounded call does not certify
  * plugin closure, successful compilation, a census or worker/test attribution. */
 export function parseAppliedCompilerReceipt(value: unknown): AppliedCompilerReceipt | undefined {
@@ -64,8 +71,7 @@ export function parseAppliedCompilerReceipt(value: unknown): AppliedCompilerRece
       || value.basis !== 'before-compiler-call' || value.populationStatus !== 'unknown'
       || typeof value.captureId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.captureId)
       || typeof value.truncated !== 'boolean' || !Array.isArray(value.calls) || !value.calls.length || value.calls.length > MAX_CALLS
-      || !Array.isArray(value.missing) || value.missing.length !== GAPS.length
-      || new Set(value.missing).size !== GAPS.length || !GAPS.every(gap => (value.missing as unknown[]).includes(gap))) return undefined;
+      || !Array.isArray(value.missing) || !GAPS.every(gap => (value.missing as unknown[]).includes(gap))) return undefined;
     const processIdentity = value.compilerProcess;
     if (processIdentity !== null && (!plain(processIdentity)
       || !keys(processIdentity, ['pid', 'threadId', 'bootId', 'startTicks'])
@@ -75,7 +81,8 @@ export function parseAppliedCompilerReceipt(value: unknown): AppliedCompilerRece
       || typeof processIdentity.startTicks !== 'string' || !/^\d+$/.test(processIdentity.startTicks))) return undefined;
     for (const [index, call] of value.calls.entries()) {
       if (!plain(call) || !keys(call, ['sequence', 'moduleId', 'codeSha256', 'optionsSha256', 'tsconfigStatus',
-        'tsconfigInputs', 'implementation', 'inputSha256']) || call.sequence !== index + 1 || !file(call.moduleId)
+        'tsconfigInputs', 'implementation', 'inputSha256', ...(Object.hasOwn(call, 'outcome') ? ['outcome'] : [])])
+        || call.sequence !== index + 1 || !file(call.moduleId)
         || !digest(call.codeSha256) || (call.optionsSha256 !== null && !digest(call.optionsSha256))
         || !['captured', 'absent', 'inline', 'not-used', 'unavailable'].includes(call.tsconfigStatus as string)
         || !Array.isArray(call.tsconfigInputs) || call.tsconfigInputs.length > 1024) return undefined;
@@ -96,7 +103,20 @@ export function parseAppliedCompilerReceipt(value: unknown): AppliedCompilerRece
         || !implementation.functionHashes.every((fn, i) => plain(fn) && keys(fn, ['name', 'sha256'])
           && fn.name === FUNCTIONS[i] && digest(fn.sha256)))) return undefined;
       if (call.inputSha256 !== callHash(call as unknown as AppliedCompilerCall)) return undefined;
+      if (Object.hasOwn(call, 'outcome')) {
+        const outcome = call.outcome;
+        if (!plain(outcome) || !['success', 'failure'].includes(outcome.status as string)
+          || !keys(outcome, ['status', 'callBinding', outcome.status === 'success' ? 'resultSha256' : 'errorSha256'])
+          || outcome.callBinding !== callBinding(value.captureId, call as unknown as AppliedCompilerCall)) return undefined;
+        const outcomeHash = outcome.status === 'success' ? outcome.resultSha256 : outcome.errorSha256;
+        if (outcomeHash !== null && !digest(outcomeHash)) return undefined;
+      }
     }
+    const outcomeUnknown = value.truncated || value.calls.some(call => !call.outcome
+      || (call.outcome.status === 'success' ? !call.outcome.resultSha256 : !call.outcome.errorSha256));
+    const missing = [...GAPS, ...(outcomeUnknown ? [OUTCOME_GAP] : [])];
+    if (value.missing.length !== missing.length || new Set(value.missing).size !== missing.length
+      || !missing.every(gap => (value.missing as unknown[]).includes(gap))) return undefined;
     return value as unknown as AppliedCompilerReceipt;
   } catch { return undefined; }
 }
@@ -139,7 +159,9 @@ export function installAppliedCompilerInputCapture(config: object): boolean {
           Object.defineProperty(environment, RECEIPTS, { value: () => Object.freeze({
             schemaVersion: 'vite-applied-compiler-inputs-v1', scope: 'vite-esbuild-calls', basis: 'before-compiler-call',
             populationStatus: 'unknown', captureId, compilerProcess, calls: Object.freeze([...entries.calls]),
-            truncated: entries.truncated, missing: Object.freeze([...GAPS]),
+            truncated: entries.truncated, missing: Object.freeze([...GAPS, ...(entries.truncated || entries.calls.some(call =>
+              !call.outcome || (call.outcome.status === 'success' ? !call.outcome.resultSha256 : !call.outcome.errorSha256))
+              ? [OUTCOME_GAP] : [])]),
           }) });
           journals.set(environment, journal);
         }
@@ -159,7 +181,32 @@ export function installAppliedCompilerInputCapture(config: object): boolean {
           optionsSha256: hashConfigurationValue(event.options, 'vite-applied-esbuild-options-v1'), tsconfigStatus: status,
           tsconfigInputs: Object.freeze([...inputs.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
           implementation: implementationIdentity(event.implementation) };
-        journal.calls.push(Object.freeze({ ...call, inputSha256: callHash(call) }));
+        const original = Object.freeze({ ...call, inputSha256: callHash(call) });
+        journal.calls.push(original);
+        // This closure owns the exact slot even when concurrent calls settle
+        // out of order. Replace frozen snapshots; never mutate earlier reads.
+        let settled = false;
+        return (settlement: unknown) => {
+          if (settled) return;
+          try {
+            if (!plain(settlement)) return;
+            const status = Object.getOwnPropertyDescriptor(settlement, 'status')?.value;
+            let outcome: AppliedCompilerCall['outcome'];
+            const binding = callBinding(captureId, original);
+            if (status === 'success') {
+              const result = Object.getOwnPropertyDescriptor(settlement, 'result')?.value;
+              outcome = Object.freeze({ status, callBinding: binding,
+                resultSha256: hashConfigurationValue(result, 'vite-esbuild-result-v1') });
+            } else if (status === 'failure') {
+              const error = Object.getOwnPropertyDescriptor(settlement, 'error')?.value;
+              const message = error && typeof error === 'object' ? Object.getOwnPropertyDescriptor(error, 'message')?.value : undefined;
+              outcome = Object.freeze({ status, callBinding: binding,
+                errorSha256: typeof message === 'string' ? sha(message) : null });
+            } else return;
+            journal!.calls[original.sequence - 1] = Object.freeze({ ...original, outcome });
+            settled = true;
+          } catch { /* An unobserved settlement retains the explicit gap. */ }
+        };
       } catch { /* Missing or unsupported input never changes compiler behavior. */ }
     } });
     installed.add(config);
@@ -172,4 +219,13 @@ export function readAppliedCompilerInputs(environment: object | undefined): Appl
     const read = environment && Object.getOwnPropertyDescriptor(environment, RECEIPTS)?.value;
     return typeof read === 'function' ? parseAppliedCompilerReceipt(read()) : undefined;
   } catch { return undefined; }
+}
+
+/** A settled result hash is only output of this one esbuild call. The other
+ * four missing inputs still prevent whole-compiler or test-proof authority. */
+export function successfulAppliedCompilerOutput(receipt: unknown, sequence: number): string | undefined {
+  const parsed = parseAppliedCompilerReceipt(receipt);
+  const call = parsed?.calls.find(call => call.sequence === sequence);
+  return !parsed?.truncated && call?.inputSha256 && call.outcome?.status === 'success'
+    && call.outcome.resultSha256 ? call.outcome.resultSha256 : undefined;
 }

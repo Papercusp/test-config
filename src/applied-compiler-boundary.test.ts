@@ -8,7 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { createServer, Plugin } from 'vite';
 import { executedSourceOriginalsPlugin } from './vitest-config.ts';
-import { parseAppliedCompilerReceipt, readAppliedCompilerInputs, type AppliedCompilerReceipt } from './applied-compiler-inputs.ts';
+import { parseAppliedCompilerReceipt, readAppliedCompilerInputs, successfulAppliedCompilerOutput,
+  installAppliedCompilerInputCapture, type AppliedCompilerReceipt } from './applied-compiler-inputs.ts';
 
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const blobHash = (value: Buffer) => createHash('sha1').update('blob ' + value.length + '\0').update(value).digest('hex');
@@ -31,6 +32,42 @@ beforeAll(async () => {
   const target = join(isolated, 'dist/node/chunks/config.js');
   const installedHash = blobHash(readFileSync(target));
   if (installedHash === index[2]) execFileSync('git', ['apply', '--reverse', patchPath], { cwd: fixture });
+  else if (installedHash !== index[1]) {
+    // A maintained dependency generation may contain the previous committed
+    // patch. Normalize only a verified tracked postimage in this isolated copy.
+    const revisions = execFileSync('git', ['log', '-8', '--format=%H', '--', 'patches/vite+7.3.5.patch'],
+      { cwd: repoRoot, encoding: 'utf8' }).trim().split('\n');
+    let restored = false;
+    for (const revision of revisions.filter(revision => /^[a-f0-9]{40}$/.test(revision))) {
+      const prior = execFileSync('git', ['show', revision + ':patches/vite+7.3.5.patch'], { cwd: repoRoot, encoding: 'utf8' });
+      const hashes = /^index ([a-f0-9]+)\.\.([a-f0-9]+) /m.exec(prior);
+      if (hashes?.[1] === index[1] && hashes[2] === installedHash) {
+        execFileSync('git', ['apply', '--reverse', '-'], { cwd: fixture, input: prior }); restored = true; break;
+      }
+    }
+    if (!restored && installedHash === 'd47de69dfa01e96415ed334a119b32dde12f7b51') {
+      // The original before-call patch can still be uncommitted during this
+      // source change. Upgrade ONLY that exact measured donor, ONLY here, then
+      // require the current full postimage before reversing/applying the patch.
+      const hunk = patch.split('\n').findIndex(line => line.startsWith('@@ -6119,'));
+      expect(hunk).toBeGreaterThan(0);
+      const lines = patch.split('\n').slice(hunk + 1);
+      const end = lines.findIndex(line => line.startsWith('@@'));
+      const current = lines.slice(0, end).filter(line => !line.startsWith('-')).map(line => line.slice(1)).join('\n') + '\n';
+      const prior = current.replace('\tlet papercuspSettle;\n', '')
+        .replace('papercuspSettle = observe({', 'observe({')
+        .replace(/\t\tlet result;\n\t\ttry \{[\s\S]*?\{ status: "success", result \}\); \} catch \{\}\n/,
+          '\t\tconst result = await transform(code, resolvedOptions);\n');
+      const donor = readFileSync(target, 'utf8');
+      expect(prior).not.toBe(current);
+      expect(donor.split(prior)).toHaveLength(2);
+      writeFileSync(target, donor.replace(prior, current));
+      expect(blobHash(readFileSync(target))).toBe(index[2]);
+      execFileSync('git', ['apply', '--reverse', patchPath], { cwd: fixture });
+      restored = true;
+    }
+    expect(restored, 'isolated donor must match a maintained exact postimage').toBe(true);
+  }
   expect(blobHash(readFileSync(target))).toBe(index[1]);
   execFileSync('git', ['apply', '--check', patchPath], { cwd: fixture });
   execFileSync('git', ['apply', patchPath], { cwd: fixture });
@@ -48,6 +85,81 @@ async function serverFor(root: string, plugins: Plugin[] = [], capture = true) {
 }
 
 describe('maintained Vite applied compiler boundary', () => {
+  it('settlement: real compiler success and failure bind to their original before-call sequence', async () => {
+    const root = join(fixture, 'settlement'); mkdirSync(root);
+    const good = join(root, 'good.ts'), bad = join(root, 'bad.ts');
+    writeFileSync(good, 'export const value: number = 1;');
+    writeFileSync(bad, 'export const broken: number = ;');
+    const server = await serverFor(root);
+    try {
+      const environment = server.environments.ssr!;
+      expect(await environment.transformRequest(good)).not.toBeNull();
+      const successful = readAppliedCompilerInputs(environment)!;
+      expect(successful.calls[0]!.outcome?.status).toBe('success');
+      expect(successfulAppliedCompilerOutput(successful, 1)).toMatch(/^[a-f0-9]{64}$/);
+      expect(successful.missing).not.toContain('compiler-outcome-unobserved');
+      await expect(environment.transformRequest(bad)).rejects.toThrow();
+      const failed = readAppliedCompilerInputs(environment)!;
+      expect(failed.calls).toHaveLength(2);
+      expect(failed.calls[1]).toMatchObject({ sequence: 2, moduleId: bad, outcome: { status: 'failure' } });
+      expect(failed.calls[1]!.outcome).toHaveProperty('errorSha256', expect.stringMatching(/^[a-f0-9]{64}$/));
+      expect(successfulAppliedCompilerOutput(failed, 2)).toBeUndefined();
+      expect(failed.calls[0]).toEqual(successful.calls[0]);
+      expect(successful.calls).toHaveLength(1);
+      expect(failed.populationStatus).toBe('unknown');
+      expect(failed.missing).toHaveLength(4);
+      expect(Object.isFrozen(failed.calls[1]!.outcome)).toBe(true);
+      expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(failed)))).toEqual(failed);
+      const forged = { ...failed, calls: [failed.calls[0], { ...failed.calls[1], outcome: failed.calls[0]!.outcome }] };
+      expect(parseAppliedCompilerReceipt(forged)).toBeUndefined();
+      expect(successfulAppliedCompilerOutput(forged, 2)).toBeUndefined();
+      expect(parseAppliedCompilerReceipt({ ...failed, captureId: '00000000-0000-0000-0000-000000000000' })).toBeUndefined();
+    } finally { await server.close(); }
+  }, 30_000);
+
+  it('settlement: inflight and legacy calls never become output, and out-of-order callbacks retain exact custody', () => {
+    // Call the observer protocol directly to hold calls inflight. Real compiler
+    // success/rejection delivery is separately exercised above, not mocked.
+    const config = {}, environment = {};
+    expect(installAppliedCompilerInputCapture(config)).toBe(true);
+    const observe = Object.getOwnPropertyDescriptor(config,
+      Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value;
+    const functions = Object.fromEntries(['loadTsconfigJsonForFile', 'parse', 'parseExtends', 'parseFile',
+      'resolveSolutionTSConfig', 'transform', 'transformWithEsbuild'].map(name => [name, function measuredFunction() {}]));
+    const event = (moduleId: string) => ({ version: 1, environment, moduleId, code: 'code', options: { loader: 'ts' },
+      tsconfig: { status: 'not-used', inputs: [] }, implementation: { viteVersion: 'test', esbuildVersion: 'test', functions } });
+    const settle1 = observe(event('/repo/first.ts')), settle2 = observe(event('/repo/second.ts'));
+    const before = readAppliedCompilerInputs(environment)!;
+    expect(before.missing).toContain('compiler-outcome-unobserved');
+    expect(successfulAppliedCompilerOutput(before, 1)).toBeUndefined();
+    settle2({ status: 'success', result: { code: 'second output' } });
+    const middle = readAppliedCompilerInputs(environment)!;
+    expect(middle.calls[1]!.outcome?.status).toBe('success');
+    expect(middle.calls[0]!.outcome).toBeUndefined();
+    expect(successfulAppliedCompilerOutput(middle, 1)).toBeUndefined();
+    expect(successfulAppliedCompilerOutput(middle, 2)).toMatch(/^[a-f0-9]{64}$/);
+    settle1({ status: 'failure', error: new Error('compiler rejected private source') });
+    const after = readAppliedCompilerInputs(environment)!;
+    expect(after.missing).toHaveLength(4);
+    expect(after.calls[0]!.outcome?.status).toBe('failure');
+    expect(after.calls[1]).toEqual(middle.calls[1]);
+    expect(after.calls.map(call => call.inputSha256)).toEqual(before.calls.map(call => call.inputSha256));
+    expect(JSON.stringify(after)).not.toContain('compiler rejected private source');
+    expect(before.calls.every(call => !call.outcome)).toBe(true);
+    expect(Object.isFrozen(after.calls[0]!.outcome)).toBe(true);
+    settle1({ status: 'success', result: { code: 'late duplicate' } });
+    expect(readAppliedCompilerInputs(environment)).toEqual(after);
+    const legacy = { ...after, missing: [...after.missing, 'compiler-outcome-unobserved'],
+      calls: after.calls.map(({ outcome: _outcome, ...call }) => call) };
+    expect(parseAppliedCompilerReceipt(legacy)).toEqual(legacy);
+    expect(successfulAppliedCompilerOutput(legacy, 2)).toBeUndefined();
+    expect(parseAppliedCompilerReceipt({ ...legacy, missing: after.missing })).toBeUndefined();
+    for (const outcome of [{ ...after.calls[0]!.outcome, status: 'inflight' },
+      { ...after.calls[0]!.outcome, resultSha256: 'a'.repeat(64) },
+      { ...after.calls[1]!.outcome, resultSha256: 'not-a-hash' }])
+      expect(parseAppliedCompilerReceipt({ ...after, calls: [{ ...after.calls[0], outcome }, after.calls[1]] })).toBeUndefined();
+  });
+
   it('captures applied per-file arguments and consumed extends bytes, with equivalent repeats', async () => {
     const root = join(fixture, 'option-mutation');
     mkdirSync(root);
