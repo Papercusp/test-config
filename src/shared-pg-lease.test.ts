@@ -111,11 +111,15 @@ describe('shared PG setup failure receipts', () => {
     const directory = mkdtempSync(join(tmpdir(), 'reporter-query-'));
     const file = join(directory, 'receipts.jsonl');
     const previous = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    const previousTrace = process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE;
+    const lines: string[] = [];
+    const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
     const failure = Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' });
     const sql = Object.assign((first: unknown) => Array.isArray(first) && !('raw' in first)
       ? {} : Promise.reject(failure), { end: async () => undefined });
     vi.doMock('postgres', () => ({ default: () => sql }));
     process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = file;
+    process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE = '1';
     const at = new Date('2026-10-26T20:00:00Z');
     try {
       await closeSharedPg();
@@ -127,11 +131,19 @@ describe('shared PG setup failure receipts', () => {
       expect(receipt).toMatchObject({ outcome: 'failed', errorCode: 'ECONNREFUSED' });
       expect(receipt).not.toHaveProperty('pgSetupFailure');
       expect(receipt.reason).not.toBe('pg_unavailable');
+      const stages = lines.filter(line => line.startsWith('TEST_FILE_FINALIZATION '))
+        .map(line => JSON.parse(line.slice('TEST_FILE_FINALIZATION '.length)))
+        .filter(event => event.event === 'end')
+        .map(event => event.stage);
+      expect(stages).toEqual(['git-context', 'pg-client', 'ledger-insert']);
     } finally {
+      sink.mockRestore();
       await closeSharedPg();
       vi.doUnmock('postgres');
       if (previous === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
       else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previous;
+      if (previousTrace === undefined) delete process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE;
+      else process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE = previousTrace;
       rmSync(directory, { recursive: true, force: true });
     }
   });

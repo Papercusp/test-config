@@ -70,7 +70,8 @@ import { testTimingRuntimeIdentity } from './test-timeout-runtime.ts';
 
 /** Diagnose private proof finalization without granting deadline or verdict authority. */
 export async function observeReporterStage<T>(reporter: 'test-runs' | 'executed-source',
-  stage: 'source-snapshot' | 'write-rows' | 'onTestRunEnd' | 'onExit' | 'pg-release' | 'completion-checkpoints' | 'completion-snapshot',
+  stage: 'source-snapshot' | 'write-rows' | 'git-context' | 'pg-client' | 'ledger-insert'
+    | 'onTestRunEnd' | 'onExit' | 'pg-release' | 'completion-checkpoints' | 'completion-snapshot',
   action: () => Promise<T>): Promise<T> {
   if (process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE !== '1'
     && process.env.PC_ISOLATED_RUNTIME_PROOF !== '1' && !process.env.VERIFY_TAURI_SOURCE_RECEIPT) return action();
@@ -2805,12 +2806,12 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<TestRunRe
   let branch: string | null = null;
   let inferredCommit: string | null = null;
   try {
-    const ctx = await resolveGitContext();
+    const ctx = await observeReporterStage('test-runs', 'git-context', resolveGitContext);
     branch = ctx.branch;
     inferredCommit = ctx.commit;
   } catch { /* fail-soft */ }
 
-  const pg = await tryGetPg();
+  const pg = await observeReporterStage('test-runs', 'pg-client', tryGetPg);
   if (!pg) {
     const receipts = unwrittenReceipts(rows, 'failed', 'pg_unavailable', {
       pgSetupFailure: sharedPg.setupFailure,
@@ -2821,17 +2822,18 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<TestRunRe
 
   const { loopLagP95Ms, rssMb } = captureReporterSaturationSnapshot();
   try {
-    const receipts = await insertTestRunRowsWithSql(pg.sql, rows, {
-      branch,
-      inferredCommit,
-      declaredSource: resolveTestRunSource(),
-      runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
-      harnessSlug: resolveTestRunHarnessSlug(),
-      workspaceId: resolveTestRunWorkspaceId(),
-      loopLagP95Ms,
-      rssMb,
-      configurationSnapshot: captureConfigurationSnapshot(process.env),
-    });
+    const receipts = await observeReporterStage('test-runs', 'ledger-insert', () =>
+      insertTestRunRowsWithSql(pg.sql, rows, {
+        branch,
+        inferredCommit,
+        declaredSource: resolveTestRunSource(),
+        runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+        harnessSlug: resolveTestRunHarnessSlug(),
+        workspaceId: resolveTestRunWorkspaceId(),
+        loopLagP95Ms,
+        rssMb,
+        configurationSnapshot: captureConfigurationSnapshot(process.env),
+      }));
     appendTestRunReceipts(process.env, receipts);
     return receipts;
   } catch (error) {

@@ -672,7 +672,7 @@ describe('ExecutedSourceMapReporter', () => {
       })) as never);
     }
 
-    it.each(['native-first', 'ledger-first'])('retains the same worker dependency and source-byte measurement for %s callback order', async order => {
+    it.each(['native-first', 'ledger-first'])('retains the same worker dependency, compiler search and source-byte measurement for %s callback order', async order => {
       const worker = { name: 'node', version: '25.1.0', executable: '/qualified/node', platform: 'linux', arch: 'x64',
         binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
         configurationSha256: '4'.repeat(64) };
@@ -692,12 +692,19 @@ describe('ExecutedSourceMapReporter', () => {
       const viteTransformOptions = readViteTransformOptions(viteEnvironment)!;
       const compilerConfig = {};
       expect(installAppliedCompilerInputCapture(compilerConfig)).toBe(true);
-      Object.getOwnPropertyDescriptor(compilerConfig, Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value({
+      const tsconfigSearch = { schemaVersion: 'tsconfig-resolution-search-v1', status: 'partial',
+        lookups: [{ path: join(ROOT, 'tsconfig.json'), outcome: 'file', errorCode: null }],
+        extends: [], cacheHits: [{ kind: 'parse', path: join(ROOT, 'tsconfig.json') }], truncated: false };
+      const settle = Object.getOwnPropertyDescriptor(compilerConfig, Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value({
         version: 1, environment: viteEnvironment, moduleId: TEST_FILE, code: 'export const n = 1',
-        options: { target: 'es2022' }, tsconfig: { status: 'not-used', inputs: [] }, implementation: null,
+        options: { target: 'es2022' }, tsconfig: { status: 'not-used', inputs: [], search: tsconfigSearch }, implementation: null,
       });
+      settle({ status: 'success', result: { code: 'export const n = 1', map: '' } });
       const appliedCompilerInputs = readAppliedCompilerInputs(viteEnvironment)!;
       expect(appliedCompilerInputs).toBeDefined();
+      expect(appliedCompilerInputs.calls[0]).toMatchObject({ tsconfigSearch, outcome: { status: 'success' } });
+      expect(appliedCompilerInputs.missing).toContain('tsconfig-resolution-search-unobserved');
+      expect(appliedCompilerInputs.missing).not.toContain('compiler-outcome-unobserved');
       process.env.PAPERCUSP_TEST_RUN_GROUP = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
       const at = new Date().toISOString();
       const workerDatabaseReset = { schemaVersion: 'worker-database-reset-v1', captureId: workerExecution.captureId,
