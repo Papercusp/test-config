@@ -3956,7 +3956,7 @@ describe('WI-10004898 — copy-out probe rows are measured against the origin ch
 });
 
 describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', () => {
-  const STATUS = 'git status --porcelain --untracked-files=all';
+  const STATUS = 'git status --porcelain --untracked-files=all --pc-partitioned';
   /** A fake git: each command answers from its queue in order; null models a timed-out exec. */
   const fakeGit = (answers: Record<string, Array<string | null>>) => {
     const calls: Array<{ cmd: string; timeoutMs: number }> = [];
@@ -4051,6 +4051,59 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     setRunRoot(root);
     return { parent, root, receiptPath, sourceCommit };
   }
+
+  it.skipIf(process.platform === 'win32')('partitions full-tree status and preserves tracked, untracked, staged-delete and literal paths', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-partitioned-status-'));
+    const bin = mkdtempSync(join(tmpdir(), 'reporter-git-shim-'));
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const log = join(bin, 'status-calls.txt');
+    writeFileSync(join(bin, 'git'), [
+      '#!/bin/sh',
+      'if [ "$1" = "--literal-pathspecs" ] && [ "$2" = "status" ]; then echo "$#" >> "$PC_TEST_STATUS_LOG"; fi',
+      'exec "$PC_TEST_REAL_GIT" "$@"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    chmodSync(join(bin, 'git'), 0o755);
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore' });
+    try {
+      git('init', '-q');
+      for (let index = 0; index < 520; index++)
+        writeFileSync(join(root, `tracked-${String(index).padStart(4, '0')}.ts`), `export const n = ${index};`);
+      writeFileSync(join(root, ':(glob)literal.ts'), 'export const literal = true;');
+      git('add', '--', '.');
+      git('-c', 'user.name=Reporter fixture', '-c', 'user.email=reporter@example.test', 'commit', '-qm', 'fixture');
+
+      vi.stubEnv('PATH', `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`);
+      vi.stubEnv('PC_TEST_REAL_GIT', realGit);
+      vi.stubEnv('PC_TEST_STATUS_LOG', log);
+      setRunRoot(root);
+      const clean = await captureWorktreeSnapshot(undefined, undefined, undefined, false);
+      expect(clean.commit).toMatch(/^[a-f0-9]{40}$/);
+      expect(clean.porcelain).toBe('');
+      const cleanCalls = readFileSync(log, 'utf8').trim().split('\n').map(Number);
+      expect(cleanCalls.length).toBeGreaterThan(1);
+      expect(cleanCalls.every(argumentCount => argumentCount <= 517)).toBe(true);
+
+      writeFileSync(log, '');
+      writeFileSync(join(root, 'tracked-0001.ts'), 'export const n = 9001;');
+      writeFileSync(join(root, ':(glob)literal.ts'), 'export const literal = false;');
+      writeFileSync(join(root, 'untracked.ts'), 'export const fresh = true;');
+      git('rm', '--quiet', '--', 'tracked-0519.ts');
+      const dirty = await captureWorktreeSnapshot(undefined, undefined, undefined, false);
+      expect(dirty.porcelain).toContain('tracked-0001.ts');
+      expect(dirty.porcelain).toContain(':(glob)literal.ts');
+      expect(dirty.porcelain).toContain('untracked.ts');
+      expect(dirty.porcelain).toContain('tracked-0519.ts');
+      const dirtyCalls = readFileSync(log, 'utf8').trim().split('\n').map(Number);
+      expect(dirtyCalls.length).toBeGreaterThan(1);
+      expect(dirtyCalls.every(argumentCount => argumentCount <= 517)).toBe(true);
+    } finally {
+      setRunRoot(null);
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('consumes the prepared receipt for the before snapshot and still checks after-run dirt', async () => {
     const fixture = preparedRootReceiptFixture();

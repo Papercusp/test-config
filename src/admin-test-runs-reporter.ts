@@ -35,7 +35,7 @@ import type { Reporter, TestCase, TestModule, TestRunEndReason, Vitest } from 'v
 import { pinModuleState } from '@papercusp/module-singleton';
 import { exec, execFileSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
-import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -635,7 +635,28 @@ export function runGit(
 ): Promise<string | null> {
   // Windows retains exec's native shell/timeout behavior. POSIX must own a
   // process group: killing exec's shell alone leaves Git and its helpers alive.
-  if (process.platform !== 'win32') return runGitProcessGroup(cmd, cwd, timeoutMs, onFailure);
+  const partitionedStatus = cmd.startsWith('git status --porcelain --untracked-files=all')
+    && cmd.includes(' --pc-partitioned');
+  const statusCommand = partitionedStatus ? cmd.replace(' --pc-partitioned', '') : cmd;
+  if (partitionedStatus && process.platform !== 'win32') {
+    let tempDir: string;
+    try {
+      tempDir = mkdtempSync('/tmp/papercusp-reporter-status-');
+    } catch (error) {
+      try {
+        onFailure?.(JSON.stringify({ command: statusCommand, timeoutMs, elapsedMs: 0,
+          code: (error as { code?: string })?.code ?? null, signal: null, killed: false,
+          message: ('status temp directory: ' + (error instanceof Error ? error.message : String(error))).slice(0, 512),
+          stderr: '' }));
+      } catch { /* Diagnostics must obey the reporter's fail-soft contract too. */ }
+      return Promise.resolve(null);
+    }
+    return runGitProcessGroup(partitionedGitStatusScript(statusCommand, tempDir), cwd, timeoutMs, onFailure)
+      .finally(() => { try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ } });
+  }
+  const actualCommand = statusCommand;
+  if (process.platform !== 'win32')
+    return runGitProcessGroup(actualCommand, cwd, timeoutMs, onFailure);
   return new Promise((resolveP) => {
     const startedAt = Date.now();
     let settled = false;
@@ -645,7 +666,7 @@ export function runGit(
       if (error || child?.killed) {
         const failure = error as { code?: string | number; signal?: string; message?: string } | null;
         try {
-          onFailure?.(JSON.stringify({ command: cmd, timeoutMs, elapsedMs: Date.now() - startedAt,
+          onFailure?.(JSON.stringify({ command: actualCommand, timeoutMs, elapsedMs: Date.now() - startedAt,
             code: failure?.code ?? child?.exitCode ?? null,
             signal: failure?.signal ?? child?.signalCode ?? null, killed: child?.killed ?? false,
             message: (failure?.message ?? String(error ?? '')).slice(0, 512),
@@ -657,13 +678,42 @@ export function runGit(
       }
     };
     try {
-      const child = exec(cmd, { cwd, timeout: timeoutMs }, (err, stdout, stderr) => {
+      const child = exec(actualCommand, { cwd, timeout: timeoutMs }, (err, stdout, stderr) => {
         finish(err, stdout, stderr, child);
       });
     } catch (error) {
       finish(error, '', '');
     }
   });
+}
+
+function partitionedGitStatusScript(statusCommand: string, tempDir: string): string {
+  const ignoreSubmodules = statusCommand.includes('--ignore-submodules=none') ? ' --ignore-submodules=none' : '';
+  const pathsFile = join(tempDir, 'paths');
+  const statusFile = join(tempDir, 'status');
+  return [
+    'git --version >/dev/null',
+    'set -eu',
+    'paths=' + pathsFile,
+    'status=' + statusFile,
+    "trap 'rm -f \"$paths\" \"$status\"' 0 HUP INT TERM",
+    'git ls-files --cached --others --exclude-standard -z > "$paths"',
+    'if git rev-parse --verify -q HEAD >/dev/null 2>&1; then',
+    '  git diff --cached --no-renames --diff-filter=D --name-only -z HEAD >> "$paths"',
+    'fi',
+    'if [ -s "$paths" ]; then',
+    '  xargs -0 -n 512 -s 65536 -P 8 git --literal-pathspecs status --porcelain --untracked-files=all' + ignoreSubmodules + ' -- < "$paths" > "$status"',
+    'fi',
+    'if [ -s "$status" ]; then',
+    '  bytes=$(wc -c < "$status" | xargs)',
+    '  if [ "$bytes" -le 1048576 ]; then cat "$status"; else',
+    '    lines=$(wc -l < "$status" | xargs)',
+    '    if command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum < "$status" | cut -d " " -f1); else digest=$(shasum -a 256 < "$status" | cut -d " " -f1); fi',
+    '    printf "# reporter git-status summary: bytes=%s lines=%s sha256=%s\\n" "$bytes" "$lines" "$digest"',
+    '    head -n 5 "$status"',
+    '  fi',
+    'fi',
+  ].join('\n');
 }
 
 /** Built-ins-only bridge to the independent deadline and process-group owner. */
@@ -887,7 +937,7 @@ export async function captureWorktreeSnapshot(
   const [commit, porcelain] = await Promise.all([
     runGitWithRetry(run, 'git rev-parse HEAD', root, failed),
     runGitWithRetry(run, 'git status --porcelain --untracked-files=all'
-      + (includeSubmodules ? ' --ignore-submodules=none' : ''), root, failed),
+      + ' --pc-partitioned' + (includeSubmodules ? ' --ignore-submodules=none' : ''), root, failed),
   ]);
   const snapshot = { commit, porcelain, ...(errors.length ? { provenanceError: errors.join('; ') } : {}) };
   if (!porcelain) return withSubmodules(snapshot);
