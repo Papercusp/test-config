@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { captureCollectedSources, qualifyCollectedSources } from './executed-source-map-reporter';
 import { executedSourceOriginalsPlugin, PC_EXECUTED_SOURCE_ORIGINAL_META, readExecutedSourceOriginals } from './vitest-config';
+import { captureViteTransformOptions, observeViteTransformOptions, readViteTransformOptions,
+  parseRecordedViteTransformOptions } from './configuration-snapshot.ts';
 
 const ROOT = '/repo';
 const SELF = '/repo/test.test.ts';
@@ -22,6 +24,63 @@ const readSource = (path: string): Buffer => {
 const options = { repoRoot: ROOT, testFile: SELF, readSource };
 
 describe('prospective Vite source fingerprints (EI-24827847586322829)', () => {
+  it('P021 observes changed Vite transform options at fixed source through the real compiler', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'vite-compiler-options-'));
+    const file = join(root, 'input.ts');
+    const source = 'export const answer: number | undefined = globalThis.input?.answer;\n';
+    writeFileSync(file, source);
+    const { createServer } = await import('vite');
+    const hashes: string[] = [];
+    try {
+      for (const target of ['esnext', 'es2015', 'esnext']) {
+        const server = await createServer({ root, configFile: false,
+          server: { middlewareMode: true, watch: null }, plugins: [executedSourceOriginalsPlugin()],
+          esbuild: { target }, optimizeDeps: { noDiscovery: true }, logLevel: 'silent' });
+        try {
+          const environment = server.environments.ssr!;
+          expect(readViteTransformOptions(environment)).toBeUndefined();
+          const result = await environment.transformRequest(file);
+          expect(result?.code.includes('?.')).toBe(target === 'esnext');
+          const options = readViteTransformOptions(environment)!;
+          expect(options).toMatchObject({ populationStatus: 'unknown', transformCount: 1, truncated: false });
+          expect(options.optionHashes).toHaveLength(1);
+          expect(options.optionHashes[0]).toMatch(/^[a-f0-9]{64}$/);
+          expect(parseRecordedViteTransformOptions(JSON.parse(JSON.stringify(options)))).toEqual(options);
+          expect(Object.isFrozen(options)).toBe(true);
+          expect(Object.isFrozen(options.optionHashes)).toBe(true);
+          hashes.push(options.optionHashes[0]!);
+          expect(readExecutedSourceOriginals(environment)?.find(entry => entry.id === file)?.sha256).toBe(hash(source));
+          expect(readFileSync(file, 'utf8')).toBe(source);
+        } finally { await server.close(); }
+      }
+      expect(hashes[0]).not.toBe(hashes[1]);
+      expect(hashes[0]).toBe(hashes[2]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  it('P021 keeps unsupported options and a bounded environment journal explicitly incomplete', () => {
+    const config = { root: '/repo', define: { SECRET: 'not-for-the-report' }, esbuild: { target: 'esnext' } };
+    const environment = {};
+    observeViteTransformOptions(environment, config);
+    const original = readViteTransformOptions(environment)!;
+    expect(JSON.stringify(original)).not.toContain('not-for-the-report');
+    expect(captureViteTransformOptions({ ...config, define: { SECRET: 'changed' } })).not.toBe(original.optionHashes[0]);
+    observeViteTransformOptions(environment, { ...config, esbuild: { target: 'es2015' } });
+    observeViteTransformOptions(environment, { ...config, esbuild: { target: 'es2016' } });
+    expect(readViteTransformOptions(environment)).toMatchObject({ transformCount: 3, truncated: true });
+    expect(original.transformCount).toBe(1);
+    expect(original.optionHashes).toHaveLength(1);
+    expect(readViteTransformOptions({})).toBeUndefined();
+    let invoked = false;
+    expect(captureViteTransformOptions({ ...config, get define() { invoked = true; return {}; } })).toBeNull();
+    expect(captureViteTransformOptions({ ...config, define: { toJSON() { invoked = true; } } })).toBeNull();
+    expect(captureViteTransformOptions({ ...config, esbuild: { plugin() { invoked = true; } } })).toBeNull();
+    expect(invoked).toBe(false);
+    for (const patch of [{ populationStatus: 'complete' }, { complete: true }, { missing: [] },
+      { optionHashes: [] }, { optionHashes: ['not-a-digest'] }, { transformCount: 0 }])
+      expect(parseRecordedViteTransformOptions({ ...original, ...patch })).toBeUndefined();
+  });
+
   it('compares original imported source bytes, independently of an unrelated HEAD change', () => {
     const captured = captureCollectedSources([node(SELF), node(DEP)], options);
     const evidence = qualifyCollectedSources(captured, { [DEP]: {} }, options);

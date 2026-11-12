@@ -68,6 +68,12 @@ export function captureWorkerTestConfiguration(workerState: unknown): string | n
     if (typeof field('root') !== 'string' || !field('root')
       || typeof field('isolate') !== 'boolean' || typeof field('pool') !== 'string'
       || !Array.isArray(field('setupFiles'))) return null;
+    return hashConfigurationValue(config, 'vitest-worker-configuration-v1', true);
+  } catch { return null; }
+}
+
+function hashConfigurationValue(config: unknown, namespace: string, omitSnapshotEnvironment = false): string | null {
+  try {
     const active = new Set<object>();
     let nodes = 0;
     let textSize = 0;
@@ -101,7 +107,7 @@ export function captureWorkerTestConfiguration(workerState: unknown): string | n
       for (const key of (keys as string[]).sort()) {
         textSize += key.length;
         if (textSize > 2_097_152) throw new Error('configuration key bound');
-        if (path.length === 1 && path[0] === 'snapshotOptions' && key === 'snapshotEnvironment') continue;
+        if (omitSnapshotEnvironment && path.length === 1 && path[0] === 'snapshotOptions' && key === 'snapshotEnvironment') continue;
         const descriptor = Object.getOwnPropertyDescriptor(object, key)!;
         if (!('value' in descriptor)) throw new Error('configuration accessor');
         entries.push([key, encode(descriptor.value, [...path, key], depth + 1)]);
@@ -109,8 +115,86 @@ export function captureWorkerTestConfiguration(workerState: unknown): string | n
       active.delete(object);
       return [array ? 'array' : 'object', entries];
     };
-    return sha256Hex(JSON.stringify(['vitest-worker-configuration-v1', encode(config, [], 0)]));
+    return sha256Hex(JSON.stringify([namespace, encode(config, [], 0)]));
   } catch { return null; }
+}
+
+/** Prospective root options at Vite's pre-transform hook. Vite resolves further
+ * per-file options and plugins can retain closure state: this is a diagnostic,
+ * never a complete compiler identity or an attributed per-test census. */
+export interface RecordedViteTransformOptions {
+  schemaVersion: 'vite-root-transform-options-v1';
+  scope: 'vite-environment-transform-hooks';
+  populationStatus: 'unknown';
+  optionHashes: Array<string | null>;
+  transformCount: number;
+  truncated: boolean;
+  missing: string[];
+}
+
+const VITE_TRANSFORM_OPTIONS = Symbol.for('@papercusp/test-config.vite-transform-options');
+const VITE_TRANSFORM_GAPS = ['per-file-tsconfig-unobserved', 'plugin-closures-unobserved',
+  'config-to-compiler-arguments-unobserved', 'environment-to-test-attribution-unverified'];
+const viteOptionJournals = new WeakMap<object, { hashes: Array<string | null>; count: number; truncated: boolean }>();
+
+/** No raw define/env values leave the compiler process, and no getters or
+ * toJSON implementations execute merely to construct an observation. */
+export function captureViteTransformOptions(config: unknown): string | null {
+  try {
+    if (!isPlainObject(config)) return null;
+    const selected = Object.create(null) as Record<string, unknown>;
+    for (const key of ['root', 'base', 'mode', 'command', 'isProduction', 'esbuild', 'define', 'resolve', 'css', 'json', 'env']) {
+      const descriptor = Object.getOwnPropertyDescriptor(config, key);
+      if (descriptor && !('value' in descriptor)) return null;
+      selected[key] = descriptor ? ['present', descriptor.value] : ['absent'];
+    }
+    if (typeof Object.getOwnPropertyDescriptor(config, 'root')?.value !== 'string') return null;
+    return hashConfigurationValue(selected, 'vite-root-transform-options-v1');
+  } catch { return null; }
+}
+
+export function parseRecordedViteTransformOptions(value: unknown): RecordedViteTransformOptions | undefined {
+  if (!isPlainObject(value) || !exactKeys(value, ['schemaVersion', 'scope', 'populationStatus', 'optionHashes',
+    'transformCount', 'truncated', 'missing']) || value.schemaVersion !== 'vite-root-transform-options-v1'
+    || value.scope !== 'vite-environment-transform-hooks' || value.populationStatus !== 'unknown'
+    || !Array.isArray(value.optionHashes) || value.optionHashes.length < 1 || value.optionHashes.length > 2
+    || !value.optionHashes.every(hash => hash === null || proofHash(hash))
+    || new Set(value.optionHashes).size !== value.optionHashes.length
+    || !Number.isSafeInteger(value.transformCount) || (value.transformCount as number) < value.optionHashes.length
+    || (value.transformCount as number) > 1_000_000 || typeof value.truncated !== 'boolean'
+    || !Array.isArray(value.missing) || value.missing.length !== VITE_TRANSFORM_GAPS.length
+    || !VITE_TRANSFORM_GAPS.every(reason => (value.missing as unknown[]).includes(reason))) return undefined;
+  return value as unknown as RecordedViteTransformOptions;
+}
+
+export function observeViteTransformOptions(environment: object, config: unknown): void {
+  try {
+    let journal = viteOptionJournals.get(environment);
+    if (!journal) {
+      journal = { hashes: [], count: 0, truncated: false };
+      const entries = journal;
+      Object.defineProperty(environment, VITE_TRANSFORM_OPTIONS, { value: () => Object.freeze({
+        schemaVersion: 'vite-root-transform-options-v1', scope: 'vite-environment-transform-hooks',
+        populationStatus: 'unknown', optionHashes: Object.freeze([...entries.hashes]),
+        transformCount: entries.count, truncated: entries.truncated, missing: Object.freeze([...VITE_TRANSFORM_GAPS]),
+      }) });
+      viteOptionJournals.set(environment, journal);
+    }
+    if (journal.count >= 1_000_000) { journal.truncated = true; return; }
+    journal.count++;
+    const hash = captureViteTransformOptions(config);
+    if (!journal.hashes.includes(hash)) {
+      if (journal.hashes.length < 2) journal.hashes.push(hash);
+      else journal.truncated = true;
+    }
+  } catch { /* Optional diagnostics never change a transform result. */ }
+}
+
+export function readViteTransformOptions(environment: object | undefined): RecordedViteTransformOptions | undefined {
+  try {
+    const reader = environment && Object.getOwnPropertyDescriptor(environment, VITE_TRANSFORM_OPTIONS)?.value;
+    return typeof reader === 'function' ? parseRecordedViteTransformOptions(reader()) : undefined;
+  } catch { return undefined; }
 }
 
 /** One field on existing qualification/repair/results, not another proof store.

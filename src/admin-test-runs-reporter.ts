@@ -54,7 +54,7 @@ import {
   TEST_RUN_READER_CONTRACT_ENV, TEST_RUN_READER_REFUSAL_PATH_ENV, TEST_RUN_READER_REFUSAL_MARKER,
   testRunExecutionDetailsReaderMismatch,
 } from './execution-details.ts';
-import { captureConfigurationSnapshot, readWorkerTestConfiguration, type ConfigurationSnapshot } from './configuration-snapshot.ts';
+import { captureConfigurationSnapshot, readWorkerTestConfiguration, readViteTransformOptions, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseRecordedWorkerCompilerInputs, parseRecordedWorkerExecution, parseRecordedWorkerDatabaseReset, parseSubmoduleCheckoutStatus,
   type RecordedSubmoduleCheckout, type RecordedSourceSubmodules } from './execution-details.ts';
 import { readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture.ts';
@@ -3354,7 +3354,9 @@ export default class AdminTestRunsReporter implements Reporter {
         const workerRuntime = parseRecordedWorkerRuntime(
           inputs?.runtime);
         if (workerRuntime) Object.assign(executionDetails, { workerRuntime });
-        const workerCompilerInputs = parseRecordedWorkerCompilerInputs(inputs?.compilerInputs);
+        const viteTransformOptions = readViteTransformOptions(testModule.viteEnvironment);
+        const workerCompilerInputs = parseRecordedWorkerCompilerInputs(inputs?.compilerInputs
+          && { ...inputs.compilerInputs, ...(viteTransformOptions ? { viteTransformOptions } : {}) });
         if (workerCompilerInputs) Object.assign(executionDetails, { workerCompilerInputs });
         const workerTestConfiguration = readWorkerTestConfiguration(inputs?.testConfiguration);
         if (workerTestConfiguration) Object.assign(executionDetails, { workerTestConfiguration });

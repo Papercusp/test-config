@@ -13,6 +13,7 @@ import { runtimeProofFingerprint, type RuntimeProofIdentity, type WorkerProcessI
 import { isAbsolute, resolve } from 'node:path';
 import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
   readWorkerTestConfiguration, type RecordedWorkerTestConfiguration,
+  parseRecordedViteTransformOptions, type RecordedViteTransformOptions,
   type ProofContextIdentity } from '@papercusp/test-config/configuration-snapshot';
 
 export interface RecordedWorkerRuntime {
@@ -32,10 +33,12 @@ export interface RecordedWorkerCompilerInputs {
   inputSha256: string | null;
   vmCallCount: number;
   missing: string[];
+  viteTransformOptions?: RecordedViteTransformOptions;
 }
 
 export function parseRecordedWorkerCompilerInputs(value: unknown): RecordedWorkerCompilerInputs | undefined {
-  if (!isRecord(value) || Object.keys(value).length !== 8
+  if (!isRecord(value) || Object.keys(value).some(key => !['schemaVersion', 'scope', 'populationStatus', 'captureId',
+    'testFile', 'inputSha256', 'vmCallCount', 'missing', 'viteTransformOptions'].includes(key))
     || !['schemaVersion', 'scope', 'populationStatus', 'captureId', 'testFile', 'inputSha256', 'vmCallCount', 'missing']
       .every(key => Object.hasOwn(value, key))
     || value.schemaVersion !== 'worker-compiler-inputs-v1' || value.scope !== 'vitest-inlined-vm-calls'
@@ -50,7 +53,8 @@ export function parseRecordedWorkerCompilerInputs(value: unknown): RecordedWorke
     || new Set(value.missing).size !== value.missing.length
     || !value.missing.includes('transform-pipeline-unobserved')
     || !value.missing.includes('vm-options-partially-observed')
-    || (value.vmCallCount === 0 && !value.missing.includes('vm-calls-unobserved'))) return undefined;
+    || (value.vmCallCount === 0 && !value.missing.includes('vm-calls-unobserved'))
+    || (value.viteTransformOptions !== undefined && !parseRecordedViteTransformOptions(value.viteTransformOptions))) return undefined;
   return value as unknown as RecordedWorkerCompilerInputs;
 }
 

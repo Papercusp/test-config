@@ -31,7 +31,8 @@ import {
   type RecordedPopulationCase,
   type TestRunExecutionDetails,
 } from './execution-details.ts';
-import { createProofContextIdentity, proofContextImpact, PROOF_CONTEXT_COMPONENTS } from './configuration-snapshot.ts';
+import { createProofContextIdentity, proofContextImpact, PROOF_CONTEXT_COMPONENTS,
+  observeViteTransformOptions, readViteTransformOptions } from './configuration-snapshot.ts';
 import { captureCurrentWorkerProcessIdentity } from './runtime-proof.ts';
 
 describe('original worker process custody', () => {
@@ -50,6 +51,18 @@ describe('original worker process custody', () => {
     const row = details({ root: '/repo', filePath: 'a.test.ts', workerExecution, workerCompilerInputs });
     expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify(row)))?.workerCompilerInputs).toEqual(workerCompilerInputs);
     expect(captureRecordedProofContext({ ...row, workerCompilerInputs } as never).components.compilerConfiguration).toBeNull();
+    const environment = {};
+    observeViteTransformOptions(environment, { root: '/repo', esbuild: { target: 'esnext' } });
+    const viteTransformOptions = readViteTransformOptions(environment)!;
+    const withOptions = { ...workerCompilerInputs, viteTransformOptions };
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify({ ...row, workerCompilerInputs: withOptions })))
+      ?.workerCompilerInputs).toEqual(withOptions);
+    expect(captureRecordedProofContext({ ...row, workerCompilerInputs: withOptions } as never)
+      .components.compilerConfiguration).toBeNull();
+    expect(parseRecordedWorkerCompilerInputs({ ...withOptions,
+      viteTransformOptions: { ...viteTransformOptions, populationStatus: 'complete' } })).toBeUndefined();
+    expect(parseTestRunExecutionDetails({ ...row, workerCompilerInputs: { ...withOptions,
+      captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' } })).toBeUndefined();
     for (const patch of [{ populationStatus: 'complete' }, { complete: true }, { missing: [] },
       { vmCallCount: -1 }, { vmCallCount: 0 }, { inputSha256: null }])
       expect(parseRecordedWorkerCompilerInputs({ ...workerCompilerInputs, ...patch })).toBeUndefined();

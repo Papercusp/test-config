@@ -17,6 +17,7 @@ import { perGroupVitestEnv } from '../../../scripts/test-files.mjs';
 
 import AdminTestRunsReporter, { inferWorkspaceRoot, type WorktreeGitSnapshot } from './admin-test-runs-reporter';
 import { parseRecordedTestPopulation, parseTestRunExecutionDetails } from './execution-details';
+import { observeViteTransformOptions, readViteTransformOptions } from './configuration-snapshot.ts';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
   EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS,
@@ -681,6 +682,13 @@ describe('ExecutedSourceMapReporter', () => {
       const workerExecution = { schemaVersion: 'worker-execution-v1',
         captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: TEST_FILE,
         before: processIdentity, after: processIdentity };
+      const compilerInputs = { schemaVersion: 'worker-compiler-inputs-v1', scope: 'vitest-inlined-vm-calls',
+        populationStatus: 'unknown', captureId: workerExecution.captureId, testFile: TEST_FILE,
+        inputSha256: '6'.repeat(64), vmCallCount: 1,
+        missing: ['transform-pipeline-unobserved', 'vm-options-partially-observed'] };
+      const viteEnvironment = {};
+      observeViteTransformOptions(viteEnvironment, { root: ROOT, esbuild: { target: 'esnext' } });
+      const viteTransformOptions = readViteTransformOptions(viteEnvironment)!;
       process.env.PAPERCUSP_TEST_RUN_GROUP = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
       const at = new Date().toISOString();
       const workerDatabaseReset = { schemaVersion: 'worker-database-reset-v1', captureId: workerExecution.captureId,
@@ -689,10 +697,12 @@ describe('ExecutedSourceMapReporter', () => {
           origin: 'empty', startedAt: at, readyAt: at, cleanup: { at, outcome: 'dropped' } }] };
       process.env[PC_EXECUTED_INPUTS_DIR_ENV] = tmp;
       const path = inputsFilePath(tmp, TEST_FILE);
-      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime, testConfiguration, workerExecution, workerDatabaseReset }));
+      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime, testConfiguration,
+        workerExecution, workerDatabaseReset, compilerInputs }));
       const source = { ...clean, submodules: [['libs/observed', 'a'.repeat(40)]] as [string, string][] };
       const { r } = reporter(snapshot(source));
       const { mod, tests } = populationModule();
+      Object.assign(mod, { viteEnvironment });
       const rows: Array<{ executionDetails?: unknown }> = [];
       const ledger = new AdminTestRunsReporter(snapshot(source), async row => { rows.push(row); });
       await ledger.onInit({} as never);
@@ -704,6 +714,7 @@ describe('ExecutedSourceMapReporter', () => {
       if (order === 'native-first') { await r.onTestModuleEnd(mod); ledger.onTestModuleEnd(mod); }
       else { ledger.onTestModuleEnd(mod); await r.onTestModuleEnd(mod); }
       expect(existsSync(path)).toBe(true);
+      expect(JSON.parse(readFileSync(path, 'utf8')).compilerInputs).toEqual(compilerInputs);
       const original = nativeOut().files[0];
       await r.onTestRunEnd([mod], [], 'passed');
       expect(existsSync(path)).toBe(false);
@@ -713,6 +724,9 @@ describe('ExecutedSourceMapReporter', () => {
       expect(details?.workerTestConfiguration).toEqual(testConfiguration);
       expect(details?.workerExecution).toEqual(workerExecution);
       expect(original.proof.inputs.workerExecution).toEqual(workerExecution);
+      expect(details?.workerCompilerInputs).toEqual({ ...compilerInputs, viteTransformOptions });
+      expect(original.proof.inputs.compilerInputs).toEqual({ ...compilerInputs, viteTransformOptions });
+      expect(details?.proofContext?.components.compilerConfiguration).toBeNull();
       expect(details?.workerDatabaseReset).toEqual(workerDatabaseReset);
       expect(original.proof.inputs.workerDatabaseReset).toEqual(workerDatabaseReset);
       expect(details?.proofContext?.components.fixtures).toBeNull();

@@ -21,6 +21,7 @@ import { configureTestDockerHost } from './test-docker-route.ts';
 // gate-file-level-test-reuse-2026-09-27 P-008: per-file pass reuse (PC_TEST_REUSE_SKIP_LIST).
 import { resolvePartialResumeSkipExclude, resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
 import type { RecordedRuntimeEnvironment } from './execution-details.ts';
+import { observeViteTransformOptions } from './configuration-snapshot.ts';
 import { createProgressForksPool } from './worker-progress-pool.ts';
 import type { PoolRunnerInitializer } from 'vitest/node';
 import {
@@ -181,14 +182,17 @@ export function readExecutedSourceOriginals(environment: object | undefined): re
 
 export function executedSourceOriginalsPlugin(): Plugin {
   const journals = new WeakMap<object, Map<string, readonly string[]>>();
+  let resolvedConfig: unknown;
   return {
     name: 'papercusp-executed-source-originals',
     enforce: 'pre',
+    configResolved(config) { resolvedConfig = config; },
     transform(code, id) {
       // Metadata only: no code/map replacement and no source text retained in memory.
       const sha256 = createHash('sha256').update(code).digest('hex');
       const environment = this.environment;
       if (environment) {
+        observeViteTransformOptions(environment, resolvedConfig);
         try {
           let journal = journals.get(environment);
           if (!journal) {
