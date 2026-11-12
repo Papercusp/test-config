@@ -9,7 +9,8 @@
  *
  *   • every node:fs read/stat/list of a path inside the repo is recorded (node_modules excluded:
  *     package-lock.json already stands for it);
- *   • a child process, a worker thread, a socket connection, or a read of `.git` makes the file
+ *   • a child process, a worker thread, a socket connection, a read outside the repo,
+ *     an unresolved file descriptor, or a read of `.git` makes the file
  *     OPAQUE — its result depends on something a git diff cannot describe, so it is never reused.
  *
  * Transport: the worker writes one JSON file per test file into PC_EXECUTED_INPUTS_DIR; the
@@ -151,11 +152,8 @@ export function inputsFilePath(dir: string, testFile: string): string {
  */
 export type CwdSource = string | (() => string);
 
-/**
- * Normalise an fs path argument to an absolute path inside `repoRoot`, or null when it is not
- * a repo path we track (a descriptor, outside the repo, under node_modules). PURE.
- */
-export function repoPathOf(arg: unknown, repoRoot: string, cwd: CwdSource): string | null {
+/** Resolve a path argument without consulting the cwd for an absolute path. */
+function absoluteReadPathOf(arg: unknown, cwd: CwdSource): string | null {
   let p: string | null = null;
   if (typeof arg === 'string') p = arg;
   else if (arg instanceof URL) {
@@ -163,20 +161,39 @@ export function repoPathOf(arg: unknown, repoRoot: string, cwd: CwdSource): stri
     p = fileURLToPath(arg);
   } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(arg)) p = arg.toString('utf8');
   if (p === null || p.length === 0) return null;
-  const abs = isAbsolute(p) ? resolve(p) : resolve(typeof cwd === 'function' ? cwd() : cwd, p);
+  return isAbsolute(p) ? resolve(p) : resolve(typeof cwd === 'function' ? cwd() : cwd, p);
+}
+
+/** Return a tracked repository path; descriptors, external paths and dependencies stay null. */
+export function repoPathOf(arg: unknown, repoRoot: string, cwd: CwdSource): string | null {
+  const abs = absoluteReadPathOf(arg, cwd);
+  if (abs === null) return null;
   const rel = relative(repoRoot, abs);
-  if (rel.startsWith('..') || isAbsolute(rel)) return null;
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
   const parts = rel.split(sep);
   if (parts.includes('node_modules')) return null;
   return abs;
 }
 
-/** Record one fs access into the active recorder. `.git` reads are opaque, not inputs. */
+/** Record an fs access or retain why its input identity cannot be measured.
+ * An absent repo path must never silently discard a fixture read. Reason codes
+ * deliberately omit external paths and descriptor values from the handoff.
+ */
 export function recordRead(rec: Recorder | null, arg: unknown, repoRoot: string, cwd: CwdSource): void {
   if (!rec) return;
-  const abs = repoPathOf(arg, repoRoot, cwd);
-  if (abs === null) return;
+  let abs: string | null;
+  try { abs = absoluteReadPathOf(arg, cwd); }
+  catch { rec.opaque.add('fs-path-unobserved'); return; }
+  if (abs === null) {
+    rec.opaque.add(typeof arg === 'number' ? 'fs-file-descriptor' : 'fs-path-unobserved');
+    return;
+  }
   const rel = relative(repoRoot, abs);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    rec.opaque.add('outside-repo-read');
+    return;
+  }
+  if (rel.split(sep).includes('node_modules')) return;
   if (rel === '.git' || rel.startsWith(`.git${sep}`) || rel.split(sep).includes('.git')) {
     rec.opaque.add('git-metadata');
     return;
@@ -194,6 +211,8 @@ export const FS_READ_FUNCTIONS = [
 export const FS_PROMISES_READ_FUNCTIONS = [
   'readFile', 'readdir', 'stat', 'lstat', 'access', 'open', 'opendir', 'readlink', 'realpath',
 ] as const;
+/** A descriptor may have been opened before this file's capture began. */
+export const FS_DESCRIPTOR_READ_FUNCTIONS = ['read', 'readSync', 'readv', 'readvSync'] as const;
 export const CHILD_PROCESS_FUNCTIONS = [
   'spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork',
 ] as const;
@@ -382,6 +401,7 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
   const nativeCwd = process.cwd.bind(process);
   const read = (args: unknown[]) => recordRead(state.current, args[0], repoRoot, nativeCwd);
   for (const name of FS_READ_FUNCTIONS) wrap(targets.fs, name, read);
+  for (const name of FS_DESCRIPTOR_READ_FUNCTIONS) wrap(targets.fs, name, read);
   for (const name of FS_PROMISES_READ_FUNCTIONS) wrap(targets.fsPromises, name, read);
   const opaque = (reason: string) => () => state.current?.opaque.add(reason);
   for (const name of CHILD_PROCESS_FUNCTIONS) wrap(targets.childProcess, name, opaque('child-process'));

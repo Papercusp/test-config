@@ -6,6 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { selectReusablePasses } from '../../../scripts/lib/test-pass-reuse.mjs';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,
   beginFile,
@@ -17,6 +18,7 @@ import {
   installCapture,
   installModuleEvaluationCapture,
   repoPathOf,
+  recordRead,
   resetCaptureForTests,
   snapshotCaptureForTests,
   type CaptureTargets,
@@ -346,6 +348,92 @@ describe('repoPathOf', () => {
     expect(repoPathOf('src/a.ts', repo, '/repo')).toBe('/repo/src/a.ts');
     expect(repoPathOf('src/a.ts', repo, () => '/repo/lib')).toBe('/repo/lib/src/a.ts');
     expect(repoPathOf('a.ts', repo, () => '/elsewhere')).toBe(null);
+  });
+
+  it('keeps a repository filename beginning with two dots inside the source population', () => {
+    expect(repoPathOf('/repo/..fixture/input.json', repo, neverCwd)).toBe('/repo/..fixture/input.json');
+    expect(repoPathOf('/repo/../outside.json', repo, neverCwd)).toBeNull();
+  });
+});
+
+describe('unmeasured filesystem input custody', () => {
+  it('keeps external, descriptor, unsupported and unresolved paths explicitly opaque without disclosing them', () => {
+    const rec = beginFile();
+    recordRead(rec, '/private/fixture.json', '/repo', () => { throw new Error('absolute cwd'); });
+    recordRead(rec, 42, '/repo', '/repo');
+    recordRead(rec, new URL('https://example.test/fixture'), '/repo', '/repo');
+    recordRead(rec, 'fixture.json', '/repo', () => { throw new Error('cwd unavailable'); });
+    recordRead(rec, '/repo/node_modules/package/index.js', '/repo', '/repo');
+    recordRead(rec, '/repo/..fixture/input.json', '/repo', '/repo');
+    const record = endFile('/repo/test.ts')!;
+    expect(record.reads).toEqual(['/repo/..fixture/input.json']);
+    expect(record.opaque).toEqual(['fs-file-descriptor', 'fs-path-unobserved', 'outside-repo-read']);
+    expect(JSON.stringify(record)).not.toContain('/private/fixture.json');
+  });
+
+  it('preserves actual external read results and makes the existing reuse consumer run the file again', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-external-input-'));
+    const file = join(root, 'fixture.txt');
+    const testFile = 'src/external-input.test.ts';
+    resetCaptureForTests();
+    const targets = { readFileSync: (path: fs.PathOrFileDescriptor, encoding: BufferEncoding) =>
+      nativeFs.readFileSync(path, encoding) };
+    installCapture({ fs: targets, fsPromises: {}, childProcess: {} }, resolve(process.cwd()));
+    try {
+      nativeFs.writeFileSync(file, 'first');
+      beginFile();
+      expect(targets.readFileSync(file, 'utf8')).toBe('first');
+      const record = endFile(testFile)!;
+      nativeFs.writeFileSync(file, 'second');
+      beginFile();
+      expect(targets.readFileSync(file, 'utf8')).toBe('second');
+      expect(endFile(testFile)?.opaque).toContain('outside-repo-read');
+      const proof = { recordedSha: 'a'.repeat(40), recordedAtMs: 1, executedModules: [testFile], inputsCaptured: true,
+        runContext: 'local', runnerIdentity: 'measured-worker', readPaths: [], opaqueReasons: record.opaque };
+      const select = (opaqueReasons: string[]) => selectReusablePasses({ candidates: [testFile],
+        proofs: new Map([[testFile, { ...proof, opaqueReasons }]]), judgedSha: 'b'.repeat(40),
+        changedBetween: () => new Set<string>(), runContext: proof.runContext, runnerIdentity: proof.runnerIdentity });
+      // Positive control: the identical source-only record would be reused.
+      expect(select([]).skip).toEqual([testFile]);
+      expect(select(record.opaque).skip).toEqual([]);
+      expect(select(record.opaque).exclusions).toMatchObject([{ reason: 'opaque',
+        evidence: { opaqueReasons: expect.arrayContaining(['outside-repo-read']) } }]);
+      beginFile();
+      let error: unknown;
+      try { targets.readFileSync(join(root, 'missing.txt'), 'utf8'); } catch (caught) { error = caught; }
+      expect(error).toMatchObject({ code: 'ENOENT' });
+      expect(endFile(testFile)?.opaque).toContain('outside-repo-read');
+    } finally { resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('captures a descriptor opened before the recorder while preserving scalar, vector and callback reads', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-descriptor-input-'));
+    const file = join(root, 'fixture.txt');
+    nativeFs.writeFileSync(file, 'abcdef');
+    const fd = nativeFs.openSync(file, 'r');
+    resetCaptureForTests();
+    const targets = {
+      readSync: (fd: number, buffer: Buffer, offset: number, length: number, position: number | null) =>
+        nativeFs.readSync(fd, buffer, offset, length, position),
+      readvSync: (...args: Parameters<typeof nativeFs.readvSync>) => nativeFs.readvSync(...args),
+      read: (fd: number, buffer: Buffer, offset: number, length: number, position: number | null,
+        callback: (error: NodeJS.ErrnoException | null, bytesRead: number, buffer: Buffer) => void) =>
+        nativeFs.read(fd, buffer, offset, length, position, callback),
+    };
+    installCapture({ fs: targets, fsPromises: {}, childProcess: {} }, resolve(process.cwd()));
+    try {
+      beginFile();
+      const first = Buffer.alloc(2), second = Buffer.alloc(2), third = Buffer.alloc(2);
+      expect(targets.readSync(fd, first, 0, 2, 0)).toBe(2);
+      expect(targets.readvSync(fd, [second], 2)).toBe(2);
+      await new Promise<void>((resolve, reject) => targets.read(fd, third, 0, 2, 4,
+        (error, bytesRead, buffer) => {
+          if (error) { reject(error); return; }
+          try { expect(bytesRead).toBe(2); expect(buffer).toBe(third); resolve(); } catch (error) { reject(error); }
+        }));
+      expect([first.toString(), second.toString(), third.toString()]).toEqual(['ab', 'cd', 'ef']);
+      expect(endFile('/repo/test.ts')?.opaque).toContain('fs-file-descriptor');
+    } finally { nativeFs.closeSync(fd); resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
   });
 });
 
