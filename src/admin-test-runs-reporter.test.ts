@@ -68,6 +68,7 @@ import AdminTestRunsReporter, {
   TEST_RUN_RECEIPT_ENV,
   appendTestRunReceipts,
   reporterWriteBudget,
+  SHARED_PG_DRAIN_TIMEOUT_MS,
   normalizeRuntimeEnvironmentCaptureTimeout,
   DEFAULT_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS,
   MAX_RUNTIME_ENVIRONMENT_CAPTURE_TIMEOUT_MS,
@@ -2601,6 +2602,10 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       await vi.advanceTimersByTimeAsync(Math.max(budget.flushBudgetMs, budget.totalInsertMs) - 1);
       expect(finished).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
+      // The reporter then gives the tracked writer one bounded shared-client drain
+      // before releasing its lease. Advance that timer too; otherwise this test
+      // waits on the fake clock it owns while deliberately holding writeRows open.
+      await vi.advanceTimersByTimeAsync(SHARED_PG_DRAIN_TIMEOUT_MS);
       await final;
       expect(finished).toBe(true);
       releaseWrite();
