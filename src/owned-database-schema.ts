@@ -30,9 +30,10 @@ export function dumpOwnedDatabaseSchema(binary: string, url: string, snapshot: s
 }
 
 /** One exported MVCC snapshot joins both actual dumps, applied ledger, extension
- * versions and role catalogs. Binary-upgrade schema dumps include extension
- * member definitions that ordinary dumps intentionally omit; they are hashed,
- * never executed. Role credentials/settings stay private; only digests leave.
+ * versions and role catalogs. Binary-upgrade dumps omit built-in extension
+ * definitions too, so their routine/language catalogs supplement the dump.
+ * Unsupported built-in members fail closed. Definitions are hashed, never
+ * executed. Role credentials/settings stay private; only digests leave.
  * Unreadable catalogs, bounds or binary changes fail closed. This still cannot
  * establish the population of unowned database connections. */
 export async function captureOwnedDatabaseSchema(url: string): Promise<OwnedDatabaseSchemaSnapshot | null> {
@@ -52,6 +53,31 @@ export async function captureOwnedDatabaseSchema(url: string): Promise<OwnedData
       if (migrations && (migrations.length > 10_000 || JSON.stringify(migrations).length > 1_048_576)) return null;
       const extensions = await tx`SELECT e.extname, e.extversion, n.nspname
         FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace ORDER BY e.extname`;
+      // Match pg_dump's FirstNormalObjectId boundary. selectDumpableExtension
+      // gives these extensions ACL-only output even in binary-upgrade mode.
+      // Deparse names under a fixed path rather than hashing allocation OIDs.
+      await tx`SELECT set_config('search_path', 'pg_catalog', true)`;
+      const builtinDefinitions = await tx`SELECT e.extname,
+          d.classid::regclass::text AS catalog, i.identity,
+          CASE WHEN d.classid = 'pg_proc'::regclass AND p.prokind <> 'a'
+            THEN pg_get_functiondef(p.oid)
+            WHEN d.classid = 'pg_language'::regclass THEN jsonb_build_object(
+              'procedural', l.lanispl, 'trusted', l.lanpltrusted,
+              'handler', l.lanplcallfoid::regprocedure::text,
+              'inline', NULLIF(l.laninline, 0)::regprocedure::text,
+              'validator', NULLIF(l.lanvalidator, 0)::regprocedure::text)::text
+            ELSE NULL END AS definition,
+          pg_get_userbyid(COALESCE(p.proowner, l.lanowner)) AS owner,
+          COALESCE(p.proacl::text, l.lanacl::text) AS acl,
+          obj_description(d.objid, d.classid::regclass::text) AS comment
+        FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
+        CROSS JOIN LATERAL pg_identify_object(d.classid, d.objid, d.objsubid) i
+        LEFT JOIN pg_proc p ON d.classid = 'pg_proc'::regclass AND p.oid = d.objid
+        LEFT JOIN pg_language l ON d.classid = 'pg_language'::regclass AND l.oid = d.objid
+        WHERE d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e' AND e.oid < 16384
+        ORDER BY e.extname, d.classid::regclass::text, i.identity LIMIT 10001`;
+      if (builtinDefinitions.length > 10_000 || JSON.stringify(builtinDefinitions).length > 1_048_576
+        || builtinDefinitions.some(member => member.definition === null)) return null;
       // Names replace catalog OIDs. Permission denial (including pg_authid)
       // remains unknown rather than an empty role population.
       const roles = await tx`SELECT (to_jsonb(r) - 'oid')::text AS value
@@ -76,7 +102,7 @@ export async function captureOwnedDatabaseSchema(url: string): Promise<OwnedData
       const body: Omit<OwnedDatabaseSchemaSnapshot, 'fingerprint'> = {
         schemaVersion: 'owned-database-schema-v2', scope: 'pg-dump-extension-definitions-migrations-and-roles',
         populationStatus: 'unknown', schemaSha256: hash(dump), appliedMigrationsSha256: digest(migrations),
-        extensionsSha256: digest(extensions), extensionDefinitionsSha256: hash(definitions),
+        extensionsSha256: digest(extensions), extensionDefinitionsSha256: digest([definitions, builtinDefinitions]),
         serverRoleStateSha256: digest([roles, memberships, settings]), dumpExecutableSha256: binaryBefore,
         serverVersionNum: row!.version, missing: [...OWNED_DATABASE_SCHEMA_V2_GAPS],
       };

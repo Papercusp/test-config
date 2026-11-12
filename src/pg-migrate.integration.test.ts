@@ -181,6 +181,7 @@ it('observes extension definitions and server role changes even when extension v
     expect(initial).toMatchObject({ schemaVersion: 'owned-database-schema-v2',
       populationStatus: 'unknown', missing: ['unowned-connections-unobserved'],
       extensionDefinitionsSha256: expect.any(String), serverRoleStateSha256: expect.any(String) });
+    expect(await captureOwnedDatabaseSchema(db.url)).toEqual(initial);
     const sql = postgres(db.url, { max: 1 });
     try {
       await sql.unsafe(`CREATE OR REPLACE FUNCTION public.schema_extension_probe() RETURNS integer LANGUAGE sql AS 'SELECT 2'`);
@@ -200,6 +201,23 @@ it('observes extension definitions and server role changes even when extension v
       const settingChanged = await captureOwnedDatabaseSchema(db.url);
       expect(settingChanged!.serverRoleStateSha256).not.toBe(changed!.serverRoleStateSha256);
       await sql.unsafe(`ALTER ROLE ${role} IN DATABASE ${db.name} RESET ALL`);
+      expect(await captureOwnedDatabaseSchema(db.url)).toEqual(changed);
+      // Built-in language definitions are omitted by binary-upgrade dumps too.
+      await sql.unsafe(`CREATE OR REPLACE LANGUAGE plpgsql HANDLER plpgsql_call_handler
+        INLINE plpgsql_inline_handler VALIDATOR plpgsql_validator`);
+      const languageChanged = await captureOwnedDatabaseSchema(db.url);
+      expect(languageChanged).not.toBeNull();
+      expect(languageChanged!.schemaSha256).toBe(changed!.schemaSha256);
+      expect(languageChanged!.extensionDefinitionsSha256).not.toBe(changed!.extensionDefinitionsSha256);
+      await sql.unsafe(`CREATE OR REPLACE TRUSTED LANGUAGE plpgsql HANDLER plpgsql_call_handler
+        INLINE plpgsql_inline_handler VALIDATOR plpgsql_validator`);
+      expect(await captureOwnedDatabaseSchema(db.url)).toEqual(changed);
+      // A newly encountered catalog class cannot silently become complete.
+      await sql.unsafe(`CREATE TABLE public.schema_extension_table(value integer);
+        ALTER EXTENSION plpgsql ADD TABLE public.schema_extension_table`);
+      expect(await captureOwnedDatabaseSchema(db.url)).toBeNull();
+      await sql.unsafe(`ALTER EXTENSION plpgsql DROP TABLE public.schema_extension_table;
+        DROP TABLE public.schema_extension_table`);
       expect(await captureOwnedDatabaseSchema(db.url)).toEqual(changed);
     } finally { await sql.end(); }
   } finally {
