@@ -6,7 +6,7 @@
  * refusing to execute code a network-isolated session wrote — WI-10005724) ships a module at the
  * conventional path `scripts/lib/vitest-host-preflight.mjs`, exporting:
  *
- *   hostPreflight({ root, files, env }) →
+ *   hostPreflight({ root, files, env, testNamePattern? }) →
  *     { verdict: 'admit', setEnv? } | { verdict: 'skipped', reason } | { verdict: 'refuse', message }
  *
  * WHERE IT RUNS. Vitest calls globalSetup after it has resolved the run's test files
@@ -39,6 +39,8 @@ export interface HostPreflightInput {
   root: string;
   files: string[];
   env: NodeJS.ProcessEnv;
+  /** Vitest's resolved global filter; absent means the complete file can run. */
+  testNamePattern?: RegExp;
 }
 
 export type HostPreflightOutcome = HostPreflightVerdict | { verdict: 'no-host-module' };
@@ -63,6 +65,7 @@ export async function runHostPreflight(opts: {
   projectRoot: string;
   files: string[];
   env: NodeJS.ProcessEnv;
+  testNamePattern?: RegExp;
   exists?: (path: string) => boolean;
   load?: (url: string) => Promise<unknown>;
 }): Promise<HostPreflightOutcome> {
@@ -74,7 +77,8 @@ export async function runHostPreflight(opts: {
   if (typeof mod?.hostPreflight !== 'function') {
     throw new Error(`HOST_PREFLIGHT_INVALID ${modulePath} does not export hostPreflight(); no test was started (fail closed)`);
   }
-  const input: HostPreflightInput = { root, files: opts.files, env: opts.env };
+  const input: HostPreflightInput = { root, files: opts.files, env: opts.env,
+    ...(opts.testNamePattern === undefined ? {} : { testNamePattern: opts.testNamePattern }) };
   const result = (await (mod.hostPreflight as (input: HostPreflightInput) => unknown)(input)) as HostPreflightVerdict | null;
   switch (result?.verdict) {
     case 'refuse':
@@ -92,5 +96,6 @@ export async function runHostPreflight(opts: {
 }
 
 export default async function setup(project: TestProject): Promise<void> {
-  await runHostPreflight({ projectRoot: project.config.root, files: project.vitest.state.getPaths(), env: process.env });
+  await runHostPreflight({ projectRoot: project.config.root, files: project.vitest.state.getPaths(), env: process.env,
+    testNamePattern: project.vitest.config.testNamePattern });
 }

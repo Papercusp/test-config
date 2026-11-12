@@ -2,7 +2,7 @@
  * The generic host-preflight seam (WI-10005724). It must be fail-closed: a refusal and any
  * verdict it cannot read both abort the run, and an admit is the only path that applies `setEnv`.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { findHostPreflightRoot, HOST_PREFLIGHT_MODULE, runHostPreflight } from './host-preflight-global-setup.ts';
@@ -34,6 +34,15 @@ describe('findHostPreflightRoot', () => {
 });
 
 describe('runHostPreflight', () => {
+  it('forwards the resolved name filter without serializing or changing it', async () => {
+    const testNamePattern = /native scenario/gi;
+    testNamePattern.lastIndex = 7;
+    const hostPreflight = vi.fn((_input: unknown) => ({ verdict: 'admit' }));
+    await runHostPreflight({ ...withModule({ hostPreflight }), env: {}, testNamePattern });
+    expect(hostPreflight.mock.calls[0]?.[0]).toMatchObject({ testNamePattern });
+    expect(testNamePattern.lastIndex).toBe(7);
+  });
+
   it('is a no-op without a host module', async () => {
     const env: NodeJS.ProcessEnv = {};
     await expect(runHostPreflight({ projectRoot: '/elsewhere', files: [], env, exists: () => false })).resolves.toEqual({
