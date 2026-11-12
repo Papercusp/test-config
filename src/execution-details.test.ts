@@ -56,6 +56,16 @@ describe('original worker process custody', () => {
     for (const patch of [{ captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }, { testFile: '/repo/other.test.ts' }])
       expect(parseTestRunExecutionDetails({ ...row, workerCompilerInputs: { ...workerCompilerInputs, ...patch } })).toBeUndefined();
     expect(parseTestRunExecutionDetails({ ...row, workerExecution: undefined })).toBeUndefined();
+    const reset = { schemaVersion: 'worker-database-reset-v1' as const, captureId: workerExecution.captureId,
+      runGroupId: row.runGroupId, testFile: workerExecution.testFile, databases: [],
+      startedAt: '2026-11-12T00:00:00.000Z', finishedAt: '2026-11-12T00:00:01.000Z' };
+    const changedCaptureId = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+    const changed = { ...row, workerExecution: { ...workerExecution, captureId: changedCaptureId },
+      workerCompilerInputs: { ...workerCompilerInputs, captureId: changedCaptureId },
+      workerDatabaseReset: { ...reset, captureId: changedCaptureId } };
+    expect(parseTestRunExecutionDetails(changed)).toBeDefined();
+    expect(parseTestRunExecutionDetails({ ...changed, workerCompilerInputs })).toBeUndefined();
+    expect(parseTestRunExecutionDetails({ ...changed, workerDatabaseReset: reset })).toBeUndefined();
     expect(parseRecordedWorkerCompilerInputs({ ...workerCompilerInputs, inputSha256: null, vmCallCount: 0,
       missing: [...workerCompilerInputs.missing, 'vm-calls-unobserved'] })).toBeDefined();
   });
