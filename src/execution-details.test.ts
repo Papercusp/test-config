@@ -65,7 +65,7 @@ describe('original worker process custody', () => {
     captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: '/repo/a.test.ts',
     before: processIdentity, after: { ...processIdentity } });
 
-  it('retains partial compiler inputs without upgrading compiler identity or accepting foreign custody', () => {
+  it('retains partial compiler search and settlement inputs without upgrading compiler identity or accepting foreign custody', () => {
     const workerExecution = execution();
     const workerCompilerInputs = { schemaVersion: 'worker-compiler-inputs-v1' as const,
       scope: 'vitest-inlined-vm-calls' as const, populationStatus: 'unknown' as const,
@@ -87,12 +87,22 @@ describe('original worker process custody', () => {
       viteTransformOptions: { ...viteTransformOptions, populationStatus: 'complete' } })).toBeUndefined();
     const config = {};
     expect(installAppliedCompilerInputCapture(config)).toBe(true);
-    Object.getOwnPropertyDescriptor(config, Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value({
+    const tsconfigSearch = { schemaVersion: 'tsconfig-resolution-search-v1', status: 'partial',
+      lookups: [{ path: '/repo/tsconfig.json', outcome: 'missing', errorCode: 'ENOENT' }],
+      extends: [{ from: '/repo/base.json', request: './parent.json', resolved: '/repo/parent.json', errorCode: null }],
+      cacheHits: [{ kind: 'find', path: '/repo/a.ts' }], truncated: false };
+    const settle = Object.getOwnPropertyDescriptor(config, Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value({
       version: 1, environment, moduleId: '/repo/a.ts', code: 'export const n = 1',
-      options: { target: 'es2022' }, tsconfig: { status: 'not-used', inputs: [] }, implementation: null,
+      options: { target: 'es2022' }, tsconfig: { status: 'not-used', inputs: [], search: tsconfigSearch }, implementation: null,
     });
+    const inflight = readAppliedCompilerInputs(environment)!;
+    settle({ status: 'success', result: { code: 'export const n = 1', map: '' } });
     const appliedCompilerInputs = readAppliedCompilerInputs(environment)!;
     expect(appliedCompilerInputs).toBeDefined();
+    expect(inflight.calls[0]?.outcome).toBeUndefined();
+    expect(appliedCompilerInputs.calls[0]).toMatchObject({ tsconfigSearch, outcome: { status: 'success' } });
+    expect(appliedCompilerInputs.missing).toContain('tsconfig-resolution-search-unobserved');
+    expect(appliedCompilerInputs.missing).not.toContain('compiler-outcome-unobserved');
     const withApplied = { ...withOptions, appliedCompilerInputs };
     expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify({ ...row, workerCompilerInputs: withApplied })))
       ?.workerCompilerInputs).toEqual(withApplied);
@@ -104,6 +114,20 @@ describe('original worker process custody', () => {
     expect(parseRecordedWorkerCompilerInputs({ ...withApplied, appliedCompilerInputs: {
       ...appliedCompilerInputs, calls: appliedCompilerInputs.calls.map(call => ({ ...call, inputSha256: 'f'.repeat(64) })),
     } })).toBeUndefined();
+    const transported = JSON.parse(JSON.stringify({ ...row, workerCompilerInputs: withApplied }));
+    for (const search of [{ ...tsconfigSearch, status: 'complete' },
+      { ...tsconfigSearch, lookups: [{ path: '../escape', outcome: 'file', errorCode: null }] }]) {
+      const corrupted = structuredClone(transported);
+      corrupted.workerCompilerInputs.appliedCompilerInputs.calls[0].tsconfigSearch = search;
+      expect(parseTestRunExecutionDetails(corrupted)).toBeUndefined();
+    }
+    const transplanted = structuredClone(transported);
+    transplanted.workerCompilerInputs.appliedCompilerInputs.calls[0].outcome.callBinding = 'f'.repeat(64);
+    expect(parseTestRunExecutionDetails(transplanted)).toBeUndefined();
+    const missingGap = structuredClone(transported);
+    missingGap.workerCompilerInputs.appliedCompilerInputs.missing = appliedCompilerInputs.missing
+      .filter(reason => reason !== 'tsconfig-resolution-search-unobserved');
+    expect(parseTestRunExecutionDetails(missingGap)).toBeUndefined();
     expect(parseTestRunExecutionDetails({ ...row, workerCompilerInputs: { ...withOptions,
       captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' } })).toBeUndefined();
     for (const patch of [{ populationStatus: 'complete' }, { complete: true }, { missing: [] },
