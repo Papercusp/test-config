@@ -26,6 +26,10 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { pinModuleState } from '@papercusp/module-singleton';
 
+// Keep the pre-install function: probing through the wrapped fs export would
+// recursively record the recorder's own path inspection.
+const lstatInputPath = lstatSync;
+
 export const PC_EXECUTED_INPUTS_DIR_ENV = 'PC_EXECUTED_INPUTS_DIR';
 
 export interface InputsRecord {
@@ -197,6 +201,25 @@ export function recordRead(rec: Recorder | null, arg: unknown, repoRoot: string,
   if (rel === '.git' || rel.startsWith(`.git${sep}`) || rel.split(sep).includes('.git')) {
     rec.opaque.add('git-metadata');
     return;
+  }
+  // A tracked link's spelling does not identify its target's bytes. This also
+  // covers directory links and dangling links without resolving or disclosing
+  // the target. Internal links stay opaque until target custody is measured.
+  let probe = repoRoot;
+  for (const part of rel.split(sep).filter(Boolean)) {
+    probe = join(probe, part);
+    try {
+      if (lstatInputPath(probe).isSymbolicLink()) {
+        rec.opaque.add('fs-symlink');
+        break;
+      }
+    } catch (error) {
+      // Missing paths are still useful absence inputs. Other probe failures
+      // leave custody unknown; the original fs operation decides its result.
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') rec.opaque.add('fs-path-unobserved');
+      break;
+    }
   }
   rec.reads.add(abs);
 }

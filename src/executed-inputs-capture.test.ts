@@ -435,6 +435,56 @@ describe('unmeasured filesystem input custody', () => {
       expect(endFile('/repo/test.ts')?.opaque).toContain('fs-file-descriptor');
     } finally { nativeFs.closeSync(fd); resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
   });
+
+  it('refuses reuse through file and directory symlinks while preserving target reads and errors', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-linked-input-'));
+    const repo = join(root, 'repo'), external = join(root, 'external');
+    nativeFs.mkdirSync(repo); nativeFs.mkdirSync(external);
+    nativeFs.writeFileSync(join(external, 'fixture.txt'), 'first');
+    nativeFs.writeFileSync(join(repo, 'local.txt'), 'local');
+    nativeFs.symlinkSync(join(external, 'fixture.txt'), join(repo, 'file.txt'));
+    nativeFs.symlinkSync(external, join(repo, 'directory'));
+    nativeFs.symlinkSync('local.txt', join(repo, 'internal.txt'));
+    nativeFs.symlinkSync(join(external, 'missing.txt'), join(repo, 'dangling.txt'));
+    const testFile = 'src/linked-input.test.ts';
+    resetCaptureForTests();
+    const targets = { readFileSync: (path: fs.PathOrFileDescriptor, encoding: BufferEncoding) =>
+      nativeFs.readFileSync(path, encoding) };
+    installCapture({ fs: targets, fsPromises: {}, childProcess: {} }, repo);
+    try {
+      for (const [path, expected] of [['file.txt', 'first'], ['directory/fixture.txt', 'first'],
+        ['internal.txt', 'local']] as const) {
+        beginFile();
+        expect(targets.readFileSync(join(repo, path), 'utf8')).toBe(expected);
+        const record = endFile(join(repo, testFile))!;
+        expect(record.opaque).toContain('fs-symlink');
+        expect(JSON.stringify(record)).not.toContain(external);
+        const select = (opaqueReasons: string[]) => selectReusablePasses({ candidates: [testFile],
+          proofs: new Map([[testFile, { recordedSha: 'a'.repeat(40), recordedAtMs: 1,
+            executedModules: [testFile], inputsCaptured: true, runContext: 'local',
+            runnerIdentity: 'measured-worker', readPaths: record.reads, opaqueReasons }]]),
+          judgedSha: 'b'.repeat(40), changedBetween: () => new Set<string>(),
+          runContext: 'local', runnerIdentity: 'measured-worker' });
+        expect(select([]).skip).toEqual([testFile]);
+        expect(select(record.opaque).skip).toEqual([]);
+        expect(select(record.opaque).exclusions).toMatchObject([{ reason: 'opaque' }]);
+      }
+      nativeFs.writeFileSync(join(external, 'fixture.txt'), 'second');
+      beginFile();
+      expect(targets.readFileSync(join(repo, 'file.txt'), 'utf8')).toBe('second');
+      expect(endFile(join(repo, testFile))?.opaque).toContain('fs-symlink');
+      beginFile();
+      expect(() => targets.readFileSync(join(repo, 'dangling.txt'), 'utf8')).toThrow(
+        expect.objectContaining({ code: 'ENOENT' }));
+      expect(endFile(join(repo, testFile))?.opaque).toContain('fs-symlink');
+      // Ordinary files and absence observations retain their existing path custody.
+      beginFile();
+      expect(targets.readFileSync(join(repo, 'local.txt'), 'utf8')).toBe('local');
+      expect(() => targets.readFileSync(join(repo, 'missing.txt'), 'utf8')).toThrow(
+        expect.objectContaining({ code: 'ENOENT' }));
+      expect(endFile(join(repo, testFile))?.opaque).toEqual([]);
+    } finally { resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 describe('installCapture — invisible to the code under test', () => {
