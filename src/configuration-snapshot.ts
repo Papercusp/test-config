@@ -48,32 +48,43 @@ export interface RecordedWorkerTestConfiguration {
  * explicit. It does not supply the complete semantic schema component. */
 export const OWNED_DATABASE_SCHEMA_GAPS = ['unowned-connections-unobserved',
   'extension-member-definitions-unobserved', 'server-role-state-unobserved'] as const;
+export const OWNED_DATABASE_SCHEMA_V2_GAPS = ['unowned-connections-unobserved'] as const;
 export interface OwnedDatabaseSchemaSnapshot {
-  schemaVersion: 'owned-database-schema-v1';
-  scope: 'pg-dump-and-baseline-migration-ledger';
+  schemaVersion: 'owned-database-schema-v1' | 'owned-database-schema-v2';
+  scope: 'pg-dump-and-baseline-migration-ledger' | 'pg-dump-extension-definitions-migrations-and-roles';
   populationStatus: 'unknown';
   schemaSha256: string;
   appliedMigrationsSha256: string;
   extensionsSha256: string;
+  extensionDefinitionsSha256?: string;
+  serverRoleStateSha256?: string;
   dumpExecutableSha256: string;
   serverVersionNum: string;
   missing: string[];
   fingerprint: string;
 }
 export function ownedDatabaseSchemaFingerprint(value: Omit<OwnedDatabaseSchemaSnapshot, 'fingerprint'>): string {
-  return sha256Hex(JSON.stringify(['owned-database-schema-v1', [value.schemaSha256,
-    value.appliedMigrationsSha256, value.extensionsSha256, value.dumpExecutableSha256, value.serverVersionNum]]));
+  return sha256Hex(JSON.stringify([value.schemaVersion, [value.schemaSha256,
+    value.appliedMigrationsSha256, value.extensionsSha256, value.dumpExecutableSha256, value.serverVersionNum,
+    ...(value.schemaVersion === 'owned-database-schema-v2'
+      ? [value.extensionDefinitionsSha256, value.serverRoleStateSha256] : [])]]));
 }
 export function parseOwnedDatabaseSchemaSnapshot(value: unknown): OwnedDatabaseSchemaSnapshot | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const v2 = value.schemaVersion === 'owned-database-schema-v2';
+  const gaps = v2 ? OWNED_DATABASE_SCHEMA_V2_GAPS : OWNED_DATABASE_SCHEMA_GAPS;
   const keys = ['schemaVersion', 'scope', 'populationStatus', 'schemaSha256', 'appliedMigrationsSha256',
-    'extensionsSha256', 'dumpExecutableSha256', 'serverVersionNum', 'missing', 'fingerprint'];
-  if (!isPlainObject(value) || !exactKeys(value, keys)
-    || value.schemaVersion !== 'owned-database-schema-v1' || value.scope !== 'pg-dump-and-baseline-migration-ledger'
+    'extensionsSha256', 'dumpExecutableSha256', 'serverVersionNum', 'missing', 'fingerprint',
+    ...(v2 ? ['extensionDefinitionsSha256', 'serverRoleStateSha256'] : [])];
+  if (!exactKeys(value, keys)
+    || (!v2 && value.schemaVersion !== 'owned-database-schema-v1')
+    || value.scope !== (v2 ? 'pg-dump-extension-definitions-migrations-and-roles' : 'pg-dump-and-baseline-migration-ledger')
     || value.populationStatus !== 'unknown' || ![value.schemaSha256, value.appliedMigrationsSha256,
-      value.extensionsSha256, value.dumpExecutableSha256, value.fingerprint].every(proofHash)
+      value.extensionsSha256, value.dumpExecutableSha256, value.fingerprint,
+      ...(v2 ? [value.extensionDefinitionsSha256, value.serverRoleStateSha256] : [])].every(proofHash)
     || typeof value.serverVersionNum !== 'string' || !/^[1-9][0-9]{5}$/.test(value.serverVersionNum)
-    || !Array.isArray(value.missing) || value.missing.length !== OWNED_DATABASE_SCHEMA_GAPS.length
-    || !OWNED_DATABASE_SCHEMA_GAPS.every(gap => (value.missing as unknown[]).includes(gap))
+    || !Array.isArray(value.missing) || value.missing.length !== gaps.length
+    || !gaps.every(gap => (value.missing as unknown[]).includes(gap))
     || value.fingerprint !== ownedDatabaseSchemaFingerprint(value as unknown as OwnedDatabaseSchemaSnapshot)) return undefined;
   return { ...value, missing: [...value.missing] } as OwnedDatabaseSchemaSnapshot;
 }

@@ -164,6 +164,50 @@ it('observes real owned database schema and applied migration changes independen
   } finally { restore(); for (const db of allocated) await db.drop(); }
 }, 120_000);
 
+it('observes extension definitions and server role changes even when extension versions and ordinary dumps stay equal', async () => {
+  const role = `schema_role_${randomBytes(6).toString('hex')}`;
+  const admin = await adminClient();
+  await admin.unsafe(`CREATE ROLE ${role}`);
+  let db: Awaited<ReturnType<typeof createFreshTestDb>> | undefined;
+  try {
+    db = await createFreshTestDb({ provision: async url => {
+      const sql = postgres(url, { max: 1 });
+      try {
+        await sql.unsafe(`CREATE FUNCTION public.schema_extension_probe() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+          ALTER EXTENSION plpgsql ADD FUNCTION public.schema_extension_probe()`);
+      } finally { await sql.end(); }
+    } });
+    const initial = await captureOwnedDatabaseSchema(db.url);
+    expect(initial).toMatchObject({ schemaVersion: 'owned-database-schema-v2',
+      populationStatus: 'unknown', missing: ['unowned-connections-unobserved'],
+      extensionDefinitionsSha256: expect.any(String), serverRoleStateSha256: expect.any(String) });
+    const sql = postgres(db.url, { max: 1 });
+    try {
+      await sql.unsafe(`CREATE OR REPLACE FUNCTION public.schema_extension_probe() RETURNS integer LANGUAGE sql AS 'SELECT 2'`);
+      const changed = await captureOwnedDatabaseSchema(db.url);
+      expect(changed).not.toBeNull();
+      expect(changed!.schemaSha256).toBe(initial!.schemaSha256);
+      expect(changed!.extensionsSha256).toBe(initial!.extensionsSha256);
+      expect(changed!.extensionDefinitionsSha256).not.toBe(initial!.extensionDefinitionsSha256);
+      expect(changed!.serverRoleStateSha256).toBe(initial!.serverRoleStateSha256);
+      await admin.unsafe(`ALTER ROLE ${role} NOINHERIT`);
+      const roleChanged = await captureOwnedDatabaseSchema(db.url);
+      expect(roleChanged!.serverRoleStateSha256).not.toBe(changed!.serverRoleStateSha256);
+      expect(roleChanged!.schemaSha256).toBe(changed!.schemaSha256);
+      await admin.unsafe(`ALTER ROLE ${role} INHERIT`);
+      expect(await captureOwnedDatabaseSchema(db.url)).toEqual(changed);
+      await sql.unsafe(`ALTER ROLE ${role} IN DATABASE ${db.name} SET search_path = public`);
+      const settingChanged = await captureOwnedDatabaseSchema(db.url);
+      expect(settingChanged!.serverRoleStateSha256).not.toBe(changed!.serverRoleStateSha256);
+      await sql.unsafe(`ALTER ROLE ${role} IN DATABASE ${db.name} RESET ALL`);
+      expect(await captureOwnedDatabaseSchema(db.url)).toEqual(changed);
+    } finally { await sql.end(); }
+  } finally {
+    await db?.drop();
+    await admin.unsafe(`DROP ROLE ${role}`);
+  }
+}, 120_000);
+
 it('captures real empty and template database reset only after confirmed PostgreSQL removal', async () => {
   const restore = snapshotCaptureForTests();
   const captureId = '12345678-9abc-def0-1234-56789abcdef0';

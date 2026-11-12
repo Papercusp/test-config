@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { OWNED_DATABASE_SCHEMA_GAPS, ownedDatabaseSchemaFingerprint, parseOwnedDatabaseSchemaSnapshot,
+import { OWNED_DATABASE_SCHEMA_GAPS, OWNED_DATABASE_SCHEMA_V2_GAPS,
+  ownedDatabaseSchemaFingerprint, parseOwnedDatabaseSchemaSnapshot,
   type OwnedDatabaseSchemaSnapshot } from './configuration-snapshot.ts';
 import { parseRecordedWorkerDatabaseReset, captureRecordedProofContext } from './execution-details.ts';
 import { beginDatabaseResetCapture, beginFile, endFile, snapshotCaptureForTests } from './executed-inputs-capture.ts';
@@ -13,6 +14,22 @@ function fixture(): OwnedDatabaseSchemaSnapshot {
 }
 
 describe('owned database schema observation', () => {
+  it('retains legacy validity while binding both new measurements without a completeness upgrade', () => {
+    const legacy = fixture();
+    expect(parseOwnedDatabaseSchemaSnapshot(legacy)).toEqual(legacy);
+    const body = { ...legacy, schemaVersion: 'owned-database-schema-v2' as const,
+      scope: 'pg-dump-extension-definitions-migrations-and-roles' as const,
+      extensionDefinitionsSha256: 'e'.repeat(64), serverRoleStateSha256: 'f'.repeat(64),
+      missing: [...OWNED_DATABASE_SCHEMA_V2_GAPS] };
+    const current = { ...body, fingerprint: ownedDatabaseSchemaFingerprint(body) };
+    expect(parseOwnedDatabaseSchemaSnapshot(current)).toEqual(current);
+    for (const patch of [{ extensionDefinitionsSha256: 'a'.repeat(64) },
+      { serverRoleStateSha256: 'a'.repeat(64) }, { serverRoleStateSha256: undefined },
+      { schemaVersion: 'owned-database-schema-v1' }, { missing: [] }, { populationStatus: 'complete' }])
+      expect(parseOwnedDatabaseSchemaSnapshot({ ...current, ...patch })).toBeUndefined();
+    expect(parseOwnedDatabaseSchemaSnapshot({ ...legacy, serverRoleStateSha256: 'f'.repeat(64) })).toBeUndefined();
+  });
+
   it('recomputes the persisted binding and refuses completeness upgrades or omitted gaps', () => {
     const original = fixture();
     expect(parseOwnedDatabaseSchemaSnapshot(original)).toEqual(original);
