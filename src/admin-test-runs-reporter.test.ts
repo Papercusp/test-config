@@ -3964,19 +3964,28 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
   };
 
   it('measures recursive materialization only for an armed clean source snapshot, retaining unreadable and changed observations as null', async () => {
-    const sha = 'a'.repeat(40), status = 'git submodule status --recursive';
-    for (const [raw, expected] of [[`${sha} libs/a (heads/main)`, [['libs/a', sha]]], ['', []],
-      [`-${sha} libs/a`, null], [`+${sha} libs/a`, null], [null, null]] as const) {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-fake-submodules-'));
+    execFileSync('git', ['init', '-q', root]);
+    setRunRoot(root);
+    try {
+      const sha = 'a'.repeat(40), status = 'git submodule status --recursive';
+      for (const [raw, expected] of [[`${sha} libs/a (heads/main)`, [['libs/a', sha]]], ['', []],
+        [`-${sha} libs/a`, null], [`+${sha} libs/a`, null], [null, null]] as const) {
+        const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha],
+          [`${STATUS} --ignore-submodules=none`]: [''], [status]: [raw, raw] });
+        const snapshot = await captureWorktreeSnapshot(run, undefined, undefined, true);
+        expect(snapshot).toMatchObject({ commit: sha, porcelain: '', submodules: expected,
+          sourceBytes: null });
+        expect(calls.some(call => call.cmd === status)).toBe(true);
+      }
       const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha],
-        [`${STATUS} --ignore-submodules=none`]: [''], [status]: [raw, raw] });
-      expect(await captureWorktreeSnapshot(run, undefined, undefined, true))
-        .toEqual({ commit: sha, porcelain: '', submodules: expected });
-      expect(calls.some(call => call.cmd === status)).toBe(true);
+        [`${STATUS} --ignore-submodules=none`]: [' M source.ts'] });
+      expect(await captureWorktreeSnapshot(run, undefined, undefined, true)).toMatchObject({ submodules: null });
+      expect(calls.some(call => call.cmd === status)).toBe(false);
+    } finally {
+      setRunRoot(null);
+      rmSync(root, { recursive: true, force: true });
     }
-    const { run, calls } = fakeGit({ 'git rev-parse HEAD': [sha],
-      [`${STATUS} --ignore-submodules=none`]: [' M source.ts'] });
-    expect(await captureWorktreeSnapshot(run, undefined, undefined, true)).toMatchObject({ submodules: null });
-    expect(calls.some(call => call.cmd === status)).toBe(false);
   });
 
   it('observes real Git checkouts, distinguishes an empty census and refuses an uninitialized submodule', async () => {
