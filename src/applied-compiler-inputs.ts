@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
-import { hashConfigurationValue } from './configuration-snapshot.ts';
-import { captureCurrentWorkerProcessIdentity, type WorkerProcessIdentity } from './runtime-proof.ts';
+import { hashConfigurationValue } from '@papercusp/test-config/configuration-snapshot';
+import { captureCurrentWorkerProcessIdentity, type WorkerProcessIdentity } from '@papercusp/test-config/runtime-proof';
 
 // Supplied only by the maintained Vite patch, after Vite resolves per-file
 // options. This observer hashes descriptors; it never changes compiler inputs.

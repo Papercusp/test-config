@@ -11,7 +11,7 @@ import { parseMutationDescriptor, type MutationDescriptor } from '@papercusp/tes
 import { createHash } from 'node:crypto';
 import { runtimeProofFingerprint, type RuntimeProofIdentity, type WorkerProcessIdentity } from '@papercusp/test-config/runtime-proof';
 import { isAbsolute, resolve } from 'node:path';
-import { parseAppliedCompilerReceipt, type AppliedCompilerReceipt } from './applied-compiler-inputs.ts';
+import { parseAppliedCompilerReceipt, type AppliedCompilerReceipt } from '@papercusp/test-config/applied-compiler-inputs';
 import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
   readWorkerTestConfiguration, type RecordedWorkerTestConfiguration,
   parseRecordedViteTransformOptions, type RecordedViteTransformOptions,

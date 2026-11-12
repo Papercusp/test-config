@@ -83,6 +83,7 @@
     },
     "./verifier-source": "./src/verifier-source.ts",
     "./runtime-proof": "./src/runtime-proof.ts",
+    "./applied-compiler-inputs": "./src/applied-compiler-inputs.ts",
     "./test-coverage-map": "./src/test-coverage-map.ts",
     "./test-coverage-store": "./src/test-coverage-store.ts",
     "./execution-details": {
