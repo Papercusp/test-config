@@ -27,7 +27,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import postgres from 'postgres';
-import { cleanupOwnedTestDatabases } from './owned-test-db-cleanup.ts';
+import { cleanupOwnedTestDatabases, createOwnedTestDatabaseScope, OWNED_TEST_DB_DIR_ENV } from './owned-test-db-cleanup.ts';
 import {
   createFreshTestDb,
   dropDatabaseOnDedicatedConnection,
@@ -58,8 +58,18 @@ function freshKey(): string {
 
 const cleanupClients: postgres.Sql[] = [];
 let ownedPg: { getConnectionUri(): string; stop(): Promise<unknown> } | undefined;
+let ownedScope: { dir: string; runId: string } | undefined;
 
 beforeAll(async () => {
+  // A nested native run has its own reporting group and dedicated server. Bind
+  // its child registry in the parent's journal before any database can register.
+  const runId = process.env.PAPERCUSP_TEST_RUN_GROUP;
+  if (process.env[OWNED_TEST_DB_DIR_ENV] && !runId) throw new Error('dedicated PG fixture requires its run group');
+  const dir = createOwnedTestDatabaseScope();
+  if (dir && runId) {
+    ownedScope = { dir, runId };
+    vi.stubEnv(OWNED_TEST_DB_DIR_ENV, dir);
+  }
   let nativeAvailable = false;
   try {
     resolveNativePgBinDir();
@@ -91,6 +101,27 @@ async function adminClient(): Promise<postgres.Sql> {
   cleanupClients.push(sql);
   return sql;
 }
+
+// Run by the original-native/ledger custody control in operator-core. Use the
+// real file capture started by the worker; a nested beginFile would replace it.
+it('P021 original schema custody target', async () => {
+  const db = await createFreshTestDb({ provision: async url => {
+    const sql = postgres(url, { max: 1 });
+    try { await sql.unsafe(`CREATE SCHEMA harness_shared;
+      CREATE TABLE harness_shared.schema_migrations(filename text PRIMARY KEY);
+      INSERT INTO harness_shared.schema_migrations VALUES ('001.sql');
+      CREATE TABLE schema_custody(value text)`); }
+    finally { await sql.end(); }
+  } });
+  try {
+    const sql = postgres(db.url, { max: 1 });
+    try {
+      await sql`INSERT INTO harness_shared.schema_migrations VALUES ('002.sql')`;
+      await sql`ALTER TABLE schema_custody ADD COLUMN changed integer`;
+      expect((await sql`SELECT count(*)::int AS n FROM harness_shared.schema_migrations`)[0]?.n).toBe(2);
+    } finally { await sql.end(); }
+  } finally { expect(await db.dropWithResult()).toBe('dropped'); }
+}, 120_000);
 
 it('observes real owned database schema and applied migration changes independently of fixture data', async () => {
   const restore = snapshotCaptureForTests();
@@ -265,6 +296,14 @@ it('retains the receipt filesystem error and confirms cleanup after registration
 afterAll(async () => {
   try {
     for (const c of cleanupClients) await c.end({ timeout: 0 }).catch(() => {});
+    if (ownedScope) {
+      // Confirm this owner's receipts while its endpoint is still alive. The
+      // parent only observes the resulting receipt and never retries our DROP.
+      const cleanup = await cleanupOwnedTestDatabases({ ...ownedScope,
+        adminUri: ownedPg?.getConnectionUri(), deadlineAtMs: Date.now() + 10_000,
+        drop: dropDatabaseOnDedicatedConnection });
+      expect(cleanup, JSON.stringify(cleanup)).toMatchObject({ complete: true, errors: [] });
+    }
   } finally {
     try {
       await ownedPg?.stop();
