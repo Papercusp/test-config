@@ -11,6 +11,7 @@ import { parseMutationDescriptor, type MutationDescriptor } from '@papercusp/tes
 import { createHash } from 'node:crypto';
 import { runtimeProofFingerprint, type RuntimeProofIdentity, type WorkerProcessIdentity } from '@papercusp/test-config/runtime-proof';
 import { isAbsolute, resolve } from 'node:path';
+import { parseAppliedCompilerReceipt, type AppliedCompilerReceipt } from './applied-compiler-inputs.ts';
 import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
   readWorkerTestConfiguration, type RecordedWorkerTestConfiguration,
   parseRecordedViteTransformOptions, type RecordedViteTransformOptions,
@@ -35,11 +36,13 @@ export interface RecordedWorkerCompilerInputs {
   vmCallCount: number;
   missing: string[];
   viteTransformOptions?: RecordedViteTransformOptions;
+  /** Environment-wide observation; it does not establish module use by this test. */
+  appliedCompilerInputs?: AppliedCompilerReceipt;
 }
 
 export function parseRecordedWorkerCompilerInputs(value: unknown): RecordedWorkerCompilerInputs | undefined {
   if (!isRecord(value) || Object.keys(value).some(key => !['schemaVersion', 'scope', 'populationStatus', 'captureId',
-    'testFile', 'inputSha256', 'vmCallCount', 'missing', 'viteTransformOptions'].includes(key))
+    'testFile', 'inputSha256', 'vmCallCount', 'missing', 'viteTransformOptions', 'appliedCompilerInputs'].includes(key))
     || !['schemaVersion', 'scope', 'populationStatus', 'captureId', 'testFile', 'inputSha256', 'vmCallCount', 'missing']
       .every(key => Object.hasOwn(value, key))
     || value.schemaVersion !== 'worker-compiler-inputs-v1' || value.scope !== 'vitest-inlined-vm-calls'
@@ -55,7 +58,8 @@ export function parseRecordedWorkerCompilerInputs(value: unknown): RecordedWorke
     || !value.missing.includes('transform-pipeline-unobserved')
     || !value.missing.includes('vm-options-partially-observed')
     || (value.vmCallCount === 0 && !value.missing.includes('vm-calls-unobserved'))
-    || (value.viteTransformOptions !== undefined && !parseRecordedViteTransformOptions(value.viteTransformOptions))) return undefined;
+    || (value.viteTransformOptions !== undefined && !parseRecordedViteTransformOptions(value.viteTransformOptions))
+    || (value.appliedCompilerInputs !== undefined && !parseAppliedCompilerReceipt(value.appliedCompilerInputs))) return undefined;
   return value as unknown as RecordedWorkerCompilerInputs;
 }
 

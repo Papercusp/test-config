@@ -34,6 +34,7 @@ import {
 import { createProofContextIdentity, proofContextImpact, PROOF_CONTEXT_COMPONENTS,
   observeViteTransformOptions, readViteTransformOptions } from './configuration-snapshot.ts';
 import { captureCurrentWorkerProcessIdentity } from './runtime-proof.ts';
+import { installAppliedCompilerInputCapture, readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 
 describe('original worker process custody', () => {
   const processIdentity = { pid: 123, threadId: 0, bootId: '01234567-89ab-cdef-0123-456789abcdef', startTicks: '456' };
@@ -61,6 +62,25 @@ describe('original worker process custody', () => {
       .components.compilerConfiguration).toBeNull();
     expect(parseRecordedWorkerCompilerInputs({ ...withOptions,
       viteTransformOptions: { ...viteTransformOptions, populationStatus: 'complete' } })).toBeUndefined();
+    const config = {};
+    expect(installAppliedCompilerInputCapture(config)).toBe(true);
+    Object.getOwnPropertyDescriptor(config, Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value({
+      version: 1, environment, moduleId: '/repo/a.ts', code: 'export const n = 1',
+      options: { target: 'es2022' }, tsconfig: { status: 'not-used', inputs: [] }, implementation: null,
+    });
+    const appliedCompilerInputs = readAppliedCompilerInputs(environment)!;
+    expect(appliedCompilerInputs).toBeDefined();
+    const withApplied = { ...withOptions, appliedCompilerInputs };
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify({ ...row, workerCompilerInputs: withApplied })))
+      ?.workerCompilerInputs).toEqual(withApplied);
+    expect(captureRecordedProofContext({ ...row, workerCompilerInputs: withApplied } as never)
+      .components.compilerConfiguration).toBeNull();
+    for (const patch of [{ populationStatus: 'complete' }, { missing: [] }, { extra: true }])
+      expect(parseRecordedWorkerCompilerInputs({ ...withApplied,
+        appliedCompilerInputs: { ...appliedCompilerInputs, ...patch } })).toBeUndefined();
+    expect(parseRecordedWorkerCompilerInputs({ ...withApplied, appliedCompilerInputs: {
+      ...appliedCompilerInputs, calls: appliedCompilerInputs.calls.map(call => ({ ...call, inputSha256: 'f'.repeat(64) })),
+    } })).toBeUndefined();
     expect(parseTestRunExecutionDetails({ ...row, workerCompilerInputs: { ...withOptions,
       captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' } })).toBeUndefined();
     for (const patch of [{ populationStatus: 'complete' }, { complete: true }, { missing: [] },

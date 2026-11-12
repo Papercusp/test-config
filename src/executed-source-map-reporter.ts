@@ -59,6 +59,7 @@ import {
 import type { RecordedTestPopulation, PopulationCaptureStatus, RecordedSourceSubmodules } from './execution-details';
 import { captureRecordedProofContext } from './execution-details';
 import { readViteTransformOptions } from './configuration-snapshot.ts';
+import { readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META, readExecutedSourceOriginals,
   type ExecutedOriginalSource } from './vitest-config';
 import { qualifyLoadedConfigSources, qualifyLoadedMainProcessSources } from './executed-config-load-capture.ts';
@@ -907,8 +908,11 @@ export default class ExecutedSourceMapReporter implements Reporter {
       try { collectionImports = testModule.diagnostic().importDurations as typeof collectionImports; } catch { /* unknown */ }
       const inputs = readInputsRecord(this.inputsDir, testModule.moduleId);
       const viteTransformOptions = readViteTransformOptions(testModule.viteEnvironment);
-      if (inputs?.compilerInputs && viteTransformOptions)
-        inputs.compilerInputs = { ...inputs.compilerInputs, viteTransformOptions };
+      const appliedCompilerInputs = readAppliedCompilerInputs(testModule.viteEnvironment);
+      if (inputs?.compilerInputs && (viteTransformOptions || appliedCompilerInputs))
+        inputs.compilerInputs = { ...inputs.compilerInputs,
+          ...(viteTransformOptions ? { viteTransformOptions } : {}),
+          ...(appliedCompilerInputs ? { appliedCompilerInputs } : {}) };
       const observed = completeModuleImports(collectionImports, inputs);
       const runtimeReasons = completeWorkerRuntime(inputs, this.completionContext.runnerIdentity);
       // A mixed or unmeasured worker population cannot stamp a reusable checkpoint

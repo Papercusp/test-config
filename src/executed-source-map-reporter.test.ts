@@ -18,6 +18,7 @@ import { perGroupVitestEnv } from '../../../scripts/test-files.mjs';
 import AdminTestRunsReporter, { inferWorkspaceRoot, type WorktreeGitSnapshot } from './admin-test-runs-reporter';
 import { parseRecordedTestPopulation, parseTestRunExecutionDetails } from './execution-details';
 import { observeViteTransformOptions, readViteTransformOptions } from './configuration-snapshot.ts';
+import { installAppliedCompilerInputCapture, readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
   EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS,
@@ -689,6 +690,14 @@ describe('ExecutedSourceMapReporter', () => {
       const viteEnvironment = {};
       observeViteTransformOptions(viteEnvironment, { root: ROOT, esbuild: { target: 'esnext' } });
       const viteTransformOptions = readViteTransformOptions(viteEnvironment)!;
+      const compilerConfig = {};
+      expect(installAppliedCompilerInputCapture(compilerConfig)).toBe(true);
+      Object.getOwnPropertyDescriptor(compilerConfig, Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value({
+        version: 1, environment: viteEnvironment, moduleId: TEST_FILE, code: 'export const n = 1',
+        options: { target: 'es2022' }, tsconfig: { status: 'not-used', inputs: [] }, implementation: null,
+      });
+      const appliedCompilerInputs = readAppliedCompilerInputs(viteEnvironment)!;
+      expect(appliedCompilerInputs).toBeDefined();
       process.env.PAPERCUSP_TEST_RUN_GROUP = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
       const at = new Date().toISOString();
       const workerDatabaseReset = { schemaVersion: 'worker-database-reset-v1', captureId: workerExecution.captureId,
@@ -724,8 +733,8 @@ describe('ExecutedSourceMapReporter', () => {
       expect(details?.workerTestConfiguration).toEqual(testConfiguration);
       expect(details?.workerExecution).toEqual(workerExecution);
       expect(original.proof.inputs.workerExecution).toEqual(workerExecution);
-      expect(details?.workerCompilerInputs).toEqual({ ...compilerInputs, viteTransformOptions });
-      expect(original.proof.inputs.compilerInputs).toEqual({ ...compilerInputs, viteTransformOptions });
+      expect(details?.workerCompilerInputs).toEqual({ ...compilerInputs, viteTransformOptions, appliedCompilerInputs });
+      expect(original.proof.inputs.compilerInputs).toEqual({ ...compilerInputs, viteTransformOptions, appliedCompilerInputs });
       expect(details?.proofContext?.components.compilerConfiguration).toBeNull();
       expect(details?.workerDatabaseReset).toEqual(workerDatabaseReset);
       expect(original.proof.inputs.workerDatabaseReset).toEqual(workerDatabaseReset);

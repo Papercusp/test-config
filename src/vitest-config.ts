@@ -22,6 +22,7 @@ import { configureTestDockerHost } from './test-docker-route.ts';
 import { resolvePartialResumeSkipExclude, resolveReuseSkipExclude } from './test-pass-reuse-skip.ts';
 import type { RecordedRuntimeEnvironment } from './execution-details.ts';
 import { observeViteTransformOptions } from './configuration-snapshot.ts';
+import { installAppliedCompilerInputCapture } from './applied-compiler-inputs.ts';
 import { createProgressForksPool } from './worker-progress-pool.ts';
 import type { PoolRunnerInitializer } from 'vitest/node';
 import {
@@ -186,7 +187,10 @@ export function executedSourceOriginalsPlugin(): Plugin {
   return {
     name: 'papercusp-executed-source-originals',
     enforce: 'pre',
-    configResolved(config) { resolvedConfig = config; },
+    configResolved(config) {
+      resolvedConfig = config;
+      installAppliedCompilerInputCapture(config);
+    },
     transform(code, id) {
       // Metadata only: no code/map replacement and no source text retained in memory.
       const sha256 = createHash('sha256').update(code).digest('hex');

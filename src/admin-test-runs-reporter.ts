@@ -55,6 +55,7 @@ import {
   testRunExecutionDetailsReaderMismatch,
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, readWorkerTestConfiguration, readViteTransformOptions, type ConfigurationSnapshot } from './configuration-snapshot.ts';
+import { readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseRecordedWorkerCompilerInputs, parseRecordedWorkerExecution, parseRecordedWorkerDatabaseReset, parseSubmoduleCheckoutStatus,
   type RecordedSubmoduleCheckout, type RecordedSourceSubmodules } from './execution-details.ts';
 import { readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture.ts';
@@ -3355,8 +3356,10 @@ export default class AdminTestRunsReporter implements Reporter {
           inputs?.runtime);
         if (workerRuntime) Object.assign(executionDetails, { workerRuntime });
         const viteTransformOptions = readViteTransformOptions(testModule.viteEnvironment);
+        const appliedCompilerInputs = readAppliedCompilerInputs(testModule.viteEnvironment);
         const workerCompilerInputs = parseRecordedWorkerCompilerInputs(inputs?.compilerInputs
-          && { ...inputs.compilerInputs, ...(viteTransformOptions ? { viteTransformOptions } : {}) });
+          && { ...inputs.compilerInputs, ...(viteTransformOptions ? { viteTransformOptions } : {}),
+            ...(appliedCompilerInputs ? { appliedCompilerInputs } : {}) });
         if (workerCompilerInputs) Object.assign(executionDetails, { workerCompilerInputs });
         const workerTestConfiguration = readWorkerTestConfiguration(inputs?.testConfiguration);
         if (workerTestConfiguration) Object.assign(executionDetails, { workerTestConfiguration });

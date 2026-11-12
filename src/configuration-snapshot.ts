@@ -117,7 +117,7 @@ export function captureWorkerTestConfiguration(workerState: unknown): string | n
   } catch { return null; }
 }
 
-function hashConfigurationValue(config: unknown, namespace: string, omitSnapshotEnvironment = false): string | null {
+export function hashConfigurationValue(config: unknown, namespace: string, omitSnapshotEnvironment = false): string | null {
   try {
     const active = new Set<object>();
     let nodes = 0;
