@@ -14,6 +14,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
   readWorkerTestConfiguration, type RecordedWorkerTestConfiguration,
   parseRecordedViteTransformOptions, type RecordedViteTransformOptions,
+  parseOwnedDatabaseSchemaSnapshot, type OwnedDatabaseSchemaSnapshot,
   type ProofContextIdentity } from '@papercusp/test-config/configuration-snapshot';
 
 export interface RecordedWorkerRuntime {
@@ -106,6 +107,7 @@ export interface RecordedWorkerDatabaseReset {
   finishedAt: string;
   databases: Array<{ allocationId: string; name: string; origin: 'empty' | 'template';
     startedAt: string; readyAt: string | null;
+    schemaInputs?: { before: OwnedDatabaseSchemaSnapshot | null; after: OwnedDatabaseSchemaSnapshot | null };
     cleanup: { at: string; outcome: 'dropped' | 'deferred' | 'detached' | 'error' } | null }>;
 }
 
@@ -123,7 +125,8 @@ export function parseRecordedWorkerDatabaseReset(value: unknown): RecordedWorker
     || !Array.isArray(value.databases) || value.databases.length > 10_000) return undefined;
   const seen = new Set<string>();
   for (const db of value.databases) {
-    if (!isRecord(db) || !keys(db, ['allocationId', 'name', 'origin', 'startedAt', 'readyAt', 'cleanup'])
+    if (!isRecord(db) || !keys(db, ['allocationId', 'name', 'origin', 'startedAt', 'readyAt', 'cleanup',
+      ...(Object.hasOwn(db, 'schemaInputs') ? ['schemaInputs'] : [])])
       || !uuid(db.allocationId) || seen.has(db.allocationId as string)
       || typeof db.name !== 'string' || db.name.length > 63 || !/^[a-z][a-z0-9_-]*_[0-9a-f]{8,}$/.test(db.name)
       || !['empty', 'template'].includes(db.origin as string) || !isRecordedInstant(db.startedAt)
@@ -135,6 +138,10 @@ export function parseRecordedWorkerDatabaseReset(value: unknown): RecordedWorker
       || Date.parse(db.cleanup.at) > Date.parse(value.finishedAt)
       || !['dropped', 'deferred', 'detached', 'error'].includes(db.cleanup.outcome as string))) return undefined;
     seen.add(db.allocationId as string);
+    if (Object.hasOwn(db, 'schemaInputs') && (!isRecord(db.schemaInputs)
+      || !keys(db.schemaInputs, ['before', 'after'])
+      || [db.schemaInputs.before, db.schemaInputs.after].some(snapshot => snapshot !== null
+        && !parseOwnedDatabaseSchemaSnapshot(snapshot)))) return undefined;
   }
   return value as unknown as RecordedWorkerDatabaseReset;
 }

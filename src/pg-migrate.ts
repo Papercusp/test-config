@@ -32,6 +32,7 @@ import { getTestPg } from './pg-container.ts';
 import { assertOwnedTestDatabaseName, GENERATED_TEST_DB_NAME_PATTERN, registerOwnedTestDatabase } from './owned-test-db-cleanup.ts';
 import { redactSensitiveText } from './sensitive-text.ts';
 import { beginDatabaseResetCapture } from './executed-inputs-capture.ts';
+import { captureOwnedDatabaseSchema } from './owned-database-schema.ts';
 
 type DatabaseResetCapture = ReturnType<typeof beginDatabaseResetCapture>;
 type CreatedDatabase = { url: string; name: string; adminUri: string; resetCapture: DatabaseResetCapture };
@@ -1172,6 +1173,7 @@ async function recordedFreshTestDb(url: string, name: string, adminUri: string, 
   }
   const dropWithResult = async (options?: DropDatabaseWithLockOptions): Promise<TestDbDropResult> => {
     try {
+      if (resetCapture.isActive()) resetCapture.schema('after', await captureOwnedDatabaseSchema(url));
       const outcome = await dropDatabaseOnDedicatedConnection(adminUri, name, options);
       record(outcome);
       resetCapture.cleanup(outcome);
@@ -1182,6 +1184,7 @@ async function recordedFreshTestDb(url: string, name: string, adminUri: string, 
       throw cause;
     }
   };
+  if (resetCapture.isActive()) resetCapture.schema('before', await captureOwnedDatabaseSchema(url));
   resetCapture.ready();
   return { url, name, dropWithResult, drop: async () => { await dropWithResult(); } };
 }

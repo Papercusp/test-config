@@ -429,6 +429,13 @@ export function beginDatabaseResetCapture(name: string, origin: 'empty' | 'templ
   };
   rec?.databaseReset?.databases.push(db);
   return {
+    isActive() { return Boolean(rec?.databaseReset && state.current === rec); },
+    schema(boundary: 'before' | 'after', value: import('./configuration-snapshot.ts').OwnedDatabaseSchemaSnapshot | null) {
+      if (rec?.databaseReset && state.current === rec) {
+        db.schemaInputs ??= { before: null, after: null };
+        db.schemaInputs[boundary] = value;
+      }
+    },
     ready() { if (rec?.databaseReset && state.current === rec) db.readyAt = new Date().toISOString(); },
     cleanup(outcome: NonNullable<typeof db.cleanup>['outcome']) {
       if (rec?.databaseReset && state.current === rec) db.cleanup = { at: new Date().toISOString(), outcome };

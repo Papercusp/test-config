@@ -44,6 +44,40 @@ export interface RecordedWorkerTestConfiguration {
   after: string | null;
 }
 
+/** A real dump and migration-ledger observation, with its unmeasured population
+ * explicit. It does not supply the complete semantic schema component. */
+export const OWNED_DATABASE_SCHEMA_GAPS = ['unowned-connections-unobserved',
+  'extension-member-definitions-unobserved', 'server-role-state-unobserved'] as const;
+export interface OwnedDatabaseSchemaSnapshot {
+  schemaVersion: 'owned-database-schema-v1';
+  scope: 'pg-dump-and-baseline-migration-ledger';
+  populationStatus: 'unknown';
+  schemaSha256: string;
+  appliedMigrationsSha256: string;
+  extensionsSha256: string;
+  dumpExecutableSha256: string;
+  serverVersionNum: string;
+  missing: string[];
+  fingerprint: string;
+}
+export function ownedDatabaseSchemaFingerprint(value: Omit<OwnedDatabaseSchemaSnapshot, 'fingerprint'>): string {
+  return sha256Hex(JSON.stringify(['owned-database-schema-v1', [value.schemaSha256,
+    value.appliedMigrationsSha256, value.extensionsSha256, value.dumpExecutableSha256, value.serverVersionNum]]));
+}
+export function parseOwnedDatabaseSchemaSnapshot(value: unknown): OwnedDatabaseSchemaSnapshot | undefined {
+  const keys = ['schemaVersion', 'scope', 'populationStatus', 'schemaSha256', 'appliedMigrationsSha256',
+    'extensionsSha256', 'dumpExecutableSha256', 'serverVersionNum', 'missing', 'fingerprint'];
+  if (!isPlainObject(value) || !exactKeys(value, keys)
+    || value.schemaVersion !== 'owned-database-schema-v1' || value.scope !== 'pg-dump-and-baseline-migration-ledger'
+    || value.populationStatus !== 'unknown' || ![value.schemaSha256, value.appliedMigrationsSha256,
+      value.extensionsSha256, value.dumpExecutableSha256, value.fingerprint].every(proofHash)
+    || typeof value.serverVersionNum !== 'string' || !/^[1-9][0-9]{5}$/.test(value.serverVersionNum)
+    || !Array.isArray(value.missing) || value.missing.length !== OWNED_DATABASE_SCHEMA_GAPS.length
+    || !OWNED_DATABASE_SCHEMA_GAPS.every(gap => (value.missing as unknown[]).includes(gap))
+    || value.fingerprint !== ownedDatabaseSchemaFingerprint(value as unknown as OwnedDatabaseSchemaSnapshot)) return undefined;
+  return { ...value, missing: [...value.missing] } as OwnedDatabaseSchemaSnapshot;
+}
+
 export function readWorkerTestConfiguration(value: unknown): RecordedWorkerTestConfiguration | null {
   if (!isPlainObject(value) || !exactKeys(value, ['schemaVersion', 'before', 'after'])
     || value.schemaVersion !== 'vitest-worker-configuration-v1'

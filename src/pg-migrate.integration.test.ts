@@ -46,8 +46,9 @@ import { getTestPg, startDedicatedTestPg } from './pg-container.ts';
 import { resolveNativePgBinDir, startDedicatedNativePg } from './dedicated-native-pg.ts';
 import { acquireBaselineMigrationLock, dropBaselineDatabase } from './baseline-schema-global-setup.ts';
 import { beginFile, endFile, snapshotCaptureForTests } from './executed-inputs-capture.ts';
-import { confirmedRecordedWorkerDatabaseReset } from './execution-details.ts';
+import { confirmedRecordedWorkerDatabaseReset, parseRecordedWorkerDatabaseReset } from './execution-details.ts';
 import { captureCurrentWorkerProcessIdentity } from './runtime-proof.ts';
+import { captureOwnedDatabaseSchema } from './owned-database-schema.ts';
 
 const READY_MARK = 'pc-template-ready';
 
@@ -90,6 +91,47 @@ async function adminClient(): Promise<postgres.Sql> {
   cleanupClients.push(sql);
   return sql;
 }
+
+it('observes real owned database schema and applied migration changes independently of fixture data', async () => {
+  const restore = snapshotCaptureForTests();
+  const allocated: Awaited<ReturnType<typeof createFreshTestDb>>[] = [];
+  try {
+    beginFile({ captureId: '12345678-9abc-def0-1234-56789abcdef0', runGroupId: 'schema-observation' });
+    const provision = async (url: string) => {
+      const sql = postgres(url, { max: 1 });
+      try { await sql.unsafe(`CREATE SCHEMA harness_shared;
+        CREATE TABLE harness_shared.schema_migrations(filename text PRIMARY KEY);
+        INSERT INTO harness_shared.schema_migrations VALUES ('001.sql');
+        CREATE TABLE schema_seed(value text)`); }
+      finally { await sql.end(); }
+    };
+    const template = { key: freshKey(), provision };
+    const first = await createFreshTestDb({ template }); allocated.push(first);
+    const second = await createFreshTestDb({ template }); allocated.push(second);
+    const original = await captureOwnedDatabaseSchema(first.url);
+    expect(original).not.toBeNull();
+    expect(await captureOwnedDatabaseSchema(first.url)).toEqual(original);
+    expect(await captureOwnedDatabaseSchema(second.url)).toEqual(original);
+    const sql = postgres(first.url, { max: 1 });
+    try {
+      await sql`INSERT INTO schema_seed VALUES ('fixture data is separate')`;
+      expect(await captureOwnedDatabaseSchema(first.url)).toEqual(original);
+      await sql`INSERT INTO harness_shared.schema_migrations VALUES ('002.sql')`;
+      const migrated = await captureOwnedDatabaseSchema(first.url);
+      expect(migrated?.schemaSha256).toBe(original?.schemaSha256);
+      expect(migrated?.appliedMigrationsSha256).not.toBe(original?.appliedMigrationsSha256);
+      await sql`ALTER TABLE schema_seed ADD COLUMN changed integer`;
+      const changed = await captureOwnedDatabaseSchema(first.url);
+      expect(changed?.schemaSha256).not.toBe(original?.schemaSha256);
+      expect(changed?.appliedMigrationsSha256).toBe(migrated?.appliedMigrationsSha256);
+    } finally { await sql.end(); }
+    for (const db of allocated) expect(await db.dropWithResult()).toBe('dropped');
+    const reset = parseRecordedWorkerDatabaseReset(endFile('/repo/schema.integration.test.ts')!.workerDatabaseReset)!;
+    expect(reset.databases[0]?.schemaInputs?.before).toEqual(original);
+    expect(reset.databases[0]?.schemaInputs?.after?.schemaSha256).not.toBe(original?.schemaSha256);
+    expect(reset.databases[1]?.schemaInputs).toEqual({ before: original, after: original });
+  } finally { restore(); for (const db of allocated) await db.drop(); }
+}, 120_000);
 
 it('captures real empty and template database reset only after confirmed PostgreSQL removal', async () => {
   const restore = snapshotCaptureForTests();
