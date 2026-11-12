@@ -21,6 +21,36 @@ const keys = (value: object, expected: string[]) => Object.keys(value).sort().jo
 const file = (value: unknown): value is string => typeof value === 'string' && value.length <= 8192
   && isAbsolute(value) && !value.includes('\0');
 
+/** Original boundary observations only. Node's internal resolver probes and
+ * cached search provenance remain opaque, so this never certifies completeness. */
+export interface AppliedTsconfigSearch {
+  schemaVersion: 'tsconfig-resolution-search-v1';
+  status: 'partial';
+  lookups: ReadonlyArray<Readonly<{ path: string; outcome: 'file' | 'fifo' | 'missing' | 'other' | 'error'; errorCode: string | null }>>;
+  extends: ReadonlyArray<Readonly<{ from: string; request: string; resolved: string | null; errorCode: string | null }>>;
+  cacheHits: ReadonlyArray<Readonly<{ kind: 'parse' | 'find' | 'file'; path: string }>>;
+  truncated: boolean;
+}
+
+function parseTsconfigSearch(value: unknown): AppliedTsconfigSearch | undefined {
+  const text = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 8192 && !v.includes('\0');
+  const errorCode = (v: unknown) => v === null || (typeof v === 'string' && /^[A-Z0-9_]{1,128}$/.test(v));
+  if (!plain(value) || !keys(value, ['schemaVersion', 'status', 'lookups', 'extends', 'cacheHits', 'truncated'])
+    || value.schemaVersion !== 'tsconfig-resolution-search-v1' || value.status !== 'partial'
+    || typeof value.truncated !== 'boolean') return undefined;
+  for (const key of ['lookups', 'extends', 'cacheHits'])
+    if (!Array.isArray(value[key]) || (value[key] as unknown[]).length > 1024) return undefined;
+  if (!(value.lookups as unknown[]).every(v => plain(v) && keys(v, ['path', 'outcome', 'errorCode'])
+    && file(v.path) && ['file', 'fifo', 'missing', 'other', 'error'].includes(v.outcome as string) && errorCode(v.errorCode)
+    && (v.outcome === 'missing' ? v.errorCode === 'ENOENT' : v.outcome === 'error' ? v.errorCode !== null : v.errorCode === null))
+    || !(value.extends as unknown[]).every(v => plain(v) && keys(v, ['from', 'request', 'resolved', 'errorCode'])
+      && file(v.from) && text(v.request) && (v.resolved === null ? v.errorCode !== null : file(v.resolved) && v.errorCode === null)
+      && errorCode(v.errorCode))
+    || !(value.cacheHits as unknown[]).every(v => plain(v) && keys(v, ['kind', 'path'])
+      && ['parse', 'find', 'file'].includes(v.kind as string) && file(v.path))) return undefined;
+  return value as unknown as AppliedTsconfigSearch;
+}
+
 export interface AppliedCompilerCall {
   sequence: number;
   moduleId: string;
@@ -32,6 +62,8 @@ export interface AppliedCompilerCall {
     functionHashes: ReadonlyArray<Readonly<{ name: string; sha256: string }>> }> | null;
   /** Hash of measured call inputs only; operational capture/process IDs are separate. */
   inputSha256: string | null;
+  /** Optional on legacy receipts; partial even when every recorded probe succeeded. */
+  tsconfigSearch?: Readonly<AppliedTsconfigSearch>;
   /** Optional for legacy/inflight observations. Bound to the original call. */
   outcome?: Readonly<{ status: 'success'; callBinding: string; resultSha256: string | null }
     | { status: 'failure'; callBinding: string; errorSha256: string | null }>;
@@ -51,9 +83,10 @@ export interface AppliedCompilerReceipt {
 }
 
 function callHash(call: Omit<AppliedCompilerCall, 'inputSha256'>): string | null {
-  if (!call.optionsSha256 || !call.implementation || call.tsconfigStatus === 'unavailable') return null;
+  if (!call.optionsSha256 || !call.implementation || call.tsconfigStatus === 'unavailable' || call.tsconfigSearch?.truncated) return null;
   return hashConfigurationValue([call.moduleId, call.codeSha256, call.optionsSha256,
-    call.tsconfigStatus, call.tsconfigInputs, call.implementation], 'vite-applied-esbuild-call-v1');
+    call.tsconfigStatus, call.tsconfigInputs, call.implementation,
+    ...(call.tsconfigSearch ? [call.tsconfigSearch] : [])], 'vite-applied-esbuild-call-v1');
 }
 
 function callBinding(captureId: string, call: AppliedCompilerCall): string {
@@ -81,7 +114,8 @@ export function parseAppliedCompilerReceipt(value: unknown): AppliedCompilerRece
       || typeof processIdentity.startTicks !== 'string' || !/^\d+$/.test(processIdentity.startTicks))) return undefined;
     for (const [index, call] of value.calls.entries()) {
       if (!plain(call) || !keys(call, ['sequence', 'moduleId', 'codeSha256', 'optionsSha256', 'tsconfigStatus',
-        'tsconfigInputs', 'implementation', 'inputSha256', ...(Object.hasOwn(call, 'outcome') ? ['outcome'] : [])])
+        'tsconfigInputs', 'implementation', 'inputSha256', ...(Object.hasOwn(call, 'outcome') ? ['outcome'] : []),
+        ...(Object.hasOwn(call, 'tsconfigSearch') ? ['tsconfigSearch'] : [])])
         || call.sequence !== index + 1 || !file(call.moduleId)
         || !digest(call.codeSha256) || (call.optionsSha256 !== null && !digest(call.optionsSha256))
         || !['captured', 'absent', 'inline', 'not-used', 'unavailable'].includes(call.tsconfigStatus as string)
@@ -102,6 +136,7 @@ export function parseAppliedCompilerReceipt(value: unknown): AppliedCompilerRece
         || !Array.isArray(implementation.functionHashes) || implementation.functionHashes.length !== FUNCTIONS.length
         || !implementation.functionHashes.every((fn, i) => plain(fn) && keys(fn, ['name', 'sha256'])
           && fn.name === FUNCTIONS[i] && digest(fn.sha256)))) return undefined;
+      if (Object.hasOwn(call, 'tsconfigSearch') && !parseTsconfigSearch(call.tsconfigSearch)) return undefined;
       if (call.inputSha256 !== callHash(call as unknown as AppliedCompilerCall)) return undefined;
       if (Object.hasOwn(call, 'outcome')) {
         const outcome = call.outcome;
@@ -177,10 +212,22 @@ export function installAppliedCompilerInputCapture(config: object): boolean {
           if (prior && (prior.sha256 !== input.sha256 || prior.byteLength !== input.byteLength)) status = 'unavailable';
           inputs.set(input.path, Object.freeze({ path: input.path, sha256: input.sha256 as string, byteLength: input.byteLength as number }));
         }
+        let tsconfigSearch: Readonly<AppliedTsconfigSearch> | undefined;
+        if (Object.hasOwn(event.tsconfig, 'search')) {
+          // Copy descriptors into an immutable snapshot; neither a later cache
+          // lookup nor the observer's caller can rewrite the original search.
+          const source = hashConfigurationValue(event.tsconfig.search, 'tsconfig-search-validation') !== null
+            ? parseTsconfigSearch(event.tsconfig.search) : undefined;
+          if (!source) status = 'unavailable';
+          else tsconfigSearch = Object.freeze({ ...source,
+            lookups: Object.freeze(source.lookups.map(v => Object.freeze({ ...v }))),
+            extends: Object.freeze(source.extends.map(v => Object.freeze({ ...v }))),
+            cacheHits: Object.freeze(source.cacheHits.map(v => Object.freeze({ ...v }))) });
+        }
         const call = { sequence: journal.calls.length + 1, moduleId: event.moduleId, codeSha256: sha(event.code),
           optionsSha256: hashConfigurationValue(event.options, 'vite-applied-esbuild-options-v1'), tsconfigStatus: status,
           tsconfigInputs: Object.freeze([...inputs.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
-          implementation: implementationIdentity(event.implementation) };
+          implementation: implementationIdentity(event.implementation), ...(tsconfigSearch ? { tsconfigSearch } : {}) };
         const original = Object.freeze({ ...call, inputSha256: callHash(call) });
         journal.calls.push(original);
         // This closure owns the exact slot even when concurrent calls settle

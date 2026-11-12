@@ -45,25 +45,27 @@ beforeAll(async () => {
         execFileSync('git', ['apply', '--reverse', '-'], { cwd: fixture, input: prior }); restored = true; break;
       }
     }
-    if (!restored && installedHash === 'd47de69dfa01e96415ed334a119b32dde12f7b51') {
-      // The original before-call patch can still be uncommitted during this
-      // source change. Upgrade ONLY that exact measured donor, ONLY here, then
-      // require the current full postimage before reversing/applying the patch.
-      const hunk = patch.split('\n').findIndex(line => line.startsWith('@@ -6119,'));
-      expect(hunk).toBeGreaterThan(0);
-      const lines = patch.split('\n').slice(hunk + 1);
-      const end = lines.findIndex(line => line.startsWith('@@'));
-      const current = lines.slice(0, end).filter(line => !line.startsWith('-')).map(line => line.slice(1)).join('\n') + '\n';
-      const prior = current.replace('\tlet papercuspSettle;\n', '')
-        .replace('papercuspSettle = observe({', 'observe({')
-        .replace(/\t\tlet result;\n\t\ttry \{[\s\S]*?\{ status: "success", result \}\); \} catch \{\}\n/,
-          '\t\tconst result = await transform(code, resolvedOptions);\n');
-      const donor = readFileSync(target, 'utf8');
-      expect(prior).not.toBe(current);
-      expect(donor.split(prior)).toHaveLength(2);
-      writeFileSync(target, donor.replace(prior, current));
-      expect(blobHash(readFileSync(target))).toBe(index[2]);
-      execFileSync('git', ['apply', '--reverse', patchPath], { cwd: fixture });
+    if (!restored && ['d47de69dfa01e96415ed334a119b32dde12f7b51',
+      '732046e1c4a35b19c964146fa0e6041f0f60ee2b'].includes(installedHash)) {
+      // Exact measured donors can precede git-sync. Normalize ONLY this isolated
+      // copy, and require the whole vanilla blob before applying the new patch.
+      let donor = readFileSync(target, 'utf8');
+      for (const hunk of patch.split(/^@@[^\n]*\n/m).slice(1)) {
+        const lines = hunk.match(/[^\n]*\n/g) ?? [];
+        const before = lines.filter(line => [' ', '-'].includes(line[0]!)).map(line => line.slice(1)).join('');
+        const after = lines.filter(line => [' ', '+'].includes(line[0]!)).map(line => line.slice(1)).join('');
+        if (donor.split(after).length === 2) donor = donor.replace(after, before);
+        else if (donor.split(before).length !== 2) {
+          const original = before.match(/[^\n]*\n/g)!;
+          const start = original.slice(0, 3).join(''), end = original.slice(-3).join('');
+          expect(donor.split(start)).toHaveLength(2);
+          const offset = donor.indexOf(start), finish = donor.indexOf(end, offset) + end.length;
+          expect(finish).toBeGreaterThan(offset);
+          donor = donor.slice(0, offset) + before + donor.slice(finish);
+        }
+      }
+      expect(blobHash(Buffer.from(donor))).toBe(index[1]);
+      writeFileSync(target, donor);
       restored = true;
     }
     expect(restored, 'isolated donor must match a maintained exact postimage').toBe(true);
@@ -85,6 +87,113 @@ async function serverFor(root: string, plugins: Plugin[] = [], capture = true) {
 }
 
 describe('maintained Vite applied compiler boundary', () => {
+
+  it('resolution search: original negative lookups rotate for nearer configs with fixed source', async () => {
+    const root = join(fixture, 'resolution-nearer'), directory = join(root, 'sub', 'deep');
+    mkdirSync(directory, { recursive: true });
+    const file = join(directory, 'input.ts'), near = join(root, 'sub', 'tsconfig.json');
+    const source = 'export class Example { value = 1; }';
+    const config = JSON.stringify({ compilerOptions: { useDefineForClassFields: true } });
+    writeFileSync(file, source); writeFileSync(join(root, 'tsconfig.json'), config);
+    const runs: Array<{ code: string; receipt: AppliedCompilerReceipt }> = [];
+    for (const state of ['original', 'nearer-equivalent', 'nearer-changed', 'repeat']) {
+      if (state === 'nearer-equivalent') writeFileSync(near, config);
+      if (state === 'nearer-changed') writeFileSync(near, JSON.stringify({ compilerOptions: { useDefineForClassFields: false } }));
+      const server = await serverFor(root);
+      try {
+        const environment = server.environments.ssr!;
+        const result = await environment.transformRequest(file);
+        runs.push({ code: result!.code, receipt: readAppliedCompilerInputs(environment)! });
+      } finally { await server.close(); }
+    }
+    const calls = runs.map(run => run.receipt.calls[0]!);
+    expect(new Set(calls.map(call => call.codeSha256))).toEqual(new Set([hash(source)]));
+    expect(calls[0]!.tsconfigSearch!.lookups).toEqual([
+      { path: join(directory, 'tsconfig.json'), outcome: 'missing', errorCode: 'ENOENT' },
+      { path: near, outcome: 'missing', errorCode: 'ENOENT' },
+      { path: join(root, 'tsconfig.json'), outcome: 'file', errorCode: null },
+    ]);
+    expect(calls[1]!.tsconfigSearch!.lookups).toEqual([
+      { path: join(directory, 'tsconfig.json'), outcome: 'missing', errorCode: 'ENOENT' },
+      { path: near, outcome: 'file', errorCode: null },
+    ]);
+    expect(calls[0]!.optionsSha256).toBe(calls[1]!.optionsSha256);
+    expect(calls[0]!.inputSha256).not.toBe(calls[1]!.inputSha256);
+    expect(runs[0]!.code).toBe(runs[1]!.code);
+    expect(calls[1]!.inputSha256).not.toBe(calls[2]!.inputSha256);
+    expect(runs[1]!.code).not.toBe(runs[2]!.code);
+    expect(calls[2]!.inputSha256).toBe(calls[3]!.inputSha256);
+    for (const run of runs) {
+      expect(run.receipt.missing).toContain('tsconfig-resolution-search-unobserved');
+      expect(run.receipt.populationStatus).toBe('unknown');
+      expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(run.receipt)))).toEqual(run.receipt);
+    }
+    expect(Object.isFrozen(calls[0]!.tsconfigSearch!.lookups[0])).toBe(true);
+  }, 30_000);
+
+  it('resolution search: captures actual extends fallback failures and changed resolved targets', async () => {
+    const root = join(fixture, 'resolution-extends'), pkg = join(root, 'node_modules', 'pc-config-search-control');
+    mkdirSync(pkg, { recursive: true });
+    const file = join(root, 'input.ts'), configFile = join(root, 'tsconfig.json');
+    const source = 'export class Example { value = 1; }';
+    const base = JSON.stringify({ compilerOptions: { useDefineForClassFields: true } });
+    writeFileSync(file, source);
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'pc-config-search-control', version: '1.0.0' }));
+    writeFileSync(join(pkg, 'tsconfig.json'), base); writeFileSync(join(root, 'alternate.json'), base);
+    const receipts: AppliedCompilerReceipt[] = [];
+    for (const extended of ['pc-config-search-control', './alternate.json']) {
+      writeFileSync(configFile, JSON.stringify({ extends: extended }));
+      const server = await serverFor(root);
+      try {
+        await server.environments.ssr!.transformRequest(file);
+        receipts.push(readAppliedCompilerInputs(server.environments.ssr)!);
+      } finally { await server.close(); }
+    }
+    expect(receipts[0]!.calls[0]!.tsconfigSearch!.extends).toEqual([
+      { from: configFile, request: 'pc-config-search-control', resolved: null, errorCode: 'MODULE_NOT_FOUND' },
+      { from: configFile, request: 'pc-config-search-control/tsconfig.json', resolved: join(pkg, 'tsconfig.json'), errorCode: null },
+    ]);
+    expect(receipts[1]!.calls[0]!.tsconfigSearch!.extends).toEqual([
+      { from: configFile, request: './alternate.json', resolved: join(root, 'alternate.json'), errorCode: null },
+    ]);
+    expect(receipts[0]!.calls[0]!.codeSha256).toBe(receipts[1]!.calls[0]!.codeSha256);
+    expect(receipts[0]!.calls[0]!.optionsSha256).toBe(receipts[1]!.calls[0]!.optionsSha256);
+    expect(receipts[0]!.calls[0]!.inputSha256).not.toBe(receipts[1]!.calls[0]!.inputSha256);
+    expect(receipts.every(receipt => receipt.missing.includes('tsconfig-resolution-search-unobserved'))).toBe(true);
+  }, 30_000);
+
+  it('resolution search: cache observations retain original custody and reject forged search completeness', async () => {
+    const root = join(fixture, 'resolution-cache'), directory = join(root, 'sub');
+    mkdirSync(directory, { recursive: true });
+    const file = join(directory, 'input.ts'), sibling = join(directory, 'sibling.ts');
+    const config = JSON.stringify({ compilerOptions: { useDefineForClassFields: true } });
+    writeFileSync(file, 'export const value: number = 1;');
+    writeFileSync(sibling, 'export const value: number = 1;');
+    writeFileSync(join(root, 'tsconfig.json'), config);
+    const server = await serverFor(root);
+    try {
+      const environment = server.environments.ssr!;
+      await environment.transformRequest(file);
+      const original = readAppliedCompilerInputs(environment)!;
+      const serialized = JSON.stringify(original);
+      writeFileSync(join(directory, 'tsconfig.json'), config);
+      await environment.transformRequest(sibling);
+      const after = readAppliedCompilerInputs(environment)!;
+      expect(JSON.stringify(original)).toBe(serialized);
+      expect(after.calls[0]).toEqual(original.calls[0]);
+      expect(after.calls[1]!.tsconfigSearch!.cacheHits.length).toBeGreaterThan(0);
+      expect(after.calls[1]!.tsconfigSearch!.lookups).toEqual([]);
+      expect(after.calls[1]!.tsconfigInputs).toEqual(original.calls[0]!.tsconfigInputs);
+      expect(after.missing).toContain('tsconfig-resolution-search-unobserved');
+      const call = original.calls[0]!, search = call.tsconfigSearch!;
+      for (const changed of [{ ...search, status: 'complete' }, { ...search, truncated: true },
+        { ...search, lookups: [] }, { ...search, cacheHits: [{ kind: 'guess', path: file }] },
+        { ...search, lookups: [{ path: file, outcome: 'missing', errorCode: null }] },
+        { ...search, extends: [{ from: file, request: './x', resolved: file, errorCode: 'ENOENT' }] }])
+        expect(parseAppliedCompilerReceipt({ ...original, calls: [{ ...call, tsconfigSearch: changed }] })).toBeUndefined();
+      expect(parseAppliedCompilerReceipt({ ...original, missing: original.missing.filter(gap => gap !== 'tsconfig-resolution-search-unobserved') })).toBeUndefined();
+    } finally { await server.close(); }
+  }, 30_000);
   it('settlement: real compiler success and failure bind to their original before-call sequence', async () => {
     const root = join(fixture, 'settlement'); mkdirSync(root);
     const good = join(root, 'good.ts'), bad = join(root, 'bad.ts');
