@@ -1,7 +1,9 @@
+import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import postgres from 'postgres';
 import { describe, expect, it } from 'vitest';
 import { nativePgSettingArgs, resolveNativePgBinDir, startDedicatedNativePg } from './dedicated-native-pg.ts';
@@ -15,6 +17,10 @@ function hasNativePg(): boolean {
   }
 }
 
+function hasNativePgTextsearch(): boolean {
+  return hasNativePg() && existsSync(join(resolveNativePgBinDir(), '..', 'lib', 'pg_textsearch.so'));
+}
+
 describe('nativePgSettingArgs', () => {
   it('renders -c name=value pairs in order', () => {
     expect(nativePgSettingArgs({ max_connections: '200', fsync: 'on' })).toEqual([
@@ -24,6 +30,44 @@ describe('nativePgSettingArgs', () => {
 });
 
 describe.skipIf(!hasNativePg())('startDedicatedNativePg (no Docker)', () => {
+  // EI-28574920105180597: a real archive restored its roles and schema, then
+  // failed at CREATE EXTENSION because the isolated target omitted the preload.
+  it.skipIf(!hasNativePgTextsearch())('strictly restores an archive requiring a preloaded extension', async () => {
+    const work = await mkdtemp(join(tmpdir(), 'native-pg-extension-restore-'));
+    let pg: Awaited<ReturnType<typeof startDedicatedNativePg>> | undefined;
+    let source: ReturnType<typeof postgres> | undefined;
+    let target: ReturnType<typeof postgres> | undefined;
+    try {
+      pg = await startDedicatedNativePg({ settings: { shared_preload_libraries: 'pg_textsearch' } });
+      source = postgres(pg.getConnectionUri(), { max: 1, onnotice: () => {} });
+      const [preflight] = await source`
+        SELECT current_setting('shared_preload_libraries') AS preload,
+               current_setting('pg_textsearch.library_version', true) AS version`;
+      expect(preflight.preload).toContain('pg_textsearch');
+      expect(preflight.version).toBeTruthy();
+      await source.unsafe('CREATE EXTENSION pg_textsearch');
+      await source.unsafe("CREATE TABLE restore_canary(body text); INSERT INTO restore_canary VALUES ('before')");
+      await source.unsafe("CREATE INDEX restore_canary_bm25 ON restore_canary USING bm25(body) WITH (text_config='english')");
+      await source.unsafe('CREATE DATABASE native_restore_target');
+      const targetUrl = new URL(pg.getConnectionUri());
+      targetUrl.pathname = '/native_restore_target';
+      const archive = join(work, 'snapshot.dump');
+      const run = promisify(execFile);
+      const bin = resolveNativePgBinDir();
+      await run(join(bin, 'pg_dump'), ['--format=custom', '--file', archive, pg.getConnectionUri()], { timeout: 60_000 });
+      await source.unsafe("INSERT INTO restore_canary VALUES ('after')");
+      await run(join(bin, 'pg_restore'), ['--exit-on-error', '--dbname', targetUrl.toString(), archive], { timeout: 60_000 });
+      target = postgres(targetUrl.toString(), { max: 1, onnotice: () => {} });
+      expect(await target`SELECT body FROM restore_canary ORDER BY body`).toEqual([{ body: 'before' }]);
+      const [index] = await target`SELECT indisvalid FROM pg_index WHERE indexrelid = 'restore_canary_bm25'::regclass`;
+      expect(index.indisvalid).toBe(true);
+    } finally {
+      await Promise.all([source?.end({ timeout: 5 }), target?.end({ timeout: 5 })]);
+      await pg?.stop();
+      await rm(work, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   it('owns a reachable cluster with the requested settings and removes it on stop', async () => {
     const pg = await startDedicatedNativePg({ settings: { max_connections: '37' } });
     const sql = postgres(pg.getConnectionUri(), { max: 1, onnotice: () => {} });
