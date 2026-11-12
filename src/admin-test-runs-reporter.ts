@@ -56,6 +56,8 @@ import {
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, readWorkerTestConfiguration, readViteTransformOptions, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
+import { listFilesIncludingUntracked } from '../../../scripts/lib/tracked-files.mjs';
+import { createSourceByteSnapshot, type SourceByteSnapshot, type RecordedSourceBytes } from './execution-details.ts';
 import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseRecordedWorkerCompilerInputs, parseRecordedWorkerExecution, parseRecordedWorkerDatabaseReset, parseSubmoduleCheckoutStatus,
   type RecordedSubmoduleCheckout, type RecordedSourceSubmodules } from './execution-details.ts';
 import { readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture.ts';
@@ -559,6 +561,28 @@ export interface WorktreeGitSnapshot {
   porcelain: string | null;
   provenanceError?: string;
   submodules?: RecordedSubmoduleCheckout[] | null;
+  sourceBytes?: SourceByteSnapshot | null;
+}
+
+/** Complete source-byte measurement; partial census or concurrent writes stay unknown. */
+export function captureSourceByteSnapshot(root: string): SourceByteSnapshot | null {
+  try {
+    const canonicalRoot = realpathSync(root);
+    const census = listFilesIncludingUntracked(canonicalRoot);
+    if (census.unscanned.length) return null;
+    const files = [...new Set(census.files as string[])].sort();
+    const hashFile = (file: string): string => {
+      const absolute = realpathSync(resolve(canonicalRoot, file));
+      if (!absolute.startsWith(canonicalRoot + sep)) throw new Error('source-path-escaped');
+      return createHash('sha256').update(readFileSync(absolute)).digest('hex');
+    };
+    const manifest = files.map(file => ({ path: file, sha256: hashFile(file) }));
+    const result = createSourceByteSnapshot(manifest);
+    const after = listFilesIncludingUntracked(canonicalRoot);
+    if (after.unscanned.length || JSON.stringify(files) !== JSON.stringify([...new Set(after.files as string[])].sort())
+      || manifest.some(file => hashFile(file.path) !== file.sha256)) return null;
+    return result;
+  } catch { return null; }
 }
 
 /**
@@ -834,11 +858,11 @@ export async function captureWorktreeSnapshot(
     if (!includeSubmodules) return snapshot;
     // Dirty source cannot qualify this context. Avoid a recursive Git command
     // on ordinary shared-tree runs, and never infer a census from HEAD alone.
-    if (describeWorktreeDirt(snapshot, snapshot) !== null) return { ...snapshot, submodules: null };
+    if (describeWorktreeDirt(snapshot, snapshot) !== null) return { ...snapshot, submodules: null, sourceBytes: null };
     signal?.throwIfAborted();
     const observed = await runGitWithRetry(run, 'git submodule status --recursive', root);
     signal?.throwIfAborted();
-    return { ...snapshot, submodules: parseSubmoduleCheckoutStatus(observed) };
+    return { ...snapshot, submodules: parseSubmoduleCheckoutStatus(observed), sourceBytes: captureSourceByteSnapshot(root) };
   };
   if (existsSync(join(root, '.verifier-source.json'))) {
     try {
@@ -3488,6 +3512,7 @@ export default class AdminTestRunsReporter implements Reporter {
     let dirtReason: string | null = 'snapshot not taken';
     let commitSha: string | null = null;
     let sourceSubmodules: RecordedSourceSubmodules = { schemaVersion: 'submodule-checkouts-v1', before: null, after: null };
+    let sourceBytes: RecordedSourceBytes = { schemaVersion: 'source-byte-observation-v1', before: null, after: null };
     try {
       const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot('before');
       signal.throwIfAborted();
@@ -3497,6 +3522,8 @@ export default class AdminTestRunsReporter implements Reporter {
       commitSha = after.commit;
       sourceSubmodules = { schemaVersion: 'submodule-checkouts-v1',
         before: before.submodules ?? null, after: after.submodules ?? null };
+      sourceBytes = { schemaVersion: 'source-byte-observation-v1',
+        before: before.sourceBytes ?? null, after: after.sourceBytes ?? null };
     } catch (err) {
       // D-007: missing proof of stability is dirty, never a false clean.
       worktreeDirty = true;
@@ -3528,8 +3555,8 @@ export default class AdminTestRunsReporter implements Reporter {
       worktreeDirty,
       commitSha,
       executionDetails: row.executionDetails
-        ? { ...row.executionDetails, worktreeDirty, commitSha, sourceSubmodules,
-          proofContext: captureRecordedProofContext({ ...row.executionDetails, worktreeDirty, commitSha, sourceSubmodules }),
+        ? { ...row.executionDetails, worktreeDirty, commitSha, sourceSubmodules, sourceBytes,
+          proofContext: captureRecordedProofContext({ ...row.executionDetails, worktreeDirty, commitSha, sourceSubmodules, sourceBytes }),
           ...(worktreeDirty && dirtReason ? { worktreeDirtyReason: dirtReason } : {}),
           runtimeEnvironmentAfterCaptureStatus: runtimeEnvironmentAfter.status,
           ...(runtimeEnvironmentAfter.status === 'captured'

@@ -27,6 +27,7 @@ import AdminTestRunsReporter, {
   observeReporterStage,
   buildOutputTail,
   captureWorktreeSnapshot,
+  captureSourceByteSnapshot,
   collectModuleExecution,
   collectIsolatedRuntimeReceipts,
   collectBoundaryObservations,
@@ -81,6 +82,28 @@ import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+describe('actual source-byte census', () => {
+  it('measures Git bytes across equivalent commits, edits and unmapped files, refusing escaped inputs', () => {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-source-bytes-'));
+    const git = (...args: string[]) => execFileSync('git', ['-C', root, '-c', 'user.email=test@test',
+      '-c', 'user.name=test', ...args], { stdio: 'pipe' });
+    try {
+      git('init', '-q'); writeFileSync(join(root, 'a.ts'), 'export const a = 1');
+      git('add', '-A'); git('commit', '-qm', 'source');
+      const before = captureSourceByteSnapshot(root);
+      expect(before).toMatchObject({ schemaVersion: 'source-bytes-v1', fileCount: 1 });
+      git('commit', '--allow-empty', '-qm', 'equivalent');
+      expect(captureSourceByteSnapshot(root)).toEqual(before);
+      writeFileSync(join(root, 'a.ts'), 'export const a = 2');
+      expect(captureSourceByteSnapshot(root)?.sha256).not.toBe(before?.sha256);
+      writeFileSync(join(root, 'unmapped.ts'), 'export const extra = 1');
+      expect(captureSourceByteSnapshot(root)?.fileCount).toBe(2);
+      symlinkSync('/etc/hostname', join(root, 'escaped'));
+      expect(captureSourceByteSnapshot(root)).toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 const MUTATION_FINALIZATION_DESCRIPTOR = JSON.stringify({
   schemaVersion: 1, probeInvocationId: 'qualified-mutation-finalization', mode: 'copy-out',
   subjectPath: 'source.ts', mutateExpression: 's/before/after/', againstCommit: null,

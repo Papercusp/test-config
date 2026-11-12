@@ -16,7 +16,7 @@ import { executedSourceOriginalsPlugin } from './vitest-config';
 import { perGroupVitestEnv } from '../../../scripts/test-files.mjs';
 
 import AdminTestRunsReporter, { inferWorkspaceRoot, type WorktreeGitSnapshot } from './admin-test-runs-reporter';
-import { parseRecordedTestPopulation, parseTestRunExecutionDetails } from './execution-details';
+import { createSourceByteSnapshot, parseRecordedTestPopulation, parseTestRunExecutionDetails } from './execution-details';
 import { observeViteTransformOptions, readViteTransformOptions } from './configuration-snapshot.ts';
 import { installAppliedCompilerInputCapture, readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
@@ -672,7 +672,7 @@ describe('ExecutedSourceMapReporter', () => {
       })) as never);
     }
 
-    it.each(['native-first', 'ledger-first'])('retains the same worker dependency measurement for %s callback order', async order => {
+    it.each(['native-first', 'ledger-first'])('retains the same worker dependency and source-byte measurement for %s callback order', async order => {
       const worker = { name: 'node', version: '25.1.0', executable: '/qualified/node', platform: 'linux', arch: 'x64',
         binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
         configurationSha256: '4'.repeat(64) };
@@ -708,7 +708,9 @@ describe('ExecutedSourceMapReporter', () => {
       const path = inputsFilePath(tmp, TEST_FILE);
       writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime, testConfiguration,
         workerExecution, workerDatabaseReset, compilerInputs }));
-      const source = { ...clean, submodules: [['libs/observed', 'a'.repeat(40)]] as [string, string][] };
+      const sourcePin = createSourceByteSnapshot([{ path: 'source.ts', sha256: '1'.repeat(64) }])!;
+      const source = { ...clean, sourceBytes: sourcePin,
+        submodules: [['libs/observed', 'a'.repeat(40)]] as [string, string][] };
       const { r } = reporter(snapshot(source));
       const { mod, tests } = populationModule();
       Object.assign(mod, { viteEnvironment });
@@ -744,6 +746,9 @@ describe('ExecutedSourceMapReporter', () => {
       expect(details?.proofContext).toEqual(original.proofContext);
       expect(details?.proofContext?.components.dependencies).toMatch(/^[a-f0-9]{64}$/);
       expect(details?.sourceSubmodules).toEqual(original.sourceSubmodules);
+      expect(details?.sourceBytes).toEqual(original.sourceBytes);
+      expect(details?.proofContext?.components.source).toBe(sourcePin.sha256);
+      expect(nativeOut().files[0].sourceBytes).toEqual(original.sourceBytes);
       expect(details?.proofContext?.components.submodules).toMatch(/^[a-f0-9]{64}$/);
       expect(nativeOut().files[0].sourceSubmodules).toEqual(original.sourceSubmodules);
       expect(details?.proofContext?.components.runtimeCapabilities).toBeNull();

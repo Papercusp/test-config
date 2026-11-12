@@ -27,6 +27,7 @@ import {
   confirmedRecordedWorkerDatabaseReset,
   parseRecordedSourceSubmodules,
   parseSubmoduleCheckoutStatus,
+  createSourceByteSnapshot,
   type RecordedPopulationIdentity,
   type RecordedPopulationCase,
   type TestRunExecutionDetails,
@@ -37,6 +38,28 @@ import { captureCurrentWorkerProcessIdentity } from './runtime-proof.ts';
 import { installAppliedCompilerInputCapture, readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 
 describe('original worker process custody', () => {
+  it('binds source-byte observations independently of commit identity and refuses missing or changed bytes', () => {
+    const pin = createSourceByteSnapshot([{ path: 'a.ts', sha256: '1'.repeat(64) }])!;
+    const sourceBytes = { schemaVersion: 'source-byte-observation-v1', before: pin, after: pin };
+    const input = { commitSha: 'a'.repeat(40), worktreeDirty: false, sourceBytes };
+    const proofContext = captureRecordedProofContext(input);
+    expect(proofContext.components.source).toBe(pin.sha256);
+    expect(captureRecordedProofContext({ ...input, commitSha: 'b'.repeat(40) })).toEqual(proofContext);
+    const row = details({ ...input, proofContext });
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify(row)))?.sourceBytes).toEqual(sourceBytes);
+    for (const sourceBytes of [{ ...input.sourceBytes, before: null }, { ...input.sourceBytes, after: null },
+      { ...input.sourceBytes, after: { ...pin, sha256: '2'.repeat(64) } },
+      { ...input.sourceBytes, after: { ...pin, fileCount: 2 } }]) {
+      expect(captureRecordedProofContext({ ...input, sourceBytes }).components.source).toBeNull();
+      expect(parseTestRunExecutionDetails({ ...row, sourceBytes })).toBeUndefined();
+    }
+    expect(captureRecordedProofContext({ ...input, worktreeDirty: true }).components.source).toBeNull();
+    expect(createSourceByteSnapshot([])).toBeNull();
+    expect(createSourceByteSnapshot([{ path: '../escape.ts', sha256: '1'.repeat(64) }])).toBeNull();
+    expect(createSourceByteSnapshot([{ path: 'a.ts', sha256: '1'.repeat(64) },
+      { path: 'a.ts', sha256: '1'.repeat(64) }])).toBeNull();
+  });
+
   const processIdentity = { pid: 123, threadId: 0, bootId: '01234567-89ab-cdef-0123-456789abcdef', startTicks: '456' };
   const execution = () => ({ schemaVersion: 'worker-execution-v1' as const,
     captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: '/repo/a.test.ts',

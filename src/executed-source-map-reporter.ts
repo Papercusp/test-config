@@ -56,7 +56,7 @@ import {
   type PgHandle,
   type WorktreeGitSnapshot,
 } from './admin-test-runs-reporter';
-import type { RecordedTestPopulation, PopulationCaptureStatus, RecordedSourceSubmodules } from './execution-details';
+import type { RecordedTestPopulation, PopulationCaptureStatus, RecordedSourceSubmodules, RecordedSourceBytes } from './execution-details';
 import { captureRecordedProofContext } from './execution-details';
 import { readViteTransformOptions } from './configuration-snapshot.ts';
 import { readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
@@ -1066,11 +1066,15 @@ export default class ExecutedSourceMapReporter implements Reporter {
         worktreeDirty: before === null || computeWorktreeDirty(before, after),
       };
       const nativeRun = { ...checkpoint.nativeRun, files: checkpoint.nativeRun.files.map(file => ({ ...file,
+        sourceBytes: { schemaVersion: 'source-byte-observation-v1' as const,
+          before: before?.sourceBytes ?? null, after: after.sourceBytes ?? null },
         sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1' as const,
           before: before?.submodules ?? null, after: after.submodules ?? null },
         proofContext: captureRecordedProofContext({ commitSha: checkpoint.recordedSha,
           worktreeDirty: checkpoint.worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime,
           workerTestConfiguration: file.proof.inputs?.testConfiguration,
+          sourceBytes: { schemaVersion: 'source-byte-observation-v1',
+            before: before?.sourceBytes ?? null, after: after.sourceBytes ?? null },
           sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1',
             before: before?.submodules ?? null, after: after.submodules ?? null } }),
       })) };
@@ -1104,6 +1108,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     let worktreeDirty = true;
     let recordedSha: string | null = null;
     let sourceSubmodules: RecordedSourceSubmodules = { schemaVersion: 'submodule-checkouts-v1', before: null, after: null };
+    let sourceBytes: RecordedSourceBytes = { schemaVersion: 'source-byte-observation-v1', before: null, after: null };
     try {
       const before = this.worktreeBefore ? await this.worktreeBefore : await this.readWorktreeSnapshot();
       const after = await this.readWorktreeSnapshot();
@@ -1111,6 +1116,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
       recordedSha = after.commit;
       sourceSubmodules = { schemaVersion: 'submodule-checkouts-v1',
         before: before.submodules ?? null, after: after.submodules ?? null };
+      sourceBytes = { schemaVersion: 'source-byte-observation-v1',
+        before: before.sourceBytes ?? null, after: after.sourceBytes ?? null };
     } catch {
       worktreeDirty = true; // no proof of stability is dirty, never a false clean
     }
@@ -1129,9 +1136,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
             skipped: this.skipped, rows, diagnostics: this.diagnostics,
             ...(this.nativeRun ? { nativeRun: { ...this.nativeRun,
               files: this.nativeRun.files.map(file => ({ ...file,
-                sourceSubmodules,
+                sourceSubmodules, sourceBytes,
                 proofContext: captureRecordedProofContext({ commitSha: recordedSha,
-                  worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime, sourceSubmodules,
+                  worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime, sourceSubmodules, sourceBytes,
                   workerTestConfiguration: file.proof.inputs?.testConfiguration }),
               })) } } : {}),
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),

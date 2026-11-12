@@ -162,6 +162,48 @@ export function confirmedRecordedWorkerDatabaseReset(value: unknown, execution: 
 }
 
 export type RecordedSubmoduleCheckout = [path: string, commitSha: string];
+/** Bounded pin of the complete recursive source-byte census, independent of HEAD. */
+export interface SourceByteSnapshot {
+  schemaVersion: 'source-bytes-v1';
+  fileCount: number;
+  sha256: string;
+}
+export interface RecordedSourceBytes {
+  schemaVersion: 'source-byte-observation-v1';
+  before: SourceByteSnapshot | null;
+  after: SourceByteSnapshot | null;
+}
+
+export function createSourceByteSnapshot(files: readonly { path: string; sha256: string }[]): SourceByteSnapshot | null {
+  if (!Array.isArray(files) || !files.length || files.length > 1_000_000) return null;
+  let previous = '';
+  for (const file of files) {
+    if (!isRecord(file) || Object.keys(file).length !== 2 || typeof file.path !== 'string'
+      || !file.path || file.path <= previous || /[\\\u0000-\u001f\u007f]/.test(file.path)
+      || file.path.startsWith('/') || /^[A-Za-z]:/.test(file.path)
+      || file.path.split('/').some(part => !part || part === '.' || part === '..')
+      || typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(file.sha256)) return null;
+    previous = file.path;
+  }
+  return { schemaVersion: 'source-bytes-v1', fileCount: files.length,
+    sha256: createHash('sha256').update(JSON.stringify(['source-bytes-v1',
+      files.map(file => ({ path: file.path, sha256: file.sha256 }))])).digest('hex') };
+}
+
+export function parseSourceByteSnapshot(value: unknown): SourceByteSnapshot | undefined {
+  return isRecord(value) && Object.keys(value).length === 3 && value.schemaVersion === 'source-bytes-v1'
+    && Number.isSafeInteger(value.fileCount) && (value.fileCount as number) > 0 && (value.fileCount as number) <= 1_000_000
+    && typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/.test(value.sha256)
+    ? value as unknown as SourceByteSnapshot : undefined;
+}
+
+export function parseRecordedSourceBytes(value: unknown): RecordedSourceBytes | undefined {
+  if (!isRecord(value) || Object.keys(value).length !== 3 || value.schemaVersion !== 'source-byte-observation-v1'
+    || !Object.hasOwn(value, 'before') || !Object.hasOwn(value, 'after')
+    || [value.before, value.after].some(pin => pin !== null && !parseSourceByteSnapshot(pin))) return undefined;
+  return value as unknown as RecordedSourceBytes;
+}
+
 export interface RecordedSourceSubmodules {
   schemaVersion: 'submodule-checkouts-v1';
   before: RecordedSubmoduleCheckout[] | null;
@@ -230,6 +272,7 @@ export function parseRecordedWorkerRuntime(value: unknown): RecordedWorkerRuntim
 export function captureRecordedProofContext(input: {
   commitSha: unknown; worktreeDirty: unknown; population?: unknown; workerRuntime?: unknown;
   sourceSubmodules?: unknown;
+  sourceBytes?: unknown;
   workerTestConfiguration?: unknown;
 }): ProofContextIdentity {
   const components = Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, null])) as
@@ -237,8 +280,16 @@ export function captureRecordedProofContext(input: {
   const digest = (kind: string, value: unknown) => createHash('sha256')
     .update(JSON.stringify(['recorded-proof-context-v1', kind, value])).digest('hex');
   if (input.worktreeDirty === false && typeof input.commitSha === 'string'
-    && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.commitSha))
-    components.source = digest('source', input.commitSha);
+    && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.commitSha)) {
+    // Legacy rows keep their old identity. New producers always supply the
+    // observation, including explicit nulls for an unavailable census.
+    if (input.sourceBytes === undefined) components.source = digest('source', input.commitSha);
+    else {
+      const bytes = parseRecordedSourceBytes(input.sourceBytes);
+      if (bytes?.before && bytes.after && bytes.before.sha256 === bytes.after.sha256
+        && bytes.before.fileCount === bytes.after.fileCount) components.source = bytes.before.sha256;
+    }
+  }
   const submodules = parseRecordedSourceSubmodules(input.sourceSubmodules);
   if (components.source && submodules?.before !== null && submodules?.before !== undefined
     && submodules.after !== null && JSON.stringify(submodules.before) === JSON.stringify(submodules.after))
@@ -261,7 +312,8 @@ function recordedProofContextMatches(value: Record<string, unknown>): boolean {
   const context = readProofContextIdentity(value.proofContext);
   const measured = captureRecordedProofContext({ commitSha: value.commitSha,
     worktreeDirty: value.worktreeDirty, population: value.population, workerRuntime: value.workerRuntime,
-    sourceSubmodules: value.sourceSubmodules, workerTestConfiguration: value.workerTestConfiguration });
+    sourceSubmodules: value.sourceSubmodules, sourceBytes: value.sourceBytes,
+    workerTestConfiguration: value.workerTestConfiguration });
   return context !== null && PROOF_CONTEXT_COMPONENTS.every(key => context.components[key] === measured.components[key]);
 }
 
@@ -759,6 +811,7 @@ export interface TestRunExecutionDetails {
   workerDatabaseReset?: RecordedWorkerDatabaseReset;
   /** Original before/after recursive checkout census; null is unqualified. */
   sourceSubmodules?: RecordedSourceSubmodules;
+  sourceBytes?: RecordedSourceBytes;
   mutationPhase: string | null;
   /** The commit observed after the run; null means runtime identity is unproven. */
   commitSha: string | null;
@@ -1002,7 +1055,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'workerCompilerInputs', 'sourceSubmodules', 'workerTestConfiguration', 'workerExecution', 'workerDatabaseReset',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'workerCompilerInputs', 'sourceSubmodules', 'sourceBytes', 'workerTestConfiguration', 'workerExecution', 'workerDatabaseReset',
 ]);
 
 /** A rollout preflight only: this does not qualify any test result or relax parsing. */
@@ -1122,6 +1175,7 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
       || (value.workerDatabaseReset as RecordedWorkerDatabaseReset).runGroupId !== value.runGroupId
       || (value.workerDatabaseReset as RecordedWorkerDatabaseReset).captureId !== parseRecordedWorkerExecution(value.workerExecution)?.captureId))
     || (value.sourceSubmodules !== undefined && !parseRecordedSourceSubmodules(value.sourceSubmodules))
+    || (value.sourceBytes !== undefined && !parseRecordedSourceBytes(value.sourceBytes))
     || (value.populationCaptureStatus !== undefined && (
       !POPULATION_CAPTURE_STATUSES.includes(value.populationCaptureStatus as PopulationCaptureStatus)
       || (value.populationCaptureStatus === 'captured') !== (value.population !== undefined)))
