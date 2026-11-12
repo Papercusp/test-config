@@ -28,6 +28,7 @@ import { pinModuleState } from '@papercusp/module-singleton';
 export const PC_EXECUTED_INPUTS_DIR_ENV = 'PC_EXECUTED_INPUTS_DIR';
 
 export interface InputsRecord {
+  workerDatabaseReset?: import('./execution-details.ts').RecordedWorkerDatabaseReset;
   workerExecution?: import('./execution-details.ts').RecordedWorkerExecution;
   testConfiguration?: import('./configuration-snapshot.ts').RecordedWorkerTestConfiguration;
   /** The actual worker measures itself on both sides of this file's execution. */
@@ -99,6 +100,7 @@ export function captureModuleImports(workerState: unknown): InputsRecord['module
 export interface Recorder {
   reads: Set<string>;
   opaque: Set<string>;
+  databaseReset?: Omit<import('./execution-details.ts').RecordedWorkerDatabaseReset, 'testFile' | 'finishedAt'>;
   moduleEvaluations?: ModuleEvaluationObservation;
   moduleCodeRoot?: string;
 }
@@ -393,10 +395,28 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
 }
 
 /** Start capturing for the next test file (setup-file top level). */
-export function beginFile(): Recorder {
-  const rec: Recorder = { reads: new Set(), opaque: new Set() };
+export function beginFile(identity?: { captureId: string; runGroupId: string | null }): Recorder {
+  const rec: Recorder = { reads: new Set(), opaque: new Set(), ...(identity ? { databaseReset: {
+    schemaVersion: 'worker-database-reset-v1' as const, ...identity, startedAt: new Date().toISOString(), databases: [],
+  } } : {}) };
   state.current = rec;
   return rec;
+}
+
+/** Called at the actual CREATE boundary. Closures remain attached to their
+ * original file; a late drop cannot upgrade a completed or subsequent file. */
+export function beginDatabaseResetCapture(name: string, origin: 'empty' | 'template') {
+  const rec = state.current;
+  const db: NonNullable<Recorder['databaseReset']>['databases'][number] = {
+    allocationId: randomUUID(), name, origin, startedAt: new Date().toISOString(), readyAt: null, cleanup: null,
+  };
+  rec?.databaseReset?.databases.push(db);
+  return {
+    ready() { if (rec?.databaseReset && state.current === rec) db.readyAt = new Date().toISOString(); },
+    cleanup(outcome: NonNullable<typeof db.cleanup>['outcome']) {
+      if (rec?.databaseReset && state.current === rec) db.cleanup = { at: new Date().toISOString(), outcome };
+    },
+  };
 }
 
 /** Stop capturing and return the record for `testFile`. */
@@ -411,6 +431,8 @@ export function endFile(testFile: string): InputsRecord | null {
     evaluations.reasons = evaluations.reasons.filter(reason => reason !== 'evaluator-wrapper-unobserved');
   }
   return { testFile: resolve(testFile), reads: [...rec.reads].sort(), opaque: [...rec.opaque].sort(),
+    ...(rec.databaseReset ? { workerDatabaseReset: { ...structuredClone(rec.databaseReset),
+      testFile: resolve(testFile), finishedAt: new Date().toISOString() } } : {}),
     ...(rec.moduleEvaluations ? { moduleEvaluations: rec.moduleEvaluations } : {}) };
 }
 

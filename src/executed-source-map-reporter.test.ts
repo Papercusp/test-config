@@ -681,9 +681,15 @@ describe('ExecutedSourceMapReporter', () => {
       const workerExecution = { schemaVersion: 'worker-execution-v1',
         captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: TEST_FILE,
         before: processIdentity, after: processIdentity };
+      process.env.PAPERCUSP_TEST_RUN_GROUP = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+      const at = new Date().toISOString();
+      const workerDatabaseReset = { schemaVersion: 'worker-database-reset-v1', captureId: workerExecution.captureId,
+        testFile: TEST_FILE, runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP, startedAt: at, finishedAt: at,
+        databases: [{ allocationId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff', name: 'it_0123456789ab',
+          origin: 'empty', startedAt: at, readyAt: at, cleanup: { at, outcome: 'dropped' } }] };
       process.env[PC_EXECUTED_INPUTS_DIR_ENV] = tmp;
       const path = inputsFilePath(tmp, TEST_FILE);
-      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime, testConfiguration, workerExecution }));
+      writeFileSync(path, JSON.stringify({ testFile: TEST_FILE, reads: [], opaque: [], runtime, testConfiguration, workerExecution, workerDatabaseReset }));
       const source = { ...clean, submodules: [['libs/observed', 'a'.repeat(40)]] as [string, string][] };
       const { r } = reporter(snapshot(source));
       const { mod, tests } = populationModule();
@@ -707,6 +713,9 @@ describe('ExecutedSourceMapReporter', () => {
       expect(details?.workerTestConfiguration).toEqual(testConfiguration);
       expect(details?.workerExecution).toEqual(workerExecution);
       expect(original.proof.inputs.workerExecution).toEqual(workerExecution);
+      expect(details?.workerDatabaseReset).toEqual(workerDatabaseReset);
+      expect(original.proof.inputs.workerDatabaseReset).toEqual(workerDatabaseReset);
+      expect(details?.proofContext?.components.fixtures).toBeNull();
       expect(details?.proofContext?.components.testConfiguration).toMatch(/^[a-f0-9]{64}$/);
       expect(original.proof.inputs.testConfiguration).toEqual(testConfiguration);
       expect(details?.proofContext).toEqual(original.proofContext);

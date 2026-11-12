@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,
   beginFile,
+  beginDatabaseResetCapture,
   captureModuleImports,
   currentRecorder,
   endFile,
@@ -36,6 +37,38 @@ const armed = Boolean(process.env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim()) && curren
 let restoreCapture: () => void = () => {};
 beforeEach(() => { restoreCapture = snapshotCaptureForTests(); });
 afterEach(() => restoreCapture());
+
+describe('original file database reset capture', () => {
+  const identity = { captureId: '12345678-9abc-def0-1234-56789abcdef0',
+    runGroupId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' };
+  it('records allocation, provision readiness and the actual drop outcome without endpoints', () => {
+    beginFile(identity);
+    const first = beginDatabaseResetCapture('it_0123456789ab', 'empty');
+    first.ready(); first.cleanup('dropped');
+    const second = beginDatabaseResetCapture('it_abcdef012345', 'template');
+    second.ready(); second.cleanup('detached');
+    const reset = endFile('/repo/first.test.ts')?.workerDatabaseReset;
+    expect(reset).toMatchObject({ ...identity, testFile: '/repo/first.test.ts', databases: [
+      { name: 'it_0123456789ab', origin: 'empty', readyAt: expect.any(String), cleanup: { outcome: 'dropped' } },
+      { name: 'it_abcdef012345', origin: 'template', cleanup: { outcome: 'detached' } },
+    ] });
+    expect(new Set(reset?.databases.map(db => db.allocationId)).size).toBe(2);
+    expect(JSON.stringify(reset)).not.toContain('postgres:');
+  });
+
+  it('does not let late cleanup upgrade a completed record or leak into the next file', () => {
+    beginFile(identity);
+    const pending = beginDatabaseResetCapture('it_0123456789ab', 'empty');
+    pending.ready();
+    const prior = endFile('/repo/first.test.ts')!;
+    beginFile({ ...identity, captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' });
+    pending.cleanup('dropped');
+    expect(prior.workerDatabaseReset?.databases[0]?.cleanup).toBeNull();
+    expect(endFile('/repo/second.test.ts')?.workerDatabaseReset?.databases).toEqual([]);
+    beginFile(); beginDatabaseResetCapture('it_abcdef012345', 'empty').cleanup('dropped');
+    expect(endFile('/repo/unobserved.test.ts')).not.toHaveProperty('workerDatabaseReset');
+  });
+});
 
 describe('final worker module observation', () => {
   it('retains body imports and external flags while excluding builtin and virtual IDs', () => {

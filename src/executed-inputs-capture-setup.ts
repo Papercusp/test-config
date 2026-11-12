@@ -52,7 +52,7 @@ if (dir) {
       },
       root,
     );
-    beginFile();
+    beginFile({ captureId, runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null });
     if (process.env.PC_EXECUTED_SOURCE_MAP_OUT?.trim()) {
       installModuleEvaluationCapture((globalThis as { __vitest_mocker__?: unknown }).__vitest_mocker__,
         `${process.env.PC_EXECUTED_SOURCE_MAP_OUT}.modules`);

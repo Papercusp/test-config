@@ -6,7 +6,7 @@ const include = process.env.PC_COMPLETION_CONTINUATION_FIXTURE === '1'
   : ['../armed-capture/sample.armed-fixture.ts', '../case-ledger/cases.case-fixture.ts', 'collection-error.fixture.ts'];
 const filter = readFilterList();
 const config = defineVitestConfig({
-  layer: 'unit',
+  layer: process.env.PC_COMPLETION_DATABASE_RESET === '1' ? 'integration' : 'unit',
   // Fixture files deliberately use non-test suffixes. Apply the maintained
   // explicit-file rule rather than the layer's suffix-glob narrowing rule.
   include: filter ? applyFilterList(include, filter.files, { explicitFiles: true }).include : include,

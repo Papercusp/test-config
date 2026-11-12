@@ -45,6 +45,9 @@ import {
 import { getTestPg, startDedicatedTestPg } from './pg-container.ts';
 import { resolveNativePgBinDir, startDedicatedNativePg } from './dedicated-native-pg.ts';
 import { acquireBaselineMigrationLock, dropBaselineDatabase } from './baseline-schema-global-setup.ts';
+import { beginFile, endFile, snapshotCaptureForTests } from './executed-inputs-capture.ts';
+import { confirmedRecordedWorkerDatabaseReset } from './execution-details.ts';
+import { captureCurrentWorkerProcessIdentity } from './runtime-proof.ts';
 
 const READY_MARK = 'pc-template-ready';
 
@@ -87,6 +90,69 @@ async function adminClient(): Promise<postgres.Sql> {
   cleanupClients.push(sql);
   return sql;
 }
+
+it('captures real empty and template database reset only after confirmed PostgreSQL removal', async () => {
+  const restore = snapshotCaptureForTests();
+  const captureId = '12345678-9abc-def0-1234-56789abcdef0';
+  const runGroupId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const testFile = '/repo/database-reset.integration.test.ts';
+  const before = captureCurrentWorkerProcessIdentity();
+  const allocated: Awaited<ReturnType<typeof createFreshTestDb>>[] = [];
+  try {
+    beginFile({ captureId, runGroupId });
+    const empty = await createFreshTestDb({ prefix: 'resetempty' }); allocated.push(empty);
+    const key = freshKey();
+    const provision = async (url: string) => {
+      const sql = postgres(url, { max: 1 });
+      try { await sql`CREATE TABLE reset_seed (value text)`; }
+      finally { await sql.end(); }
+    };
+    const first = await createFreshTestDb({ template: { key, provision } }); allocated.push(first);
+    const sql = postgres(first.url, { max: 1 });
+    try { await sql`INSERT INTO reset_seed VALUES ('first fixture only')`; }
+    finally { await sql.end(); }
+    const second = await createFreshTestDb({ template: { key, provision } }); allocated.push(second);
+    const clone = postgres(second.url, { max: 1 });
+    try { expect(await clone`SELECT value FROM reset_seed`).toEqual([]); }
+    finally { await clone.end(); }
+    const admin = await adminClient();
+    for (const db of allocated) {
+      expect(await db.dropWithResult()).toBe('dropped');
+      expect(await admin`SELECT datname FROM pg_database WHERE datname = ${db.name}`).toEqual([]);
+    }
+    const record = endFile(testFile)!;
+    const worker = { schemaVersion: 'worker-execution-v1', captureId, testFile, before,
+      after: captureCurrentWorkerProcessIdentity() };
+    const reset = confirmedRecordedWorkerDatabaseReset(record.workerDatabaseReset, worker, runGroupId);
+    expect(reset?.databases.map(db => db.origin)).toEqual(['empty', 'template', 'template']);
+    expect(new Set(reset?.databases.map(db => db.name)).size).toBe(3);
+    expect(reset?.databases.map(db => db.name)).toEqual(allocated.map(db => db.name));
+  } finally {
+    restore();
+    for (const db of allocated) await db.drop();
+  }
+}, 120_000);
+
+it('leaves a real provision failure and a late database drop unconfirmed in the original reset record', async () => {
+  const restore = snapshotCaptureForTests();
+  const captureId = '12345678-9abc-def0-1234-56789abcdef0';
+  const runGroupId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  let db: Awaited<ReturnType<typeof createFreshTestDb>> | undefined;
+  try {
+    beginFile({ captureId, runGroupId });
+    await expect(createFreshTestDb({ provision: async () => { throw new Error('provision control'); } }))
+      .rejects.toThrow('provision control');
+    db = await createFreshTestDb({ prefix: 'resetpending' });
+    const prior = endFile('/repo/reset-pending.test.ts')!.workerDatabaseReset!;
+    expect(prior.databases).toHaveLength(2);
+    expect(prior.databases[0]?.readyAt).toBeNull();
+    expect(prior.databases[1]?.cleanup).toBeNull();
+    beginFile({ captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff', runGroupId });
+    expect(await db.dropWithResult()).toBe('dropped');
+    expect(prior.databases[1]?.cleanup).toBeNull();
+    expect(endFile('/repo/reset-next.test.ts')?.workerDatabaseReset?.databases).toEqual([]);
+  } finally { restore(); await db?.drop(); }
+}, 120_000);
 
 it('creates the requested database locale before provision and drops the owned database', async () => {
   const db = await createFreshTestDb({ prefix: 'localepin', locale: 'C', provision: async url => {

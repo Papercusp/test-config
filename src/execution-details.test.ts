@@ -22,6 +22,8 @@ import {
   parseRecordedWorkerRuntime,
   parseRecordedWorkerExecution,
   stableRecordedWorkerExecution,
+  parseRecordedWorkerDatabaseReset,
+  confirmedRecordedWorkerDatabaseReset,
   parseRecordedSourceSubmodules,
   parseSubmoduleCheckoutStatus,
   type RecordedPopulationIdentity,
@@ -36,6 +38,43 @@ describe('original worker process custody', () => {
   const execution = () => ({ schemaVersion: 'worker-execution-v1' as const,
     captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: '/repo/a.test.ts',
     before: processIdentity, after: { ...processIdentity } });
+
+  it('binds confirmed database reset to the original file, run and stable worker without claiming fixture identity', () => {
+    const worker = execution();
+    const reset = { schemaVersion: 'worker-database-reset-v1', captureId: worker.captureId,
+      runGroupId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', testFile: worker.testFile,
+      startedAt: '2026-11-12T00:00:00.000Z', finishedAt: '2026-11-12T00:00:04.000Z',
+      databases: [{ allocationId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff', name: 'it_0123456789ab', origin: 'empty',
+        startedAt: '2026-11-12T00:00:01.000Z', readyAt: '2026-11-12T00:00:02.000Z',
+        cleanup: { at: '2026-11-12T00:00:03.000Z', outcome: 'dropped' } }] };
+    const confirmed = (value: unknown, current: unknown = worker, group = reset.runGroupId) =>
+      confirmedRecordedWorkerDatabaseReset(value, current, group);
+    expect(confirmed(reset)).toEqual(reset);
+    expect(parseTestRunExecutionDetails(details({ root: '/repo', filePath: 'a.test.ts',
+      runGroupId: reset.runGroupId, workerExecution: worker, workerDatabaseReset: reset } as never))?.workerDatabaseReset).toEqual(reset);
+    expect(confirmed({ ...reset, databases: [] })).toBeUndefined();
+    for (const outcome of ['deferred', 'detached', 'error']) {
+      const pending = { ...reset, databases: [{ ...reset.databases[0], cleanup: { ...reset.databases[0]!.cleanup, outcome } }] };
+      expect(parseRecordedWorkerDatabaseReset(pending)).toEqual(pending);
+      expect(confirmed(pending)).toBeUndefined();
+    }
+    for (const patch of [{ readyAt: null }, { cleanup: null }])
+      expect(confirmed({ ...reset, databases: [{ ...reset.databases[0], ...patch }] })).toBeUndefined();
+    expect(confirmed(reset, { ...worker, captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' })).toBeUndefined();
+    expect(confirmed(reset, { ...worker, testFile: '/repo/other.test.ts' })).toBeUndefined();
+    expect(confirmed(reset, { ...worker, after: { ...processIdentity, pid: 124 } })).toBeUndefined();
+    expect(confirmed(reset, worker, 'ffffffff-ffff-ffff-ffff-ffffffffffff')).toBeUndefined();
+    const invalid = [
+      { ...reset, complete: true }, { ...reset, runGroupId: '' },
+      { ...reset, databases: [reset.databases[0], reset.databases[0]] },
+      { ...reset, databases: [{ ...reset.databases[0], readyAt: reset.startedAt }] },
+      { ...reset, databases: [{ ...reset.databases[0], cleanup: { at: reset.startedAt, outcome: 'dropped' } }] },
+      { ...reset, databases: [{ ...reset.databases[0], cleanup: { at: '2026-11-12T00:00:05.000Z', outcome: 'dropped' } }] },
+    ];
+    for (const value of invalid) expect(parseRecordedWorkerDatabaseReset(value)).toBeUndefined();
+    expect(captureRecordedProofContext({ commitSha: 'a'.repeat(40), worktreeDirty: false,
+      workerDatabaseReset: reset } as never).components.fixtures).toBeNull();
+  });
 
   it('retains the actual kernel incarnation independently of input equivalence or fixture reset', () => {
     const current = captureCurrentWorkerProcessIdentity();

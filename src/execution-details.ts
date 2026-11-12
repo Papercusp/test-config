@@ -58,6 +58,60 @@ export function stableRecordedWorkerExecution(value: unknown): RecordedWorkerExe
     && JSON.stringify(execution.before) === JSON.stringify(execution.after) ? execution : undefined;
 }
 
+/** Actual fresh-database lifetime, separate from fixture contents and reuse authority. */
+export interface RecordedWorkerDatabaseReset {
+  schemaVersion: 'worker-database-reset-v1';
+  captureId: string;
+  runGroupId: string | null;
+  testFile: string;
+  startedAt: string;
+  finishedAt: string;
+  databases: Array<{ allocationId: string; name: string; origin: 'empty' | 'template';
+    startedAt: string; readyAt: string | null;
+    cleanup: { at: string; outcome: 'dropped' | 'deferred' | 'detached' | 'error' } | null }>;
+}
+
+export function parseRecordedWorkerDatabaseReset(value: unknown): RecordedWorkerDatabaseReset | undefined {
+  const uuid = (id: unknown) => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id);
+  const keys = (row: Record<string, unknown>, expected: string[]) =>
+    Object.keys(row).length === expected.length && expected.every(key => Object.hasOwn(row, key));
+  if (!isRecord(value) || !keys(value, ['schemaVersion', 'captureId', 'runGroupId', 'testFile', 'startedAt', 'finishedAt', 'databases'])
+    || value.schemaVersion !== 'worker-database-reset-v1' || !uuid(value.captureId)
+    || value.runGroupId !== null && (typeof value.runGroupId !== 'string' || !value.runGroupId.trim()
+      || value.runGroupId.length > 200 || /[\u0000-\u001f\u007f]/.test(value.runGroupId))
+    || typeof value.testFile !== 'string' || !isAbsolute(value.testFile) || value.testFile.includes('\u0000')
+    || !isRecordedInstant(value.startedAt) || !isRecordedInstant(value.finishedAt)
+    || Date.parse(value.finishedAt) < Date.parse(value.startedAt)
+    || !Array.isArray(value.databases) || value.databases.length > 10_000) return undefined;
+  const seen = new Set<string>();
+  for (const db of value.databases) {
+    if (!isRecord(db) || !keys(db, ['allocationId', 'name', 'origin', 'startedAt', 'readyAt', 'cleanup'])
+      || !uuid(db.allocationId) || seen.has(db.allocationId as string)
+      || typeof db.name !== 'string' || db.name.length > 63 || !/^[a-z][a-z0-9_-]*_[0-9a-f]{8,}$/.test(db.name)
+      || !['empty', 'template'].includes(db.origin as string) || !isRecordedInstant(db.startedAt)
+      || Date.parse(db.startedAt) < Date.parse(value.startedAt) || Date.parse(db.startedAt) > Date.parse(value.finishedAt)
+      || db.readyAt !== null && (!isRecordedInstant(db.readyAt) || Date.parse(db.readyAt) < Date.parse(db.startedAt)
+        || Date.parse(db.readyAt) > Date.parse(value.finishedAt))) return undefined;
+    if (db.cleanup !== null && (!isRecord(db.cleanup) || !keys(db.cleanup, ['at', 'outcome'])
+      || !isRecordedInstant(db.cleanup.at) || Date.parse(db.cleanup.at) < Date.parse((db.readyAt ?? db.startedAt) as string)
+      || Date.parse(db.cleanup.at) > Date.parse(value.finishedAt)
+      || !['dropped', 'deferred', 'detached', 'error'].includes(db.cleanup.outcome as string))) return undefined;
+    seen.add(db.allocationId as string);
+  }
+  return value as unknown as RecordedWorkerDatabaseReset;
+}
+
+/** Empty, pending, foreign and merely detached drops are not confirmed resets.
+ * Even a confirmed record only covers these databases, never all fixture state. */
+export function confirmedRecordedWorkerDatabaseReset(value: unknown, execution: unknown,
+  runGroupId: string): RecordedWorkerDatabaseReset | undefined {
+  const reset = parseRecordedWorkerDatabaseReset(value), worker = stableRecordedWorkerExecution(execution);
+  return reset && worker && reset.captureId === worker.captureId && reset.testFile === worker.testFile
+    && reset.runGroupId === runGroupId && reset.databases.length > 0
+    && new Set(reset.databases.map(db => db.name)).size === reset.databases.length
+    && reset.databases.every(db => db.readyAt !== null && db.cleanup?.outcome === 'dropped') ? reset : undefined;
+}
+
 export type RecordedSubmoduleCheckout = [path: string, commitSha: string];
 export interface RecordedSourceSubmodules {
   schemaVersion: 'submodule-checkouts-v1';
@@ -652,6 +706,7 @@ export interface TestRunExecutionDetails {
   workerRuntime?: RecordedWorkerRuntime;
   workerTestConfiguration?: RecordedWorkerTestConfiguration;
   workerExecution?: RecordedWorkerExecution;
+  workerDatabaseReset?: RecordedWorkerDatabaseReset;
   /** Original before/after recursive checkout census; null is unqualified. */
   sourceSubmodules?: RecordedSourceSubmodules;
   mutationPhase: string | null;
@@ -897,7 +952,7 @@ const executionDetailsKeys = new Set<keyof TestRunExecutionDetails>([
   'passedCaseTitles', 'passedCaseTitlesTruncated', 'runtimeEnvironmentBefore', 'runtimeEnvironmentAfter',
   'runtimeEnvironmentBeforeCaptureStatus', 'runtimeEnvironmentAfterCaptureStatus',
   'isolatedRuntimeReceipts', 'mutation', 'check', 'operational', 'boundaryObservations', 'llmBlockCustody',
-  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules', 'workerTestConfiguration', 'workerExecution',
+  'sqlCoverageObservations', 'population', 'populationCaptureStatus', 'proofContext', 'workerRuntime', 'sourceSubmodules', 'workerTestConfiguration', 'workerExecution', 'workerDatabaseReset',
 ]);
 
 /** A rollout preflight only: this does not qualify any test result or relax parsing. */
@@ -1009,6 +1064,10 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.workerTestConfiguration !== undefined && !readWorkerTestConfiguration(value.workerTestConfiguration))
     || (value.workerExecution !== undefined && parseRecordedWorkerExecution(value.workerExecution)?.testFile
       !== resolve(value.root as string, value.filePath as string))
+    || (value.workerDatabaseReset !== undefined && (!parseRecordedWorkerDatabaseReset(value.workerDatabaseReset)
+      || (value.workerDatabaseReset as RecordedWorkerDatabaseReset).testFile !== resolve(value.root as string, value.filePath as string)
+      || (value.workerDatabaseReset as RecordedWorkerDatabaseReset).runGroupId !== value.runGroupId
+      || (value.workerDatabaseReset as RecordedWorkerDatabaseReset).captureId !== parseRecordedWorkerExecution(value.workerExecution)?.captureId))
     || (value.sourceSubmodules !== undefined && !parseRecordedSourceSubmodules(value.sourceSubmodules))
     || (value.populationCaptureStatus !== undefined && (
       !POPULATION_CAPTURE_STATUSES.includes(value.populationCaptureStatus as PopulationCaptureStatus)

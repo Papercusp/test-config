@@ -31,6 +31,10 @@ import postgres from 'postgres';
 import { getTestPg } from './pg-container.ts';
 import { assertOwnedTestDatabaseName, GENERATED_TEST_DB_NAME_PATTERN, registerOwnedTestDatabase } from './owned-test-db-cleanup.ts';
 import { redactSensitiveText } from './sensitive-text.ts';
+import { beginDatabaseResetCapture } from './executed-inputs-capture.ts';
+
+type DatabaseResetCapture = ReturnType<typeof beginDatabaseResetCapture>;
+type CreatedDatabase = { url: string; name: string; adminUri: string; resetCapture: DatabaseResetCapture };
 
 export interface MigratedTestDb {
   /** Connection URL for the freshly-provisioned database. Open your own client against it. */
@@ -98,8 +102,9 @@ export async function withConnectRetry<T>(
   throw lastErr;
 }
 
-async function createFreshDb(name: string, locale?: string): Promise<{ url: string; name: string; adminUri: string }> {
+async function createFreshDb(name: string, locale?: string): Promise<CreatedDatabase> {
   const adminUri = await getTestPg();
+  const resetCapture = beginDatabaseResetCapture(name, 'empty');
   // Pre-register the generated name so a forced exit during CREATE/provision
   // still leaves the supervisor an exact, owned, idempotent cleanup target.
   registerOwnedTestDatabase(name, adminUri);
@@ -114,7 +119,7 @@ async function createFreshDb(name: string, locale?: string): Promise<{ url: stri
     }
   });
   await markOrDropUntrackedDatabase(adminUri, name);
-  return { url: swapDbName(adminUri, name), name, adminUri };
+  return { url: swapDbName(adminUri, name), name, adminUri, resetCapture };
 }
 
 /**
@@ -1077,8 +1082,9 @@ export async function getOrBuildTemplate(
   return p;
 }
 
-async function createDbFromTemplate(name: string, template: string): Promise<{ url: string; name: string; adminUri: string }> {
+async function createDbFromTemplate(name: string, template: string): Promise<CreatedDatabase> {
   const adminUri = await getTestPg();
+  const resetCapture = beginDatabaseResetCapture(name, 'template');
   registerOwnedTestDatabase(name, adminUri);
   // EI-10571: this is the HOT path every `createOrgTestDb`-style fixture takes
   // on every integration test file's beforeAll — see withConnectRetry's docstring.
@@ -1095,7 +1101,7 @@ async function createDbFromTemplate(name: string, template: string): Promise<{ u
     }
   });
   await markOrDropUntrackedDatabase(adminUri, name);
-  return { url: swapDbName(adminUri, name), name, adminUri };
+  return { url: swapDbName(adminUri, name), name, adminUri, resetCapture };
 }
 
 /** PostgreSQL's `template database "x" does not exist` (SQLSTATE 3D000) on CREATE DATABASE … TEMPLATE. */
@@ -1128,7 +1134,7 @@ export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Pr
   if (opts.template) {
     const { key, provision, lockTimeoutMs } = opts.template;
     const tmpl = await getOrBuildTemplate(key, provision, { lockTimeoutMs });
-    let created: { url: string; name: string; adminUri: string };
+    let created: CreatedDatabase;
     try {
       created = await createDbFromTemplate(name, tmpl);
     } catch (e) {
@@ -1138,9 +1144,9 @@ export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Pr
       if (templateBuilds.has(key)) templateBuilds.delete(key);
       created = await createDbFromTemplate(name, await getOrBuildTemplate(key, provision, { lockTimeoutMs }));
     }
-    return recordedFreshTestDb(created.url, created.name, created.adminUri);
+    return recordedFreshTestDb(created.url, created.name, created.adminUri, created.resetCapture);
   }
-  const { url, adminUri } = await createFreshDb(name, opts.locale);
+  const { url, adminUri, resetCapture } = await createFreshDb(name, opts.locale);
   if (opts.provision) {
     try {
       await opts.provision(url);
@@ -1149,10 +1155,10 @@ export async function createFreshTestDb(opts: CreateFreshTestDbOptions = {}): Pr
       throw new Error(`createFreshTestDb: provision failed for ${name}: ${(err as Error).message}`);
     }
   }
-  return recordedFreshTestDb(url, name, adminUri);
+  return recordedFreshTestDb(url, name, adminUri, resetCapture);
 }
 
-async function recordedFreshTestDb(url: string, name: string, adminUri: string): Promise<FreshTestDb> {
+async function recordedFreshTestDb(url: string, name: string, adminUri: string, resetCapture: DatabaseResetCapture): Promise<FreshTestDb> {
   let record: ReturnType<typeof registerOwnedTestDatabase>;
   try {
     record = registerOwnedTestDatabase(name, adminUri);
@@ -1168,12 +1174,15 @@ async function recordedFreshTestDb(url: string, name: string, adminUri: string):
     try {
       const outcome = await dropDatabaseOnDedicatedConnection(adminUri, name, options);
       record(outcome);
+      resetCapture.cleanup(outcome);
       return outcome;
     } catch (cause) {
       record('error');
+      resetCapture.cleanup('error');
       throw cause;
     }
   };
+  resetCapture.ready();
   return { url, name, dropWithResult, drop: async () => { await dropWithResult(); } };
 }
 
