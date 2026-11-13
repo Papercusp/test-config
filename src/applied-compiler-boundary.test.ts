@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -10,6 +10,9 @@ import type { createServer, Plugin } from 'vite';
 import { executedSourceOriginalsPlugin } from './vitest-config.ts';
 import { parseAppliedCompilerReceipt, readAppliedCompilerInputs, successfulAppliedCompilerOutput,
   installAppliedCompilerInputCapture, type AppliedCompilerReceipt } from './applied-compiler-inputs.ts';
+import { captureRecordedProofContext, parseTestRunExecutionDetails, TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
+  type TestRunExecutionDetails } from './execution-details.ts';
+import { captureCurrentWorkerProcessIdentity } from './runtime-proof.ts';
 
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const blobHash = (value: Buffer) => createHash('sha1').update('blob ' + value.length + '\0').update(value).digest('hex');
@@ -227,6 +230,70 @@ describe('maintained Vite applied compiler boundary', () => {
       expect(run.receipt.missing).toContain('transitive-compiler-implementation-unobserved');
     }
   }, 120_000);
+
+  it('execution-details JSON: real compiler implementation inputs retain unknown scope and reject tampering or foreign worker custody', () => {
+    const runtime = implementationRuntime('implementation-execution-details');
+    const { receipt } = implementationRun(runtime);
+    const implementationInputs = receipt.calls[0]!.implementationInputs!;
+    expect(implementationInputs).toMatchObject({ status: 'partial', javascriptStatus: 'captured' });
+    expect(implementationInputs.javascript.length).toBeGreaterThan(0);
+    expect(receipt.missing).toContain('transitive-compiler-implementation-unobserved');
+
+    // The envelope is a contract fixture; only the nested compiler receipt is
+    // produced by the real isolated compiler. It grants no VM/test-use custody.
+    const captureId = randomUUID(), testFile = join(runtime.root, 'execution-record.test.ts');
+    const processIdentity = captureCurrentWorkerProcessIdentity();
+    const row: TestRunExecutionDetails = {
+      schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
+      root: runtime.root, filePath: 'execution-record.test.ts', runGroupId: null,
+      workspaceId: null, harnessSlug: 'papercusp', testNamePattern: null,
+      passed: 1, failed: 0, skipped: 0, collectionFailed: false,
+      mutationPhase: null, commitSha: null, worktreeDirty: false,
+      workerExecution: { schemaVersion: 'worker-execution-v1', captureId, testFile,
+        before: processIdentity, after: processIdentity },
+      workerCompilerInputs: { schemaVersion: 'worker-compiler-inputs-v1',
+        scope: 'vitest-inlined-vm-calls', populationStatus: 'unknown', captureId, testFile,
+        inputSha256: null, vmCallCount: 0,
+        missing: ['transform-pipeline-unobserved', 'vm-options-partially-observed', 'vm-calls-unobserved'],
+        appliedCompilerInputs: receipt },
+    };
+    row.proofContext = captureRecordedProofContext(row);
+    const json = JSON.stringify(row), parsed = parseTestRunExecutionDetails(json);
+    expect(parsed).toBeDefined();
+    expect(parsed!.workerCompilerInputs).toEqual(row.workerCompilerInputs);
+    expect(parsed!.workerCompilerInputs!.appliedCompilerInputs!.calls[0]!.implementationInputs)
+      .toEqual(implementationInputs);
+    expect(parsed!.proofContext!.components.compilerConfiguration).toBeNull();
+    expect(parsed!.workerCompilerInputs!.populationStatus).toBe('unknown');
+    expect(parsed!.workerCompilerInputs!.appliedCompilerInputs!.missing).toEqual(receipt.missing);
+
+    const decode = () => JSON.parse(json) as TestRunExecutionDetails;
+    const altered = decode();
+    const alteredReceipt = altered.workerCompilerInputs!.appliedCompilerInputs!;
+    alteredReceipt.calls = alteredReceipt.calls.map((call, index) => index ? call : { ...call,
+      implementationInputs: { ...call.implementationInputs!,
+        javascript: call.implementationInputs!.javascript.map((source, sourceIndex) => sourceIndex ? source
+          : { ...source, sha256: hash('tampered compiler implementation') }) } });
+    expect(parseTestRunExecutionDetails(JSON.stringify(altered))).toBeUndefined();
+    const omittedGap = decode();
+    omittedGap.workerCompilerInputs!.appliedCompilerInputs!.missing = receipt.missing
+      .filter(reason => reason !== 'transitive-compiler-implementation-unobserved');
+    expect(parseTestRunExecutionDetails(JSON.stringify(omittedGap))).toBeUndefined();
+    for (const patch of [{ captureId: randomUUID() }, { testFile: join(runtime.root, 'other.test.ts') }]) {
+      const foreign = decode();
+      Object.assign(foreign.workerCompilerInputs!, patch);
+      expect(parseTestRunExecutionDetails(JSON.stringify(foreign))).toBeUndefined();
+    }
+    const missingWorker = decode();
+    delete missingWorker.workerExecution;
+    expect(parseTestRunExecutionDetails(JSON.stringify(missingWorker))).toBeUndefined();
+    const foreignWorker = decode();
+    foreignWorker.workerExecution!.captureId = randomUUID();
+    expect(parseTestRunExecutionDetails(JSON.stringify(foreignWorker))).toBeUndefined();
+    const foreignFile = decode();
+    foreignFile.filePath = 'other.test.ts';
+    expect(parseTestRunExecutionDetails(JSON.stringify(foreignFile))).toBeUndefined();
+  }, 60_000);
 
   it('implementation inputs: unavailable loaded source fails closed without changing the compiler result or invoking twice', async () => {
     const config = {}, environment = {};
