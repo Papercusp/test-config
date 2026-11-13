@@ -53,9 +53,9 @@ describe('standalone test-config consumer', () => {
       'const {defineVitestConfig}=await import(' + JSON.stringify(url) + ');'
       + 'process.argv=["node","consumer"];'
       + 'const config=defineVitestConfig({layer:"e2e"});'
-      + 'const entry=config.test.reporters.find(value=>Array.isArray(value)&&String(value[0]).endsWith("/admin-test-runs-reporter.ts"));'
+      + 'const entry=config.test.reporters.map(value=>Array.isArray(value)?value[0]:value).find(value=>typeof value==="string"&&value.endsWith("/admin-test-runs-reporter.ts"));'
       + 'if(!entry)throw new Error("real reporter missing from consumer config");'
-      + 'const {default:Reporter}=await import(entry[0]);'
+      + 'const {default:Reporter}=await import(entry);'
       + 'console.log(JSON.stringify({reporter:typeof Reporter,layer:config.test.provide.papercuspTestLayer}));',
       { PAPERCUSP_DISABLE_TEST_RUNS_REPORTER: '0' },
     );
