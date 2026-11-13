@@ -98,6 +98,15 @@ describe("shared test PG data-volume admission (WI-10007793)", () => {
       .toMatch(/assertSharedTestPgStorageHeadroom\(container\)\);\s*dsn = container\.getConnectionUri\(\);/);
   });
 
+  it("selects the maintained Docker route on the shared-container acquisition path", () => {
+    const getTestPgSource = EXECUTABLE_SOURCE.slice(
+      EXECUTABLE_SOURCE.indexOf("export async function getTestPg"),
+    );
+    expect(getTestPgSource).toMatch(
+      /if \(existingAdminUrl\) \{[\s\S]*?return noDockerAdminUrlPromise;\s*\}\s*configureTestDockerHost\(\);[\s\S]*?substrateBreaker\.check\(\);[\s\S]*?new CappedLogPostgreSqlContainer/,
+    );
+  });
+
   it("uses the maintained absolute floor and capped percentage policy", async () => {
     await expect(assertSharedTestPgStorageHeadroom(pg, {}, volume(8_000 * GiB, 70 * GiB))).resolves.toBeUndefined();
     await expect(assertSharedTestPgStorageHeadroom(pg, {}, volume(20 * GiB, GiB))).rejects.toThrow(/STORAGE LOW/);

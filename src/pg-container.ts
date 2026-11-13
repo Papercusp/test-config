@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { testcontainerStartLockRoot, withTestcontainerStartLock } from "./testcontainer-start-lock.ts";
 import { SubstrateCircuitBreaker } from "./substrate-circuit-breaker.ts";
 import { tmpdirHasCriticalHeadroom, type TmpdirStatfs } from "./tmpdir-guard.ts";
-import { assertIsolatedTestDockerStorage } from "./test-docker-route.ts";
+import { assertIsolatedTestDockerStorage, configureTestDockerHost } from "./test-docker-route.ts";
 import {
   probePgReachable,
   RETRYABLE_PG_STARTUP_MSG,
@@ -698,6 +698,11 @@ export async function getTestPg(): Promise<string> {
     }
     return noDockerAdminUrlPromise;
   }
+
+  // Select the maintained isolated engine on every shared-container entrypoint,
+  // including direct script preflights that do not load the Vitest config.
+  // This must happen before Testcontainers first creates or caches its client.
+  configureTestDockerHost();
 
   // Fail-fast: once the breaker has latched (substrate persistently down), throw
   // the distinct TEST SUBSTRATE DOWN error immediately — no container start, no
