@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { open, opendir } from 'node:fs/promises';
 import { expect, it, vi } from 'vitest';
 
 // Fixture test run by executed-inputs-capture-armed-run.test.ts inside a child vitest. It reads
@@ -9,6 +9,10 @@ async function readFixtureInput() {
   const handle = await open(new URL('./input.txt', import.meta.url), 'r');
   try { expect(await handle.readFile('utf8')).toBe('armed-capture-input\n'); }
   finally { await handle.close(); }
+  const directory = await opendir(new URL('.', import.meta.url));
+  const entries = [];
+  for await (const entry of directory) entries.push(entry.name);
+  expect(entries).toContain('input.txt');
 }
 it('reads one input file', readFixtureInput);
 

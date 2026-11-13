@@ -50,11 +50,14 @@ if (dir) {
     let fileHandlePrototype: Record<string, unknown>;
     try { fileHandlePrototype = Object.getPrototypeOf(handle); }
     finally { await handle.close(); }
+    const directoryPrototype = (cjs(fs).Dir as { prototype?: object } | undefined)?.prototype;
+    if (!directoryPrototype) throw new Error('directory-capture-unavailable');
     installCapture(
       {
         fs: cjs(fs),
         fsPromises: cjs(fsPromises),
         fileHandlePrototype,
+        directoryPrototype,
         childProcess: cjs(childProcess),
         workerThreads: cjs(workerThreads),
         netSocketPrototype: (cjs(net).Socket as { prototype: Record<string, unknown> } | undefined)?.prototype,

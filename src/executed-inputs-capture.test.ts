@@ -495,6 +495,103 @@ describe('unmeasured filesystem input custody', () => {
     }
   });
 
+  it('captures preopened directory cursors including deferred iteration and refuses source-only reuse', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-directory-input-'));
+    nativeFs.writeFileSync(join(root, 'first.txt'), 'first');
+    nativeFs.writeFileSync(join(root, 'second.txt'), 'second');
+    const directories = Array.from({ length: 4 }, () => nativeFs.opendirSync(root));
+    const prototype = nativeFs.Dir.prototype;
+    const descriptors = Object.getOwnPropertyDescriptors(prototype);
+    const testFile = 'src/directory-input.test.ts';
+    resetCaptureForTests();
+    const targets = { fs: {}, fsPromises: {}, childProcess: {}, directoryPrototype: prototype };
+    installCapture(targets, resolve(process.cwd()));
+    try {
+      beginFile();
+      expect(directories[0]!.readSync()?.isFile()).toBe(true);
+      const record = endFile(testFile)!;
+      expect(record.opaque).toContain('fs-directory-cursor');
+      expect(JSON.stringify(record)).not.toContain(root);
+      beginFile();
+      expect((await directories[1]!.read())?.isFile()).toBe(true);
+      expect(endFile(testFile)?.opaque).toContain('fs-directory-cursor');
+      beginFile();
+      await new Promise<void>((resolve, reject) => directories[2]!.read((error, entry) => {
+        if (error) { reject(error); return; }
+        try { expect(entry?.isFile()).toBe(true); resolve(); } catch (error) { reject(error); }
+      }));
+      expect(endFile(testFile)?.opaque).toContain('fs-directory-cursor');
+      // Node's iterator uses a private bound reader, bypassing public read().
+      // Creation before beginFile must not lose its later per-file reads.
+      const iterator = directories[3]![Symbol.asyncIterator]();
+      for (const file of [testFile, 'src/second-directory-input.test.ts']) {
+        beginFile();
+        expect((await iterator.next()).value?.isFile()).toBe(true);
+        expect(endFile(file)?.opaque).toContain('fs-directory-cursor');
+      }
+      await iterator.return!();
+      const proof = { recordedSha: 'a'.repeat(40), recordedAtMs: 1, executedModules: [testFile], inputsCaptured: true,
+        runContext: 'local', runnerIdentity: 'measured-worker', readPaths: [], opaqueReasons: record.opaque };
+      const select = (opaqueReasons: string[]) => selectReusablePasses({ candidates: [testFile],
+        proofs: new Map([[testFile, { ...proof, opaqueReasons }]]), judgedSha: 'b'.repeat(40),
+        changedBetween: () => new Set<string>(), runContext: proof.runContext, runnerIdentity: proof.runnerIdentity });
+      expect(select([]).skip).toEqual([testFile]);
+      expect(select(record.opaque).skip).toEqual([]);
+      beginFile();
+      directories[0]!.closeSync();
+      expect(() => directories[0]!.readSync()).toThrow();
+      expect(endFile(testFile)?.opaque).toContain('fs-directory-cursor');
+    } finally {
+      for (const directory of directories) {
+        try { directory.closeSync(); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ERR_DIR_CLOSED') throw error;
+        }
+      }
+      Object.defineProperties(prototype, descriptors);
+      resetCaptureForTests();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves directory iterator identity and delegates advancement across recorders', async () => {
+    const pending = Promise.resolve({ value: 'entry', done: false });
+    const error = new Error('original directory read');
+    const calls: unknown[][] = [];
+    const iterator = { next(this: unknown, ...args: unknown[]) { calls.push([this, ...args]); return pending; } };
+    const prototype = { read() { throw error; }, readSync() {},
+      entries() { return iterator; }, [Symbol.asyncIterator]() { return iterator; } };
+    resetCaptureForTests();
+    installCapture({ fs: {}, fsPromises: {}, childProcess: {}, directoryPrototype: prototype }, '/repo');
+    expect(prototype.entries()).toBe(iterator);
+    expect(prototype[Symbol.asyncIterator]()).toBe(iterator);
+    beginFile();
+    expect(iterator.next('first')).toBe(pending);
+    expect(() => prototype.read()).toThrow(error);
+    expect(endFile('/repo/first.test.ts')?.opaque).toEqual(['fs-directory-cursor']);
+    beginFile();
+    expect(iterator.next('second')).toBe(pending);
+    expect(endFile('/repo/second.test.ts')?.opaque).toEqual(['fs-directory-cursor']);
+    expect(calls).toEqual([[iterator, 'first'], [iterator, 'second']]);
+    await pending;
+    resetCaptureForTests();
+  });
+
+  it('keeps future files opaque after an unobservable directory iterator and rejects unsupported prototypes', () => {
+    const valid = () => ({ read() {}, readSync() {},
+      [Symbol.asyncIterator]() { return Object.freeze({ next() {} }); } });
+    for (const prototype of [{}, Object.freeze(valid())]) {
+      resetCaptureForTests();
+      expect(() => installCapture({ fs: {}, fsPromises: {}, childProcess: {}, directoryPrototype: prototype }, '/repo'))
+        .toThrow('directory-capture-unavailable');
+      const replacement = valid();
+      installCapture({ fs: {}, fsPromises: {}, childProcess: {}, directoryPrototype: replacement }, '/repo');
+      replacement[Symbol.asyncIterator]();
+      beginFile();
+      expect(endFile('/repo/future.test.ts')?.opaque).toEqual(['fs-directory-cursor']);
+    }
+    resetCaptureForTests();
+  });
+
   it('preserves FileHandle method receivers, promises, optional streams and failures across file recorders', () => {
     const pending = Promise.resolve('read'), stream = {}, lines = {}, web = {};
     const error = new Error('original stat failure');

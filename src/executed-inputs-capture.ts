@@ -130,6 +130,7 @@ export interface Recorder {
 interface CaptureState {
   current: Recorder | null;
   installed: boolean;
+  directoryIteratorUnobserved: boolean;
   repoRoot: string | null;
   evaluationContext: AsyncLocalStorage<{ recorder: Recorder; inputIndex: number; id: string; code: string }>;
 }
@@ -137,6 +138,7 @@ interface CaptureState {
 const state = pinModuleState<CaptureState>('@papercusp/test-config.executed-inputs-capture', () => ({
   current: null,
   installed: false,
+  directoryIteratorUnobserved: false,
   repoRoot: null,
   evaluationContext: new AsyncLocalStorage(),
 }));
@@ -256,9 +258,10 @@ type Patchable = Record<string, unknown>;
 
 const WRAPPED = Symbol.for('@papercusp/test-config.executed-inputs-capture.wrapped');
 
-function wrap(target: Patchable, name: string, before: (args: unknown[]) => void,
+function wrap(target: Patchable, name: string | symbol, before: (args: unknown[]) => void,
   invoke?: (original: AnyFn, receiver: unknown, args: unknown[]) => unknown): void {
-  const original = target[name];
+  const properties = target as Record<PropertyKey, unknown>;
+  const original = properties[name];
   if (typeof original !== 'function' || (original as unknown as Record<symbol, unknown>)[WRAPPED]) return;
   const orig = original as AnyFn;
   const wrapped = function (this: unknown, ...args: unknown[]) {
@@ -281,7 +284,7 @@ function wrap(target: Patchable, name: string, before: (args: unknown[]) => void
   }
   Object.defineProperty(wrapped, WRAPPED, { value: true });
   try {
-    target[name] = wrapped;
+    properties[name] = wrapped;
   } catch {
     /* frozen export — leave it */
   }
@@ -414,6 +417,8 @@ export interface CaptureTargets {
   fsPromises: Patchable;
   /** Actual runtime prototype, obtained before beginFile. Omitted by fake targets. */
   fileHandlePrototype?: Patchable;
+  /** Dir iterators use a private bound reader rather than public fs exports. */
+  directoryPrototype?: object;
   childProcess: Patchable;
   workerThreads?: Patchable;
   netSocketPrototype?: Patchable;
@@ -452,6 +457,35 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
         throw new Error('file-handle-capture-unavailable');
     }
   }
+  if (targets.directoryPrototype) {
+    const prototype = targets.directoryPrototype as Record<PropertyKey, unknown>;
+    const readDirectory = opaque('fs-directory-cursor');
+    const observeIterator = (original: AnyFn, receiver: unknown, args: unknown[]) => {
+      const iterator = original.apply(receiver, args);
+      try {
+        if (!iterator || typeof iterator !== 'object') throw new Error('directory iterator unavailable');
+        // Observe advancement, including when creation precedes beginFile or
+        // one iterator crosses file boundaries. Keep the original iterator,
+        // method receiver, promises and errors intact.
+        wrap(iterator as Patchable, 'next', readDirectory);
+        if (!(iterator as { next?: Record<symbol, unknown> }).next?.[WRAPPED])
+          throw new Error('directory iterator unavailable');
+      } catch {
+        // A retained iterator can advance in a future file. An unobservable
+        // instance therefore prevents reuse for the rest of this worker.
+        state.directoryIteratorUnobserved = true;
+      }
+      return iterator;
+    };
+    for (const name of ['read', 'readSync', Symbol.asyncIterator])
+      if (typeof prototype[name] !== 'function') throw new Error('directory-capture-unavailable');
+    for (const name of ['read', 'readSync', 'entries', Symbol.asyncIterator]) {
+      if (typeof prototype[name] !== 'function') continue;
+      wrap(prototype as Patchable, name, readDirectory,
+        typeof name === 'symbol' || name === 'entries' ? observeIterator : undefined);
+      if (!(prototype[name] as unknown as Record<symbol, unknown>)[WRAPPED]) throw new Error('directory-capture-unavailable');
+    }
+  }
   for (const name of CHILD_PROCESS_FUNCTIONS) wrap(targets.childProcess, name, opaque('child-process'));
   if (targets.workerThreads) {
     const W = targets.workerThreads.Worker;
@@ -482,7 +516,7 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
 
 /** Start capturing for the next test file (setup-file top level). */
 export function beginFile(identity?: { captureId: string; runGroupId: string | null }): Recorder {
-  const rec: Recorder = { reads: new Set(), opaque: new Set(), ...(identity ? { databaseReset: {
+  const rec: Recorder = { reads: new Set(), opaque: new Set(state.directoryIteratorUnobserved ? ['fs-directory-cursor'] : []), ...(identity ? { databaseReset: {
     schemaVersion: 'worker-database-reset-v1' as const, ...identity, startedAt: new Date().toISOString(), databases: [],
   } } : {}) };
   state.current = rec;
@@ -540,11 +574,13 @@ export function currentRecorder(): Recorder | null {
  * that reset and install against fakes, or the file's record is lost (WI-6554700010042252).
  */
 export function snapshotCaptureForTests(): () => void {
-  const saved = { current: state.current, installed: state.installed, repoRoot: state.repoRoot };
+  const saved = { current: state.current, installed: state.installed, repoRoot: state.repoRoot,
+    directoryIteratorUnobserved: state.directoryIteratorUnobserved };
   return () => {
     state.current = saved.current;
     state.installed = saved.installed;
     state.repoRoot = saved.repoRoot;
+    state.directoryIteratorUnobserved = saved.directoryIteratorUnobserved;
   };
 }
 
@@ -552,5 +588,6 @@ export function snapshotCaptureForTests(): () => void {
 export function resetCaptureForTests(): void {
   state.current = null;
   state.installed = false;
+  state.directoryIteratorUnobserved = false;
   state.repoRoot = null;
 }
