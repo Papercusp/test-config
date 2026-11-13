@@ -436,6 +436,95 @@ describe('unmeasured filesystem input custody', () => {
     } finally { nativeFs.closeSync(fd); resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('captures preopened buffered file streams across recorders and refuses source-only reuse', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-file-stream-input-'));
+    const file = join(root, 'fixture.txt');
+    nativeFs.writeFileSync(file, 'abcdef');
+    const stream = nativeFs.createReadStream(file, { highWaterMark: 6 });
+    await new Promise<void>((resolve, reject) => {
+      stream.once('readable', resolve);
+      stream.once('error', reject);
+    });
+    // The bytes are already buffered before installation and beginFile. No
+    // later public fs export or native read is needed to supply these bytes.
+    expect(stream.readableLength).toBe(6);
+    const prototype = nativeFs.ReadStream.prototype;
+    const descriptors = Object.getOwnPropertyDescriptors(prototype);
+    const testFile = 'src/file-stream-input.test.ts';
+    resetCaptureForTests();
+    const targets = { fs: {}, fsPromises: {}, childProcess: {}, readStreamPrototype: prototype };
+    installCapture(targets, resolve(process.cwd()));
+    try {
+      beginFile();
+      expect(stream.read(2).toString()).toBe('ab');
+      const record = endFile(testFile)!;
+      expect(record.opaque).toContain('fs-file-stream');
+      expect(JSON.stringify(record)).not.toContain(file);
+      beginFile();
+      expect(stream.read(2).toString()).toBe('cd');
+      expect(endFile('/repo/second-stream.test.ts')?.opaque).toContain('fs-file-stream');
+      beginFile();
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      expect(Buffer.concat(chunks).toString()).toBe('ef');
+      expect(endFile('/repo/iterator-stream.test.ts')?.opaque).toContain('fs-file-stream');
+      const proof = { recordedSha: 'a'.repeat(40), recordedAtMs: 1, executedModules: [testFile], inputsCaptured: true,
+        runContext: 'local', runnerIdentity: 'measured-worker', readPaths: [], opaqueReasons: record.opaque };
+      const select = (opaqueReasons: string[]) => selectReusablePasses({ candidates: [testFile],
+        proofs: new Map([[testFile, { ...proof, opaqueReasons }]]), judgedSha: 'b'.repeat(40),
+        changedBetween: () => new Set<string>(), runContext: proof.runContext, runnerIdentity: proof.runnerIdentity });
+      expect(select([]).skip).toEqual([testFile]);
+      expect(select(record.opaque).skip).toEqual([]);
+    } finally {
+      stream.destroy();
+      for (const key of Reflect.ownKeys(prototype))
+        if (!Object.hasOwn(descriptors, key)) Reflect.deleteProperty(prototype, key);
+      Object.defineProperties(prototype, descriptors);
+      resetCaptureForTests();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves file stream consumption and data delivery receivers, returns and errors across recorders', () => {
+    const value = Buffer.from('buffered'), error = new Error('original stream failure');
+    const calls: unknown[][] = [];
+    const prototype = { read(this: unknown, ...args: unknown[]) { calls.push([this, ...args]); return value; },
+      emit(this: unknown, ...args: unknown[]) {
+        calls.push([this, ...args]);
+        if (args[0] === 'error') throw error;
+        return true;
+      } };
+    resetCaptureForTests();
+    installCapture({ fs: {}, fsPromises: {}, childProcess: {}, readStreamPrototype: prototype }, '/repo');
+    const stream = Object.create(prototype);
+    beginFile();
+    expect(stream.emit('readable')).toBe(true);
+    expect(() => stream.emit('error', error)).toThrow(error);
+    expect(endFile('/repo/non-data.test.ts')?.opaque).toEqual([]);
+    beginFile();
+    expect(stream.read(8)).toBe(value);
+    expect(endFile('/repo/pull.test.ts')?.opaque).toEqual(['fs-file-stream']);
+    beginFile();
+    expect(stream.emit('data', value)).toBe(true);
+    expect(endFile('/repo/flow.test.ts')?.opaque).toEqual(['fs-file-stream']);
+    expect(calls).toEqual([[stream, 'readable'], [stream, 'error', error], [stream, 8], [stream, 'data', value]]);
+    resetCaptureForTests();
+  });
+
+  it('rejects missing or frozen file stream seams and allows a later valid installation', () => {
+    const valid = () => ({ read() {}, emit() {} });
+    for (const prototype of [{}, Object.freeze(valid())]) {
+      resetCaptureForTests();
+      expect(() => installCapture({ fs: {}, fsPromises: {}, childProcess: {}, readStreamPrototype: prototype }, '/repo'))
+        .toThrow('file-stream-capture-unavailable');
+      const replacement = valid();
+      installCapture({ fs: {}, fsPromises: {}, childProcess: {}, readStreamPrototype: replacement }, '/repo');
+      beginFile(); replacement.read();
+      expect(endFile('/repo/recovered.test.ts')?.opaque).toEqual(['fs-file-stream']);
+    }
+    resetCaptureForTests();
+  });
+
   it('captures direct FileHandle reads opened before the recorder and refuses source-only reuse', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pc-file-handle-input-'));
     const file = join(root, 'fixture.txt');

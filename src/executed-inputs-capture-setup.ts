@@ -52,12 +52,15 @@ if (dir) {
     finally { await handle.close(); }
     const directoryPrototype = (cjs(fs).Dir as { prototype?: object } | undefined)?.prototype;
     if (!directoryPrototype) throw new Error('directory-capture-unavailable');
+    const readStreamPrototype = (cjs(fs).ReadStream as { prototype?: object } | undefined)?.prototype;
+    if (!readStreamPrototype) throw new Error('file-stream-capture-unavailable');
     installCapture(
       {
         fs: cjs(fs),
         fsPromises: cjs(fsPromises),
         fileHandlePrototype,
         directoryPrototype,
+        readStreamPrototype,
         childProcess: cjs(childProcess),
         workerThreads: cjs(workerThreads),
         netSocketPrototype: (cjs(net).Socket as { prototype: Record<string, unknown> } | undefined)?.prototype,

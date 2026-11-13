@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { createReadStream, readFileSync } from 'node:fs';
 import { open, opendir } from 'node:fs/promises';
 import { expect, it, vi } from 'vitest';
 
@@ -9,6 +9,9 @@ async function readFixtureInput() {
   const handle = await open(new URL('./input.txt', import.meta.url), 'r');
   try { expect(await handle.readFile('utf8')).toBe('armed-capture-input\n'); }
   finally { await handle.close(); }
+  const chunks: Buffer[] = [];
+  for await (const chunk of createReadStream(new URL('./input.txt', import.meta.url))) chunks.push(chunk);
+  expect(Buffer.concat(chunks).toString()).toBe('armed-capture-input\n');
   const directory = await opendir(new URL('.', import.meta.url));
   const entries = [];
   for await (const entry of directory) entries.push(entry.name);

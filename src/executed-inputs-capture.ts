@@ -419,6 +419,8 @@ export interface CaptureTargets {
   fileHandlePrototype?: Patchable;
   /** Dir iterators use a private bound reader rather than public fs exports. */
   directoryPrototype?: object;
+  /** Streams can supply bytes buffered before this file's recorder began. */
+  readStreamPrototype?: object;
   childProcess: Patchable;
   workerThreads?: Patchable;
   netSocketPrototype?: Patchable;
@@ -484,6 +486,19 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
       wrap(prototype as Patchable, name, readDirectory,
         typeof name === 'symbol' || name === 'entries' ? observeIterator : undefined);
       if (!(prototype[name] as unknown as Record<symbol, unknown>)[WRAPPED]) throw new Error('directory-capture-unavailable');
+    }
+  }
+  if (targets.readStreamPrototype) {
+    const prototype = targets.readStreamPrototype as Patchable;
+    for (const name of ['read', 'emit']) {
+      if (typeof prototype[name] !== 'function') throw new Error('file-stream-capture-unavailable');
+      // read covers buffered pulls; data delivery also covers flowing reads
+      // whose underlying I/O was scheduled before this recorder began.
+      wrap(prototype, name, name === 'read' ? opaque('fs-file-stream') : args => {
+        if (args[0] === 'data') state.current?.opaque.add('fs-file-stream');
+      });
+      if (!(prototype[name] as unknown as Record<symbol, unknown>)[WRAPPED])
+        throw new Error('file-stream-capture-unavailable');
     }
   }
   for (const name of CHILD_PROCESS_FUNCTIONS) wrap(targets.childProcess, name, opaque('child-process'));
