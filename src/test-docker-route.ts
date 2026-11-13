@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { stat, statfs } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
+import { tmpdirHasCriticalHeadroom, type TmpdirStatfs } from './tmpdir-guard.ts';
 
 export const HOST_TEST_DOCKER_SOCKET = '/run/docker-bench.sock';
 export const TEST_DOCKER_ISOLATION_REQUIRED = 'PAPERCUSP_TEST_DOCKER_ISOLATION_REQUIRED';
@@ -36,13 +37,14 @@ export function configureTestDockerHost(
 }
 
 /** A different directory on root is not writeback isolation. Read the selected
- * daemon's actual data-root and compare filesystem devices before container
- * creation can block in overlay unmount -> ovl_sync_fs -> root writeback.
+ * daemon's actual data-root, compare filesystem devices, and verify the shared
+ * test headroom floor before container allocation.
  */
 export async function assertIsolatedTestDockerStorage(
   readInfo: () => Promise<{ ID?: string; DockerRootDir?: string }>,
   env: NodeJS.ProcessEnv = process.env,
   deviceFor: (path: string) => Promise<number> = async path => (await stat(path)).dev,
+  readStorage: (path: string) => Promise<TmpdirStatfs> = path => statfs(path),
 ) {
   if (env[TEST_DOCKER_ISOLATION_REQUIRED] !== '1') return null;
   const dockerHost = env.DOCKER_HOST;
@@ -63,5 +65,31 @@ export async function assertIsolatedTestDockerStorage(
       + 'Docker overlay unmount can wait on unrelated root writeback; select an engine on a separate filesystem. '
       + 'No PostgreSQL container was created; do not restart or migrate the shared daemon here.');
   }
-  return { dockerHost, daemonId: info.ID, dataRoot, dataDevice, hostDevice, isolated: true as const };
+  let snapshot: TmpdirStatfs;
+  try {
+    snapshot = await readStorage(dataRoot);
+  } catch (cause) {
+    throw new Error(`TEST DOCKER STORAGE UNKNOWN: cannot read selected daemon data-root headroom at ${dataRoot}`, { cause });
+  }
+  const totalBytes = Number(snapshot.blocks) * Number(snapshot.bsize);
+  const freeBytes = Number(snapshot.bavail) * Number(snapshot.bsize);
+  if (!Number.isSafeInteger(totalBytes) || totalBytes <= 0 ||
+      !Number.isSafeInteger(freeBytes) || freeBytes < 0 || freeBytes > totalBytes) {
+    throw new Error(`TEST DOCKER STORAGE UNKNOWN: invalid capacity for selected daemon data-root ${dataRoot}`);
+  }
+  if (!tmpdirHasCriticalHeadroom(dataRoot, env, () => snapshot)) {
+    throw new Error(`TEST DOCKER STORAGE LOW: selected daemon data-root ${dataRoot} has ${freeBytes} free bytes `
+      + `of ${totalBytes}. Refusing PostgreSQL container allocation before launch; select a private test PG `
+      + 'volume with headroom via PAPERCUSP_TEST_PG_ADMIN_URL.');
+  }
+  return {
+    dockerHost,
+    daemonId: info.ID,
+    dataRoot,
+    dataDevice,
+    hostDevice,
+    dataRootTotalBytes: totalBytes,
+    dataRootFreeBytes: freeBytes,
+    isolated: true as const,
+  };
 }

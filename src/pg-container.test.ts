@@ -105,6 +105,10 @@ describe("shared test PG data-volume admission (WI-10007793)", () => {
     expect(getTestPgSource).toMatch(
       /if \(existingAdminUrl\) \{[\s\S]*?return noDockerAdminUrlPromise;\s*\}\s*configureTestDockerHost\(\);[\s\S]*?substrateBreaker\.check\(\);[\s\S]*?new CappedLogPostgreSqlContainer/,
     );
+    const cappedContainerSource = SOURCE.slice(SOURCE.indexOf("export class CappedLogPostgreSqlContainer"));
+    expect(cappedContainerSource).toMatch(
+      /override async start\(\): Promise<StartedPostgreSqlContainer> \{[\s\S]*?await this\.assertRuntimeReady\(client\);[\s\S]*?const started = await super\.start\(\);/,
+    );
   });
 
   it("uses the maintained absolute floor and capped percentage policy", async () => {

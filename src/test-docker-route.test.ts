@@ -3,6 +3,8 @@ import { assertIsolatedTestDockerStorage, configureTestDockerHost,
   HOST_TEST_DOCKER_SOCKET, TEST_DOCKER_ISOLATION_REQUIRED } from './test-docker-route.ts';
 
 describe('maintained host test Docker route (WI-6554700010046431)', () => {
+  const GiB = 1024 ** 3;
+
   it('selects the installed isolated engine and requires storage admission', () => {
     const env: NodeJS.ProcessEnv = {};
     configureTestDockerHost(env, { platform: 'linux', socketExists: path => path === HOST_TEST_DOCKER_SOCKET });
@@ -42,10 +44,39 @@ describe('maintained host test Docker route (WI-6554700010046431)', () => {
   const selected = { DOCKER_HOST: 'unix:///run/custom.sock', [TEST_DOCKER_ISOLATION_REQUIRED]: '1' };
   const info = async () => ({ ID: 'selected-daemon', DockerRootDir: '/mnt/test/docker' });
 
-  it('records the selected daemon and the actual distinct filesystem devices', async () => {
-    await expect(assertIsolatedTestDockerStorage(info, selected, async path => path === '/' ? 1 : 2))
+  it('records the selected daemon, distinct filesystem devices, and verified headroom', async () => {
+    await expect(assertIsolatedTestDockerStorage(
+      info,
+      selected,
+      async path => path === '/' ? 1 : 2,
+      async () => ({ blocks: 20 * GiB / 1024, bavail: 5 * GiB / 1024, bsize: 1024 }),
+    ))
       .resolves.toEqual({ dockerHost: selected.DOCKER_HOST, daemonId: 'selected-daemon',
-        dataRoot: '/mnt/test/docker', dataDevice: 2, hostDevice: 1, isolated: true });
+        dataRoot: '/mnt/test/docker', dataDevice: 2, hostDevice: 1,
+        dataRootTotalBytes: 20 * GiB, dataRootFreeBytes: 5 * GiB, isolated: true });
+  });
+
+  it('refuses low data-root headroom before allocating a PostgreSQL container', async () => {
+    const measured: string[] = [];
+    await expect(assertIsolatedTestDockerStorage(
+      info,
+      selected,
+      async path => path === '/' ? 1 : 2,
+      async path => {
+        measured.push(path);
+        return { blocks: 20 * GiB / 1024, bavail: GiB / 1024, bsize: 1024 };
+      },
+    )).rejects.toThrow(/TEST DOCKER STORAGE LOW.*Refusing PostgreSQL container allocation before launch/);
+    expect(measured).toEqual(['/mnt/test/docker']);
+  });
+
+  it('fails closed when selected data-root capacity cannot be read', async () => {
+    await expect(assertIsolatedTestDockerStorage(
+      info,
+      selected,
+      async path => path === '/' ? 1 : 2,
+      async () => { throw new Error('statfs unavailable'); },
+    )).rejects.toThrow(/TEST DOCKER STORAGE UNKNOWN.*headroom/);
   });
 
   it('rejects a different directory on the same filesystem before allocation', async () => {
