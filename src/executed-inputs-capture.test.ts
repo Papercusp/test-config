@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import nativeFs from 'node:fs';
 import nativeNet from 'node:net';
+import { Worker } from 'node:worker_threads';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -435,6 +436,100 @@ describe('unmeasured filesystem input custody', () => {
       expect([first.toString(), second.toString(), third.toString()]).toEqual(['ab', 'cd', 'ef']);
       expect(endFile('/repo/test.ts')?.opaque).toContain('fs-file-descriptor');
     } finally { nativeFs.closeSync(fd); resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('captures messages from workers created before the recorder and refuses source-only reuse', async () => {
+    resetCaptureForTests();
+    const worker = new Worker(`
+      const { parentPort } = require('node:worker_threads');
+      parentPort.on('message', value => parentPort.postMessage(value));
+    `, { eval: true });
+    const originalEmit = Object.getOwnPropertyDescriptor(Worker.prototype, 'emit');
+    try {
+      await new Promise<void>((resolve, reject) => {
+        worker.once('online', resolve);
+        worker.once('error', reject);
+      });
+      // Creation and startup precede capture. Only actual message delivery can
+      // identify this input for the file that consumes it.
+      installCapture({ fs: {}, fsPromises: {}, childProcess: {}, workerThreads: { Worker } }, '/repo');
+      const receive = (value: string) => new Promise<string>((resolve, reject) => {
+        worker.once('message', resolve);
+        worker.once('error', reject);
+        worker.postMessage(value);
+      });
+      beginFile();
+      expect(await receive('first')).toBe('first');
+      const testFile = 'src/worker-input.test.ts';
+      const record = endFile(testFile)!;
+      expect(record.opaque).toContain('worker-thread');
+      beginFile();
+      expect(await receive('second')).toBe('second');
+      expect(endFile('/repo/second-worker.test.ts')?.opaque).toContain('worker-thread');
+      const proof = { recordedSha: 'a'.repeat(40), recordedAtMs: 1, executedModules: [testFile], inputsCaptured: true,
+        runContext: 'local', runnerIdentity: 'measured-worker', readPaths: [], opaqueReasons: record.opaque };
+      const select = (opaqueReasons: string[]) => selectReusablePasses({ candidates: [testFile],
+        proofs: new Map([[testFile, { ...proof, opaqueReasons }]]), judgedSha: 'b'.repeat(40),
+        changedBetween: () => new Set<string>(), runContext: proof.runContext, runnerIdentity: proof.runnerIdentity });
+      expect(select([]).skip).toEqual([testFile]);
+      expect(select(record.opaque).skip).toEqual([]);
+      expect(select(record.opaque).exclusions).toMatchObject([{ reason: 'opaque' }]);
+    } finally {
+      await worker.terminate();
+      if (originalEmit) Object.defineProperty(Worker.prototype, 'emit', originalEmit);
+      else Reflect.deleteProperty(Worker.prototype, 'emit');
+      resetCaptureForTests();
+    }
+  });
+
+  it('preserves worker event receivers, return values and errors while ignoring non-message events', () => {
+    const error = new Error('original worker failure');
+    const value = { input: 'message' };
+    const calls: unknown[][] = [];
+    class OriginalWorker {
+      emit(...args: unknown[]) {
+        calls.push([this, ...args]);
+        if (args[0] === 'error') throw error;
+        return true;
+      }
+    }
+    const worker = new OriginalWorker();
+    const threads = { Worker: OriginalWorker };
+    resetCaptureForTests();
+    try {
+      installCapture({ fs: {}, fsPromises: {}, childProcess: {}, workerThreads: threads }, '/repo');
+      beginFile();
+      expect(worker.emit('online')).toBe(true);
+      expect(worker.emit('exit', 0)).toBe(true);
+      expect(() => worker.emit('error', error)).toThrow(error);
+      expect(endFile('/repo/non-message-worker.test.ts')?.opaque).toEqual([]);
+      beginFile(); expect(worker.emit('message', value)).toBe(true);
+      expect(endFile('/repo/message-worker.test.ts')?.opaque).toEqual(['worker-thread']);
+      beginFile(); expect(worker.emit('messageerror', error)).toBe(true);
+      expect(endFile('/repo/messageerror-worker.test.ts')?.opaque).toEqual(['worker-thread']);
+      beginFile(); expect(new threads.Worker()).toBeInstanceOf(OriginalWorker);
+      expect(endFile('/repo/new-worker.test.ts')?.opaque).toEqual(['worker-thread']);
+      expect(calls).toEqual([[worker, 'online'], [worker, 'exit', 0], [worker, 'error', error],
+        [worker, 'message', value], [worker, 'messageerror', error]]);
+    } finally { resetCaptureForTests(); }
+  });
+
+  it('rejects missing or frozen worker seams and allows a later valid installation', () => {
+    class MissingWorker {}
+    class FrozenWorker { emit() { return true; } }
+    Object.freeze(FrozenWorker.prototype);
+    class FrozenExportWorker { emit() { return true; } }
+    const targets = [{ Worker: MissingWorker }, { Worker: FrozenWorker }, Object.freeze({ Worker: FrozenExportWorker })];
+    for (const workerThreads of targets) {
+      resetCaptureForTests();
+      expect(() => installCapture({ fs: {}, fsPromises: {}, childProcess: {}, workerThreads }, '/repo'))
+        .toThrow('worker-thread-capture-unavailable');
+      class ValidWorker { emit() { return true; } }
+      installCapture({ fs: {}, fsPromises: {}, childProcess: {}, workerThreads: { Worker: ValidWorker } }, '/repo');
+      beginFile(); expect(new ValidWorker().emit()).toBe(true);
+      expect(endFile('/repo/recovered-worker.test.ts')?.opaque).toEqual([]);
+      resetCaptureForTests();
+    }
   });
 
   it('captures preconnected buffered sockets across recorders and refuses source-only reuse', async () => {

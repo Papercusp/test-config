@@ -504,6 +504,17 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
   for (const name of CHILD_PROCESS_FUNCTIONS) wrap(targets.childProcess, name, opaque('child-process'));
   if (targets.workerThreads) {
     const W = targets.workerThreads.Worker;
+    const prototype = (W as { prototype?: Patchable } | undefined)?.prototype;
+    if (typeof W !== 'function' || !prototype || typeof prototype.emit !== 'function')
+      throw new Error('worker-thread-capture-unavailable');
+    // A worker can predate capture. Record its actual inbound messages using
+    // the current file's recorder, including deserialization failures. Startup,
+    // exit and unrelated events are not input delivery.
+    wrap(prototype, 'emit', args => {
+      if (args[0] === 'message' || args[0] === 'messageerror') state.current?.opaque.add('worker-thread');
+    });
+    if (!(prototype.emit as unknown as Record<symbol, unknown>)[WRAPPED])
+      throw new Error('worker-thread-capture-unavailable');
     if (typeof W === 'function' && !(W as unknown as Record<symbol, unknown>)[WRAPPED]) {
       const Original = W as unknown as new (...a: unknown[]) => object;
       class CapturedWorker extends Original {
@@ -516,8 +527,9 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
       try {
         targets.workerThreads.Worker = CapturedWorker;
       } catch {
-        /* leave it */
+        throw new Error('worker-thread-capture-unavailable');
       }
+      if (targets.workerThreads.Worker !== CapturedWorker) throw new Error('worker-thread-capture-unavailable');
     }
   }
   if (targets.netSocketPrototype) {

@@ -1,6 +1,7 @@
 import { createReadStream, readFileSync } from 'node:fs';
 import { open, opendir } from 'node:fs/promises';
 import { createConnection, createServer, type Socket, type AddressInfo } from 'node:net';
+import { Worker } from 'node:worker_threads';
 import { expect, it, vi } from 'vitest';
 
 // Fixture test run by executed-inputs-capture-armed-run.test.ts inside a child vitest. It reads
@@ -32,6 +33,18 @@ async function readFixtureInput() {
     socket.destroy(); peer?.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
+  const worker = new Worker(`
+    const { parentPort } = require('node:worker_threads');
+    parentPort.once('message', value => parentPort.postMessage(value));
+  `, { eval: true });
+  try {
+    const received = new Promise<string>((resolve, reject) => {
+      worker.once('message', resolve);
+      worker.once('error', reject);
+    });
+    worker.postMessage('worker-input');
+    expect(await received).toBe('worker-input');
+  } finally { await worker.terminate(); }
 }
 it('reads one input file', readFixtureInput);
 
