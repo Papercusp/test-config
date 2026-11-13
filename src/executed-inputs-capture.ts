@@ -157,7 +157,7 @@ export function inputsFilePath(dir: string, testFile: string): string {
 export type CwdSource = string | (() => string);
 
 /** Resolve a path argument without consulting the cwd for an absolute path. */
-function absoluteReadPathOf(arg: unknown, cwd: CwdSource): string | null {
+function absoluteReadPathOf(arg: unknown, cwd: CwdSource, onParentTraversal?: () => void): string | null {
   let p: string | null = null;
   if (typeof arg === 'string') p = arg;
   else if (arg instanceof URL) {
@@ -165,7 +165,13 @@ function absoluteReadPathOf(arg: unknown, cwd: CwdSource): string | null {
     p = fileURLToPath(arg);
   } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(arg)) p = arg.toString('utf8');
   if (p === null || p.length === 0) return null;
-  return isAbsolute(p) ? resolve(p) : resolve(typeof cwd === 'function' ? cwd() : cwd, p);
+  const base = isAbsolute(p) ? null : typeof cwd === 'function' ? cwd() : cwd;
+  // The kernel follows a directory link before processing a later '..'. resolve
+  // erases that distinction, so lexical custody cannot qualify these reads.
+  const delimiter = process.platform === 'win32' ? /[\\/]/ : '/';
+  if ([p, ...(base === null ? [] : [base])].some(value => value.split(delimiter).includes('..')))
+    onParentTraversal?.();
+  return base === null ? resolve(p) : resolve(base, p);
 }
 
 /** Return a tracked repository path; descriptors, external paths and dependencies stay null. */
@@ -186,7 +192,7 @@ export function repoPathOf(arg: unknown, repoRoot: string, cwd: CwdSource): stri
 export function recordRead(rec: Recorder | null, arg: unknown, repoRoot: string, cwd: CwdSource): void {
   if (!rec) return;
   let abs: string | null;
-  try { abs = absoluteReadPathOf(arg, cwd); }
+  try { abs = absoluteReadPathOf(arg, cwd, () => rec.opaque.add('fs-path-unobserved')); }
   catch { rec.opaque.add('fs-path-unobserved'); return; }
   if (abs === null) {
     rec.opaque.add(typeof arg === 'number' ? 'fs-file-descriptor' : 'fs-path-unobserved');

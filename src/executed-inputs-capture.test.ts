@@ -436,6 +436,39 @@ describe('unmeasured filesystem input custody', () => {
     } finally { nativeFs.closeSync(fd); resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('keeps parent traversal through a directory symlink opaque before path normalization', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-parent-input-'));
+    const repo = join(root, 'repo'), external = join(root, 'external');
+    nativeFs.mkdirSync(repo); nativeFs.mkdirSync(join(external, 'child'), { recursive: true });
+    nativeFs.writeFileSync(join(repo, 'fixture.txt'), 'lexical');
+    nativeFs.writeFileSync(join(external, 'fixture.txt'), 'actual');
+    nativeFs.symlinkSync(join(external, 'child'), join(repo, 'bridge'));
+    // join/resolve would erase the operation whose kernel semantics we need to observe.
+    const traversed = `${repo}/bridge/../fixture.txt`;
+    const testFile = 'src/parent-input.test.ts';
+    resetCaptureForTests();
+    const targets = { readFileSync: (file: fs.PathOrFileDescriptor, encoding: BufferEncoding) =>
+      nativeFs.readFileSync(file, encoding) };
+    installCapture({ fs: targets, fsPromises: {}, childProcess: {} }, repo);
+    try {
+      for (const file of [traversed, Buffer.from(traversed)]) {
+        beginFile();
+        expect(targets.readFileSync(file, 'utf8')).toBe('actual');
+        const record = endFile(join(repo, testFile))!;
+        expect(record.opaque).toContain('fs-path-unobserved');
+        expect(JSON.stringify(record)).not.toContain(external);
+        const select = (opaqueReasons: string[]) => selectReusablePasses({ candidates: [testFile],
+          proofs: new Map([[testFile, { recordedSha: 'a'.repeat(40), recordedAtMs: 1,
+            executedModules: [testFile], inputsCaptured: true, runContext: 'local',
+            runnerIdentity: 'measured-worker', readPaths: record.reads, opaqueReasons }]]),
+          judgedSha: 'b'.repeat(40), changedBetween: () => new Set<string>(),
+          runContext: 'local', runnerIdentity: 'measured-worker' });
+        expect(select([]).skip).toEqual([testFile]);
+        expect(select(record.opaque).skip).toEqual([]);
+      }
+    } finally { resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('refuses reuse through file and directory symlinks while preserving target reads and errors', () => {
     const root = mkdtempSync(join(tmpdir(), 'pc-linked-input-'));
     const repo = join(root, 'repo'), external = join(root, 'external');
