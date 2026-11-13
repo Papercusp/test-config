@@ -14,7 +14,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { createRequire } from 'node:module';
+import { createRequire, stripTypeScriptTypes } from 'node:module';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -88,6 +88,24 @@ import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+describe('native Node TypeScript parser compatibility (EI-28690145575369014)', () => {
+  it('parses the complete reporter with native type stripping', () => {
+    const source = readFileSync(new URL('./admin-test-runs-reporter.ts', import.meta.url), 'utf8');
+
+    expect(() => stripTypeScriptTypes(source, { mode: 'strip' })).not.toThrow();
+  });
+
+  it('detects a type assertion separated from its initializer by a newline', () => {
+    const source = [
+      'type Receipt = { outcome: "timeout" } | { outcome: "inserted" };',
+      'const receipts = ([] as Receipt[]).filter(receipt => receipt.outcome === "timeout")',
+      '  as Extract<Receipt, { outcome: "timeout" }>[];',
+    ].join('\n');
+
+    expect(() => stripTypeScriptTypes(source, { mode: 'strip' })).toThrow();
+  });
+});
+
 describe('actual source-byte census', () => {
   it('measures Git bytes across equivalent commits, edits and unmapped files, refusing escaped inputs', () => {
     const root = mkdtempSync(join(tmpdir(), 'reporter-source-bytes-'));
@@ -630,12 +648,16 @@ describe('receipt-backed native archive reporter', () => {
     try {
       const results = [];
       for (const mode of ['sync', 'async', 'ordinary']) {
-        const { stdout } = await promisify(execFile)(process.execPath,
+        const { stdout, stderr } = await promisify(execFile)(process.execPath,
           ['--import', require.resolve('tsx'), probePath, root, receiptPath, mode, parent],
           { timeout: 20_000, maxBuffer: 1024 * 1024 }).catch(error => {
+            writeFileSync(join(parent, mode + '.stdout.log'), error.stdout ?? '');
+            writeFileSync(join(parent, mode + '.stderr.log'), error.stderr ?? '');
             throw new Error(`fork-stop probe ${mode} failed: code=${error.code} signal=${error.signal}` +
               ` killed=${error.killed}\nstdout:\n${error.stdout}\nstderr:\n${error.stderr}`, { cause: error });
           });
+        writeFileSync(join(parent, mode + '.stdout.log'), stdout);
+        writeFileSync(join(parent, mode + '.stderr.log'), stderr);
         results.push(JSON.parse(stdout.trim().split('\n').at(-1)!));
       }
       const [sync, async, ordinary] = results;
@@ -673,7 +695,7 @@ describe('receipt-backed native archive reporter', () => {
       verified = true;
     } finally {
       if (verified) rmSync(parent, { recursive: true, force: true });
-      else console.error(`fork-stop probe diagnostics retained at ${parent}`);
+      else process.stderr.write(`fork-stop probe diagnostics retained at ${parent}\n`);
     }
   }, 45_000);
 
