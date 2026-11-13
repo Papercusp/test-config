@@ -161,6 +161,33 @@ describe('full verifier source census', () => {
       .toThrow(`changed ${artifact}`);
   });
 
+  it('treats operator-vite dist as generated output while preserving recorded source files', () => {
+    const root = archive();
+    writeFileSync(join(root, 'source.ts'), 'export {};');
+    const files = verifierSourceFiles(root);
+    const receipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'f'.repeat(40), files,
+      testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(root, '.verifier-source.json'), JSON.stringify(receipt));
+
+    const generated = join(root, 'apps/operator-vite/dist/cli.cjs');
+    mkdirSync(dirname(generated), { recursive: true });
+    writeFileSync(generated, 'rebuilt managed client');
+    expect(() => verifyVerifierSourceSync(root, receipt)).toThrow('added apps/operator-vite/dist');
+    expect(verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true })).toEqual(receipt);
+
+    const recordedRoot = archive();
+    const recorded = join(recordedRoot, 'apps/operator-vite/dist/cli.cjs');
+    mkdirSync(dirname(recorded), { recursive: true });
+    writeFileSync(recorded, 'committed managed client');
+    const recordedFiles = verifierSourceFiles(recordedRoot);
+    const recordedReceipt = { schemaVersion: 'verifier-source-v1', sourceCommit: 'e'.repeat(40), files: recordedFiles,
+      testedInputs: recordedFiles.map(({ path, sha256 }) => ({ path, sha256 })) };
+    writeFileSync(join(recordedRoot, '.verifier-source.json'), JSON.stringify(recordedReceipt));
+    writeFileSync(recorded, 'changed recorded managed client');
+    expect(() => verifyVerifierSourceSync(recordedRoot, recordedReceipt, { runtimeArtifacts: true }))
+      .toThrow('changed apps/operator-vite/dist/cli.cjs');
+  });
+
   it('relays async census progress without treating it as a completed receipt', async () => {
     const root = archive();
     writeFileSync(join(root, 'source.ts'), 'export {};');

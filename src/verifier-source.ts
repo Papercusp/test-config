@@ -263,6 +263,8 @@ export function verifierSourceFiles(root: string, {
       // This option attests source only, with the full recorded population intact.
       const runtimeDirectory = entry.name === 'node_modules' || [
         'apps/operator/dist-verify', 'apps/operator/test-results',
+        // The native dependency-generation verifier rebuilds the managed Vite client here.
+        'apps/operator-vite/dist',
         'apps/operator/playwright-report', 'papercusp-desktop/src-tauri/target',
         'papercusp-desktop/src-tauri/gen/schemas',
         'libs/generic/sse/dist', 'packages/omp-plugin/dist',
