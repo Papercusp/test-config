@@ -37,6 +37,7 @@ if (dir) {
     const captureId = randomUUID();
     const processBefore = runtimeProof.captureCurrentWorkerProcessIdentity();
     const runtimeBefore = runtimeProof.captureCurrentRuntimeProofIdentity?.({ root }) ?? null;
+    const capabilitiesBefore = runtimeProof.captureCurrentRuntimeCapabilities();
     const workerState = () => (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__;
     const configurationBefore = captureWorkerTestConfiguration(workerState());
     // `import * as` yields the ESM namespace (read-only); the CJS module objects are what
@@ -87,6 +88,9 @@ if (dir) {
         const record = endFile(filepath ?? '');
         if (record) record.runtime = { before: runtimeBefore,
           after: runtimeProof.captureCurrentRuntimeProofIdentity?.({ root }) ?? null };
+        if (record?.runtime && filepath) record.runtime.capabilities = {
+          schemaVersion: 'worker-runtime-capabilities-v1', captureId, testFile: filepath,
+          before: capabilitiesBefore, after: runtimeProof.captureCurrentRuntimeCapabilities() };
         if (record) record.testConfiguration = { schemaVersion: 'vitest-worker-configuration-v1',
           before: configurationBefore, after: captureWorkerTestConfiguration(workerState()) };
         if (record && filepath) record.workerExecution = { schemaVersion: 'worker-execution-v1',

@@ -9,7 +9,8 @@
  */
 import { parseMutationDescriptor, type MutationDescriptor } from '@papercusp/test-config/mutation-descriptor';
 import { createHash } from 'node:crypto';
-import { runtimeProofFingerprint, type RuntimeProofIdentity, type WorkerProcessIdentity } from '@papercusp/test-config/runtime-proof';
+import { runtimeProofFingerprint, parseRecordedWorkerRuntimeCapabilities,
+  type RecordedWorkerRuntimeCapabilities, type RuntimeProofIdentity, type WorkerProcessIdentity } from '@papercusp/test-config/runtime-proof';
 import { isAbsolute, resolve } from 'node:path';
 import { parseAppliedCompilerReceipt, type AppliedCompilerReceipt } from '@papercusp/test-config/applied-compiler-inputs';
 import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COMPONENTS,
@@ -21,6 +22,8 @@ import { createProofContextIdentity, readProofContextIdentity, PROOF_CONTEXT_COM
 export interface RecordedWorkerRuntime {
   before: RuntimeProofIdentity | null;
   after: RuntimeProofIdentity | null;
+  /** Bounded original-worker observation; never a complete capability census. */
+  capabilities?: RecordedWorkerRuntimeCapabilities;
 }
 
 /** Original VM calls, not a complete compiler configuration. Full inputs stay
@@ -256,8 +259,9 @@ export function parseRecordedSourceSubmodules(value: unknown): RecordedSourceSub
 /** Validate the retained worker measurements without substituting this reader's
  * interpreter or install. Null is a measured inability to obtain a qualified pin. */
 export function parseRecordedWorkerRuntime(value: unknown): RecordedWorkerRuntime | undefined {
-  if (!isRecord(value) || Object.keys(value).length !== 2
+  if (!isRecord(value) || Object.keys(value).some(key => !['before', 'after', 'capabilities'].includes(key))
     || !Object.hasOwn(value, 'before') || !Object.hasOwn(value, 'after')
+    || (Object.hasOwn(value, 'capabilities') && !parseRecordedWorkerRuntimeCapabilities(value.capabilities))
     || [value.before, value.after].some(identity => identity !== null && !runtimeProofFingerprint(identity)))
     return undefined;
   return value as unknown as RecordedWorkerRuntime;
@@ -1164,6 +1168,9 @@ export function parseTestRunExecutionDetails(stored: unknown): TestRunExecutionD
     || (value.population !== undefined && !executionPopulationMatches(value))
     || (value.proofContext !== undefined && !recordedProofContextMatches(value))
     || (value.workerRuntime !== undefined && !parseRecordedWorkerRuntime(value.workerRuntime))
+    || (isRecord(value.workerRuntime) && Object.hasOwn(value.workerRuntime, 'capabilities') && (
+      (value.workerRuntime.capabilities as RecordedWorkerRuntimeCapabilities).testFile !== resolve(value.root as string, value.filePath as string)
+      || (value.workerRuntime.capabilities as RecordedWorkerRuntimeCapabilities).captureId !== parseRecordedWorkerExecution(value.workerExecution)?.captureId))
     || (value.workerCompilerInputs !== undefined && (!parseRecordedWorkerCompilerInputs(value.workerCompilerInputs)
       || (value.workerCompilerInputs as RecordedWorkerCompilerInputs).testFile !== resolve(value.root as string, value.filePath as string)
       || (value.workerCompilerInputs as RecordedWorkerCompilerInputs).captureId !== parseRecordedWorkerExecution(value.workerExecution)?.captureId))

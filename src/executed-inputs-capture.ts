@@ -38,10 +38,7 @@ export interface InputsRecord {
   workerExecution?: import('./execution-details.ts').RecordedWorkerExecution;
   testConfiguration?: import('./configuration-snapshot.ts').RecordedWorkerTestConfiguration;
   /** The actual worker measures itself on both sides of this file's execution. */
-  runtime?: {
-    before: import('./runtime-proof.ts').RuntimeProofIdentity | null;
-    after: import('./runtime-proof.ts').RuntimeProofIdentity | null;
-  };
+  runtime?: import('./execution-details.ts').RecordedWorkerRuntime;
   /** Absolute path of the test file the inputs belong to. */
   testFile: string;
   /** Absolute paths read, listed or stat-ed inside the repo root (node_modules excluded). */

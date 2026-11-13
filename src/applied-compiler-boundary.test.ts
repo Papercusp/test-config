@@ -17,6 +17,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const patchPath = join(repoRoot, 'patches/vite+7.3.5.patch');
 let fixture: string;
 let createPatchedServer: typeof createServer;
+let patchedViteRoot: string;
 
 beforeAll(async () => {
   fixture = mkdtempSync(join(tmpdir(), 'applied-compiler-patch-'));
@@ -74,6 +75,7 @@ beforeAll(async () => {
   execFileSync('git', ['apply', '--check', patchPath], { cwd: fixture });
   execFileSync('git', ['apply', patchPath], { cwd: fixture });
   expect(blobHash(readFileSync(target))).toBe(index[2]);
+  patchedViteRoot = isolated;
   const vite = await import(/* @vite-ignore */ pathToFileURL(join(isolated, 'dist/node/index.js')).href);
   createPatchedServer = vite.createServer;
 }, 30_000);
@@ -87,6 +89,168 @@ async function serverFor(root: string, plugins: Plugin[] = [], capture = true) {
 }
 
 describe('maintained Vite applied compiler boundary', () => {
+
+  function implementationRuntime(name: string) {
+    const root = join(fixture, name), vite = join(root, 'node_modules/vite');
+    mkdirSync(dirname(vite), { recursive: true });
+    cpSync(patchedViteRoot, vite, { recursive: true,
+      filter: path => path === patchedViteRoot || !path.startsWith(join(patchedViteRoot, 'node_modules')) });
+    const original = dirname(createRequire(import.meta.url).resolve('vite/package.json'));
+    mkdirSync(join(vite, 'node_modules'));
+    for (const dependency of Object.keys(JSON.parse(readFileSync(join(original, 'package.json'), 'utf8')).dependencies)) {
+      if (dependency === 'esbuild') continue;
+      const link = join(vite, 'node_modules', dependency); mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(join(dirname(original), dependency), link, 'dir');
+    }
+    const esbuild = join(vite, 'node_modules/esbuild');
+    const source = dirname(createRequire(import.meta.url).resolve('esbuild/package.json'));
+    cpSync(source, esbuild, { recursive: true, filter: path => path === source || !path.startsWith(join(source, 'node_modules')) });
+    symlinkSync(dirname(source), join(esbuild, 'node_modules'), 'dir');
+    return { root, vite, esbuild, helper: join(esbuild, 'lib/pc-implementation-control.js') };
+  }
+
+  function implementationRun(runtime: ReturnType<typeof implementationRuntime>, overwrite = false, native = '') {
+    // Permanent real-compiler control: each process loads its own copied Vite
+    // and esbuild. Installed dependencies are only read, never edited.
+    const script = `
+      import { pathToFileURL } from 'node:url';
+      import { writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      import { createRequire } from 'node:module';
+      const [entry, producer, root, helper, overwrite] = process.argv.slice(1);
+      const { createServer } = await import(pathToFileURL(entry));
+      const { installAppliedCompilerInputCapture, readAppliedCompilerInputs } = await import(pathToFileURL(producer));
+      if (overwrite === 'true') writeFileSync(helper, 'module.exports = { value: 999 };');
+      const file = join(root, 'input.ts'), sibling = join(root, 'sibling.ts');
+      writeFileSync(file, 'export const value: number = 1;');
+      writeFileSync(sibling, 'export const value: number = 1;');
+      const server = await createServer({ root, configFile: false, logLevel: 'silent', esbuild: { target: 'es2015' },
+        optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true, watch: null },
+        plugins: [{ name: 'implementation-control', configResolved: installAppliedCompilerInputCapture }] });
+      try {
+        const environment = server.environments.ssr;
+        const result = await environment.transformRequest(file);
+        const receipt = readAppliedCompilerInputs(environment), frozen = JSON.stringify(receipt);
+        await environment.transformRequest(sibling);
+        const warm = readAppliedCompilerInputs(environment);
+        process.stdout.write(JSON.stringify({ code: result.code, receipt, warm, originalUnchanged: frozen === JSON.stringify(receipt) }));
+      } finally {
+        await server.close();
+        await createRequire(pathToFileURL(entry))('esbuild').stop();
+      }
+    `;
+    return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script,
+      join(runtime.vite, 'dist/node/index.js'), join(repoRoot, 'libs/test-config/src/applied-compiler-inputs.ts'),
+      runtime.root, runtime.helper, String(overwrite)], { encoding: 'utf8', timeout: 25_000, maxBuffer: 2 * 1024 * 1024,
+      env: { ...process.env, ...(native ? { ESBUILD_BINARY_PATH: native } : {}) } })) as {
+        code: string; receipt: AppliedCompilerReceipt; warm: AppliedCompilerReceipt; originalUnchanged: boolean };
+  }
+
+  it('implementation inputs: loaded transitive JS mutation rotates identity at equal versions and function text, not later disk bytes', () => {
+    const runtime = implementationRuntime('implementation-js');
+    const main = join(runtime.esbuild, 'lib/main.js');
+    writeFileSync(main, readFileSync(main, 'utf8') + `
+      const pcImplementationControl = require('./pc-implementation-control.js');
+      const pcOriginalTransform = transform;
+      transform = (input, options) => pcOriginalTransform(input + '\\nexport const implementationControl = ' + pcImplementationControl.value + ';', options);
+    `);
+    const helper = (value: number) => 'module.exports = { value: ' + value + ' };';
+    const runs: ReturnType<typeof implementationRun>[] = [];
+    for (const value of [1, 2, 1, 1]) {
+      writeFileSync(runtime.helper, helper(value));
+      runs.push(implementationRun(runtime, runs.length === 3));
+    }
+    const calls = runs.map(run => run.receipt.calls[0]!);
+    expect(calls[0]!.implementation).toEqual(calls[1]!.implementation);
+    expect(calls.map(call => call.codeSha256)).toEqual(Array(4).fill(calls[0]!.codeSha256));
+    expect(calls.map(call => call.optionsSha256)).toEqual(Array(4).fill(calls[0]!.optionsSha256));
+    const sources = calls.map(call => call.implementationInputs!.javascript);
+    expect(sources[0]!.find(source => source.path === main)).toEqual(sources[1]!.find(source => source.path === main));
+    expect(sources.map(rows => rows.find(source => source.path === runtime.helper)?.sha256))
+      .toEqual([hash(helper(1)), hash(helper(2)), hash(helper(1)), hash(helper(1))]);
+    expect(calls[0]!.inputSha256).not.toBe(calls[1]!.inputSha256);
+    expect(calls[0]!.inputSha256).toBe(calls[2]!.inputSha256);
+    expect(calls[0]!.inputSha256).toBe(calls[3]!.inputSha256);
+    expect(runs[0]!.code).not.toBe(runs[1]!.code);
+    expect(runs[0]!.code).toBe(runs[2]!.code);
+    expect(runs[0]!.code).toBe(runs[3]!.code);
+    expect(readFileSync(runtime.helper, 'utf8')).toBe(helper(999));
+    for (const run of runs) {
+      expect(run.originalUnchanged).toBe(true);
+      expect(run.receipt.calls[0]!.implementationInputs).toMatchObject({ status: 'partial', javascriptStatus: 'captured' });
+      expect(run.warm.calls[0]).toEqual(run.receipt.calls[0]);
+      expect(run.receipt.missing).toContain('transitive-compiler-implementation-unobserved');
+      expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(run.receipt)))).toEqual(run.receipt);
+    }
+    const receipt = runs[0]!.receipt, call = receipt.calls[0]!, inputs = call.implementationInputs!;
+    for (const changed of [{ ...inputs, status: 'complete' }, { ...inputs, javascriptStatus: 'guessed' },
+      { ...inputs, javascript: [...inputs.javascript].reverse() }, { ...inputs, nativeStatus: 'guessed' },
+      { ...inputs, javascript: inputs.javascript.map((source, i) => i ? source : { ...source, sha256: 'a'.repeat(64) }) }])
+      expect(parseAppliedCompilerReceipt({ ...receipt, calls: [{ ...call, implementationInputs: changed }] })).toBeUndefined();
+    expect(parseAppliedCompilerReceipt({ ...receipt, missing: receipt.missing.filter(gap => gap !== 'transitive-compiler-implementation-unobserved') })).toBeUndefined();
+  }, 120_000);
+
+  it('implementation inputs: native image mutation and equivalent repeat bind to actual spawned service, retaining original warm custody', () => {
+    const runtime = implementationRuntime('implementation-native');
+    writeFileSync(runtime.helper, 'module.exports = {};');
+    const initial = implementationRun(runtime);
+    const first = initial.receipt.calls[0]!.implementationInputs!;
+    if (process.platform !== 'linux') {
+      expect(first.nativeStatus).not.toBe('observed');
+      expect(first.native).toBeNull();
+      return;
+    }
+    expect(first.nativeStatus).toBe('observed');
+    const binary = join(runtime.root, 'esbuild-native-control'), bytes = readFileSync(first.native!.path);
+    const runs: ReturnType<typeof implementationRun>[] = [];
+    for (const suffix of ['', '\nPAPERCUSP_NATIVE_IDENTITY_CONTROL\n', '']) {
+      // ELF permits a trailing section; compilation stays equivalent while the
+      // executing image changes. This touches only a disposable fixture copy.
+      writeFileSync(binary, Buffer.concat([bytes, Buffer.from(suffix)]), { mode: 0o755 });
+      runs.push(implementationRun(runtime, false, binary));
+    }
+    const calls = runs.map(run => run.receipt.calls[0]!);
+    expect(calls[0]!.implementation).toEqual(calls[1]!.implementation);
+    expect(calls[0]!.implementationInputs!.javascript).toEqual(calls[1]!.implementationInputs!.javascript);
+    expect(calls.map(call => call.implementationInputs!.native!.sha256))
+      .toEqual([hash(bytes), hash(Buffer.concat([bytes, Buffer.from('\nPAPERCUSP_NATIVE_IDENTITY_CONTROL\n')])), hash(bytes)]);
+    expect(calls[0]!.inputSha256).not.toBe(calls[1]!.inputSha256);
+    expect(calls[0]!.inputSha256).toBe(calls[2]!.inputSha256);
+    expect(new Set(runs.map(run => run.code)).size).toBe(1);
+    for (const run of runs) {
+      const native = run.receipt.calls[0]!.implementationInputs!.native!;
+      expect(native.path).toBe(binary);
+      expect(native.process.pid).not.toBe(process.pid);
+      expect(native.origin).toEqual({ captureId: run.receipt.captureId, sequence: 1, moduleId: join(runtime.root, 'input.ts') });
+      expect(run.warm.calls[1]!.implementationInputs!.native).toEqual(native);
+      expect(run.warm.calls[0]).toEqual(run.receipt.calls[0]);
+      expect(run.receipt.missing).toContain('transitive-compiler-implementation-unobserved');
+    }
+  }, 120_000);
+
+  it('implementation inputs: unavailable loaded source fails closed without changing the compiler result or invoking twice', async () => {
+    const config = {}, environment = {};
+    installAppliedCompilerInputCapture(config);
+    const observe = Object.getOwnPropertyDescriptor(config, Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value;
+    const functions = Object.fromEntries(['loadTsconfigJsonForFile', 'parse', 'parseExtends', 'parseFile',
+      'resolveSolutionTSConfig', 'transform', 'transformWithEsbuild'].map(name => [name, function measuredFunction() {}]));
+    const settle = observe({ version: 1, environment, moduleId: '/repo/input.ts', code: 'source', options: { loader: 'ts' },
+      tsconfig: { status: 'not-used', inputs: [] }, implementation: { viteVersion: 'test', esbuildVersion: 'test', functions } });
+    const before = readAppliedCompilerInputs(environment)!;
+    let calls = 0;
+    const result = { code: 'unchanged compiler result' };
+    expect(await settle.run(async () => { calls++; return result; })).toBe(result);
+    expect(await settle.run(async () => { calls++; throw new Error('must not invoke'); })).toBe(result);
+    settle({ status: 'success', result });
+    const receipt = readAppliedCompilerInputs(environment)!;
+    expect(calls).toBe(1);
+    expect(before.calls[0]!.implementationInputs).toBeUndefined();
+    expect(receipt.calls[0]!.implementationInputs).toMatchObject({ status: 'partial', javascriptStatus: 'unavailable', nativeStatus: 'unobserved', native: null });
+    expect(Object.isFrozen(receipt.calls[0]!.implementationInputs!.javascript)).toBe(true);
+    expect(receipt.calls[0]!.inputSha256).toBeNull();
+    expect(successfulAppliedCompilerOutput(receipt, 1)).toBeUndefined();
+    expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(receipt)))).toEqual(receipt);
+  });
 
   it('resolution search: original negative lookups rotate for nearer configs with fixed source', async () => {
     const root = join(fixture, 'resolution-nearer'), directory = join(root, 'sub', 'deep');

@@ -34,10 +34,32 @@ import {
 } from './execution-details.ts';
 import { createProofContextIdentity, proofContextImpact, PROOF_CONTEXT_COMPONENTS,
   observeViteTransformOptions, readViteTransformOptions } from './configuration-snapshot.ts';
-import { captureCurrentWorkerProcessIdentity } from './runtime-proof.ts';
+import { captureCurrentWorkerProcessIdentity, captureCurrentRuntimeCapabilities } from './runtime-proof.ts';
 import { installAppliedCompilerInputCapture, readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 
 describe('original worker process custody', () => {
+  it('preserves bounded runtime surfaces through JSON and requires original capture/file custody', () => {
+    const snapshot = captureCurrentRuntimeCapabilities()!;
+    expect(snapshot).not.toBeNull();
+    const workerExecution = execution();
+    const capabilities = { schemaVersion: 'worker-runtime-capabilities-v1', captureId: workerExecution.captureId,
+      testFile: workerExecution.testFile, before: snapshot, after: snapshot };
+    const workerRuntime = { before: null, after: null, capabilities };
+    const row = details({ root: '/repo', filePath: 'a.test.ts', workerExecution, workerRuntime });
+    expect(parseTestRunExecutionDetails(JSON.parse(JSON.stringify(row)))?.workerRuntime).toEqual(workerRuntime);
+    expect(captureRecordedProofContext({ ...row, workerRuntime } as never).components.runtimeCapabilities).toBeNull();
+    expect(parseTestRunExecutionDetails({ ...row, workerExecution: undefined })).toBeUndefined();
+    for (const patch of [{ captureId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }, { testFile: '/repo/other.test.ts' },
+      { before: { ...snapshot, populationStatus: 'complete' } }, { after: { ...snapshot, missing: [] } }])
+      expect(parseTestRunExecutionDetails({ ...row, workerRuntime: { ...workerRuntime,
+        capabilities: { ...capabilities, ...patch } } })).toBeUndefined();
+    expect(parseRecordedWorkerRuntime({ before: null, after: null })).toEqual({ before: null, after: null });
+    expect(parseRecordedWorkerRuntime({ ...workerRuntime, extra: true })).toBeUndefined();
+    expect(parseRecordedWorkerRuntime({ ...workerRuntime, capabilities: undefined })).toBeUndefined();
+    expect(parseRecordedWorkerRuntime({ ...workerRuntime, capabilities: { ...capabilities, before: null } }))
+      .toEqual({ ...workerRuntime, capabilities: { ...capabilities, before: null } });
+  });
+
   it('binds source-byte observations independently of commit identity and refuses missing or changed bytes', () => {
     const pin = createSourceByteSnapshot([{ path: 'a.ts', sha256: '1'.repeat(64) }])!;
     const sourceBytes = { schemaVersion: 'source-byte-observation-v1', before: pin, after: pin };

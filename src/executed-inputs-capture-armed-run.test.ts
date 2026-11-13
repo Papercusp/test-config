@@ -94,7 +94,9 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
         completionCheckpoint: { runnerIdentity: string | null };
         nativeRun: { files: Array<{ proof: { inputs: {
           runtime?: { before: { name: string; executable: string } | null;
-            after: { name: string; executable: string } | null };
+            after: { name: string; executable: string } | null;
+            capabilities?: import('./runtime-proof.ts').RecordedWorkerRuntimeCapabilities };
+          workerExecution?: { captureId: string; testFile: string };
           testConfiguration?: { schemaVersion: string; before: string | null; after: string | null };
         } | null } }> };
         rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[];
@@ -125,6 +127,14 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       expect(options!.after).toBe(options!.before);
       expect(runtime).toHaveProperty('before');
       expect(runtime).toHaveProperty('after');
+      const capabilities = runtime?.capabilities;
+      expect(capabilities, 'actual worker capability surface must survive the original handoff').toBeDefined();
+      expect(capabilities!.captureId).toBe(map.nativeRun.files[0]?.proof.inputs?.workerExecution?.captureId);
+      expect(capabilities!.testFile).toBe(map.nativeRun.files[0]?.proof.inputs?.workerExecution?.testFile);
+      expect(capabilities!.before?.values.versions).toContainEqual(['node', process.versions.node]);
+      expect(capabilities!.after).toEqual(capabilities!.before);
+      expect(capabilities!.before?.populationStatus).toBe('unknown');
+      expect(capabilities!.before?.missing).toContain('required-capability-population-unobserved');
       if (!runtime?.before || !runtime.after) {
         expect(map.rows[0]?.opaqueReasons).toContain('worker-runtime-unavailable');
         expect(map.completionCheckpoint.runnerIdentity).toBeNull();
