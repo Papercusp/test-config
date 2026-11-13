@@ -436,6 +436,104 @@ describe('unmeasured filesystem input custody', () => {
     } finally { nativeFs.closeSync(fd); resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('captures direct FileHandle reads opened before the recorder and refuses source-only reuse', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-file-handle-input-'));
+    const file = join(root, 'fixture.txt');
+    nativeFs.writeFileSync(file, 'abcdef');
+    const handle = await nativeFs.promises.open(file, 'r');
+    const prototype = Object.getPrototypeOf(handle);
+    const descriptors = Object.getOwnPropertyDescriptors(prototype);
+    const testFile = 'src/file-handle-input.test.ts';
+    resetCaptureForTests();
+    const targets = { fs: {}, fsPromises: {}, childProcess: {}, fileHandlePrototype: prototype };
+    installCapture(targets, resolve(process.cwd()));
+    try {
+      const observe = async (operation: () => Promise<unknown>) => {
+        beginFile();
+        await operation();
+        const record = endFile(testFile)!;
+        expect(record.opaque).toContain('fs-file-descriptor');
+        expect(JSON.stringify(record)).not.toContain(file);
+        return record;
+      };
+      await observe(async () => {
+        const buffer = Buffer.alloc(2);
+        const result = await handle.read(buffer, 0, 2, 0);
+        expect(result.buffer).toBe(buffer);
+        expect(result.bytesRead).toBe(2);
+        expect(buffer.toString()).toBe('ab');
+      });
+      await observe(async () => {
+        const buffers = [Buffer.alloc(2)];
+        expect((await handle.readv(buffers, 2)).bytesRead).toBe(2);
+        expect(buffers[0]!.toString()).toBe('cd');
+      });
+      const record = await observe(async () => { expect(await handle.readFile('utf8')).toBe('abcdef'); });
+      await observe(async () => { expect((await handle.stat()).size).toBe(6); });
+      await observe(async () => {
+        const stream = handle.createReadStream({ start: 0, autoClose: false });
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        expect(Buffer.concat(chunks).toString()).toBe('abcdef');
+      });
+      const proof = { recordedSha: 'a'.repeat(40), recordedAtMs: 1, executedModules: [testFile], inputsCaptured: true,
+        runContext: 'local', runnerIdentity: 'measured-worker', readPaths: [], opaqueReasons: record.opaque };
+      const select = (opaqueReasons: string[]) => selectReusablePasses({ candidates: [testFile],
+        proofs: new Map([[testFile, { ...proof, opaqueReasons }]]), judgedSha: 'b'.repeat(40),
+        changedBetween: () => new Set<string>(), runContext: proof.runContext, runnerIdentity: proof.runnerIdentity });
+      expect(select([]).skip).toEqual([testFile]);
+      expect(select(record.opaque).skip).toEqual([]);
+      beginFile();
+      await handle.close();
+      await expect(handle.readFile('utf8')).rejects.toMatchObject({ code: 'EBADF' });
+      expect(endFile(testFile)?.opaque).toContain('fs-file-descriptor');
+    } finally {
+      await handle.close();
+      Object.defineProperties(prototype, descriptors);
+      resetCaptureForTests();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves FileHandle method receivers, promises, optional streams and failures across file recorders', () => {
+    const pending = Promise.resolve('read'), stream = {}, lines = {}, web = {};
+    const error = new Error('original stat failure');
+    const calls: unknown[][] = [];
+    const prototype = { read(this: unknown, ...args: unknown[]) { calls.push([this, ...args]); return pending; },
+      readv() {}, readFile() {}, stat() { throw error; }, createReadStream() { return stream; },
+      readLines() { return lines; }, readableWebStream() { return web; } };
+    resetCaptureForTests();
+    installCapture({ fs: {}, fsPromises: {}, childProcess: {}, fileHandlePrototype: prototype }, '/repo');
+    const handle = Object.create(prototype);
+    beginFile();
+    const buffer = Buffer.alloc(2);
+    expect(handle.read(buffer, 0, 2, 3)).toBe(pending);
+    expect(calls).toEqual([[handle, buffer, 0, 2, 3]]);
+    expect(() => handle.stat()).toThrow(error);
+    const first = endFile('/repo/first.test.ts')!;
+    beginFile();
+    expect(handle.createReadStream()).toBe(stream);
+    expect(handle.readLines()).toBe(lines);
+    expect(handle.readableWebStream()).toBe(web);
+    expect(endFile('/repo/second.test.ts')?.opaque).toEqual(['fs-file-descriptor']);
+    expect(first.opaque).toEqual(['fs-file-descriptor']);
+    resetCaptureForTests();
+  });
+
+  it('refuses unsupported or frozen FileHandle seams and allows a subsequent valid installation', () => {
+    const valid = () => ({ read() {}, readv() {}, readFile() {}, stat() {}, createReadStream() {} });
+    for (const prototype of [{}, Object.freeze(valid())]) {
+      resetCaptureForTests();
+      expect(() => installCapture({ fs: {}, fsPromises: {}, childProcess: {}, fileHandlePrototype: prototype }, '/repo'))
+        .toThrow('file-handle-capture-unavailable');
+      const replacement = valid();
+      installCapture({ fs: {}, fsPromises: {}, childProcess: {}, fileHandlePrototype: replacement }, '/repo');
+      beginFile(); replacement.stat();
+      expect(endFile('/repo/test.ts')?.opaque).toEqual(['fs-file-descriptor']);
+    }
+    resetCaptureForTests();
+  });
+
   it('keeps parent traversal through a directory symlink opaque before path normalization', () => {
     const root = mkdtempSync(join(tmpdir(), 'pc-parent-input-'));
     const repo = join(root, 'repo'), external = join(root, 'external');

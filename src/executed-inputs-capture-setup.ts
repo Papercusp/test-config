@@ -42,10 +42,19 @@ if (dir) {
     // `import * as` yields the ESM namespace (read-only); the CJS module objects are what
     // callers and syncBuiltinESMExports see, so patch those.
     const cjs = (ns: object) => ((ns as { default?: object }).default ?? ns) as Record<string, unknown>;
+    // Node does not export FileHandle's constructor. Obtain the actual shared
+    // prototype through a read-only handle before capture begins, then close
+    // the probe. This also covers handles opened by earlier setup modules.
+    // A failed probe leaves the whole capture unavailable via the outer catch.
+    const handle = await fsPromises.open(process.execPath, 'r');
+    let fileHandlePrototype: Record<string, unknown>;
+    try { fileHandlePrototype = Object.getPrototypeOf(handle); }
+    finally { await handle.close(); }
     installCapture(
       {
         fs: cjs(fs),
         fsPromises: cjs(fsPromises),
+        fileHandlePrototype,
         childProcess: cjs(childProcess),
         workerThreads: cjs(workerThreads),
         netSocketPrototype: (cjs(net).Socket as { prototype: Record<string, unknown> } | undefined)?.prototype,

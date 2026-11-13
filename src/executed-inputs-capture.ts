@@ -242,6 +242,11 @@ export const FS_PROMISES_READ_FUNCTIONS = [
 ] as const;
 /** A descriptor may have been opened before this file's capture began. */
 export const FS_DESCRIPTOR_READ_FUNCTIONS = ['read', 'readSync', 'readv', 'readvSync'] as const;
+/** FileHandle methods bypass the public fs functions, including for handles
+ * opened before this recorder. Their descriptor has no measured path custody. */
+export const FILE_HANDLE_READ_FUNCTIONS = [
+  'read', 'readv', 'readFile', 'stat', 'createReadStream', 'readLines', 'readableWebStream',
+] as const;
 export const CHILD_PROCESS_FUNCTIONS = [
   'spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork',
 ] as const;
@@ -407,6 +412,8 @@ function retainEvaluationCode(code: string, recorder: Recorder, observation: Mod
 export interface CaptureTargets {
   fs: Patchable;
   fsPromises: Patchable;
+  /** Actual runtime prototype, obtained before beginFile. Omitted by fake targets. */
+  fileHandlePrototype?: Patchable;
   childProcess: Patchable;
   workerThreads?: Patchable;
   netSocketPrototype?: Patchable;
@@ -420,7 +427,6 @@ export interface CaptureTargets {
 export function installCapture(targets: CaptureTargets, repoRoot: string): void {
   state.repoRoot = repoRoot;
   if (state.installed) return;
-  state.installed = true;
   // The recorder must be INVISIBLE to the code under test. Reading the live `process.cwd`
   // property on every intercepted fs call made it observable: a test that replaces
   // `process.cwd` to assert nothing calls it (register-papercusp.test.ts) counted OUR calls and
@@ -433,6 +439,19 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
   for (const name of FS_DESCRIPTOR_READ_FUNCTIONS) wrap(targets.fs, name, read);
   for (const name of FS_PROMISES_READ_FUNCTIONS) wrap(targets.fsPromises, name, read);
   const opaque = (reason: string) => () => state.current?.opaque.add(reason);
+  if (targets.fileHandlePrototype) {
+    const prototype = targets.fileHandlePrototype;
+    // Reject an unsupported/frozen seam rather than produce an apparently
+    // complete file record with direct descriptor reads silently omitted.
+    for (const name of ['read', 'readv', 'readFile', 'stat', 'createReadStream'])
+      if (typeof prototype[name] !== 'function') throw new Error('file-handle-capture-unavailable');
+    for (const name of FILE_HANDLE_READ_FUNCTIONS) {
+      if (typeof prototype[name] !== 'function') continue;
+      wrap(prototype, name, opaque('fs-file-descriptor'));
+      if (!(prototype[name] as unknown as Record<symbol, unknown>)[WRAPPED])
+        throw new Error('file-handle-capture-unavailable');
+    }
+  }
   for (const name of CHILD_PROCESS_FUNCTIONS) wrap(targets.childProcess, name, opaque('child-process'));
   if (targets.workerThreads) {
     const W = targets.workerThreads.Worker;
@@ -458,6 +477,7 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
   } catch {
     /* ESM named imports keep the originals; CJS callers are still captured */
   }
+  state.installed = true;
 }
 
 /** Start capturing for the next test file (setup-file top level). */
