@@ -47,6 +47,8 @@ import AdminTestRunsReporter, {
   missingTestRunReceiptPaths,
   latestTestRunReceipts,
   recoverTimedOutTestRunReceipts,
+  reconcileTimedOutTestRunReceiptsWithSql,
+  pendingTestRunRecoveryPaths,
   readRunConfigRoot,
   setRunRoot,
   testRunReceiptBaseFor,
@@ -66,6 +68,7 @@ import AdminTestRunsReporter, {
   shouldRecordTestRunPath,
   TEST_RUN_INSERT_BATCH_SIZE,
   TEST_RUN_RECEIPT_ENV,
+  TEST_RUN_RECOVERY_ENV,
   appendTestRunReceipts,
   reporterWriteBudget,
   SHARED_PG_DRAIN_TIMEOUT_MS,
@@ -1682,6 +1685,91 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         }]);
       });
 
+      it.each(['timeout', 'inserted'] as const)('recovers omitted cases after a %s file receipt without another file INSERT', async outcome => {
+        const cases = [{ caseIndex: 0, caseKey: 'suite > original', occurrence: 1,
+          status: 'pass' as const, durationMs: 1, errorTail: null }];
+        const original = { ...receipt, outcome, ...(outcome === 'inserted' ? { id: '901' } : {}),
+          row: { ...receipt.row, cases }, caseInsertOutcome: { written: 0, unwritten: 1, reason: 'file_insert_timeout' } };
+        const statements: string[] = [];
+        const batches: Record<string, unknown>[][] = [];
+        const sql = Object.assign((first: unknown) => {
+          if (Array.isArray(first) && !('raw' in first)) {
+            if (typeof first[0] === 'object') batches.push(first as Record<string, unknown>[]);
+            return {};
+          }
+          const query = (first as TemplateStringsArray).join('?');
+          statements.push(query);
+          return Promise.resolve(query.includes('SELECT') ? [candidate] : []);
+        }, { end: async () => undefined }) as unknown as PgSql;
+        const log = JSON.stringify(original);
+        expect(pendingTestRunRecoveryPaths(log, ['a.test.ts'], details.root)).toEqual(['a.test.ts']);
+        const options = { expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a', env: {} };
+        const recovered = await reconcileTimedOutTestRunReceiptsWithSql(sql, log, options);
+        expect(recovered).toMatchObject([{ outcome: 'inserted', id: '901',
+          caseInsertOutcome: { written: 1, unwritten: 0, reason: null } }]);
+        expect(statements).toHaveLength(2);
+        expect(statements[0]).toContain('SELECT');
+        expect(statements[1]).toContain('INSERT INTO harness_shared.test_case_runs');
+        expect(statements[1]).toContain('ON CONFLICT (test_run_id, case_index) DO NOTHING');
+        expect(statements.join('')).not.toContain('INSERT INTO harness_shared.test_runs');
+        expect(batches).toEqual([[expect.objectContaining({ test_run_id: '901', case_index: 0, case_key: cases[0].caseKey })]]);
+        const completeLog = log + '\n' + JSON.stringify(recovered[0]);
+        expect(pendingTestRunRecoveryPaths(completeLog, ['a.test.ts'], details.root)).toEqual([]);
+        expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, completeLog, options)).toEqual([]);
+        expect(statements).toHaveLength(2);
+      });
+
+      it.each(['foreign metadata', 'ambiguous row', 'different acknowledged id'])('never writes recovered cases for %s', async control => {
+        const original = { ...base, outcome: 'inserted', id: '901', row: { ...base.row,
+          cases: [{ caseIndex: 0, caseKey: 'original', occurrence: 1, status: 'pass', durationMs: 1, errorTail: null }] } };
+        const candidates = control === 'foreign metadata' ? [{ ...candidate, executionDetails: { ...details, passed: 2 } }]
+          : control === 'ambiguous row' ? [candidate, { ...candidate, id: '902' }] : [{ ...candidate, id: '902' }];
+        const queries: string[] = [];
+        const sql = Object.assign((first: unknown) => {
+          if (Array.isArray(first) && !('raw' in first)) return {};
+          queries.push((first as TemplateStringsArray).join('?'));
+          return Promise.resolve(candidates);
+        }, { end: async () => undefined }) as unknown as PgSql;
+        expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, JSON.stringify(original), {
+          expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a', env: {},
+        })).toEqual([]);
+        expect(queries).toHaveLength(1);
+        expect(queries[0]).toContain('SELECT');
+      });
+
+      it('never substitutes file identity or weakens case acknowledgement when merging recovery', () => {
+        const original = { ...base, outcome: 'inserted', id: '901', row: { ...base.row,
+          cases: [{ caseIndex: 0, caseKey: 'original', occurrence: 1, status: 'pass', durationMs: 1, errorTail: null }] },
+          caseInsertOutcome: { written: 0, unwritten: 1, reason: 'file_insert_timeout' } };
+        const complete = { ...original, caseInsertOutcome: { written: 1, unwritten: 0, reason: null } };
+        const read = (...history: unknown[]) => latestTestRunReceipts(history.map(value => JSON.stringify(value)).join('\n'));
+        expect(read(original, complete, original)).toEqual([complete]);
+        for (const changed of [
+          { id: '902' }, { attempt: 1 }, { status: 'fail' },
+          { row: { ...complete.row, cases: [{ ...complete.row.cases[0], caseKey: 'foreign' }] } },
+          { caseInsertOutcome: { written: 2, unwritten: -1, reason: null } },
+        ]) expect(read(original, { ...complete, ...changed })).toEqual([original]);
+      });
+
+      it('does not queue case recovery behind a pending canonical readback', async () => {
+        const queries: string[] = [];
+        let release!: (value: unknown) => void;
+        const pending = new Promise(resolve => { release = resolve; });
+        const sql = Object.assign((first: unknown) => {
+          if (Array.isArray(first) && !('raw' in first)) return {};
+          queries.push((first as TemplateStringsArray).join('?'));
+          return pending;
+        }, { end: async () => undefined }) as unknown as PgSql;
+        const original = { ...receipt, row: { ...receipt.row, cases: [{ caseIndex: 0, caseKey: 'original',
+          occurrence: 1, status: 'pass', durationMs: 1, errorTail: null }] } };
+        expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, JSON.stringify(original), {
+          expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a', env: {}, timeoutMs: 10,
+        })).toEqual([]);
+        release([candidate]);
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(queries).toHaveLength(1);
+      });
+
       it.each([
         undefined, null, 'json-string-scalar',
         { ...details, passed: 2 }, { ...details, failed: 1 }, { ...details, skipped: 1 },
@@ -2110,6 +2198,10 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         ]);
         // Fail-soft: an unwritable receipt path never throws out of the reporter.
         expect(() => appendTestRunReceipts({ [TEST_RUN_RECEIPT_ENV]: join(dir, 'missing', 'x.jsonl') }, [receipt])).not.toThrow();
+        const recovery = join(dir, 'recovery.jsonl');
+        appendTestRunReceipts({ [TEST_RUN_RECOVERY_ENV]: recovery }, [receipt]);
+        expect(JSON.parse(readFileSync(recovery, 'utf8').trim())).toEqual(receipt);
+        expect(reporterWriteBudget({ [TEST_RUN_RECOVERY_ENV]: recovery })).toEqual(reporterWriteBudget({}));
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

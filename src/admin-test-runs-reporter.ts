@@ -1929,6 +1929,8 @@ export function isMissingConfigurationSnapshotColumn(error: unknown): boolean {
  * nothing said so until a bind found nothing to bind.
  */
 export const TEST_RUN_RECEIPT_ENV = 'PAPERCUSP_TEST_RUN_RECEIPT_FILE';
+/** Capture ordinary runs without enabling proof admission or changing write budgets. */
+export const TEST_RUN_RECOVERY_ENV = 'PAPERCUSP_TEST_RUN_RECOVERY_FILE';
 
 type ReceiptIdentifiedTestRunRow = TestRunRow & { receiptId: string; receiptAttempt: number };
 export type SerializedTestRunReceiptRow = Omit<ReceiptIdentifiedTestRunRow, 'startedAt' | 'finishedAt'> & {
@@ -2048,7 +2050,22 @@ export function latestTestRunReceipts(receiptLog: string, forReadback = false): 
     try { parsed = JSON.parse(line); } catch { continue; }
     if (!isTestRunReceipt(parsed)) continue;
     const prior = latest.get(parsed.receiptId);
-    if (prior?.outcome === 'inserted') continue;
+    if (prior?.outcome === 'inserted') {
+      // File success remains final; secondary acknowledgements may only improve
+      // for the same immutable row, id and attempt.
+      const cases = prior.row.cases?.length ?? 0;
+      const outcome = parsed.caseInsertOutcome;
+      const rowHash = receiptExecutionDetailsHash(prior.row);
+      if (parsed.outcome === 'inserted' && parsed.id === prior.id && parsed.attempt === prior.attempt
+        && parsed.filePath === prior.filePath && parsed.status === prior.status && cases > 0
+        && rowHash !== null && receiptExecutionDetailsHash(parsed.row) === rowHash
+        && outcome && Number.isSafeInteger(outcome.written) && Number.isSafeInteger(outcome.unwritten)
+        && outcome.written >= (prior.caseInsertOutcome?.written ?? 0) && outcome.unwritten >= 0
+        && outcome.written + outcome.unwritten === cases) {
+        latest.set(parsed.receiptId, { ...prior, caseInsertOutcome: outcome });
+      }
+      continue;
+    }
     // Destroying a connection after its waiter timed out does not prove that
     // PostgreSQL rolled the INSERT back. Preserve that same attempt's timeout
     // only for exact canonical readback; ordinary receipt readers still report
@@ -2212,36 +2229,71 @@ export function recoverTimedOutTestRunReceipts(
  * After the receipt-file wait, read the existing run group once and append an inserted receipt
  * only for exact, unique rows. The query and row count are bounded; failure remains fail-soft.
  */
-export async function reconcileTimedOutTestRunReceipts(
-  receiptLog: string,
-  options: {
+type TestRunReceiptReconciliationOptions = {
     expectedPaths: readonly string[];
     expectedRoot: string;
     runGroupId: string | null | undefined;
     env?: Readonly<Record<string, string | undefined>>;
     timeoutMs?: number;
-  },
+};
+
+/** File acknowledgement alone does not discharge captured secondary case results. */
+export function pendingTestRunRecoveryPaths(
+  receiptLog: string, expectedPaths: readonly string[], expectedRoot: string,
+): string[] {
+  const pending = new Set(missingTestRunReceiptPaths(receiptLog, expectedPaths, expectedRoot));
+  const expected = new Set(expectedPaths);
+  for (const receipt of latestTestRunReceipts(receiptLog)) {
+    const path = testRunReceiptPathForRoot(receipt, expectedRoot);
+    if (path && expected.has(path) && (receipt.row.cases?.length ?? 0) > 0
+      && (receipt.outcome !== 'inserted' || !receipt.caseInsertOutcome
+        || receipt.caseInsertOutcome.unwritten > 0)) pending.add(path);
+  }
+  return [...pending];
+}
+
+export async function reconcileTimedOutTestRunReceipts(
+  receiptLog: string, options: TestRunReceiptReconciliationOptions,
+): Promise<Extract<TestRunReceipt, { outcome: 'inserted' }>[]> {
+  // Reconciliation runs after the child exits, with its own bounded client lifetime.
+  const release = retainSharedPg();
+  try {
+    const pg = await tryGetPg();
+    return pg ? await reconcileTimedOutTestRunReceiptsWithSql(pg.sql, receiptLog, options) : [];
+  } finally {
+    await release();
+  }
+}
+
+/** Same exact readback seam with an injectable client for maintained regression tests. */
+export async function reconcileTimedOutTestRunReceiptsWithSql(
+  sql: PgSql, receiptLog: string, options: TestRunReceiptReconciliationOptions,
 ): Promise<Extract<TestRunReceipt, { outcome: 'inserted' }>[]> {
   const runGroupId = options.runGroupId?.trim();
   if (!runGroupId || !isAbsolute(options.expectedRoot) || options.expectedPaths.length === 0) return [];
   const missingPaths = new Set(options.expectedPaths.map(path => path.replaceAll('\\', '/')));
   const timedOutReceipts = latestTestRunReceipts(receiptLog, true).filter(receipt => {
-    if (receipt.outcome !== 'timeout'
-      || receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
+    if (receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
+    if (receipt.outcome !== 'timeout' && !(receipt.outcome === 'inserted'
+      && (receipt.row.cases?.length ?? 0) > 0
+      && (!receipt.caseInsertOutcome || receipt.caseInsertOutcome.unwritten > 0))) return false;
     const expectedPath = testRunReceiptPathForRoot(receipt, options.expectedRoot);
     return expectedPath !== null && missingPaths.has(expectedPath);
   });
   if (timedOutReceipts.length === 0
     || timedOutReceipts.length > TEST_RUN_RECEIPT_READBACK_MAX_RECEIPTS) return [];
 
-  const pg = await tryGetPg();
-  if (!pg) return [];
   try {
+    const requestedTimeout = options.timeoutMs;
+    const timeoutMs = Number.isSafeInteger(requestedTimeout) && requestedTimeout! > 0
+      ? Math.min(5_000, requestedTimeout!)
+      : TEST_RUN_RECEIPT_READBACK_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
     const filePaths = [...new Set(timedOutReceipts.map(receipt => receipt.row.filePath))];
     const maxRows = Math.min(TEST_RUN_RECEIPT_READBACK_MAX_ROWS, timedOutReceipts.length * 2 + 1);
     let readbacks: unknown = [];
     const query = trackSharedPgOperation(Promise.resolve().then(async () => {
-      readbacks = await pg.sql`
+      readbacks = await sql`
         SELECT id::text AS id,
           run_group_id AS "runGroupId",
           file_path AS "filePath",
@@ -2264,32 +2316,35 @@ export async function reconcileTimedOutTestRunReceipts(
           execution_details AS "executionDetails"
         FROM harness_shared.test_runs
         WHERE run_group_id = ${runGroupId}
-          AND file_path IN ${pg.sql(filePaths)}
+          AND file_path IN ${sql(filePaths)}
         ORDER BY id
         LIMIT ${maxRows}
       `;
     }).catch(() => { readbacks = []; }));
-    const requestedTimeout = options.timeoutMs;
-    const timeoutMs = Number.isSafeInteger(requestedTimeout) && requestedTimeout! > 0
-      ? Math.min(5_000, requestedTimeout!)
-      : TEST_RUN_RECEIPT_READBACK_TIMEOUT_MS;
     if (!await settleWithin(query, timeoutMs)) return [];
     const candidates = Array.isArray(readbacks)
       ? readbacks.filter((row): row is TestRunReceiptReadbackCandidate =>
           Boolean(row && typeof row === 'object'))
       : [];
     const recovered = recoverTimedOutTestRunReceipts(
-      timedOutReceipts,
+      timedOutReceipts.map(receipt => receipt.outcome === 'inserted'
+        ? { ...receipt, outcome: 'timeout' as const, reason: 'case_recovery_readback', replayable: false }
+        : receipt),
       candidates,
       runGroupId,
       candidates.length >= maxRows,
-    );
-    appendTestRunReceipts(options.env ?? process.env, recovered);
-    return recovered;
+    ).filter(receipt => {
+      const original = timedOutReceipts.find(source => source.receiptId === receipt.receiptId);
+      return original?.outcome !== 'inserted' || original.id === receipt.id;
+    });
+    const parents = recovered.flatMap(receipt => receipt.row.cases?.length
+      ? [{ testRunId: receipt.id, cases: receipt.row.cases }] : []);
+    const outcome = await insertTestCaseRowsWithSql(sql, parents, { deadline, insertTimeoutMs: timeoutMs });
+    const recorded = withTestCaseInsertOutcomes(recovered, parents, outcome) as Extract<TestRunReceipt, { outcome: 'inserted' }>[];
+    appendTestRunReceipts(options.env ?? process.env, recorded);
+    return recorded;
   } catch {
     return [];
-  } finally {
-    await closeSharedPgIfUnheld();
   }
 }
 
@@ -2297,7 +2352,7 @@ export function appendTestRunReceipts(
   env: Readonly<Record<string, string | undefined>>,
   receipts: readonly TestRunReceipt[],
 ): void {
-  const file = env[TEST_RUN_RECEIPT_ENV]?.trim();
+  const file = env[TEST_RUN_RECEIPT_ENV]?.trim() || env[TEST_RUN_RECOVERY_ENV]?.trim();
   if (!file || receipts.length === 0) return;
   try {
     appendFileSync(file, receipts.map((receipt) => `${JSON.stringify(receipt)}\n`).join(''));
@@ -2443,7 +2498,8 @@ export async function insertTestRunRowsWithSql(
   const identifiedRows = receiptIdentifiedRows(rows);
   // Keep delayed settlement on the evidence sink that belonged to this run,
   // even if another in-process runner changes its environment meanwhile.
-  const receiptEnv = { [TEST_RUN_RECEIPT_ENV]: process.env[TEST_RUN_RECEIPT_ENV] };
+  const receiptEnv = { [TEST_RUN_RECEIPT_ENV]: process.env[TEST_RUN_RECEIPT_ENV],
+    [TEST_RUN_RECOVERY_ENV]: process.env[TEST_RUN_RECOVERY_ENV] };
   const deadline = Date.now() + budget.totalInsertMs;
   let columns: readonly (typeof TEST_RUN_INSERT_COLUMNS)[number][] = TEST_RUN_INSERT_COLUMNS;
   // Case rows ride behind their file rows: collected per inserted batch, written once
@@ -2451,24 +2507,7 @@ export async function insertTestRunRowsWithSql(
   const caseParents: Array<{ testRunId: string; cases: readonly TestCaseRecord[] }> = [];
   const expectedCases = identifiedRows.reduce((total, row) => total + (row.cases?.length ?? 0), 0);
   const withCaseOutcomes = (sourceReceipts: TestRunReceipt[], outcome: TestCaseInsertOutcome): TestRunReceipt[] => {
-    // Case INSERTs consume this ordered population in sequential batches. Only
-    // the acknowledged prefix may be attributed back to individual file ids.
-    let acknowledged = outcome.written;
-    const reason = outcome.reason === null ? null : redactSensitiveText(outcome.reason).slice(0, 200);
-    const byId = new Map<string, TestCaseInsertOutcome>();
-    for (const parent of caseParents) {
-      const written = Math.min(acknowledged, parent.cases.length);
-      acknowledged -= written;
-      const unwritten = parent.cases.length - written;
-      byId.set(parent.testRunId, { written, unwritten, reason: unwritten ? reason : null });
-    }
-    return sourceReceipts.map(receipt => {
-      const expected = receipt.row.cases?.length ?? 0;
-      if (expected === 0) return receipt;
-      const inserted = receipt.outcome === 'inserted' ? byId.get(receipt.id) : undefined;
-      return { ...receipt, caseInsertOutcome: inserted ?? { written: 0, unwritten: expected,
-        reason: reason ?? 'file_insert_unacknowledged' } };
-    });
+    return withTestCaseInsertOutcomes(sourceReceipts, caseParents, outcome);
   };
   const finish = async (skipReason?: string): Promise<TestRunReceipt[]> => {
     if (expectedCases > 0) {
@@ -2796,6 +2835,30 @@ export function isMissingTestCaseRunsTable(error: unknown): boolean {
  * caller's deadline. Case rows are secondary evidence: they are attempted only after
  * every file row, and a failure here never touches the file rows' receipts (D-007).
  */
+function withTestCaseInsertOutcomes(
+  receipts: readonly TestRunReceipt[],
+  parents: ReadonlyArray<{ testRunId: string; cases: readonly TestCaseRecord[] }>,
+  outcome: TestCaseInsertOutcome,
+): TestRunReceipt[] {
+  // Only the acknowledged ordered prefix belongs to individual parent ids.
+  let acknowledged = outcome.written;
+  const reason = outcome.reason === null ? null : redactSensitiveText(outcome.reason).slice(0, 200);
+  const byId = new Map<string, TestCaseInsertOutcome>();
+  for (const parent of parents) {
+    const written = Math.min(acknowledged, parent.cases.length);
+    acknowledged -= written;
+    const unwritten = parent.cases.length - written;
+    byId.set(parent.testRunId, { written, unwritten, reason: unwritten ? reason : null });
+  }
+  return receipts.map(receipt => {
+    const expected = receipt.row.cases?.length ?? 0;
+    if (expected === 0) return receipt;
+    const inserted = receipt.outcome === 'inserted' ? byId.get(receipt.id) : undefined;
+    return { ...receipt, caseInsertOutcome: inserted ?? { written: 0, unwritten: expected,
+      reason: reason ?? 'file_insert_unacknowledged' } };
+  });
+}
+
 export async function insertTestCaseRowsWithSql(
   sql: PgSql,
   parents: ReadonlyArray<{ testRunId: string; cases: readonly TestCaseRecord[] }>,
