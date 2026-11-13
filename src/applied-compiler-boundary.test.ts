@@ -554,6 +554,67 @@ describe('maintained Vite applied compiler boundary', () => {
     expect(parseTestRunExecutionDetails(JSON.stringify(foreignFile))).toBeUndefined();
   }, 60_000);
 
+  it('execution-details JSON: real native-use receipts preserve matching origins and reject foreign origins', () => {
+    const runtime = nativeUseRuntime('native-use-execution-details');
+    const { receipts } = nativeUseRun(runtime, 'prewarm'), receipt = receipts[0]!;
+    expect(receipt.calls).toHaveLength(2);
+    const uses = receipt.calls.map(call => call.implementationInputs!.nativeUse!);
+    expect(uses.every(use => use !== undefined)).toBe(true);
+    if (process.platform === 'linux') {
+      expect(uses.map(use => use.status)).toEqual(['observed', 'observed']);
+      expect(uses[0]!.request!.serviceId).toBe(uses[1]!.request!.serviceId);
+      expect(uses[0]!.request!.requestId).not.toBe(uses[1]!.request!.requestId);
+    } else expect(uses.every(use => use.status !== 'observed')).toBe(true);
+
+    // Only the nested receipt is observed compiler evidence. Persisting this
+    // outer contract fixture establishes no VM/test-use or population custody.
+    const captureId = randomUUID(), testFile = join(runtime.root, 'native-use-record.test.ts');
+    const processIdentity = captureCurrentWorkerProcessIdentity();
+    const row: TestRunExecutionDetails = {
+      schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
+      root: runtime.root, filePath: 'native-use-record.test.ts', runGroupId: null,
+      workspaceId: null, harnessSlug: 'papercusp', testNamePattern: null,
+      passed: 1, failed: 0, skipped: 0, collectionFailed: false,
+      mutationPhase: null, commitSha: null, worktreeDirty: false,
+      workerExecution: { schemaVersion: 'worker-execution-v1', captureId, testFile,
+        before: processIdentity, after: processIdentity },
+      workerCompilerInputs: { schemaVersion: 'worker-compiler-inputs-v1',
+        scope: 'vitest-inlined-vm-calls', populationStatus: 'unknown', captureId, testFile,
+        inputSha256: null, vmCallCount: 0,
+        missing: ['transform-pipeline-unobserved', 'vm-options-partially-observed', 'vm-calls-unobserved'],
+        appliedCompilerInputs: receipt },
+    };
+    row.proofContext = captureRecordedProofContext(row);
+    const path = join(runtime.root, 'execution-details.json');
+    writeFileSync(path, JSON.stringify(row));
+    const json = readFileSync(path, 'utf8'), parsed = parseTestRunExecutionDetails(json);
+    expect(parsed).toBeDefined();
+    expect(parsed!.workerCompilerInputs).toEqual(row.workerCompilerInputs);
+    expect(parsed!.workerCompilerInputs!.appliedCompilerInputs!.calls
+      .map(call => call.implementationInputs!.nativeUse)).toEqual(uses);
+    expect(parsed!.proofContext!.components.compilerConfiguration).toBeNull();
+    expect(parsed!.workerCompilerInputs!.populationStatus).toBe('unknown');
+    expect(parsed!.workerCompilerInputs!.appliedCompilerInputs!.populationStatus).toBe('unknown');
+    expect(parsed!.workerCompilerInputs!.appliedCompilerInputs!.missing).toEqual(receipt.missing);
+    expect(receipt.missing).toContain('transitive-compiler-implementation-unobserved');
+    if (process.platform !== 'linux') return;
+
+    for (const [index, call] of receipt.calls.entries()) {
+      expect(uses[index]!.request!.image.origin).toEqual({
+        captureId: receipt.captureId, sequence: call.sequence, moduleId: call.moduleId });
+      for (const patch of [{ captureId: randomUUID() }, { sequence: call.sequence + 1 },
+        { moduleId: join(runtime.root, 'foreign.ts') }]) {
+        const foreign = JSON.parse(json) as TestRunExecutionDetails;
+        const foreignReceipt = foreign.workerCompilerInputs!.appliedCompilerInputs!;
+        Object.assign(foreignReceipt.calls[index]!.implementationInputs!.nativeUse!.request!.image.origin, patch);
+        // Origin custody is checked independently of the semantic input hash.
+        expect(foreignReceipt.calls[index]!.inputSha256).toBe(call.inputSha256);
+        expect(parseAppliedCompilerReceipt(foreignReceipt)).toBeUndefined();
+        expect(parseTestRunExecutionDetails(JSON.stringify(foreign))).toBeUndefined();
+      }
+    }
+  }, 60_000);
+
   it('implementation inputs: unavailable loaded source fails closed without changing the compiler result or invoking twice', async () => {
     const config = {}, environment = {};
     installAppliedCompilerInputCapture(config);
