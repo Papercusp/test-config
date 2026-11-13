@@ -71,12 +71,22 @@ export interface AppliedCompilerImplementationInputs {
   native: Readonly<{ path: string; sha256: string; byteLength: number;
     process: Readonly<{ pid: number; startTicks: string }>; argv: readonly string[];
     origin: Readonly<{ captureId: string; sequence: number; moduleId: string }> }> | null;
+  /** Current request use, separate from the original native spawn observation. */
+  nativeUse?: Readonly<AppliedCompilerNativeUse>;
+}
+
+type NativeImage = NonNullable<AppliedCompilerImplementationInputs['native']>;
+export interface AppliedCompilerNativeUse {
+  schemaVersion: 'esbuild-native-use-v1';
+  status: 'observed' | 'unobserved' | 'unavailable' | 'ambiguous';
+  request: Readonly<{ serviceId: string; requestId: number; image: NativeImage }> | null;
 }
 
 const MAX_IMPLEMENTATION_FILES = 64;
 const MAX_IMPLEMENTATION_BYTES = 16 * 1024 * 1024;
 function parseImplementationInputs(value: unknown): AppliedCompilerImplementationInputs | undefined {
-  if (!plain(value) || !keys(value, ['schemaVersion', 'status', 'selection', 'javascriptStatus', 'javascript', 'nativeStatus', 'native'])
+  if (!plain(value) || !keys(value, ['schemaVersion', 'status', 'selection', 'javascriptStatus', 'javascript', 'nativeStatus', 'native',
+    ...(Object.hasOwn(value, 'nativeUse') ? ['nativeUse'] : [])])
     || value.schemaVersion !== 'compiler-implementation-inputs-v1' || value.status !== 'partial'
     || value.selection !== 'vite-boundary-and-esbuild-cjs-cache'
     || !['captured', 'unavailable', 'ambiguous', 'truncated'].includes(value.javascriptStatus as string)
@@ -91,7 +101,22 @@ function parseImplementationInputs(value: unknown): AppliedCompilerImplementatio
   if (bytes > MAX_IMPLEMENTATION_BYTES || (value.javascriptStatus === 'captured' && !value.javascript.length)) return undefined;
   const native = value.native;
   if (value.nativeStatus !== 'observed') { if (native !== null) return undefined; }
-  else if (!plain(native) || !keys(native, ['path', 'sha256', 'byteLength', 'process', 'argv', 'origin'])
+  else if (!validNativeImage(native)) return undefined;
+  if (Object.hasOwn(value, 'nativeUse')) {
+    const use = value.nativeUse;
+    if (!plain(use) || !keys(use, ['schemaVersion', 'status', 'request']) || use.schemaVersion !== 'esbuild-native-use-v1'
+      || !['observed', 'unobserved', 'unavailable', 'ambiguous'].includes(use.status as string)) return undefined;
+    if (use.status !== 'observed') { if (use.request !== null) return undefined; }
+    else if (!plain(use.request) || !keys(use.request, ['serviceId', 'requestId', 'image'])
+      || typeof use.request.serviceId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(use.request.serviceId)
+      || !Number.isSafeInteger(use.request.requestId) || (use.request.requestId as number) < 0
+      || !validNativeImage(use.request.image)) return undefined;
+  }
+  return value as unknown as AppliedCompilerImplementationInputs;
+}
+
+function validNativeImage(native: unknown): native is NativeImage {
+  return !(!plain(native) || !keys(native, ['path', 'sha256', 'byteLength', 'process', 'argv', 'origin'])
     || !file(native.path) || !digest(native.sha256) || !Number.isSafeInteger(native.byteLength)
     || (native.byteLength as number) < 1 || (native.byteLength as number) > 64 * 1024 * 1024
     || !plain(native.process) || !keys(native.process, ['pid', 'startTicks'])
@@ -101,8 +126,7 @@ function parseImplementationInputs(value: unknown): AppliedCompilerImplementatio
     || typeof native.argv[1] !== 'string' || !/^--service=[0-9.]{1,64}$/.test(native.argv[1]) || native.argv[2] !== '--ping'
     || !plain(native.origin) || !keys(native.origin, ['captureId', 'sequence', 'moduleId']) || !file(native.origin.moduleId)
     || typeof native.origin.captureId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(native.origin.captureId)
-    || !Number.isSafeInteger(native.origin.sequence) || (native.origin.sequence as number) < 1) return undefined;
-  return value as unknown as AppliedCompilerImplementationInputs;
+    || !Number.isSafeInteger(native.origin.sequence) || (native.origin.sequence as number) < 1);
 }
 
 type JavascriptInputs = Pick<AppliedCompilerImplementationInputs, 'javascriptStatus' | 'javascript'>;
@@ -167,6 +191,24 @@ async function loadedJavascriptInputs(implementation: unknown): Promise<Javascri
 }
 
 const implementationCall = new AsyncLocalStorage<object>();
+const NATIVE_USE_OBSERVER = Symbol.for('@papercusp/test-config.esbuild-native-use-observer-v1');
+const nativeUseObservers = new WeakMap<object, Set<(event: unknown) => void>>();
+const serviceIdentities = new WeakMap<object, string>();
+function subscribeNativeUse(implementation: unknown, observe: (event: unknown) => void): (() => void) | undefined {
+  if (!plain(implementation)) return undefined;
+  let listeners = nativeUseObservers.get(implementation);
+  if (!listeners) {
+    if (Object.hasOwn(implementation, NATIVE_USE_OBSERVER)) return undefined;
+    listeners = new Set();
+    const registered = listeners;
+    Object.defineProperty(implementation, NATIVE_USE_OBSERVER, { value: (event: unknown) => {
+      for (const listener of registered) { try { listener(event); } catch { /* Diagnostics never change compilation. */ } }
+    } });
+    nativeUseObservers.set(implementation, listeners);
+  }
+  listeners.add(observe);
+  return () => { listeners.delete(observe); };
+}
 type ObservedChild = ChildProcess;
 const nativeServices = new WeakMap<Function, { child: ObservedChild; native: NonNullable<AppliedCompilerImplementationInputs['native']> }>();
 const childStartTicks = (pid: number) => readFileSync('/proc/' + pid + '/stat', 'utf8').split(') ').slice(1).join(') ').split(' ')[19];
@@ -233,8 +275,12 @@ function callHash(call: Omit<AppliedCompilerCall, 'inputSha256'>): string | null
     || (call.implementationInputs && call.implementationInputs.javascriptStatus !== 'captured')) return null;
   const inputs = call.implementationInputs;
   // PID/lifetime are custody, not semantic compiler inputs.
+  const semanticImage = (image: NativeImage | null) => image && {
+    path: image.path, sha256: image.sha256, byteLength: image.byteLength, argv: image.argv };
   const implementation = inputs && { ...inputs, native: inputs.native && {
-    path: inputs.native.path, sha256: inputs.native.sha256, byteLength: inputs.native.byteLength, argv: inputs.native.argv } };
+    path: inputs.native.path, sha256: inputs.native.sha256, byteLength: inputs.native.byteLength, argv: inputs.native.argv },
+    ...(inputs.nativeUse ? { nativeUse: { schemaVersion: inputs.nativeUse.schemaVersion, status: inputs.nativeUse.status,
+      image: semanticImage(inputs.nativeUse.request?.image ?? null) } } : {}) };
   return hashConfigurationValue([call.moduleId, call.codeSha256, call.optionsSha256,
     call.tsconfigStatus, call.tsconfigInputs, call.implementation,
     ...(call.tsconfigSearch ? [call.tsconfigSearch] : []), ...(implementation ? [implementation] : [])], 'vite-applied-esbuild-call-v1');
@@ -289,7 +335,11 @@ export function parseAppliedCompilerReceipt(value: unknown): AppliedCompilerRece
         || !implementation.functionHashes.every((fn, i) => plain(fn) && keys(fn, ['name', 'sha256'])
           && fn.name === FUNCTIONS[i] && digest(fn.sha256)))) return undefined;
       if (Object.hasOwn(call, 'tsconfigSearch') && !parseTsconfigSearch(call.tsconfigSearch)) return undefined;
-      if (Object.hasOwn(call, 'implementationInputs') && !parseImplementationInputs(call.implementationInputs)) return undefined;
+      const inputs = Object.hasOwn(call, 'implementationInputs') ? parseImplementationInputs(call.implementationInputs) : undefined;
+      if (Object.hasOwn(call, 'implementationInputs') && !inputs) return undefined;
+      const useOrigin = inputs?.nativeUse?.request?.image.origin;
+      if (useOrigin && (useOrigin.captureId !== value.captureId || useOrigin.sequence !== call.sequence
+        || useOrigin.moduleId !== call.moduleId)) return undefined;
       if (call.inputSha256 !== callHash(call as unknown as AppliedCompilerCall)) return undefined;
       if (Object.hasOwn(call, 'outcome')) {
         const outcome = call.outcome;
@@ -415,6 +465,37 @@ export function installAppliedCompilerInputCapture(config: object): boolean {
           const pendingSpawns: Array<{ child: ObservedChild; listener: () => void }> = [];
           const transform = plain(event.implementation) && plain(event.implementation.functions)
             ? event.implementation.functions.transform : undefined;
+          const esbuild = plain(event.implementation) ? event.implementation.esbuild : undefined;
+          let requests = 0, responses = 0, useUnavailable = false;
+          let useRequest: AppliedCompilerNativeUse['request'] = null;
+          const observeUse = (message: unknown) => {
+            try {
+              if (implementationCall.getStore() !== context || !plain(message) || message.implementation !== esbuild) return;
+              requests++;
+              if (requests !== 1 || message.version !== 1 || !plain(message.channel)
+                || !Number.isSafeInteger(message.requestId) || (message.requestId as number) < 0
+                || typeof message.register !== 'function') { useUnavailable = true; return; }
+              const { channel: service, requestId, child, register } = message;
+              const origin = { captureId, sequence: original.sequence, moduleId: original.moduleId };
+              const image = observedNative(child, original.implementation?.esbuildVersion ?? '', origin);
+              if (!image) useUnavailable = true;
+              let serviceId = serviceIdentities.get(service);
+              if (!serviceId) { serviceId = randomUUID(); serviceIdentities.set(service, serviceId); }
+              // Register at SEND. Stream delivery may run in another call's ALS
+              // context; this closure retains the exact channel/request origin.
+              register((reply: unknown) => {
+                try {
+                  responses++;
+                  if (responses !== 1 || !plain(reply) || reply.version !== 1 || reply.phase !== 'response'
+                    || reply.channel !== service || reply.requestId !== requestId || reply.child !== child
+                    || reply.implementation !== esbuild || !image) { useUnavailable = true; return; }
+                  const after = observedNative(child, original.implementation?.esbuildVersion ?? '', origin);
+                  if (!after || JSON.stringify(after) !== JSON.stringify(image)) { useUnavailable = true; return; }
+                  useRequest = Object.freeze({ serviceId: serviceId!, requestId: requestId as number, image });
+                } catch { useUnavailable = true; }
+              });
+            } catch { useUnavailable = true; }
+          };
           let unavailable = false, spawns = 0;
           const spawned = channel('tracing:child_process.spawn:end');
           const observeSpawn = (message: unknown) => {
@@ -438,10 +519,13 @@ export function installAppliedCompilerInputCapture(config: object): boolean {
             } catch { unavailable = true; }
           };
           let subscribed = false;
+          let unsubscribeUse: (() => void) | undefined;
           try {
             try { spawned.subscribe(observeSpawn); subscribed = true; } catch { unavailable = true; }
+            try { unsubscribeUse = subscribeNativeUse(esbuild, observeUse); } catch { useUnavailable = true; }
             return await implementationCall.run(context, invoke);
           } finally {
+            unsubscribeUse?.();
             if (subscribed) spawned.unsubscribe(observeSpawn);
             for (const { child, listener } of pendingSpawns) child.off('spawn', listener);
             let service = natives[0];
@@ -460,7 +544,11 @@ export function installAppliedCompilerInputCapture(config: object): boolean {
               schemaVersion: 'compiler-implementation-inputs-v1', status: 'partial',
               selection: 'vite-boundary-and-esbuild-cjs-cache', ...javascript,
               nativeStatus: spawns > 1 ? 'ambiguous' : unavailable ? 'unavailable' : service ? 'observed' : 'unobserved',
-              native: spawns <= 1 && !unavailable ? service?.native ?? null : null });
+              native: spawns <= 1 && !unavailable ? service?.native ?? null : null,
+              nativeUse: Object.freeze({ schemaVersion: 'esbuild-native-use-v1',
+                status: requests > 1 || responses > 1 ? 'ambiguous' : useUnavailable || (requests > 0 && !useRequest)
+                  ? 'unavailable' : useRequest ? 'observed' : 'unobserved',
+                request: requests === 1 && responses === 1 && !useUnavailable ? useRequest : null }) });
             const updated = { ...call, implementationInputs: inputs };
             original = Object.freeze({ ...updated, inputSha256: callHash(updated) });
             journal!.calls[original.sequence - 1] = original;
