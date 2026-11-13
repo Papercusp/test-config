@@ -149,6 +149,265 @@ describe('maintained Vite applied compiler boundary', () => {
         code: string; receipt: AppliedCompilerReceipt; warm: AppliedCompilerReceipt; originalUnchanged: boolean };
   }
 
+  function nativeUseRuntime(name: string, patched = true) {
+    const runtime = implementationRuntime(name);
+    if (patched) {
+      const patch = join(repoRoot, 'patches/esbuild+0.27.3.patch');
+      const source = readFileSync(patch, 'utf8'), hashes = /^index ([a-f0-9]+)\.\.([a-f0-9]+) /m.exec(source)!;
+      const main = join(runtime.esbuild, 'lib/main.js');
+      expect(hashes).not.toBeNull();
+      if (blobHash(readFileSync(main)) === hashes[2]) execFileSync('git', ['apply', '--reverse', patch], { cwd: runtime.vite });
+      expect(blobHash(readFileSync(main)), 'exact isolated esbuild donor').toBe(hashes[1]);
+      execFileSync('git', ['apply', '--check', patch], { cwd: runtime.vite });
+      execFileSync('git', ['apply', patch], { cwd: runtime.vite });
+      expect(blobHash(readFileSync(main))).toBe(hashes[2]);
+    }
+    return runtime;
+  }
+
+  function nativeUseRun(runtime: ReturnType<typeof implementationRuntime>, mode: string, native = '', decoy = '') {
+    const script = `
+      import { pathToFileURL } from 'node:url';
+      import { readFileSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      import { createRequire } from 'node:module';
+      import { channel } from 'node:diagnostics_channel';
+      import { once } from 'node:events';
+      const [entry, producer, root, mode, binary, decoyEntry] = process.argv.slice(1);
+      const { createServer } = await import(pathToFileURL(entry));
+      const { installAppliedCompilerInputCapture, readAppliedCompilerInputs } = await import(pathToFileURL(producer));
+      const esbuild = createRequire(pathToFileURL(entry))('esbuild');
+      const hook = Symbol.for('@papercusp/test-config.esbuild-native-use-observer-v1');
+      const output = { receipts: [], codes: [], deliveries: [], errors: [], snapshotsUnchanged: [] };
+      let child;
+      const spawned = message => { if (message.process.spawnargs?.some(arg => arg.startsWith('--service='))) child = message.process; };
+      const spawns = channel('tracing:child_process.spawn:end');
+      spawns.subscribe(spawned);
+      async function stop() {
+        const current = child;
+        // esbuild unrefs its child. Keep cleanup alive until the exit event;
+        // an await alone does not retain a Node event-loop handle.
+        current?.ref();
+        try {
+          await esbuild.stop();
+          if (current && current.exitCode === null && current.signalCode === null) await once(current, 'exit');
+        } finally { current?.unref(); }
+      }
+      async function compile(names) {
+        for (const name of names) writeFileSync(join(root, name), 'export const value: number = 1;');
+        const server = await createServer({ root, configFile: false, logLevel: 'silent', esbuild: { target: 'es2015' },
+          optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true, watch: null },
+          plugins: [{ name: 'native-use-control', configResolved: installAppliedCompilerInputCapture }] });
+        try {
+          const environment = server.environments.ssr;
+          let results;
+          if (mode === 'concurrent') results = await Promise.all(names.map(name => environment.transformRequest(join(root, name))));
+          else {
+            results = [];
+            let original, before;
+            for (const name of names) {
+              results.push(await environment.transformRequest(join(root, name)));
+              if (!original) { original = readAppliedCompilerInputs(environment); before = JSON.stringify(original); }
+            }
+            output.snapshotsUnchanged.push(JSON.stringify(original) === before);
+          }
+          output.codes.push(...results.map(result => result.code));
+          output.receipts.push(readAppliedCompilerInputs(environment));
+        } finally { await server.close(); }
+      }
+      let unrelated;
+      try {
+        if (mode === 'throwing') {
+          Object.defineProperty(esbuild, hook, { value: () => { throw new Error('observer failure'); } });
+          output.codes.push((await esbuild.transform('export const value: number = 1;', { loader: 'ts' })).code);
+          try { await esbuild.transform('const = invalid;', { loader: 'ts' }); } catch (error) { output.errors.push(error.message); }
+        } else if (mode === 'negative') {
+          // Negative adapter controls use an unpatched real compiler and
+          // explicit synthetic observation messages, never positive pipe proof.
+          await esbuild.transform('export const warm: number = 0;', { loader: 'ts' });
+          const realChild = child, service = {};
+          for (const control of ['unpatched', 'duplicate-request', 'missing-reply', 'closed', 'foreign-id', 'unavailable-image', 'duplicate-reply', 'foreign-export']) {
+            const config = {}, environment = {};
+            installAppliedCompilerInputCapture(config);
+            const observe = Object.getOwnPropertyDescriptor(config, Symbol.for('@papercusp/test-config.applied-compiler-observer-v1')).value;
+            const functions = Object.fromEntries(['loadTsconfigJsonForFile', 'parse', 'parseExtends', 'parseFile',
+              'resolveSolutionTSConfig', 'transform', 'transformWithEsbuild'].map(name => [name, name === 'transform' ? esbuild.transform : function measured() {}]));
+            const settle = observe({ version: 1, environment, moduleId: join(root, control + '.ts'), code: 'export const value: number = 1;',
+              options: { loader: 'ts' }, tsconfig: { status: 'not-used', inputs: [] },
+              implementation: { viteVersion: '7.3.5', esbuildVersion: esbuild.version, functions,
+                moduleUrl: pathToFileURL(join(entry, '../chunks/config.js')).href, esbuild } });
+            let invocations = 0;
+            const result = await settle.run(async () => {
+              invocations++;
+              const send = () => esbuild[hook]({ version: 1, channel: service, requestId: 7,
+                implementation: control === 'foreign-export' ? {} : esbuild,
+                child: control === 'unavailable-image' ? {} : realChild,
+                register(reply) {
+                  if (control === 'missing-reply') return;
+                  const response = { version: 1, phase: control === 'closed' ? 'closed' : 'response', channel: service,
+                    requestId: control === 'foreign-id' ? 8 : 7, implementation: esbuild, child: realChild };
+                  reply(response); if (control === 'duplicate-reply') reply(response);
+                } });
+              if (control !== 'unpatched') send();
+              if (control === 'duplicate-request') send();
+              return esbuild.transform('export const value: number = 1;', { loader: 'ts' });
+            });
+            await settle.run(() => { throw new Error('duplicate invocation'); });
+            if (invocations !== 1) throw new Error('compiler invoked more than once');
+            settle({ status: 'success', result });
+            output.codes.push(result.code); output.receipts.push(readAppliedCompilerInputs(environment));
+          }
+        } else if (mode === 'restart') {
+          const bytes = readFileSync(binary);
+          for (const suffix of ['', '\\nPAPERCUSP_NATIVE_USE_CONTROL\\n', '']) {
+            await stop();
+            writeFileSync(binary, Buffer.concat([bytes, Buffer.from(suffix)]), { mode: 0o755 });
+            await esbuild.transform('export const warm: number = 0;', { loader: 'ts' });
+            await compile(['input.ts']);
+          }
+        } else {
+          await esbuild.transform('export const warm: number = 0;', { loader: 'ts' });
+          if (mode === 'concurrent') {
+            unrelated = createRequire(import.meta.url)(decoyEntry);
+            globalThis[Symbol.for('papercusp.test.unrelated-esbuild')] = unrelated;
+            const queued = [];
+            // Deliberate fixture callback reversal, not production latency.
+            globalThis[Symbol.for('papercusp.test.esbuild-delivery')] = (id, deliver) => {
+              queued.push({ id, deliver });
+              if (queued.length === 2) for (const item of [...queued].reverse()) { output.deliveries.push(item.id); item.deliver(); }
+            };
+            await compile(['first.ts', 'second.ts']);
+          } else await compile(['first.ts', 'second.ts']);
+        }
+        process.stdout.write(JSON.stringify(output));
+      } finally {
+        spawns.unsubscribe(spawned);
+        if (unrelated) await unrelated.stop();
+        await stop();
+      }
+    `;
+    return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script,
+      join(runtime.vite, 'dist/node/index.js'), join(repoRoot, 'libs/test-config/src/applied-compiler-inputs.ts'),
+      runtime.root, mode, native, decoy], { encoding: 'utf8', timeout: 40_000, maxBuffer: 3 * 1024 * 1024,
+      env: { ...process.env, ...(native ? { ESBUILD_BINARY_PATH: native } : {}) } })) as {
+        receipts: AppliedCompilerReceipt[]; codes: string[]; deliveries: number[]; errors: string[]; snapshotsUnchanged: boolean[] };
+  }
+
+  it('native use: a prewarmed real service binds each current request without inventing a spawn', () => {
+    const runtime = nativeUseRuntime('native-use-prewarm');
+    const result = nativeUseRun(runtime, 'prewarm'), receipt = result.receipts[0]!;
+    expect(receipt.calls).toHaveLength(2);
+    const uses = receipt.calls.map(call => call.implementationInputs!.nativeUse!);
+    if (process.platform !== 'linux') { expect(uses.every(use => use.status !== 'observed')).toBe(true); return; }
+    expect(uses.map(use => use.status)).toEqual(['observed', 'observed']);
+    expect(receipt.calls.map(call => call.implementationInputs!.nativeStatus)).toEqual(['unobserved', 'unobserved']);
+    expect(uses[0]!.request!.serviceId).toBe(uses[1]!.request!.serviceId);
+    expect(uses[0]!.request!.requestId).not.toBe(uses[1]!.request!.requestId);
+    for (const [index, use] of uses.entries()) expect(use.request!.image.origin).toEqual({
+      captureId: receipt.captureId, sequence: index + 1, moduleId: receipt.calls[index]!.moduleId });
+    expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(receipt)))).toEqual(receipt);
+    expect(result.snapshotsUnchanged).toEqual([true]);
+    expect(receipt.populationStatus).toBe('unknown');
+    expect(receipt.missing).toContain('cached-module-test-custody-unobserved');
+  }, 60_000);
+
+  it('native use: concurrent real replies keep request custody under fixture reversal and an unrelated service', () => {
+    const runtime = nativeUseRuntime('native-use-concurrent'), decoy = nativeUseRuntime('native-use-decoy');
+    const main = join(runtime.esbuild, 'lib/main.js');
+    let source = readFileSync(main, 'utf8');
+    const original = '      if (packet.value.error) callback(packet.value.error, {}, true);\n      else callback(null, packet.value, true);';
+    expect(source.split(original)).toHaveLength(2);
+    source = source.replace(original, `      const deliver = () => { ${original} };
+      const delayed = globalThis[Symbol.for('papercusp.test.esbuild-delivery')];
+      if (typeof delayed === 'function') delayed(packet.id, deliver); else deliver();`);
+    source += `\nconst pcOriginalNativeUseTransform = transform;
+      transform = (input, options) => {
+        const unrelated = globalThis[Symbol.for('papercusp.test.unrelated-esbuild')];
+        if (unrelated) {
+          const hook = Symbol.for('@papercusp/test-config.esbuild-native-use-observer-v1');
+          if (!Object.hasOwn(unrelated, hook)) Object.defineProperty(unrelated, hook, { value: module.exports[hook] });
+          unrelated.transform('export const decoy: number = 2;', { loader: 'ts' }).catch(() => {});
+        }
+        return pcOriginalNativeUseTransform(input, options);
+      };\n`;
+    writeFileSync(main, source);
+    const result = nativeUseRun(runtime, 'concurrent', '', join(decoy.esbuild, 'lib/main.js'));
+    const receipt = result.receipts[0]!, uses = receipt.calls.map(call => call.implementationInputs!.nativeUse!);
+    expect(result.deliveries).toHaveLength(2);
+    expect(result.deliveries[0]).toBeGreaterThan(result.deliveries[1]!);
+    expect(uses).toHaveLength(2);
+    if (process.platform === 'linux') {
+      expect(uses.map(use => use.status)).toEqual(['observed', 'observed']);
+      expect(new Set(uses.map(use => use.request!.image.process.pid)).size).toBe(1);
+      expect(new Set(uses.map(use => use.request!.requestId)).size).toBe(2);
+      for (const [index, use] of uses.entries()) expect(use.request!.image.origin).toEqual({
+        captureId: receipt.captureId, sequence: index + 1, moduleId: receipt.calls[index]!.moduleId });
+    }
+    expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(receipt)))).toEqual(receipt);
+  }, 60_000);
+
+  it('native use: real A/B/A service stop and restart rotates image inputs while custody remains separate', () => {
+    const runtime = nativeUseRuntime('native-use-restart');
+    if (process.platform !== 'linux') { expect(nativeUseRun(runtime, 'prewarm').receipts[0]!.calls[0]!.implementationInputs!.nativeUse!.status).not.toBe('observed'); return; }
+    const seed = nativeUseRun(runtime, 'prewarm').receipts[0]!.calls[0]!.implementationInputs!.nativeUse!.request!;
+    const bytes = readFileSync(seed.image.path), binary = join(runtime.root, 'esbuild-native-use-control');
+    writeFileSync(binary, bytes, { mode: 0o755 });
+    const result = nativeUseRun(runtime, 'restart', binary), calls = result.receipts.map(receipt => receipt.calls[0]!);
+    const uses = calls.map(call => call.implementationInputs!.nativeUse!.request!);
+    expect(uses.map(use => use.image.sha256)).toEqual([hash(bytes), hash(Buffer.concat([bytes, Buffer.from('\nPAPERCUSP_NATIVE_USE_CONTROL\n')])), hash(bytes)]);
+    expect(new Set(uses.map(use => use.serviceId)).size).toBe(3);
+    expect(calls[0]!.inputSha256).not.toBe(calls[1]!.inputSha256);
+    expect(calls[0]!.inputSha256).toBe(calls[2]!.inputSha256);
+    expect(new Set(result.codes).size).toBe(1);
+    expect(result.snapshotsUnchanged).toEqual([true, true, true]);
+    expect(calls.every(call => call.implementationInputs!.nativeStatus === 'unobserved')).toBe(true);
+    for (const receipt of result.receipts) {
+      expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(receipt)))).toEqual(receipt);
+      expect(receipt.missing).toContain('transitive-compiler-implementation-unobserved');
+    }
+  }, 90_000);
+
+  it('native use: unsupported, missing, duplicate and foreign observations fail closed without changing compilation', () => {
+    const runtime = nativeUseRuntime('native-use-negative', false), result = nativeUseRun(runtime, 'negative');
+    expect(result.receipts.map(receipt => receipt.calls[0]!.implementationInputs!.nativeUse!.status)).toEqual([
+      'unobserved', 'ambiguous', 'unavailable', 'unavailable', 'unavailable', 'unavailable', 'ambiguous', 'unobserved']);
+    expect(result.receipts.every(receipt => receipt.calls[0]!.implementationInputs!.nativeUse!.request === null)).toBe(true);
+    expect(new Set(result.codes).size).toBe(1);
+    for (const receipt of result.receipts) expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(receipt)))).toEqual(receipt);
+    const throwing = nativeUseRun(nativeUseRuntime('native-use-throwing'), 'throwing');
+    expect(throwing.codes).toHaveLength(1);
+    expect(throwing.errors[0]).toContain('Transform failed');
+    const legacyConfig = {}, legacyEnvironment = {};
+    installAppliedCompilerInputCapture(legacyConfig);
+    const legacyObserve = Object.getOwnPropertyDescriptor(legacyConfig,
+      Symbol.for('@papercusp/test-config.applied-compiler-observer-v1'))!.value;
+    const legacyFunctions = Object.fromEntries(['loadTsconfigJsonForFile', 'parse', 'parseExtends', 'parseFile',
+      'resolveSolutionTSConfig', 'transform', 'transformWithEsbuild'].map(name => [name, function legacyFunction() {}]));
+    const legacySettle = legacyObserve({ version: 1, environment: legacyEnvironment,
+      moduleId: '/repo/legacy-native-use.ts', code: 'legacy', options: {}, tsconfig: { status: 'not-used', inputs: [] },
+      implementation: { viteVersion: 'legacy', esbuildVersion: 'legacy', functions: legacyFunctions } });
+    legacySettle({ status: 'success', result: { code: 'legacy' } });
+    const legacy = readAppliedCompilerInputs(legacyEnvironment)!;
+    expect(legacy.calls[0]!.implementationInputs).toBeUndefined();
+    expect(parseAppliedCompilerReceipt(JSON.parse(JSON.stringify(legacy)))).toEqual(legacy);
+    const receipt = nativeUseRun(nativeUseRuntime('native-use-origin'), 'prewarm').receipts[0]!;
+    if (process.platform === 'linux') {
+      for (const origin of [{ captureId: randomUUID() }, { sequence: 2 }, { moduleId: join(runtime.root, 'foreign.ts') }]) {
+        const changed = JSON.parse(JSON.stringify(receipt)) as AppliedCompilerReceipt;
+        Object.assign(changed.calls[0]!.implementationInputs!.nativeUse!.request!.image.origin, origin);
+        expect(parseAppliedCompilerReceipt(changed)).toBeUndefined();
+      }
+      const changed = JSON.parse(JSON.stringify(receipt)) as AppliedCompilerReceipt;
+      (changed.calls[0]!.implementationInputs!.nativeUse! as { status: string }).status = 'unavailable';
+      expect(parseAppliedCompilerReceipt(changed)).toBeUndefined();
+      for (const malformed of [{ schemaVersion: 'complete' }, { status: 'complete' }, { request: { requestId: -1 } }]) {
+        const bad = JSON.parse(JSON.stringify(receipt)) as AppliedCompilerReceipt;
+        Object.assign(bad.calls[0]!.implementationInputs!.nativeUse!, malformed);
+        expect(parseAppliedCompilerReceipt(bad)).toBeUndefined();
+      }
+    }
+  }, 90_000);
+
   it('implementation inputs: loaded transitive JS mutation rotates identity at equal versions and function text, not later disk bytes', () => {
     const runtime = implementationRuntime('implementation-js');
     const main = join(runtime.esbuild, 'lib/main.js');
