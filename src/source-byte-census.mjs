@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
-import { listFilesIncludingUntracked } from '../../../scripts/lib/tracked-files.mjs';
+import { listFilesIncludingUntracked } from './tracked-files.mjs';
 
 /** Return the complete, stable file manifest or null when coverage is uncertain. */
 export function captureSourceByteManifest(root) {
