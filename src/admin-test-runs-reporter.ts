@@ -56,7 +56,7 @@ import {
 } from './execution-details.ts';
 import { captureConfigurationSnapshot, readWorkerTestConfiguration, readViteTransformOptions, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
-import { listFilesIncludingUntracked } from '../../../scripts/lib/tracked-files.mjs';
+import { captureSourceByteManifest } from './source-byte-census.mjs';
 import { createSourceByteSnapshot, type SourceByteSnapshot, type RecordedSourceBytes } from './execution-details.ts';
 import { captureRecordedProofContext, parseRecordedWorkerRuntime, parseRecordedWorkerCompilerInputs, parseRecordedWorkerExecution, parseRecordedWorkerDatabaseReset, parseSubmoduleCheckoutStatus,
   type RecordedSubmoduleCheckout, type RecordedSourceSubmodules } from './execution-details.ts';
@@ -568,22 +568,70 @@ export interface WorktreeGitSnapshot {
 /** Complete source-byte measurement; partial census or concurrent writes stay unknown. */
 export function captureSourceByteSnapshot(root: string): SourceByteSnapshot | null {
   try {
-    const canonicalRoot = realpathSync(root);
-    const census = listFilesIncludingUntracked(canonicalRoot);
-    if (census.unscanned.length) return null;
-    const files = [...new Set(census.files as string[])].sort();
-    const hashFile = (file: string): string => {
-      const absolute = realpathSync(resolve(canonicalRoot, file));
-      if (!absolute.startsWith(canonicalRoot + sep)) throw new Error('source-path-escaped');
-      return createHash('sha256').update(readFileSync(absolute)).digest('hex');
-    };
-    const manifest = files.map(file => ({ path: file, sha256: hashFile(file) }));
-    const result = createSourceByteSnapshot(manifest);
-    const after = listFilesIncludingUntracked(canonicalRoot);
-    if (after.unscanned.length || JSON.stringify(files) !== JSON.stringify([...new Set(after.files as string[])].sort())
-      || manifest.some(file => hashFile(file.path) !== file.sha256)) return null;
-    return result;
+    const manifest = captureSourceByteManifest(root);
+    if (!manifest) return null;
+    return createSourceByteSnapshot(manifest);
   } catch { return null; }
+}
+
+export type SourceByteCensusWorkerFactory = (root: string) => Pick<Worker, 'once' | 'terminate'>;
+
+/**
+ * Keep the complete source census away from Vitest's reporter event loop. A
+ * deadline abort terminates the worker and settles this promise only after the
+ * worker has exited, so pendingPreparation retains ownership until the census
+ * is actually gone.
+ */
+export function captureSourceByteSnapshotInWorker(
+  root: string,
+  signal?: AbortSignal,
+  workerFactory: SourceByteCensusWorkerFactory = censusRoot => new Worker(
+    new URL('./source-byte-census-worker.mjs', import.meta.url),
+    { workerData: { root: censusRoot }, execArgv: [] },
+  ),
+): Promise<SourceByteSnapshot | null> {
+  if (signal?.aborted) return Promise.resolve(null);
+  return new Promise(resolvePromise => {
+    let worker: Pick<Worker, 'once' | 'terminate'>;
+    try { worker = workerFactory(root); }
+    catch { resolvePromise(null); return; }
+
+    let settled = false;
+    let aborting = false;
+    const cleanup = () => signal?.removeEventListener('abort', onAbort);
+    const settle = (snapshot: SourceByteSnapshot | null) => {
+      if (settled || aborting) return;
+      settled = true;
+      cleanup();
+      resolvePromise(snapshot);
+    };
+    const settleAfterAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolvePromise(null);
+    };
+    const onAbort = () => {
+      if (settled || aborting) return;
+      aborting = true;
+      try { void worker.terminate().then(settleAfterAbort, settleAfterAbort); }
+      catch { settleAfterAbort(); }
+    };
+
+    worker.once('message', message => {
+      if (settled || aborting) return;
+      const result = message as { type?: unknown; manifest?: unknown } | null;
+      if (result?.type !== 'result') return;
+      if (!Array.isArray(result.manifest)) { settle(null); return; }
+      try {
+        settle(createSourceByteSnapshot(result.manifest as Array<{ path: string; sha256: string }>));
+      } catch { settle(null); }
+    });
+    worker.once('error', () => settle(null));
+    worker.once('exit', () => settle(null));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }
 
 /**
@@ -913,7 +961,9 @@ export async function captureWorktreeSnapshot(
     signal?.throwIfAborted();
     const observed = await runGitWithRetry(run, 'git submodule status --recursive', root);
     signal?.throwIfAborted();
-    return { ...snapshot, submodules: parseSubmoduleCheckoutStatus(observed), sourceBytes: captureSourceByteSnapshot(root) };
+    const sourceBytes = await captureSourceByteSnapshotInWorker(root, signal);
+    signal?.throwIfAborted();
+    return { ...snapshot, submodules: parseSubmoduleCheckoutStatus(observed), sourceBytes };
   };
   if (existsSync(join(root, '.verifier-source.json'))) {
     try {

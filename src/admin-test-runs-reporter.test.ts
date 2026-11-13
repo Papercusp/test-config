@@ -28,6 +28,8 @@ import AdminTestRunsReporter, {
   buildOutputTail,
   captureWorktreeSnapshot,
   captureSourceByteSnapshot,
+  captureSourceByteSnapshotInWorker,
+  type SourceByteCensusWorkerFactory,
   collectModuleExecution,
   collectIsolatedRuntimeReceipts,
   collectBoundaryObservations,
@@ -105,6 +107,40 @@ describe('actual source-byte census', () => {
       symlinkSync('/etc/hostname', join(root, 'escaped'));
       expect(captureSourceByteSnapshot(root)).toBeNull();
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('returns the same complete manifest from the cancellable worker', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-source-bytes-worker-'));
+    const git = (...args: string[]) => execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
+    try {
+      git('init', '-q');
+      writeFileSync(join(root, 'tracked.ts'), 'export const tracked = 1;\n');
+      git('add', '-A');
+      git('-c', 'user.email=test@test', '-c', 'user.name=test', 'commit', '-qm', 'source');
+      writeFileSync(join(root, 'untracked.ts'), 'export const untracked = 2;\n');
+      await expect(captureSourceByteSnapshotInWorker(root))
+        .resolves.toEqual(captureSourceByteSnapshot(root));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('waits for an abandoned census worker to terminate before settling', async () => {
+    let finishTermination: ((exitCode: number) => void) | undefined;
+    const worker = {
+      once: vi.fn(),
+      terminate: vi.fn(() => new Promise<number>(resolve => { finishTermination = resolve; })),
+    };
+    const workerFactory = (() => worker) as unknown as SourceByteCensusWorkerFactory;
+    const controller = new AbortController();
+    let settled = false;
+    const pending = captureSourceByteSnapshotInWorker('/unused', controller.signal, workerFactory)
+      .then(result => { settled = true; return result; });
+
+    controller.abort();
+    expect(worker.terminate).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
+    finishTermination?.(1);
+    await expect(pending).resolves.toBeNull();
+    expect(settled).toBe(true);
   });
 });
 
