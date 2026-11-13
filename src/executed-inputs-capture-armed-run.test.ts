@@ -115,6 +115,7 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       expect(map.rows[0]?.opaqueReasons).toContain('fs-file-descriptor');
       expect(map.rows[0]?.opaqueReasons).toContain('fs-directory-cursor');
       expect(map.rows[0]?.opaqueReasons).toContain('fs-file-stream');
+      expect(map.rows[0]?.opaqueReasons).toContain('socket');
       const runtime = map.nativeRun.files[0]?.proof.inputs?.runtime;
       const options = map.nativeRun.files[0]?.proof.inputs?.testConfiguration;
       expect(options, 'original worker options must survive the actual handoff').toMatchObject({

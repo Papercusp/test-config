@@ -54,6 +54,8 @@ if (dir) {
     if (!directoryPrototype) throw new Error('directory-capture-unavailable');
     const readStreamPrototype = (cjs(fs).ReadStream as { prototype?: object } | undefined)?.prototype;
     if (!readStreamPrototype) throw new Error('file-stream-capture-unavailable');
+    const netSocketPrototype = (cjs(net).Socket as { prototype?: Record<string, unknown> } | undefined)?.prototype;
+    if (!netSocketPrototype) throw new Error('socket-capture-unavailable');
     installCapture(
       {
         fs: cjs(fs),
@@ -63,7 +65,7 @@ if (dir) {
         readStreamPrototype,
         childProcess: cjs(childProcess),
         workerThreads: cjs(workerThreads),
-        netSocketPrototype: (cjs(net).Socket as { prototype: Record<string, unknown> } | undefined)?.prototype,
+        netSocketPrototype,
         syncBuiltinESMExports,
       },
       root,

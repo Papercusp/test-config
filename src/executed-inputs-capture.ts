@@ -520,7 +520,20 @@ export function installCapture(targets: CaptureTargets, repoRoot: string): void 
       }
     }
   }
-  if (targets.netSocketPrototype) wrap(targets.netSocketPrototype, 'connect', opaque('socket'));
+  if (targets.netSocketPrototype) {
+    const prototype = targets.netSocketPrototype;
+    for (const name of ['connect', 'read', 'emit']) {
+      if (typeof prototype[name] !== 'function') throw new Error('socket-capture-unavailable');
+      // A connection and its buffered bytes can predate this file. Observe
+      // pulls and flowing data delivery using the current recorder, while
+      // leaving unrelated events (including stdio writes) alone.
+      wrap(prototype, name, name === 'emit' ? args => {
+        if (args[0] === 'data') state.current?.opaque.add('socket');
+      } : opaque('socket'));
+      if (!(prototype[name] as unknown as Record<symbol, unknown>)[WRAPPED])
+        throw new Error('socket-capture-unavailable');
+    }
+  }
   try {
     targets.syncBuiltinESMExports?.();
   } catch {

@@ -1,5 +1,6 @@
 import { createReadStream, readFileSync } from 'node:fs';
 import { open, opendir } from 'node:fs/promises';
+import { createConnection, createServer, type Socket, type AddressInfo } from 'node:net';
 import { expect, it, vi } from 'vitest';
 
 // Fixture test run by executed-inputs-capture-armed-run.test.ts inside a child vitest. It reads
@@ -16,6 +17,21 @@ async function readFixtureInput() {
   const entries = [];
   for await (const entry of directory) entries.push(entry.name);
   expect(entries).toContain('input.txt');
+  let peer: Socket | undefined;
+  const server = createServer(socket => { peer = socket; socket.end('socket-input'); });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const socket = createConnection((server.address() as AddressInfo).port, '127.0.0.1');
+  try {
+    const received: Buffer[] = [];
+    for await (const chunk of socket) received.push(chunk);
+    expect(Buffer.concat(received).toString()).toBe('socket-input');
+  } finally {
+    socket.destroy(); peer?.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 }
 it('reads one input file', readFixtureInput);
 

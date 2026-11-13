@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import nativeFs from 'node:fs';
+import nativeNet from 'node:net';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -434,6 +435,102 @@ describe('unmeasured filesystem input custody', () => {
       expect([first.toString(), second.toString(), third.toString()]).toEqual(['ab', 'cd', 'ef']);
       expect(endFile('/repo/test.ts')?.opaque).toContain('fs-file-descriptor');
     } finally { nativeFs.closeSync(fd); resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('captures preconnected buffered sockets across recorders and refuses source-only reuse', async () => {
+    resetCaptureForTests();
+    let peer: nativeNet.Socket | undefined;
+    const server = nativeNet.createServer(socket => { peer = socket; socket.end('abcdef'); });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address() as nativeNet.AddressInfo;
+    const socket = nativeNet.createConnection(address.port, '127.0.0.1');
+    const prototype = nativeNet.Socket.prototype;
+    const descriptors = Object.getOwnPropertyDescriptors(prototype);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.once('readable', resolve);
+        socket.once('error', reject);
+      });
+      // Real network bytes and the connection both precede capture. No new
+      // connect or kernel read is needed to consume the buffered input.
+      expect(socket.readableLength).toBe(6);
+      installCapture({ fs: {}, fsPromises: {}, childProcess: {},
+        netSocketPrototype: prototype as unknown as Record<string, unknown> }, '/repo');
+      const testFile = 'src/socket-input.test.ts';
+      beginFile();
+      expect(socket.read(2).toString()).toBe('ab');
+      const record = endFile(testFile)!;
+      expect(record.opaque).toContain('socket');
+      expect(JSON.stringify(record)).not.toContain(address.address);
+      beginFile();
+      expect(socket.read(2).toString()).toBe('cd');
+      expect(endFile('/repo/second-socket.test.ts')?.opaque).toContain('socket');
+      beginFile();
+      const chunks: Buffer[] = [];
+      for await (const chunk of socket) chunks.push(chunk);
+      expect(Buffer.concat(chunks).toString()).toBe('ef');
+      expect(endFile('/repo/iterator-socket.test.ts')?.opaque).toContain('socket');
+      const proof = { recordedSha: 'a'.repeat(40), recordedAtMs: 1, executedModules: [testFile], inputsCaptured: true,
+        runContext: 'local', runnerIdentity: 'measured-worker', readPaths: [], opaqueReasons: record.opaque };
+      const select = (opaqueReasons: string[]) => selectReusablePasses({ candidates: [testFile],
+        proofs: new Map([[testFile, { ...proof, opaqueReasons }]]), judgedSha: 'b'.repeat(40),
+        changedBetween: () => new Set<string>(), runContext: proof.runContext, runnerIdentity: proof.runnerIdentity });
+      expect(select([]).skip).toEqual([testFile]);
+      expect(select(record.opaque).skip).toEqual([]);
+    } finally {
+      socket.destroy(); peer?.destroy();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      for (const key of Reflect.ownKeys(prototype))
+        if (!Object.hasOwn(descriptors, key)) Reflect.deleteProperty(prototype, key);
+      Object.defineProperties(prototype, descriptors);
+      resetCaptureForTests();
+    }
+  });
+
+  it('preserves socket call receivers, returns and errors while ignoring non-data events', () => {
+    const value = Buffer.from('buffered'), error = new Error('original socket failure');
+    const calls: unknown[][] = [];
+    const prototype = {
+      connect(this: unknown, ...args: unknown[]) { calls.push([this, ...args]); return this; },
+      read(this: unknown, ...args: unknown[]) { calls.push([this, ...args]); return value; },
+      emit(this: unknown, ...args: unknown[]) {
+        calls.push([this, ...args]);
+        if (args[0] === 'error') throw error;
+        return true;
+      },
+    };
+    resetCaptureForTests();
+    installCapture({ fs: {}, fsPromises: {}, childProcess: {}, netSocketPrototype: prototype }, '/repo');
+    const socket = Object.create(prototype);
+    beginFile();
+    expect(socket.emit('drain')).toBe(true);
+    expect(() => socket.emit('error', error)).toThrow(error);
+    expect(endFile('/repo/non-data-socket.test.ts')?.opaque).toEqual([]);
+    beginFile(); expect(socket.connect(1234)).toBe(socket);
+    expect(endFile('/repo/connect-socket.test.ts')?.opaque).toEqual(['socket']);
+    beginFile(); expect(socket.read(8)).toBe(value);
+    expect(endFile('/repo/pull-socket.test.ts')?.opaque).toEqual(['socket']);
+    beginFile(); expect(socket.emit('data', value)).toBe(true);
+    expect(endFile('/repo/flow-socket.test.ts')?.opaque).toEqual(['socket']);
+    expect(calls).toEqual([[socket, 'drain'], [socket, 'error', error], [socket, 1234], [socket, 8], [socket, 'data', value]]);
+    resetCaptureForTests();
+  });
+
+  it('rejects missing or frozen socket seams and allows a later valid installation', () => {
+    const valid = () => ({ connect() {}, read() {}, emit() {} });
+    for (const prototype of [{}, Object.freeze(valid())]) {
+      resetCaptureForTests();
+      expect(() => installCapture({ fs: {}, fsPromises: {}, childProcess: {}, netSocketPrototype: prototype }, '/repo'))
+        .toThrow('socket-capture-unavailable');
+      const replacement = valid();
+      installCapture({ fs: {}, fsPromises: {}, childProcess: {}, netSocketPrototype: replacement }, '/repo');
+      beginFile(); replacement.read();
+      expect(endFile('/repo/recovered-socket.test.ts')?.opaque).toEqual(['socket']);
+    }
+    resetCaptureForTests();
   });
 
   it('captures preopened buffered file streams across recorders and refuses source-only reuse', async () => {
