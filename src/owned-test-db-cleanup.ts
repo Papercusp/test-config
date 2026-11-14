@@ -2,7 +2,7 @@
 import { appendFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { DropDatabaseWithLockOptions, TestDbDropResult } from './pg-migrate.ts';
+import type { DropDatabaseWithLockOptions, TestDbDropResult } from './test-db-drop.ts';
 
 export const OWNED_TEST_DB_DIR_ENV = 'PAPERCUSP_TEST_OWNED_DB_DIR';
 /** Shared by generated names, private receipts and the unmarked database janitor. */

@@ -56,6 +56,16 @@
       "import": "./src/pg.ts",
       "default": "./src/pg.ts"
     },
+    "./owned-test-db-cleanup": {
+      "types": "./src/owned-test-db-cleanup.ts",
+      "import": "./src/owned-test-db-cleanup.ts",
+      "default": "./src/owned-test-db-cleanup.ts"
+    },
+    "./test-db-drop": {
+      "types": "./src/test-db-drop.ts",
+      "import": "./src/test-db-drop.ts",
+      "default": "./src/test-db-drop.ts"
+    },
     "./baseline-schema-mutex": {
       "types": "./src/baseline-schema-mutex.ts",
       "import": "./src/baseline-schema-mutex.ts",
