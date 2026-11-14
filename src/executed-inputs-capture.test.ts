@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { selectReusablePasses } from '../../../scripts/lib/test-pass-reuse.mjs';
+import { hashConfigurationValue } from './configuration-snapshot.ts';
 import {
   PC_EXECUTED_INPUTS_DIR_ENV,
   beginFile,
@@ -185,11 +186,80 @@ describe('prospective evaluator inputs', () => {
       expect(receipt).toMatchObject({ scope: 'vitest-inlined-vm-calls', populationStatus: 'unknown',
         vmCallCount: 2, inputSha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
       expect(receipt.missing).toContain('transform-pipeline-unobserved');
-      expect(receipt.missing).toContain('vm-options-partially-observed');
-      const moved = { ...observation!, vmInputs: observation!.vmInputs!.map(row => ({ ...row, codeRef: '/moved/artifact.js' })) };
+      // Both calls passed plain data options, so each carries a complete options digest.
+      expect(receipt.missing).not.toContain('vm-options-partially-observed');
+      const moved ={ ...observation!, vmInputs: observation!.vmInputs!.map(row => ({ ...row, codeRef: '/moved/artifact.js' })) };
       expect(captureWorkerCompilerInputs(moved, receipt.captureId, receipt.testFile)?.inputSha256).toBe(receipt.inputSha256);
       const changed = { ...observation!, vmInputs: observation!.vmInputs!.map(row => ({ ...row, columnOffset: -30 })) };
       expect(captureWorkerCompilerInputs(changed, receipt.captureId, receipt.testFile)?.inputSha256).not.toBe(receipt.inputSha256);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('binds each VM call to a digest of its complete options without running option getters', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pc-vm-options-'));
+    const observe = (makeOptions: (id: string) => Record<string, unknown>) => {
+      const vmTarget = { runInThisContext(_code: unknown, options: Record<string, unknown>) {
+        // A VM or caller that changes its options afterwards must not rewrite the record.
+        options.columnOffset = 7;
+        return 'compiled';
+      } };
+      const evaluator = { runInlinedModule(_context: unknown, code: string, module: { id: string }) {
+        return vmTarget.runInThisContext(`'use strict';async (exports)=>{{${code}\n}}`, makeOptions(module.id));
+      } };
+      beginFile();
+      installModuleEvaluationCapture({ moduleRunner: { evaluator } }, root, vmTarget);
+      evaluator.runInlinedModule({}, 'return 1;', { id: '/repo/one.ts' });
+      const observation = endFile('/repo/test.ts')!.moduleEvaluations!;
+      return { observation, row: observation.vmInputs![0],
+        receipt: captureWorkerCompilerInputs(observation, '12345678-9abc-def0-1234-56789abcdef0', '/repo/test.ts')! };
+    };
+    try {
+      const plain = (id: string) => ({ filename: id, lineOffset: 0, columnOffset: -31 });
+      const base = observe(plain);
+      const equivalent = observe(id => ({ columnOffset: -31, lineOffset: 0, filename: id }));
+      // Recorded at the call: the later write to columnOffset is not what was compiled.
+      expect(base.row).toMatchObject({ filename: '/repo/one.ts', columnOffset: -31 });
+      expect(base.row?.optionsSha256).toBe(hashConfigurationValue(plain('/repo/one.ts'), 'node-vm-call-options-v1'));
+      expect(base.row?.optionsSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(equivalent.row?.optionsSha256).toBe(base.row?.optionsSha256);
+      expect(equivalent.receipt.inputSha256).toBe(base.receipt.inputSha256);
+      expect(base.receipt.missing).not.toContain('vm-options-partially-observed');
+
+      // An option other than filename and offsets changes the identity at fixed code.
+      const changed = observe(id => ({ ...plain(id), displayErrors: false }));
+      expect(changed.row).toMatchObject({ sha256: base.row!.sha256, columnOffset: -31 });
+      expect(changed.row?.optionsSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(changed.row?.optionsSha256).not.toBe(base.row?.optionsSha256);
+      expect(changed.receipt.inputSha256).not.toBe(base.receipt.inputSha256);
+
+      // A function cannot be identified by value: the call is kept and its options stay a named gap.
+      const unsupported = observe(id => ({ ...plain(id), importModuleDynamically: () => null }));
+      expect(unsupported.row).toMatchObject({ filename: '/repo/one.ts', sha256: base.row!.sha256 });
+      expect(unsupported.row).not.toHaveProperty('optionsSha256');
+      expect(unsupported.receipt.missing).toContain('vm-options-partially-observed');
+
+      // A getter is application code: it is never run and never read as a value.
+      let getterRuns = 0;
+      const accessor = observe(id => Object.defineProperty(plain(id), 'timeout',
+        { enumerable: true, configurable: true, get() { getterRuns++; return 5; } }));
+      expect(accessor.row).toMatchObject({ filename: '/repo/one.ts' });
+      expect(accessor.row).not.toHaveProperty('optionsSha256');
+      expect(accessor.receipt.missing).toContain('vm-options-partially-observed');
+      const hiddenName = observe(id => Object.defineProperty({ lineOffset: 0 } as Record<string, unknown>, 'filename',
+        { enumerable: true, configurable: true, get() { getterRuns++; return id; } }));
+      expect(hiddenName.row).toBeUndefined();
+      expect(hiddenName.receipt.missing).toContain('vm-calls-unobserved');
+      expect(getterRuns).toBe(0);
+
+      // A row stored before the options digest existed still recomputes to its original value.
+      const legacyRow = { ...base.row! };
+      delete legacyRow.optionsSha256;
+      const legacy = captureWorkerCompilerInputs({ ...base.observation, vmInputs: [legacyRow] },
+        base.receipt.captureId, base.receipt.testFile)!;
+      expect(legacy.inputSha256).toBe(createHash('sha256').update(JSON.stringify(['worker-compiler-inputs-v1',
+        [[0, '/repo/one.ts', 'runInThisContext', '/repo/one.ts', 0, -31, legacyRow.sha256, legacyRow.byteLength]]])).digest('hex'));
+      expect(legacy.inputSha256).not.toBe(base.receipt.inputSha256);
+      expect(legacy.missing).toContain('vm-options-partially-observed');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

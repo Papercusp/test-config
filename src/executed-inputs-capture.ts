@@ -25,6 +25,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { pinModuleState } from '@papercusp/module-singleton';
+import { hashConfigurationValue } from './configuration-snapshot.ts';
 
 // Keep the pre-install function: probing through the wrapped fs export would
 // recursively record the recorder's own path inspection.
@@ -72,6 +73,9 @@ export interface ModuleEvaluationObservation {
   /** Actual VM arguments correlated with an inlined evaluator invocation. */
   vmInputs?: Array<{ inputIndex: number; id: string; api: 'runInThisContext' | 'runInContext';
     filename: string; lineOffset?: number; columnOffset?: number;
+    /** Digest of the complete options object passed to this call. Absent when it
+     * holds a function, accessor or host object and so cannot be identified by value. */
+    optionsSha256?: string;
     sha256: string; byteLength: number; codeRef?: string }>;
   /** Evaluator calls only: Node may return cached exports or a Vitest stub. */
   externalCalls?: Array<{ id: string }>;
@@ -84,10 +88,15 @@ export function captureWorkerCompilerInputs(observation: ModuleEvaluationObserva
   captureId: string, testFile: string): import('./execution-details.ts').RecordedWorkerCompilerInputs | undefined {
   if (!observation) return undefined;
   const calls = observation.vmInputs ?? [];
-  const missing = new Set([...observation.reasons, 'transform-pipeline-unobserved', 'vm-options-partially-observed']);
+  const missing = new Set([...observation.reasons, 'transform-pipeline-unobserved']);
+  // Options are complete only when every observed call carries its own digest.
+  if (!calls.length || calls.some(row => !row.optionsSha256)) missing.add('vm-options-partially-observed');
   if (!calls.length) missing.add('vm-calls-unobserved');
+  // A row recorded before the options digest existed keeps its original tuple,
+  // so its stored inputSha256 still recomputes to the same value.
   const inputs = calls.map(row => [row.inputIndex, row.id, row.api, row.filename,
-    row.lineOffset ?? null, row.columnOffset ?? null, row.sha256, row.byteLength]);
+    row.lineOffset ?? null, row.columnOffset ?? null, row.sha256, row.byteLength,
+    ...(row.optionsSha256 ? [row.optionsSha256] : [])]);
   return { schemaVersion: 'worker-compiler-inputs-v1', scope: 'vitest-inlined-vm-calls', populationStatus: 'unknown',
     captureId, testFile: resolve(testFile), inputSha256: calls.length
       ? createHash('sha256').update(JSON.stringify(['worker-compiler-inputs-v1', inputs])).digest('hex') : null,
@@ -333,21 +342,34 @@ export function installModuleEvaluationCapture(mocker: unknown, artifactRoot?: s
         const active = state.evaluationContext.getStore();
         if (!active || active.recorder !== state.current) return;
         const observation = active.recorder.moduleEvaluations;
-        const code = args[0], options = args[api === 'runInContext' ? 2 : 1] as
-          { filename?: unknown; lineOffset?: unknown; columnOffset?: unknown } | undefined;
+        const code = args[0], options = args[api === 'runInContext' ? 2 : 1];
+        // Read own data properties only. A getter on the options object is
+        // application code and must not run inside this observer; an accessor
+        // filename therefore leaves the call unmatched.
+        const own = (key: string): unknown => {
+          if (!options || typeof options !== 'object') return undefined;
+          const property = Object.getOwnPropertyDescriptor(options, key);
+          return property && 'value' in property ? property.value : undefined;
+        };
         // Observe actual compiler arguments, never reconstruct a presumed wrapper.
         // The current Vitest writer supplies this filename and embeds the exact input.
         // A changed writer remains an explicit gap instead of silently matching.
         const filename = active.id.startsWith('mock:') ? active.id.slice(5) : active.id;
-        if (!observation || typeof code !== 'string' || options?.filename !== filename ||
+        if (!observation || typeof code !== 'string' || own('filename') !== filename ||
             !code.startsWith("'use strict';async (") || !code.endsWith(`${active.code}\n}}`)) return;
         if ((observation.vmInputs?.length ?? 0) >= 100_000) {
           if (!observation.reasons.includes('evaluator-observation-limit')) observation.reasons.push('evaluator-observation-limit');
           return;
         }
+        const lineOffset = own('lineOffset'), columnOffset = own('columnOffset');
+        // Digest the whole options object now, before the VM or its caller can
+        // change it. An option that cannot be identified by value yields no
+        // digest, which the compiler receipt reports as a named gap.
+        const optionsSha256 = hashConfigurationValue(options, 'node-vm-call-options-v1');
         observation.vmInputs?.push({ inputIndex: active.inputIndex, id: active.id, api, filename,
-          ...(typeof options.lineOffset === 'number' ? { lineOffset: options.lineOffset } : {}),
-          ...(typeof options.columnOffset === 'number' ? { columnOffset: options.columnOffset } : {}),
+          ...(typeof lineOffset === 'number' ? { lineOffset } : {}),
+          ...(typeof columnOffset === 'number' ? { columnOffset } : {}),
+          ...(optionsSha256 ? { optionsSha256 } : {}),
           ...retainEvaluationCode(code, active.recorder, observation) });
       });
     }
