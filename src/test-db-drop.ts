@@ -72,7 +72,7 @@ export async function markDatabaseDropDeferred(admin: SqlExecutor, name: string)
   }
 }
 
-type UncancellableDropOutcome = 'dropped' | 'detached';
+export type UncancellableDropOutcome = 'dropped' | 'detached';
 
 /** Issue one forced DROP that no timeout on this side can cancel. */
 export async function runUncancellableDrop(

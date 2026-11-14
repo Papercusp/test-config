@@ -31,6 +31,7 @@ import postgres from 'postgres';
 import {
   dropDatabaseWithLock as dropDatabaseWithLockCore,
   runUncancellableDrop,
+  type UncancellableDropOutcome,
   TEST_DB_DEFERRED_MARKER as CORE_TEST_DB_DEFERRED_MARKER,
   TEST_DB_DEFERRED_SWEEP_BUDGET_MS as CORE_TEST_DB_DEFERRED_SWEEP_BUDGET_MS,
   TEST_DB_DEFERRED_SWEEP_LIMIT as CORE_TEST_DB_DEFERRED_SWEEP_LIMIT,
