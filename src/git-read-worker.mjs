@@ -7,7 +7,7 @@ import { readlinkSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
 
 const { cmd, cwd, timeoutMs } = workerData;
-const summarizeStatus = cmd === 'git status --porcelain --untracked-files=all';
+const summarizeStatus = /^git status --porcelain --untracked-files=all(?: --ignore-submodules=none)?$/.test(cmd);
 const captureLimit = 1024 * 1024;
 // Trace2 gets its own pipe, so phase evidence never contaminates porcelain or
 // stderr. Respect an explicitly configured destination. Keep only bounded
