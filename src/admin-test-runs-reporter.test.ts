@@ -27,6 +27,7 @@ import AdminTestRunsReporter, {
   observeReporterStage,
   buildOutputTail,
   captureWorktreeSnapshot,
+  PARTITIONED_STATUS_GROUPS,
   captureSourceByteSnapshot,
   captureSourceByteSnapshotInWorker,
   type SourceByteCensusWorkerFactory,
@@ -4305,9 +4306,13 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore' });
     try {
       git('init', '-q');
+      const tracked = (index: number) => join(`pkg-${index % 4}`, `tracked-${String(index).padStart(4, '0')}.ts`);
+      for (let index = 0; index < 4; index++) mkdirSync(join(root, `pkg-${index}`));
+      mkdirSync(join(root, 'solo'));
       for (let index = 0; index < 520; index++)
-        writeFileSync(join(root, `tracked-${String(index).padStart(4, '0')}.ts`), `export const n = ${index};`);
+        writeFileSync(join(root, tracked(index)), `export const n = ${index};`);
       writeFileSync(join(root, ':(glob)literal.ts'), 'export const literal = true;');
+      writeFileSync(join(root, 'solo', 'only.ts'), 'export const only = true;');
       git('add', '--', '.');
       git('-c', 'user.name=Reporter fixture', '-c', 'user.email=reporter@example.test', 'commit', '-qm', 'fixture');
 
@@ -4315,26 +4320,35 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
       vi.stubEnv('PC_TEST_REAL_GIT', realGit);
       vi.stubEnv('PC_TEST_STATUS_LOG', log);
       setRunRoot(root);
+      // EI-28118730753605868: pathspecs are TOP-LEVEL names in at most PARTITIONED_STATUS_GROUPS
+      // processes. Literal 512-path chunks made status O(index x paths) per chunk — quadratic in tree
+      // size — so one call carrying hundreds of literal paths is the regression this pins.
+      const STATUS_ARGS = 5; // --literal-pathspecs status --porcelain --untracked-files=all --
       const clean = await captureWorktreeSnapshot(undefined, undefined, undefined, false);
       expect(clean.commit).toMatch(/^[a-f0-9]{40}$/);
       expect(clean.porcelain).toBe('');
       const cleanCalls = readFileSync(log, 'utf8').trim().split('\n').map(Number);
       expect(cleanCalls.length).toBeGreaterThan(1);
-      expect(cleanCalls.every(argumentCount => argumentCount <= 517)).toBe(true);
+      expect(cleanCalls.length).toBeLessThanOrEqual(PARTITIONED_STATUS_GROUPS);
+      expect(cleanCalls.reduce((sum, argumentCount) => sum + argumentCount - STATUS_ARGS, 0)).toBe(6);
 
       writeFileSync(log, '');
-      writeFileSync(join(root, 'tracked-0001.ts'), 'export const n = 9001;');
+      writeFileSync(join(root, tracked(1)), 'export const n = 9001;');
       writeFileSync(join(root, ':(glob)literal.ts'), 'export const literal = false;');
       writeFileSync(join(root, 'untracked.ts'), 'export const fresh = true;');
-      git('rm', '--quiet', '--', 'tracked-0519.ts');
+      git('rm', '--quiet', '--', tracked(519));
+      git('rm', '--quiet', '--', join('solo', 'only.ts'));
       const dirty = await captureWorktreeSnapshot(undefined, undefined, undefined, false);
       expect(dirty.porcelain).toContain('tracked-0001.ts');
       expect(dirty.porcelain).toContain(':(glob)literal.ts');
       expect(dirty.porcelain).toContain('untracked.ts');
       expect(dirty.porcelain).toContain('tracked-0519.ts');
+      expect(dirty.porcelain).toContain('solo/only.ts');
+      expect(dirty.porcelain?.split('\n')).toHaveLength(5);
       const dirtyCalls = readFileSync(log, 'utf8').trim().split('\n').map(Number);
       expect(dirtyCalls.length).toBeGreaterThan(1);
-      expect(dirtyCalls.every(argumentCount => argumentCount <= 517)).toBe(true);
+      expect(dirtyCalls.length).toBeLessThanOrEqual(PARTITIONED_STATUS_GROUPS);
+      expect(dirtyCalls.reduce((sum, argumentCount) => sum + argumentCount - STATUS_ARGS, 0)).toBe(7);
     } finally {
       setRunRoot(null);
       vi.unstubAllEnvs();

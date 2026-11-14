@@ -907,8 +907,11 @@ export default class ExecutedSourceMapReporter implements Reporter {
       let collectionImports: Record<string, ImportDurationLike> | undefined;
       try { collectionImports = testModule.diagnostic().importDurations as typeof collectionImports; } catch { /* unknown */ }
       const inputs = readInputsRecord(this.inputsDir, testModule.moduleId);
-      const viteTransformOptions = readViteTransformOptions(testModule.viteEnvironment);
-      const appliedCompilerInputs = readAppliedCompilerInputs(testModule.viteEnvironment);
+      // The Vite environment is read only when a captured compiler-input record exists to bind it to:
+      // with neither the OUT channel nor input capture armed, module end must do no graph work.
+      const bindsCompilerInputs = Boolean(inputs?.compilerInputs);
+      const viteTransformOptions = bindsCompilerInputs ? readViteTransformOptions(testModule.viteEnvironment) : undefined;
+      const appliedCompilerInputs = bindsCompilerInputs ? readAppliedCompilerInputs(testModule.viteEnvironment) : undefined;
       if (inputs?.compilerInputs && (viteTransformOptions || appliedCompilerInputs))
         inputs.compilerInputs = { ...inputs.compilerInputs,
           ...(viteTransformOptions ? { viteTransformOptions } : {}),

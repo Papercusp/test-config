@@ -735,6 +735,30 @@ export function runGit(
   });
 }
 
+/** Parallel status processes per snapshot. Each one reads the whole index, so this is also the fixed-cost multiplier. */
+export const PARTITIONED_STATUS_GROUPS = 8;
+
+/**
+ * Groups the snapshot's paths by TOP-LEVEL name into at most N bins balanced by file count
+ * (node -e, so NUL-separated byte paths survive intact). Pathspecs are top-level names, never
+ * literal file lists: git matches every index entry against every pathspec, so a status over K
+ * literal paths costs O(index x K) and 512-path chunks made the whole snapshot quadratic in tree
+ * size (EI-28118730753605868: 47k files = 92 chunks, 11-47s against the 2s/8s budgets, vs ~1.5s
+ * whole-tree). Top-level groups keep the parallel refresh EI-27987532442733865 needed for
+ * stat-invalidated clones at near whole-tree cost. Double quotes only: it runs inside sh '...'.
+ */
+const PARTITION_GROUPING_SCRIPT = [
+  'const fs=require("fs");const [src,dir,n]=process.argv.slice(1);const counts=new Map();',
+  'for(const p of fs.readFileSync(src,"latin1").split("\\0")){if(!p)continue;const i=p.indexOf("/");',
+  'const top=i<0?p:p.slice(0,i);counts.set(top,(counts.get(top)||0)+1);}',
+  'const bins=Array.from({length:Number(n)},()=>({load:0,names:[]}));',
+  'for(const [top,c] of [...counts].sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:a[0]>b[0]?1:0))){',
+  'const bin=bins.reduce((m,b)=>b.load<m.load?b:m);bin.load+=c;bin.names.push(top);}',
+  'bins.forEach((b,i)=>{if(b.names.length)fs.writeFileSync(dir+"/g"+i,b.names.join("\\0")+"\\0","latin1");});',
+].join('');
+
+const shellQuote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'";
+
 function partitionedGitStatusScript(statusCommand: string, tempDir: string): string {
   const ignoreSubmodules = statusCommand.includes('--ignore-submodules=none') ? ' --ignore-submodules=none' : '';
   const pathsFile = join(tempDir, 'paths');
@@ -744,13 +768,29 @@ function partitionedGitStatusScript(statusCommand: string, tempDir: string): str
     'set -eu',
     'paths=' + pathsFile,
     'status=' + statusFile,
-    "trap 'rm -f \"$paths\" \"$status\"' 0 HUP INT TERM",
+    'groups=' + shellQuote(join(tempDir, 'groups')),
+    "trap 'rm -rf \"$paths\" \"$status\" \"$groups\"' 0 HUP INT TERM",
     'git ls-files --cached --others --exclude-standard -z > "$paths"',
     'if git rev-parse --verify -q HEAD >/dev/null 2>&1; then',
     '  git diff --cached --no-renames --diff-filter=D --name-only -z HEAD >> "$paths"',
     'fi',
     'if [ -s "$paths" ]; then',
-    '  xargs -0 -n 512 -s 65536 -P 8 git --literal-pathspecs status --porcelain --untracked-files=all' + ignoreSubmodules + ' -- < "$paths" > "$status"',
+    '  mkdir "$groups"',
+    '  ' + shellQuote(process.execPath) + ' -e ' + shellQuote(PARTITION_GROUPING_SCRIPT)
+      + ' "$paths" "$groups" ' + PARTITIONED_STATUS_GROUPS,
+    "  pids=''",
+    '  for group in "$groups"/g*; do',
+    '    [ -f "$group" ] || continue',
+    '    xargs -0 -n 512 -s 65536 git --literal-pathspecs status --porcelain --untracked-files=all' + ignoreSubmodules
+      + ' -- < "$group" > "$group.out" &',
+    '    pids="$pids $!"',
+    '  done',
+    // `set -e` turns any failed group into a failed snapshot: missing proof stays dirty, never clean.
+    '  for pid in $pids; do wait "$pid"; done',
+    '  : > "$status"',
+    '  for index in $(seq 0 ' + (PARTITIONED_STATUS_GROUPS - 1) + '); do',
+    '    if [ -f "$groups/g$index.out" ]; then cat "$groups/g$index.out" >> "$status"; fi',
+    '  done',
     'fi',
     'if [ -s "$status" ]; then',
     '  bytes=$(wc -c < "$status" | xargs)',
