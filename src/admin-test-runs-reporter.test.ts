@@ -1894,7 +1894,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         ], 'group-a')).toEqual([]);
       });
 
-      it('replays a first pre-submit PG setup failure only after an exact empty readback', async () => {
+      it.each(['pg-setup', 'terminal-queue'] as const)(
+        'recovers a first pre-submit %s receipt only after an exact empty readback', async phase => {
         const directory = mkdtempSync(join(tmpdir(), 'test-run-setup-replay-'));
         const receiptFile = join(directory, 'receipts.jsonl');
         const runContext = {
@@ -1903,8 +1904,10 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           loopLagP95Ms: 2, rssMb: 100, configurationSnapshot: captureConfigurationSnapshot({}),
         };
         const setupFailure: TestRunReceipt = {
-          ...base, outcome: 'failed', reason: 'pg_unavailable', replayable: true,
-          pgSetupFailure: { phase: 'client-construction', code: 'ECONNREFUSED' }, runContext,
+          ...base, outcome: 'failed', replayable: true, runContext,
+          ...(phase === 'pg-setup'
+            ? { reason: 'pg_unavailable', pgSetupFailure: { phase: 'client-construction' as const, code: 'ECONNREFUSED' } }
+            : { reason: 'terminal_queue_not_submitted' }),
         };
         const statements: string[] = [];
         const insertedRows: Record<string, unknown>[][] = [];
@@ -1947,10 +1950,13 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         }
       });
 
-      it('does not replay when a matching path has a pending insert or ambiguous ledger readback', async () => {
+      it.each(['pg-setup', 'terminal-queue'] as const)(
+        'does not recover %s when a matching path has a pending insert or ambiguous ledger readback', async phase => {
         const setupFailure: TestRunReceipt = {
-          ...base, outcome: 'failed', reason: 'pg_unavailable', replayable: true,
-          pgSetupFailure: { phase: 'module-import' },
+          ...base, outcome: 'failed', replayable: true,
+          ...(phase === 'pg-setup'
+            ? { reason: 'pg_unavailable', pgSetupFailure: { phase: 'module-import' as const } }
+            : { reason: 'terminal_queue_not_submitted' }),
           runContext: {
             branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: 'group-a',
             harnessSlug: 'papercusp', workspaceId: 'workspace-a', loopLagP95Ms: null, rssMb: null,
@@ -1965,6 +1971,11 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           { log: JSON.stringify(setupFailure), rows: [candidate, { ...candidate, id: '902' }] },
           { log: JSON.stringify(setupFailure), rows: [{ ...candidate, commitSha: 'other', detailsCommitSha: 'other' }] },
           { log: [setupFailure, pending].map(receipt => JSON.stringify(receipt)).join('\n'), rows: [] },
+          { log: [setupFailure, { ...setupFailure, receiptId: 'receipt-duplicate',
+            row: { ...setupFailure.row, receiptId: 'receipt-duplicate' } }].map(receipt => JSON.stringify(receipt)).join('\n'), rows: [] },
+          { log: JSON.stringify({ ...setupFailure, attempt: 1,
+            row: { ...setupFailure.row, receiptAttempt: 1 } }), rows: [] },
+          { log: JSON.stringify({ ...setupFailure, runContext: undefined }), rows: [] },
         ];
         for (const scenario of scenarios) {
           const statements: string[] = [];
@@ -1981,6 +1992,23 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           expect(statements[0]).toContain('FROM harness_shared.test_runs');
         }
       });
+
+      it.each(['interim_flush_incomplete', 'interim_flush_finalization_deadline', 'flush_budget_5000ms'])(
+        'never replays a historical or possibly submitted %s receipt', async reason => {
+          const original: TestRunReceipt = { ...base, outcome: 'timeout', reason, replayable: false };
+          const queries: string[] = [];
+          const sql = Object.assign((first: unknown) => {
+            if (Array.isArray(first) && !('raw' in first)) return {};
+            queries.push((first as TemplateStringsArray).join('?'));
+            return Promise.resolve([]);
+          }, { end: async () => undefined }) as unknown as PgSql;
+          expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, JSON.stringify(original), {
+            expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a', env: {},
+          })).toEqual([]);
+          expect(queries).toHaveLength(1);
+          expect(queries[0]).toContain('FROM harness_shared.test_runs');
+        },
+      );
 
       it.each([
         ['a definite pre-submit failure', { errorCode: 'CONNECT_TIMEOUT', replayable: true }],
@@ -3115,7 +3143,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     }
   });
 
-  it('EI-26701962157024953: a timed-out interim writer never overlaps final persistence', async () => {
+  it.each([false, true])(
+    'EI-26701962157024953: a timed-out interim writer never overlaps final persistence (already expired %s)', async expired => {
     const dir = mkdtempSync(join(tmpdir(), 'reporter-interim-timeout-'));
     const receiptPath = join(dir, 'receipts.jsonl');
     const previous = process.env[TEST_RUN_RECEIPT_ENV];
@@ -3134,14 +3163,24 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(writeRows).toHaveBeenCalledTimes(1);
       reporter.onTestModuleEnd(module('passed') as never);
+      if (expired) await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs);
       const final = reporter.onTestRunEnd();
       await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs);
       expect(writeRows).toHaveBeenCalledTimes(1);
+      // The reporter retains the actual in-flight writer through PG release;
+      // unblock it only after observing that no terminal INSERT overlapped it.
+      release();
+      await vi.advanceTimersByTimeAsync(0);
       await final;
       const receipts = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(receipts).toEqual(expect.arrayContaining([
-        expect.objectContaining({ filePath: expect.stringMatching(/passed\.test\.ts$/), outcome: 'timeout' }),
+        expect.objectContaining({ filePath: expect.stringMatching(/passed\.test\.ts$/),
+          outcome: 'failed', reason: 'terminal_queue_not_submitted', replayable: true,
+          attempt: 0, runContext: expect.objectContaining({ configurationSnapshot: expect.any(Object) }) }),
       ]));
+      const queued = receipts.find(receipt => receipt.filePath.endsWith('/passed.test.ts'));
+      expect(queued.insertDiagnostics).toBeUndefined();
+      expect(queued.row).toMatchObject({ commitSha: null, worktreeDirty: true });
     } finally {
       release();
       await vi.runAllTimersAsync();

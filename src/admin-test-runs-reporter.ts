@@ -2034,7 +2034,7 @@ export type TestRunReceiptBase = {
   filePath: string;
   status: string;
   row: SerializedTestRunReceiptRow;
-  /** Original non-secret writer context needed to replay a proven pre-submit setup failure. */
+  /** Original non-secret writer context needed to recover a proven unsubmitted row. */
   runContext?: TestRunInsertContext;
   /** Client observations, not server execution or commit timestamps. */
   insertDiagnostics?: TestRunInsertDiagnostics;
@@ -2365,7 +2365,11 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
   if (!runGroupId || !isAbsolute(options.expectedRoot) || options.expectedPaths.length === 0) return [];
   const missingPaths = new Set(options.expectedPaths.map(path => path.replaceAll('\\', '/')));
   const latestReceipts = latestTestRunReceipts(receiptLog, true);
+  const setupReceipts = latestReceipts.filter(receipt =>
+    isPreSubmitPgSetupReceipt(receipt, missingPaths, options.expectedRoot, runGroupId));
+  const unsubmittedIds = new Set(setupReceipts.map(receipt => receipt.receiptId));
   const timedOutReceipts = latestReceipts.filter(receipt => {
+    if (unsubmittedIds.has(receipt.receiptId)) return false;
     if (receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
     if (receipt.outcome !== 'timeout' && !(receipt.outcome === 'inserted'
       && (receipt.row.cases?.length ?? 0) > 0
@@ -2373,8 +2377,6 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
     const expectedPath = testRunReceiptPathForRoot(receipt, options.expectedRoot);
     return expectedPath !== null && missingPaths.has(expectedPath);
   });
-  const setupReceipts = latestReceipts.filter(receipt =>
-    isPreSubmitPgSetupReceipt(receipt, missingPaths, options.expectedRoot, runGroupId));
   const readbackReceipts: TestRunReceipt[] = [
     ...timedOutReceipts,
     ...setupReceipts.map(receipt => ({ ...receipt, outcome: 'timeout' as const,
@@ -2562,7 +2564,7 @@ type TestRunInsertContext = {
 type PgSetupFailureReceipt = TestRunReceiptBase & {
   outcome: 'failed';
   reason: string;
-  pgSetupFailure: PgSetupFailure;
+  pgSetupFailure?: PgSetupFailure;
   replayable: boolean;
 };
 
@@ -2578,8 +2580,10 @@ function isPreSubmitPgSetupReceipt(
   expectedRoot: string,
   runGroupId: string,
 ): receipt is PgSetupFailureReceipt {
-  if (receipt.outcome !== 'failed' || receipt.reason !== 'pg_unavailable'
-    || !isPreSubmitPgSetupFailure(receipt.pgSetupFailure)
+  if (receipt.outcome !== 'failed'
+    || !(receipt.reason === 'pg_unavailable' && isPreSubmitPgSetupFailure(receipt.pgSetupFailure)
+      || receipt.reason === 'terminal_queue_not_submitted' && receipt.replayable
+        && receipt.insertDiagnostics === undefined && receipt.pgSetupFailure === undefined)
     || receipt.row.receiptId !== receipt.receiptId || receipt.row.receiptAttempt !== receipt.attempt
     || receipt.row.filePath !== receipt.filePath || receipt.row.status !== receipt.status
     || receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
@@ -3527,6 +3531,9 @@ export default class AdminTestRunsReporter implements Reporter {
    * A database write deadline must not abandon that reader before it writes. */
   private pendingPreparation: Promise<TestRunRow[]> | null = null;
   private finalizationDeadlineMs: number | null = null;
+  /** Freeze attribution before tests can change process.env; never infer a
+   * committed source for terminal rows whose provenance was not prepared. */
+  private unsubmittedContext: TestRunInsertContext | null = null;
   /** EI-18767688096795873: computed once in onInit from the run's resolved
    *  config file — see computeIsScratchConfig / isScratchConfigFile. */
   private isScratchConfig = false;
@@ -3683,6 +3690,14 @@ export default class AdminTestRunsReporter implements Reporter {
         testLayer: (ctx?.config?.provide as Record<string, unknown> | undefined)?.papercuspTestLayer }),
       mutationPhase: resolveMutationProbePhase(),
     };
+    this.unsubmittedContext = {
+      branch: null, inferredCommit: null, declaredSource: resolveTestRunSource(),
+      runGroupId: this.executionContext.runGroupId,
+      harnessSlug: this.executionContext.harnessSlug,
+      workspaceId: this.executionContext.workspaceId,
+      ...captureReporterSaturationSnapshot(),
+      configurationSnapshot: captureConfigurationSnapshot(process.env),
+    };
     this.mutationInvocation = readMutationInvocationDescriptor();
     const runtimeEnvironmentBefore = await this.captureRuntimeEnvironment();
     this.executionContext.runtimeEnvironmentBeforeCaptureStatus = runtimeEnvironmentBefore.status;
@@ -3826,6 +3841,21 @@ export default class AdminTestRunsReporter implements Reporter {
     return this.finalFlush ??= this.flushPendingRows();
   }
 
+  /** These rows have never entered prepareRows/writeRows. Persist that fact
+   * separately from an in-flight writer's unknown outcome. The router may
+   * recover them once, after child exit and an exact empty ledger readback. */
+  private retainUnsubmittedTerminalRows(unsubmitted: readonly PendingTestRunRow[] = this.pending.splice(0)): void {
+    const rows = unsubmitted.map(row => ({
+      ...row, worktreeDirty: true, commitSha: null,
+      executionDetails: row.executionDetails
+        ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
+    }));
+    appendTestRunReceipts(process.env, unwrittenReceipts(rows, 'failed', 'terminal_queue_not_submitted', {
+      replayable: this.unsubmittedContext !== null,
+      ...(this.unsubmittedContext ? { runContext: this.unsubmittedContext } : {}),
+    }));
+  }
+
   private async flushPendingRows(): Promise<void> {
     if (this.flushed) return;
     this.flushed = true;
@@ -3848,13 +3878,14 @@ export default class AdminTestRunsReporter implements Reporter {
       ]);
       if (interimTimer) clearTimeout(interimTimer);
       if (!finished) {
-        const unresolved = [...this.interimRows, ...this.pending.splice(0)].map(row => ({
+        const unresolved = this.interimRows.map(row => ({
           ...row, worktreeDirty: true, commitSha: null,
           executionDetails: row.executionDetails
             ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
         }));
         appendTestRunReceipts(process.env,
           unwrittenReceipts(unresolved, 'timeout', 'interim_flush_finalization_deadline'));
+        this.retainUnsubmittedTerminalRows();
         return;
       }
     }
@@ -3863,11 +3894,7 @@ export default class AdminTestRunsReporter implements Reporter {
       // Promise.race bounds waiting, not the operation. A second writer here
       // would overlap the interim writer (or its unfinished provenance read).
       // Keep the missing final rows explicit without issuing competing inserts.
-      appendTestRunReceipts(process.env, unwrittenReceipts(this.pending.splice(0).map(row => ({
-        ...row, worktreeDirty: true, commitSha: null,
-        executionDetails: row.executionDetails
-          ? { ...row.executionDetails, worktreeDirty: true, commitSha: null } : null,
-      })), 'timeout', 'interim_flush_incomplete'));
+      this.retainUnsubmittedTerminalRows();
       return;
     }
     // Vitest awaits onTestRunEnd before starting its close timeout. A complete
@@ -3984,8 +4011,7 @@ export default class AdminTestRunsReporter implements Reporter {
     if (finalProvenance) localDeadlineMs = Date.now() + writeBudgetMs;
     const remainingMs = Math.max(0, deadlineMs() - Date.now());
     if (remainingMs === 0) {
-      appendTestRunReceipts(process.env,
-        unwrittenReceipts(rows, 'timeout', 'finalization_deadline'));
+      this.retainUnsubmittedTerminalRows(rows);
       return;
     }
     // Retain the whole writer across the foreground timeout. Tracking individual
