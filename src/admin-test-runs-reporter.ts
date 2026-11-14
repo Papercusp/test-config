@@ -54,7 +54,7 @@ import {
   TEST_RUN_READER_CONTRACT_ENV, TEST_RUN_READER_REFUSAL_PATH_ENV, TEST_RUN_READER_REFUSAL_MARKER,
   testRunExecutionDetailsReaderMismatch,
 } from './execution-details.ts';
-import { captureConfigurationSnapshot, readWorkerTestConfiguration, readViteTransformOptions, type ConfigurationSnapshot } from './configuration-snapshot.ts';
+import { captureConfigurationSnapshot, readConfigurationSnapshot, readWorkerTestConfiguration, readViteTransformOptions, type ConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 import { captureSourceByteManifest } from './source-byte-census.mjs';
 import { createSourceByteSnapshot, type SourceByteSnapshot, type RecordedSourceBytes } from './execution-details.ts';
@@ -1994,6 +1994,8 @@ export type TestRunReceiptBase = {
   filePath: string;
   status: string;
   row: SerializedTestRunReceiptRow;
+  /** Original non-secret writer context needed to replay a proven pre-submit setup failure. */
+  runContext?: TestRunInsertContext;
   /** Client observations, not server execution or commit timestamps. */
   insertDiagnostics?: TestRunInsertDiagnostics;
   /** This file's secondary case acknowledgements; file insertion alone proves none.
@@ -2270,7 +2272,7 @@ export function recoverTimedOutTestRunReceipts(
     const candidate = matchesForReceipt[0]!;
     if (useCount.get(candidate.id) !== 1) return [];
     const { outcome: _outcome, reason: _reason, errorCode: _errorCode,
-      pgSetupFailure: _pgSetupFailure, replayable: _replayable, ...base } = receipt;
+      pgSetupFailure: _pgSetupFailure, replayable: _replayable, runContext: _runContext, ...base } = receipt;
     return [{ ...base, outcome: 'inserted' as const, id: candidate.id }];
   });
 }
@@ -2322,7 +2324,8 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
   const runGroupId = options.runGroupId?.trim();
   if (!runGroupId || !isAbsolute(options.expectedRoot) || options.expectedPaths.length === 0) return [];
   const missingPaths = new Set(options.expectedPaths.map(path => path.replaceAll('\\', '/')));
-  const timedOutReceipts = latestTestRunReceipts(receiptLog, true).filter(receipt => {
+  const latestReceipts = latestTestRunReceipts(receiptLog, true);
+  const timedOutReceipts = latestReceipts.filter(receipt => {
     if (receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
     if (receipt.outcome !== 'timeout' && !(receipt.outcome === 'inserted'
       && (receipt.row.cases?.length ?? 0) > 0
@@ -2330,8 +2333,15 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
     const expectedPath = testRunReceiptPathForRoot(receipt, options.expectedRoot);
     return expectedPath !== null && missingPaths.has(expectedPath);
   });
-  if (timedOutReceipts.length === 0
-    || timedOutReceipts.length > TEST_RUN_RECEIPT_READBACK_MAX_RECEIPTS) return [];
+  const setupReceipts = latestReceipts.filter(receipt =>
+    isPreSubmitPgSetupReceipt(receipt, missingPaths, options.expectedRoot, runGroupId));
+  const readbackReceipts: TestRunReceipt[] = [
+    ...timedOutReceipts,
+    ...setupReceipts.map(receipt => ({ ...receipt, outcome: 'timeout' as const,
+      reason: 'pg_setup_failure_readback', replayable: false })),
+  ];
+  if (readbackReceipts.length === 0
+    || readbackReceipts.length > TEST_RUN_RECEIPT_READBACK_MAX_RECEIPTS) return [];
 
   try {
     const requestedTimeout = options.timeoutMs;
@@ -2339,11 +2349,12 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
       ? Math.min(5_000, requestedTimeout!)
       : TEST_RUN_RECEIPT_READBACK_TIMEOUT_MS;
     const deadline = Date.now() + timeoutMs;
-    const filePaths = [...new Set(timedOutReceipts.map(receipt => receipt.row.filePath))];
-    const maxRows = Math.min(TEST_RUN_RECEIPT_READBACK_MAX_ROWS, timedOutReceipts.length * 2 + 1);
+    const filePaths = [...new Set(readbackReceipts.map(receipt => receipt.row.filePath))];
+    const maxRows = Math.min(TEST_RUN_RECEIPT_READBACK_MAX_ROWS, readbackReceipts.length * 2 + 1);
     let readbacks: unknown = [];
+    let readbackFailed = false;
     const query = trackSharedPgOperation(Promise.resolve().then(async () => {
-      readbacks = await sql`
+      const result = await sql`
         SELECT id::text AS id,
           run_group_id AS "runGroupId",
           file_path AS "filePath",
@@ -2370,29 +2381,71 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
         ORDER BY id
         LIMIT ${maxRows}
       `;
-    }).catch(() => { readbacks = []; }));
-    if (!await settleWithin(query, timeoutMs)) return [];
+      if (Array.isArray(result)) readbacks = result;
+      else readbackFailed = true;
+    }).catch(() => { readbacks = []; readbackFailed = true; }));
+    if (!await settleWithin(query, timeoutMs) || readbackFailed) return [];
     const candidates = Array.isArray(readbacks)
       ? readbacks.filter((row): row is TestRunReceiptReadbackCandidate =>
           Boolean(row && typeof row === 'object'))
       : [];
+    const truncated = candidates.length >= maxRows;
     const recovered = recoverTimedOutTestRunReceipts(
-      timedOutReceipts.map(receipt => receipt.outcome === 'inserted'
+      readbackReceipts.map(receipt => receipt.outcome === 'inserted'
         ? { ...receipt, outcome: 'timeout' as const, reason: 'case_recovery_readback', replayable: false }
         : receipt),
       candidates,
       runGroupId,
-      candidates.length >= maxRows,
+      truncated,
     ).filter(receipt => {
-      const original = timedOutReceipts.find(source => source.receiptId === receipt.receiptId);
+      const original = readbackReceipts.find(source => source.receiptId === receipt.receiptId);
       return original?.outcome !== 'inserted' || original.id === receipt.id;
     });
     const parents = recovered.flatMap(receipt => receipt.row.cases?.length
       ? [{ testRunId: receipt.id, cases: receipt.row.cases }] : []);
     const outcome = await insertTestCaseRowsWithSql(sql, parents, { deadline, insertTimeoutMs: timeoutMs });
     const recorded = withTestCaseInsertOutcomes(recovered, parents, outcome) as Extract<TestRunReceipt, { outcome: 'inserted' }>[];
-    appendTestRunReceipts(options.env ?? process.env, recorded);
-    return recorded;
+    const replayReceipts: TestRunReceipt[] = [];
+    if (!truncated && setupReceipts.length > 0) {
+      const recoveredIds = new Set(recorded.map(receipt => receipt.receiptId));
+      const candidatePaths = new Set(candidates.map(candidate => candidate.filePath));
+      const pendingInsertPaths = new Set(timedOutReceipts.map(receipt => receipt.filePath));
+      const setupCountsByPath = new Map<string, number>();
+      for (const receipt of setupReceipts) {
+        setupCountsByPath.set(receipt.filePath, (setupCountsByPath.get(receipt.filePath) ?? 0) + 1);
+      }
+      const groups = new Map<string, { context: TestRunInsertContext; rows: TestRunRow[] }>();
+      for (const receipt of setupReceipts) {
+        if (recoveredIds.has(receipt.receiptId) || candidatePaths.has(receipt.filePath)
+          || pendingInsertPaths.has(receipt.filePath)
+          || setupCountsByPath.get(receipt.filePath) !== 1) continue;
+        const context = replayContextForSetupReceipt(receipt, runGroupId);
+        const row = context ? replayRowFromPgSetupReceipt(receipt) : null;
+        if (!context || !row) continue;
+        const key = JSON.stringify(context);
+        const group = groups.get(key) ?? { context, rows: [] };
+        group.rows.push(row);
+        groups.set(key, group);
+      }
+      const replayEnvironment = options.env ?? process.env;
+      const replayBudget = reporterWriteBudget(replayEnvironment as NodeJS.ProcessEnv);
+      const replayDeadline = Date.now() + replayBudget.totalInsertMs;
+      for (const group of groups.values()) {
+        const remainingMs = replayDeadline - Date.now();
+        if (remainingMs <= 0) break;
+        const replayed = await insertTestRunRowsWithSql(sql, group.rows, group.context, {
+          insertTimeoutMs: Math.min(replayBudget.insertTimeoutMs, remainingMs),
+          totalInsertMs: remainingMs,
+        }, undefined, replayEnvironment);
+        replayReceipts.push(...replayed);
+      }
+    }
+    appendTestRunReceipts(options.env ?? process.env, [...recorded, ...replayReceipts]);
+    return [
+      ...recorded,
+      ...replayReceipts.filter((receipt): receipt is Extract<TestRunReceipt, { outcome: 'inserted' }> =>
+        receipt.outcome === 'inserted'),
+    ];
   } catch {
     return [];
   }
@@ -2437,7 +2490,8 @@ function unwrittenReceipts(
   rows: readonly TestRunRow[],
   outcome: 'timeout' | 'failed',
   reason: string,
-  options: { error?: unknown; replayable?: boolean; insertDiagnostics?: TestRunInsertDiagnostics; pgSetupFailure?: PgSetupFailure } = {},
+  options: { error?: unknown; replayable?: boolean; insertDiagnostics?: TestRunInsertDiagnostics;
+    pgSetupFailure?: PgSetupFailure; runContext?: TestRunInsertContext } = {},
 ): TestRunReceipt[] {
   const code = options.error === undefined ? undefined : errorCode(options.error);
   return receiptIdentifiedRows(rows).map(row => ({
@@ -2447,6 +2501,7 @@ function unwrittenReceipts(
     ...(options.insertDiagnostics ? { insertDiagnostics: options.insertDiagnostics } : {}),
     ...(code ? { errorCode: code } : {}),
     ...(options.pgSetupFailure ? { pgSetupFailure: options.pgSetupFailure } : {}),
+    ...(options.runContext ? { runContext: options.runContext } : {}),
     replayable: options.replayable === true && row.receiptAttempt === 0,
   }));
 }
@@ -2463,6 +2518,100 @@ type TestRunInsertContext = {
   /** The configuration this test process ran under (one per process, like its env). */
   configurationSnapshot?: ConfigurationSnapshot | null;
 };
+
+type PgSetupFailureReceipt = TestRunReceiptBase & {
+  outcome: 'failed';
+  reason: string;
+  pgSetupFailure: PgSetupFailure;
+  replayable: boolean;
+};
+
+function isPreSubmitPgSetupFailure(value: unknown): value is PgSetupFailure {
+  if (!value || typeof value !== 'object') return false;
+  const phase = (value as { phase?: unknown }).phase;
+  return phase === 'module-import' || phase === 'client-construction';
+}
+
+function isPreSubmitPgSetupReceipt(
+  receipt: TestRunReceipt,
+  expectedPaths: ReadonlySet<string>,
+  expectedRoot: string,
+  runGroupId: string,
+): receipt is PgSetupFailureReceipt {
+  if (receipt.outcome !== 'failed' || receipt.reason !== 'pg_unavailable'
+    || !isPreSubmitPgSetupFailure(receipt.pgSetupFailure)
+    || receipt.row.receiptId !== receipt.receiptId || receipt.row.receiptAttempt !== receipt.attempt
+    || receipt.row.filePath !== receipt.filePath || receipt.row.status !== receipt.status
+    || receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
+  const path = testRunReceiptPathForRoot(receipt, expectedRoot);
+  return path !== null && expectedPaths.has(path);
+}
+
+function parseTestRunInsertContext(value: unknown): TestRunInsertContext | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const nullableString = (candidate: unknown): candidate is string | null =>
+    candidate === null || (typeof candidate === 'string' && candidate.length <= 2_000);
+  const nullableMetric = (candidate: unknown): candidate is number | null =>
+    candidate === null || (typeof candidate === 'number' && Number.isFinite(candidate));
+  if (!nullableString(raw.branch) || !nullableString(raw.inferredCommit)
+    || typeof raw.declaredSource !== 'string' || !VALID_SOURCES.has(raw.declaredSource as TestRunSource)
+    || !nullableString(raw.runGroupId) || !nullableString(raw.harnessSlug) || !nullableString(raw.workspaceId)
+    || !nullableMetric(raw.loopLagP95Ms) || !nullableMetric(raw.rssMb)) return null;
+  const configurationSnapshot = readConfigurationSnapshot(raw.configurationSnapshot);
+  if (!configurationSnapshot) return null;
+  return {
+    branch: raw.branch,
+    inferredCommit: raw.inferredCommit,
+    declaredSource: raw.declaredSource as TestRunSource,
+    runGroupId: raw.runGroupId,
+    harnessSlug: raw.harnessSlug,
+    workspaceId: raw.workspaceId,
+    loopLagP95Ms: raw.loopLagP95Ms,
+    rssMb: raw.rssMb,
+    configurationSnapshot,
+  };
+}
+
+function replayContextForSetupReceipt(
+  receipt: PgSetupFailureReceipt,
+  runGroupId: string,
+): TestRunInsertContext | null {
+  if (!receipt.replayable || receipt.attempt !== 0 || receipt.row.receiptAttempt !== 0) return null;
+  const context = parseTestRunInsertContext(receipt.runContext);
+  return context?.runGroupId === runGroupId ? context : null;
+}
+
+function replayRowFromPgSetupReceipt(receipt: PgSetupFailureReceipt): TestRunRow | null {
+  const row = receipt.row;
+  const startedAt = new Date(row.startedAt);
+  const finishedAt = new Date(row.finishedAt);
+  const statuses: readonly string[] = ['pass', 'fail', 'skip', 'cancelled', 'error'];
+  const caseStatuses: readonly string[] = ['pass', 'fail', 'skip'];
+  const validCases = row.cases === undefined || row.cases === null || (Array.isArray(row.cases)
+    && row.cases.every(testCase => Number.isSafeInteger(testCase.caseIndex) && testCase.caseIndex >= 0
+      && typeof testCase.caseKey === 'string' && testCase.caseKey.length <= TEST_CASE_KEY_MAX_CHARS
+      && Number.isSafeInteger(testCase.occurrence) && testCase.occurrence > 0
+      && caseStatuses.includes(testCase.status)
+      && (testCase.durationMs === null || (typeof testCase.durationMs === 'number'
+        && Number.isFinite(testCase.durationMs) && testCase.durationMs >= 0))
+      && (testCase.errorTail === null || (typeof testCase.errorTail === 'string'
+        && testCase.errorTail.length <= TEST_CASE_ERROR_TAIL_MAX_CHARS))));
+  if (!Number.isFinite(startedAt.getTime()) || !Number.isFinite(finishedAt.getTime())
+    || !statuses.includes(row.status) || row.status !== receipt.status
+    || !Number.isFinite(row.durationMs) || row.durationMs < 0
+    || (row.framework !== undefined && row.framework !== 'vitest' && row.framework !== 'node')
+    || (row.outputTail !== null && typeof row.outputTail !== 'string')
+    || typeof row.isScratchConfig !== 'boolean' || typeof row.worktreeDirty !== 'boolean'
+    || (row.commitSha !== null && typeof row.commitSha !== 'string') || !validCases) return null;
+  return {
+    ...row,
+    startedAt,
+    finishedAt,
+    receiptId: receipt.receiptId,
+    receiptAttempt: receipt.attempt + 1,
+  } as unknown as TestRunRow;
+}
 
 /** PostgreSQL text/jsonb cannot store NUL. Preserve binary diagnostics visibly
  * without dropping the failed file or its cases from the evidence ledger. */
@@ -2543,13 +2692,14 @@ export async function insertTestRunRowsWithSql(
   budget: Pick<ReturnType<typeof reporterWriteBudget>, 'insertTimeoutMs' | 'totalInsertMs'> = reporterWriteBudget(process.env),
   onCaseOutcome: (outcome: TestCaseInsertOutcome) => void =
     outcome => reportTestCaseInsertOutcome(context, outcome),
+  receiptEnv: Readonly<Record<string, string | undefined>> = process.env,
 ): Promise<TestRunReceipt[]> {
   const receipts: TestRunReceipt[] = [];
   const identifiedRows = receiptIdentifiedRows(rows);
   // Keep delayed settlement on the evidence sink that belonged to this run,
   // even if another in-process runner changes its environment meanwhile.
-  const receiptEnv = { [TEST_RUN_RECEIPT_ENV]: process.env[TEST_RUN_RECEIPT_ENV],
-    [TEST_RUN_RECOVERY_ENV]: process.env[TEST_RUN_RECOVERY_ENV] };
+  const capturedReceiptEnv = { [TEST_RUN_RECEIPT_ENV]: receiptEnv[TEST_RUN_RECEIPT_ENV],
+    [TEST_RUN_RECOVERY_ENV]: receiptEnv[TEST_RUN_RECOVERY_ENV] };
   const deadline = Date.now() + budget.totalInsertMs;
   let columns: readonly (typeof TEST_RUN_INSERT_COLUMNS)[number][] = TEST_RUN_INSERT_COLUMNS;
   // Case rows ride behind their file rows: collected per inserted batch, written once
@@ -2761,9 +2911,9 @@ export async function insertTestRunRowsWithSql(
         // without retrying the statement or extending the foreground budget.
         const omittedCases: TestCaseInsertOutcome = { written: 0, unwritten: expectedCases, reason: 'file_insert_timeout' };
         void query.then(
-          () => appendTestRunReceipts(receiptEnv, withCaseOutcomes(
+          () => appendTestRunReceipts(capturedReceiptEnv, withCaseOutcomes(
             insertedReceipts(sourceRows, attempt.readWritten(), attempt.readDiagnostics()), omittedCases)),
-          (error) => appendTestRunReceipts(receiptEnv, withCaseOutcomes(unwrittenReceipts(sourceRows, 'failed', receiptReason(error), {
+          (error) => appendTestRunReceipts(capturedReceiptEnv, withCaseOutcomes(unwrittenReceipts(sourceRows, 'failed', receiptReason(error), {
             error, insertDiagnostics: attempt.readDiagnostics(),
           }), omittedCases)),
         );
@@ -2976,8 +3126,22 @@ export async function insertRows(rows: readonly TestRunRow[]): Promise<TestRunRe
 
   const pg = await observeReporterStage('test-runs', 'pg-client', tryGetPg);
   if (!pg) {
+    const context: TestRunInsertContext = {
+      branch,
+      inferredCommit,
+      declaredSource: resolveTestRunSource(),
+      runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+      harnessSlug: resolveTestRunHarnessSlug(),
+      workspaceId: resolveTestRunWorkspaceId(),
+      ...captureReporterSaturationSnapshot(),
+      configurationSnapshot: captureConfigurationSnapshot(process.env),
+    };
+    const setupFailure = sharedPg.setupFailure;
+    const replayable = setupFailure?.phase === 'module-import' || setupFailure?.phase === 'client-construction';
     const receipts = unwrittenReceipts(rows, 'failed', 'pg_unavailable', {
-      pgSetupFailure: sharedPg.setupFailure,
+      replayable,
+      ...(replayable ? { runContext: context } : {}),
+      pgSetupFailure: setupFailure,
     });
     appendTestRunReceipts(process.env, receipts);
     return receipts;

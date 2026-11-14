@@ -1893,6 +1893,94 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         ], 'group-a')).toEqual([]);
       });
 
+      it('replays a first pre-submit PG setup failure only after an exact empty readback', async () => {
+        const directory = mkdtempSync(join(tmpdir(), 'test-run-setup-replay-'));
+        const receiptFile = join(directory, 'receipts.jsonl');
+        const runContext = {
+          branch: 'staging', inferredCommit: 'abc123', declaredSource: 'mutation-probe' as const,
+          runGroupId: 'group-a', harnessSlug: 'papercusp', workspaceId: 'workspace-a',
+          loopLagP95Ms: 2, rssMb: 100, configurationSnapshot: captureConfigurationSnapshot({}),
+        };
+        const setupFailure: TestRunReceipt = {
+          ...base, outcome: 'failed', reason: 'pg_unavailable', replayable: true,
+          pgSetupFailure: { phase: 'client-construction', code: 'ECONNREFUSED' }, runContext,
+        };
+        const statements: string[] = [];
+        const insertedRows: Record<string, unknown>[][] = [];
+        const sql = Object.assign((first: unknown) => {
+          if (Array.isArray(first) && !('raw' in first)) {
+            if (first.length > 0 && typeof first[0] === 'object') insertedRows.push(first as Record<string, unknown>[]);
+            return {};
+          }
+          const query = (first as TemplateStringsArray).join('?');
+          statements.push(query);
+          if (query.includes('FROM harness_shared.test_runs')) return Promise.resolve([]);
+          if (query.includes('INSERT INTO harness_shared.test_runs'))
+            return Promise.resolve([{ id: '901', file_path: 'a.test.ts' }]);
+          return Promise.resolve([]);
+        }, { end: async () => undefined }) as unknown as PgSql;
+        try {
+          const replayed = await reconcileTimedOutTestRunReceiptsWithSql(sql, JSON.stringify(setupFailure), {
+            expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a',
+            env: { [TEST_RUN_RECEIPT_ENV]: receiptFile }, timeoutMs: 1_000,
+          });
+          expect(replayed).toMatchObject([{
+            receiptId: base.receiptId, attempt: 1, outcome: 'inserted', id: '901',
+            row: { receiptAttempt: 1, executionDetails: details },
+          }]);
+          expect(statements.filter(query => query.includes('FROM harness_shared.test_runs'))).toHaveLength(1);
+          expect(statements.filter(query => query.includes('INSERT INTO harness_shared.test_runs'))).toHaveLength(1);
+          expect(insertedRows).toHaveLength(1);
+          expect(insertedRows[0]?.[0]).toMatchObject({
+            run_group_id: 'group-a', branch: 'staging', commit_sha: 'abc123',
+            harness_slug: 'papercusp', workspace_id: 'workspace-a',
+            loop_lag_p95_ms: 2, rss_mb: 100, configuration_snapshot: runContext.configurationSnapshot,
+          });
+          expect(JSON.parse(readFileSync(receiptFile, 'utf8').trim())).toMatchObject({
+            receiptId: base.receiptId, attempt: 1, outcome: 'inserted', id: '901',
+          });
+          expect(latestTestRunReceipts(JSON.stringify(setupFailure) + '\n' + readFileSync(receiptFile, 'utf8')))
+            .toMatchObject([{ receiptId: base.receiptId, attempt: 1, outcome: 'inserted', id: '901' }]);
+        } finally {
+          rmSync(directory, { recursive: true, force: true });
+        }
+      });
+
+      it('does not replay when a matching path has a pending insert or ambiguous ledger readback', async () => {
+        const setupFailure: TestRunReceipt = {
+          ...base, outcome: 'failed', reason: 'pg_unavailable', replayable: true,
+          pgSetupFailure: { phase: 'module-import' },
+          runContext: {
+            branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: 'group-a',
+            harnessSlug: 'papercusp', workspaceId: 'workspace-a', loopLagP95Ms: null, rssMb: null,
+            configurationSnapshot: captureConfigurationSnapshot({}),
+          },
+        };
+        const pending: TestRunReceipt = {
+          ...base, receiptId: 'receipt-b', row: { ...base.row, receiptId: 'receipt-b' },
+          outcome: 'timeout', reason: 'pending insert', replayable: false,
+        };
+        const scenarios = [
+          { log: JSON.stringify(setupFailure), rows: [candidate, { ...candidate, id: '902' }] },
+          { log: JSON.stringify(setupFailure), rows: [{ ...candidate, commitSha: 'other', detailsCommitSha: 'other' }] },
+          { log: [setupFailure, pending].map(receipt => JSON.stringify(receipt)).join('\n'), rows: [] },
+        ];
+        for (const scenario of scenarios) {
+          const statements: string[] = [];
+          const sql = Object.assign((first: unknown) => {
+            if (Array.isArray(first) && !('raw' in first)) return {};
+            const query = (first as TemplateStringsArray).join('?');
+            statements.push(query);
+            return Promise.resolve(scenario.rows);
+          }, { end: async () => undefined }) as unknown as PgSql;
+          await expect(reconcileTimedOutTestRunReceiptsWithSql(sql, scenario.log, {
+            expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a', env: {},
+          })).resolves.toEqual([]);
+          expect(statements).toHaveLength(1);
+          expect(statements[0]).toContain('FROM harness_shared.test_runs');
+        }
+      });
+
       it.each([
         ['a definite pre-submit failure', { errorCode: 'CONNECT_TIMEOUT', replayable: true }],
         ['a database rejection', { errorCode: '23514', replayable: false }],

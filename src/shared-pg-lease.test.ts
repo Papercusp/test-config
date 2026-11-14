@@ -64,6 +64,7 @@ describe('shared PG setup failure receipts', () => {
     const directory = mkdtempSync(join(tmpdir(), 'reporter-setup-'));
     const file = join(directory, 'receipts.jsonl');
     const previous = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    const previousGroup = process.env.PAPERCUSP_TEST_RUN_GROUP;
     const NEVER_EMIT_MARKER = 'never-emit-me';
     const failure = Object.assign(new Error(`postgresql://reporter:${NEVER_EMIT_MARKER}@localhost/private`), { code });
     if (code === 'changing-code-sentinel') {
@@ -77,6 +78,7 @@ describe('shared PG setup failure receipts', () => {
       return { default: () => { throw failure; } };
     });
     process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = file;
+    process.env.PAPERCUSP_TEST_RUN_GROUP = 'setup-failure-group';
     const at = new Date('2026-10-26T20:00:00Z');
     const row: TestRunRow = { filePath: 'setup.test.ts', status: 'pass', durationMs: 1,
       startedAt: at, finishedAt: at, outputTail: null, isScratchConfig: false,
@@ -92,7 +94,9 @@ describe('shared PG setup failure receipts', () => {
       expect(firstReceipts).toEqual([receipts[0]]);
       for (const receipt of receipts) {
         expect(receipt).toMatchObject({ outcome: 'failed', reason: 'pg_unavailable',
-          pgSetupFailure: { phase, ...(expectedCode ? { code: expectedCode } : {}) } });
+          pgSetupFailure: { phase, ...(expectedCode ? { code: expectedCode } : {}) },
+          replayable: true, runContext: { runGroupId: 'setup-failure-group', declaredSource: expect.any(String),
+            configurationSnapshot: { schemaVersion: 1, fingerprint: expect.stringMatching(/^sha256-config-snapshot-v1:/) } } });
         expect(receipt.pgSetupFailure).toEqual({ phase, ...(expectedCode ? { code: expectedCode } : {}) });
       }
       expect(text).not.toContain(NEVER_EMIT_MARKER);
@@ -103,6 +107,8 @@ describe('shared PG setup failure receipts', () => {
       vi.doUnmock('postgres');
       if (previous === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
       else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previous;
+      if (previousGroup === undefined) delete process.env.PAPERCUSP_TEST_RUN_GROUP;
+      else process.env.PAPERCUSP_TEST_RUN_GROUP = previousGroup;
       rmSync(directory, { recursive: true, force: true });
     }
   });
