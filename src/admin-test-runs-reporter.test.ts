@@ -4330,6 +4330,51 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
     return { parent, root, receiptPath, sourceCommit };
   }
 
+  it.skipIf(process.platform === 'win32')('reads a clean many-submodule census once before paying the partitioned index cost (EI-28784453905450051)', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'reporter-submodule-census-'));
+    const root = join(parent, 'root');
+    const seed = join(parent, 'seed');
+    const bin = join(parent, 'bin');
+    const log = join(parent, 'status-calls');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const git = (cwd: string, ...args: string[]) => execFileSync(realGit, args, { cwd, stdio: 'ignore' });
+    const commit = (cwd: string) => git(cwd, '-c', 'user.name=Reporter fixture',
+      '-c', 'user.email=reporter@example.test', 'commit', '-qm', 'fixture');
+    try {
+      mkdirSync(root); mkdirSync(seed); mkdirSync(bin);
+      git(seed, 'init', '-q');
+      writeFileSync(join(seed, 'source.ts'), 'export const value = 1;');
+      git(seed, 'add', '.'); commit(seed);
+      git(root, 'init', '-q');
+      const modules = Array.from({ length: 12 }, (_, index) => `module-${index}`);
+      for (const name of modules) git(root, 'clone', '-q', '--shared', seed, name);
+      writeFileSync(join(root, '.gitmodules'), modules.map(name =>
+        `[submodule "${name}"]\n\tpath = ${name}\n\turl = ${seed}\n`).join(''));
+      git(root, 'add', '.'); commit(root); git(root, 'submodule', 'init');
+      writeFileSync(join(bin, 'git'), [
+        '#!/bin/sh',
+        'if [ "$1" = "status" ]; then echo whole >> "$PC_TEST_STATUS_LOG"; fi',
+        'if [ "$1" = "--literal-pathspecs" ]; then echo partition >> "$PC_TEST_STATUS_LOG"; fi',
+        'exec "$PC_TEST_REAL_GIT" "$@"',
+        '',
+      ].join('\n'), { mode: 0o755 });
+      vi.stubEnv('PATH', `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`);
+      vi.stubEnv('PC_TEST_REAL_GIT', realGit);
+      vi.stubEnv('PC_TEST_STATUS_LOG', log);
+      const clean = await runGit(`${STATUS} --ignore-submodules=none`, root,
+        WORKTREE_SNAPSHOT_GIT_BUDGETS_MS[0]!);
+      expect(clean).toBe('');
+      expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual(['whole']);
+      writeFileSync(join(root, modules[0]!, 'source.ts'), 'export const value = 2;');
+      const dirty = await runGit(`${STATUS} --ignore-submodules=none`, root,
+        WORKTREE_SNAPSHOT_GIT_BUDGETS_MS[0]!);
+      expect(dirty).toContain(modules[0]);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(parent, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it.skipIf(process.platform === 'win32')('partitions full-tree status and preserves tracked, untracked, staged-delete and literal paths', async () => {
     const root = mkdtempSync(join(tmpdir(), 'reporter-partitioned-status-'));
     const bin = mkdtempSync(join(tmpdir(), 'reporter-git-shim-'));
@@ -4363,9 +4408,10 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
       // processes. Literal 512-path chunks made status O(index x paths) per chunk — quadratic in tree
       // size — so one call carrying hundreds of literal paths is the regression this pins.
       const STATUS_ARGS = 5; // --literal-pathspecs status --porcelain --untracked-files=all --
-      const clean = await captureWorktreeSnapshot(undefined, undefined, undefined, false);
-      expect(clean.commit).toMatch(/^[a-f0-9]{40}$/);
-      expect(clean.porcelain).toBe('');
+      // Exercise the longer retry explicitly; the first attempt uses a single
+      // full-tree status, covered by the many-submodule regression above.
+      const clean = await runGit(STATUS, root, WORKTREE_SNAPSHOT_GIT_BUDGETS_MS[1]!);
+      expect(clean).toBe('');
       const cleanCalls = readFileSync(log, 'utf8').trim().split('\n').map(Number);
       expect(cleanCalls.length).toBeGreaterThan(1);
       expect(cleanCalls.length).toBeLessThanOrEqual(PARTITIONED_STATUS_GROUPS);
@@ -4377,13 +4423,13 @@ describe('captureWorktreeSnapshot retries a timed-out git read (WI-10004931)', (
       writeFileSync(join(root, 'untracked.ts'), 'export const fresh = true;');
       git('rm', '--quiet', '--', tracked(519));
       git('rm', '--quiet', '--', join('solo', 'only.ts'));
-      const dirty = await captureWorktreeSnapshot(undefined, undefined, undefined, false);
-      expect(dirty.porcelain).toContain('tracked-0001.ts');
-      expect(dirty.porcelain).toContain(':(glob)literal.ts');
-      expect(dirty.porcelain).toContain('untracked.ts');
-      expect(dirty.porcelain).toContain('tracked-0519.ts');
-      expect(dirty.porcelain).toContain('solo/only.ts');
-      expect(dirty.porcelain?.split('\n')).toHaveLength(5);
+      const dirty = await runGit(STATUS, root, WORKTREE_SNAPSHOT_GIT_BUDGETS_MS[1]!);
+      expect(dirty).toContain('tracked-0001.ts');
+      expect(dirty).toContain(':(glob)literal.ts');
+      expect(dirty).toContain('untracked.ts');
+      expect(dirty).toContain('tracked-0519.ts');
+      expect(dirty).toContain('solo/only.ts');
+      expect(dirty?.split('\n')).toHaveLength(5);
       const dirtyCalls = readFileSync(log, 'utf8').trim().split('\n').map(Number);
       expect(dirtyCalls.length).toBeGreaterThan(1);
       expect(dirtyCalls.length).toBeLessThanOrEqual(PARTITIONED_STATUS_GROUPS);
@@ -4629,7 +4675,8 @@ describe('completed Git reads across a delayed parent timer (EI-2683065978401391
 });
 
 describe('oversized Git status provenance (EI-26835807023614872)', () => {
-  it.skipIf(process.platform === 'win32')('summarizes the complete status without losing dirty evidence or its digest', async () => {
+  it.skipIf(process.platform === 'win32').each(['', ' --ignore-submodules=none'])(
+    'summarizes the complete status without losing dirty evidence or its digest%s', async (submoduleOption) => {
     const root = mkdtempSync(join(tmpdir(), 'reporter-large-status-'));
     const failures: string[] = [];
     try {
@@ -4642,7 +4689,7 @@ describe('oversized Git status provenance (EI-26835807023614872)', () => {
         { cwd: root, maxBuffer: 2 * 1024 * 1024 });
       expect(raw.byteLength).toBeGreaterThan(1024 * 1024);
 
-      const output = await runGit('git status --porcelain --untracked-files=all', root, 10_000,
+      const output = await runGit('git status --porcelain --untracked-files=all' + submoduleOption, root, 10_000,
         detail => failures.push(detail));
       expect(output).not.toBeNull();
       expect(failures).toEqual([]);

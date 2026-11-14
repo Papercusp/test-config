@@ -686,6 +686,14 @@ export function runGit(
   const partitionedStatus = cmd.startsWith('git status --porcelain --untracked-files=all')
     && cmd.includes(' --pc-partitioned');
   const statusCommand = partitionedStatus ? cmd.replace(' --pc-partitioned', '') : cmd;
+  // A clean maintained clone normally needs one index read. Partitioning
+  // multiplies that fixed cost (plus inventory/grouping) by up to eight, and
+  // exhausted the short first-attempt deadline even with no source changes.
+  // Keep partitioning for the longer retry: stat-invalidated checkouts can
+  // still benefit from parallel refresh. Both paths read the complete tree.
+  if (partitionedStatus && process.platform !== 'win32'
+      && timeoutMs <= WORKTREE_SNAPSHOT_GIT_BUDGETS_MS[0]!)
+    return runGitProcessGroup(statusCommand, cwd, timeoutMs, onFailure);
   if (partitionedStatus && process.platform !== 'win32') {
     let tempDir: string;
     try {
