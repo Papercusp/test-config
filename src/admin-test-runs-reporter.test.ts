@@ -4749,8 +4749,12 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
       const failures: string[] = [];
       const pending = runGit(`git -c ${quote(`alias.reporter-block=${alias}`)} reporter-block`, root, 5_000,
         detail => failures.push(detail));
+      // HANG detector only. This main-thread clock also counts Worker boot and
+      // event-loop scheduling, neither of which is the deadline under test, so a
+      // tight bound here flakes under fleet load (WI-6554700010048479). The
+      // deadline's own timing is asserted on the worker clock (elapsedMs) below.
       const result = await Promise.race([pending, new Promise<string>(resolve => {
-        deadline = setTimeout(() => resolve('reporter timeout did not settle'), 8_000);
+        deadline = setTimeout(() => resolve('reporter timeout did not settle'), 20_000);
       })]);
       descendant = Number(readFileSync(pidPath, 'utf8'));
       expect(descendant).toBeGreaterThan(0);
@@ -4758,6 +4762,9 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
       expect(failures).toHaveLength(1);
       expect(JSON.parse(failures[0])).toMatchObject({ timeoutMs: 5_000, killed: true });
       const failure = JSON.parse(failures[0]);
+      // The worker owns the deadline: it fired at the timeout, neither early nor stuck.
+      expect(failure.elapsedMs).toBeGreaterThanOrEqual(5_000);
+      expect(failure.elapsedMs).toBeLessThan(10_000);
       expect(failure.identity).toMatchObject({ uid: process.getuid!(), gid: process.getgid!() });
       expect(failure.gitTrace.events).toBeGreaterThan(0);
       expect(failure.gitTrace.droppedLines).toBeGreaterThanOrEqual(2);
@@ -4789,7 +4796,7 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
       rmSync(root, { recursive: true, force: true });
       vi.unstubAllEnvs();
     }
-  }, 15_000);
+  }, 30_000);
 
   it.skipIf(process.platform === 'win32')('preserves an explicit Git trace destination and keeps it out of the reading', async () => {
     const root = mkdtempSync(join(tmpdir(), 'git-explicit-trace-'));
