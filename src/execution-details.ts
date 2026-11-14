@@ -59,8 +59,10 @@ export function parseRecordedWorkerCompilerInputs(value: unknown): RecordedWorke
     || !value.missing.every(reason => typeof reason === 'string' && /^[a-z][a-z0-9-]{0,127}$/.test(reason))
     || new Set(value.missing).size !== value.missing.length
     || !value.missing.includes('transform-pipeline-unobserved')
-    || !value.missing.includes('vm-options-partially-observed')
-    || (value.vmCallCount === 0 && !value.missing.includes('vm-calls-unobserved'))
+    // A worker whose every VM call carried a complete options digest no longer
+    // reports the partial-options gap; with zero calls nothing was observed.
+    || (value.vmCallCount === 0 && (!value.missing.includes('vm-calls-unobserved')
+      || !value.missing.includes('vm-options-partially-observed')))
     || (value.viteTransformOptions !== undefined && !parseRecordedViteTransformOptions(value.viteTransformOptions))
     || (value.appliedCompilerInputs !== undefined && !parseAppliedCompilerReceipt(value.appliedCompilerInputs))) return undefined;
   return value as unknown as RecordedWorkerCompilerInputs;

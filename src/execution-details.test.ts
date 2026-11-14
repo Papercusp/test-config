@@ -87,6 +87,21 @@ describe('original worker process custody', () => {
     captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: '/repo/a.test.ts',
     before: processIdentity, after: { ...processIdentity } });
 
+  it('accepts a receipt without the VM-options gap only when VM calls were observed', () => {
+    const observed = { schemaVersion: 'worker-compiler-inputs-v1' as const,
+      scope: 'vitest-inlined-vm-calls' as const, populationStatus: 'unknown' as const,
+      captureId: '12345678-9abc-def0-1234-56789abcdef0', testFile: '/repo/a.test.ts',
+      inputSha256: '1'.repeat(64), vmCallCount: 2, missing: ['transform-pipeline-unobserved'] };
+    expect(parseRecordedWorkerCompilerInputs(observed)).toEqual(observed);
+    expect(parseRecordedWorkerCompilerInputs({ ...observed, missing: [] })).toBeUndefined();
+    expect(parseRecordedWorkerCompilerInputs({ ...observed, populationStatus: 'complete' })).toBeUndefined();
+    const noCalls = { ...observed, inputSha256: null, vmCallCount: 0 };
+    expect(parseRecordedWorkerCompilerInputs({ ...noCalls,
+      missing: ['transform-pipeline-unobserved', 'vm-calls-unobserved'] })).toBeUndefined();
+    expect(parseRecordedWorkerCompilerInputs({ ...noCalls,
+      missing: ['transform-pipeline-unobserved', 'vm-options-partially-observed', 'vm-calls-unobserved'] })).toBeDefined();
+  });
+
   it('retains partial compiler search and settlement inputs without upgrading compiler identity or accepting foreign custody', () => {
     const workerExecution = execution();
     const workerCompilerInputs = { schemaVersion: 'worker-compiler-inputs-v1' as const,
