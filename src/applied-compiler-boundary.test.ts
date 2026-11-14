@@ -151,13 +151,17 @@ describe('maintained Vite applied compiler boundary', () => {
 
   function nativeUseRuntime(name: string, patched = true) {
     const runtime = implementationRuntime(name);
+    // patch-package applies the maintained esbuild patch at install, so the
+    // copied esbuild may already be the patched postimage. Normalise the
+    // isolated copy to the exact donor first: the patched flag alone decides
+    // the isolated runtime state, never the ambient install.
+    const patch = join(repoRoot, 'patches/esbuild+0.27.3.patch');
+    const source = readFileSync(patch, 'utf8'), hashes = /^index ([a-f0-9]+)\.\.([a-f0-9]+) /m.exec(source)!;
+    const main = join(runtime.esbuild, 'lib/main.js');
+    expect(hashes).not.toBeNull();
+    if (blobHash(readFileSync(main)) === hashes[2]) execFileSync('git', ['apply', '--reverse', patch], { cwd: runtime.vite });
+    expect(blobHash(readFileSync(main)), 'exact isolated esbuild donor').toBe(hashes[1]);
     if (patched) {
-      const patch = join(repoRoot, 'patches/esbuild+0.27.3.patch');
-      const source = readFileSync(patch, 'utf8'), hashes = /^index ([a-f0-9]+)\.\.([a-f0-9]+) /m.exec(source)!;
-      const main = join(runtime.esbuild, 'lib/main.js');
-      expect(hashes).not.toBeNull();
-      if (blobHash(readFileSync(main)) === hashes[2]) execFileSync('git', ['apply', '--reverse', patch], { cwd: runtime.vite });
-      expect(blobHash(readFileSync(main)), 'exact isolated esbuild donor').toBe(hashes[1]);
       execFileSync('git', ['apply', '--check', patch], { cwd: runtime.vite });
       execFileSync('git', ['apply', patch], { cwd: runtime.vite });
       expect(blobHash(readFileSync(main))).toBe(hashes[2]);
