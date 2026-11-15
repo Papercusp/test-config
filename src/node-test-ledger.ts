@@ -35,6 +35,7 @@ import {
   MAX_RECORDED_PASSED_CASES,
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
   isRecordedCaseTitle,
+  registeredNodeTestFileLayer,
 } from './execution-details.ts';
 import type { TestRunExecutionDetails } from './execution-details.ts';
 import {
@@ -134,9 +135,10 @@ export function buildNodeTestRunRows(summary: NodeTestLedgerSummary, runContext:
     const durationMs = Math.max(0, Math.round(result.durationMs));
     const executionDetails: TestRunExecutionDetails = {
       schemaVersion: TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION,
-      // The router's native Node route executes unit tests without a Vitest project.
-      // Record that runtime layer explicitly; never infer integration/llm from a filename.
-      testLayer: 'unit',
+      // The router's native Node route executes files without a Vitest project, so the layer
+      // comes from that route's explicit per-file declaration (`unit` unless registered).
+      // Never inferred from a filename, and never taken from the collector or the env.
+      testLayer: registeredNodeTestFileLayer(filePath),
       runStartedAt: runContext.runStartedAt,
       root: runContext.repoRoot,
       filePath,

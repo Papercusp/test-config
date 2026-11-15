@@ -9,14 +9,14 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runGit, testRunReceiptBaseFor } from './admin-test-runs-reporter.ts';
 import type { TestRunRow, WorktreeGitSnapshot } from './admin-test-runs-reporter.ts';
-import { MAX_RECORDED_PASSED_CASES, parseTestRunExecutionDetails } from './execution-details.ts';
+import { MAX_RECORDED_PASSED_CASES, parseTestRunExecutionDetails, registeredNodeTestFileLayer } from './execution-details.ts';
 import { createNodeTestLedgerFold, oneLineMessage } from './node-test-ledger-collector.ts';
 import type { NodeTestLedgerSummary } from './node-test-ledger-collector.ts';
 import {
@@ -198,6 +198,36 @@ describe('buildNodeTestRunRows', () => {
     });
   });
 
+  it('resolves the native Node layer from the exact declared path only (EI-28821566028028635)', () => {
+    const declared = 'papercusp-desktop/test/native-workbench-gnome.test.mjs';
+    expect(registeredNodeTestFileLayer(declared)).toBe('integration');
+    expect(registeredNodeTestFileLayer(`./${declared}`)).toBe('integration');
+    expect(registeredNodeTestFileLayer(declared.replaceAll('/', '\\'))).toBe('integration');
+    for (const undeclared of ['papercusp-desktop/test/guard.test.js', 'native-workbench-gnome.test.mjs',
+      declared.toUpperCase(), 'papercusp-desktop/test/native-workbench-gnome.integration.test.mjs', '']) {
+      expect(registeredNodeTestFileLayer(undeclared)).toBe('unit');
+    }
+  });
+
+  it('stamps each row with its own file layer; a lookalike name or forged collector/env layer never upgrades (EI-28821566028028635)', () => {
+    vi.stubEnv('PAPERCUSP_TEST_LAYER', 'integration');
+    try {
+      const forged = { ...result({ passed: 1 }), testLayer: 'integration', layer: 'llm' } as unknown as NodeTestLedgerSummary['files'][number];
+      const rows = buildNodeTestRunRows(summary([
+        forged,
+        result({ file: '/repo/papercusp-desktop/test/native-workbench-gnome.test.mjs', passed: 1 }),
+        result({ file: '/repo/papercusp-desktop/test/native-workbench-gnome.integration.test.mjs', passed: 1 }),
+      ]), ctx());
+      expect(rows.map(row => [row.filePath, parseTestRunExecutionDetails(row.executionDetails)?.testLayer])).toEqual([
+        ['papercusp-desktop/test/guard.test.js', 'unit'],
+        ['papercusp-desktop/test/native-workbench-gnome.test.mjs', 'integration'],
+        ['papercusp-desktop/test/native-workbench-gnome.integration.test.mjs', 'unit'],
+      ]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('preserves passed-title truncation metadata in persisted execution details', () => {
     const [row] = buildNodeTestRunRows(summary([result({
       passed: 65,
@@ -277,9 +307,10 @@ describe('beginNodeTestLedger — a real node --test child', () => {
   });
 
   async function runChild(fixture: string, readExecutedSource?: Parameters<typeof beginNodeTestLedger>[0]['readExecutedSource'],
-    writeOutcome: 'inserted' | 'failed' | 'timeout' | 'unknown' = 'inserted') {
+    writeOutcome: 'inserted' | 'failed' | 'timeout' | 'unknown' = 'inserted', relFile = 'fx.test.mjs') {
     dir = mkdtempSync(join(tmpdir(), 'node-test-ledger-fixture-'));
-    writeFileSync(join(dir, 'fx.test.mjs'), fixture);
+    mkdirSync(dirname(join(dir, relFile)), { recursive: true });
+    writeFileSync(join(dir, relFile), fixture);
     const written: TestRunRow[] = [];
     const snapshot: WorktreeGitSnapshot = { commit: 'feedface00', porcelain: '' };
     const session = await beginNodeTestLedger({
@@ -316,7 +347,7 @@ describe('beginNodeTestLedger — a real node --test child', () => {
       }`);
     const reporterArgs = session.reporterArgs.map(arg =>
       arg.startsWith('--test-reporter=') && arg !== '--test-reporter=spec' ? `--test-reporter=${tee}` : arg);
-    const child = spawnSync(process.execPath, ['--test', ...reporterArgs, 'fx.test.mjs'], {
+    const child = spawnSync(process.execPath, ['--test', ...reporterArgs, relFile], {
       cwd: dir, encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '' },
     });
     const summaryArg = session.reporterArgs.find(arg => arg.startsWith('--test-reporter-destination=') && arg.endsWith('summary.json'));
@@ -338,6 +369,16 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     mutantDiffTruncated: false,
     testCommandSha256: 'c'.repeat(64),
   };
+
+  it('persists the declared native integration layer from a real child run (EI-28821566028028635)', async () => {
+    const rel = 'papercusp-desktop/test/native-workbench-gnome.test.mjs';
+    const { session, child, written } = await runChild(
+      "import { test } from 'node:test'; test('declared integration stand-in', () => {});", undefined, 'inserted', rel);
+    expect(child.status).toBe(0);
+    expect(await session.record()).toMatchObject({ attempted: 1, recorded: 1 });
+    expect(written.map(row => [row.filePath, parseTestRunExecutionDetails(row.executionDetails)?.testLayer]))
+      .toEqual([[rel, 'integration']]);
+  });
 
   it.each(['inserted', 'failed', 'timeout', 'unknown'] as const)(
     'reports confirmed persistence separately from attempts when the writer returns %s', async outcome => {

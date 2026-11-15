@@ -555,6 +555,33 @@ export function registeredVitestFileLayer(path: string): RecordedTestLayer | und
   return undefined;
 }
 
+/** Explicit node:test file layers (EI-28821566028028635). The router's native Node route has
+ * no Vitest project to carry `provide.papercuspTestLayer`, so its recorder stamps `unit` for
+ * every file EXCEPT the maintained, repository-relative paths declared here. This is the
+ * runtime route's own configuration, not a filename inference: a lookalike name such as
+ * `*.integration.test.mjs` stays `unit`, and no collector field or environment variable can
+ * override it. Add an entry only for a maintained file that really exercises an integration
+ * boundary, with the reason.
+ */
+export const REGISTERED_NODE_TEST_FILE_LAYERS = [
+  {
+    file: 'papercusp-desktop/test/native-workbench-gnome.test.mjs',
+    layer: 'integration',
+    // quick-access-search-launcher-2026-10-26#D-029: the PREP-UBUNTU integration proof.
+    reason: 'spawns real glib-compile-schemas and gjs processes against the GNOME extension source',
+  },
+] as const satisfies readonly { file: string; layer: RecordedTestLayer; reason: string }[];
+
+/** The layer the native node:test route records for one repository-relative file. Exact,
+ * case-sensitive match after separator normalization; every undeclared file is `unit`. */
+export function registeredNodeTestFileLayer(path: string): RecordedTestLayer {
+  const normalized = path.trim().replaceAll('\\', '/').replace(/^\.\//, '');
+  for (const entry of REGISTERED_NODE_TEST_FILE_LAYERS) {
+    if (entry.file === normalized) return entry.layer;
+  }
+  return 'unit';
+}
+
 /** Independently measured by a registered runtime reader, never a test assertion. */
 export interface RecordedRuntimeEnvironment {
   schemaVersion: 1;
