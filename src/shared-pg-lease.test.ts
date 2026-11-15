@@ -10,7 +10,7 @@
  * No real database here: a fake handle is installed in the SAME pinned slot the reporters use,
  * and it rejects any query issued after end() exactly the way postgres.js does.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { pinModuleState } from '@papercusp/module-singleton';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -25,6 +25,28 @@ const shared = pinModuleState('@papercusp/test-config.shared-pg', () => ({
   promise: undefined as Promise<PgHandle> | undefined,
   holders: 0,
 }));
+
+// Synthetic timeout rows and late fake acknowledgements belong to these
+// fixtures, never to the owning native run's receipt/recovery file.
+const fixtureReceiptDirectory = mkdtempSync(join(tmpdir(), 'shared-pg-fixture-receipts-'));
+const fixtureReceiptPath = join(fixtureReceiptDirectory, 'receipts.jsonl');
+const outerReceiptEnvironment = {
+  PAPERCUSP_TEST_RUN_RECEIPT_FILE: process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE,
+  PAPERCUSP_TEST_RUN_RECOVERY_FILE: process.env.PAPERCUSP_TEST_RUN_RECOVERY_FILE,
+};
+beforeEach(() => {
+  if (outerReceiptEnvironment.PAPERCUSP_TEST_RUN_RECEIPT_FILE?.trim()) {
+    process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = fixtureReceiptPath;
+  } else delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+  process.env.PAPERCUSP_TEST_RUN_RECOVERY_FILE = fixtureReceiptPath;
+});
+afterAll(() => {
+  for (const [key, value] of Object.entries(outerReceiptEnvironment)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(fixtureReceiptDirectory, { recursive: true, force: true });
+});
 
 function installFakeClient() {
   const state = { ended: false, queries: 0 };
