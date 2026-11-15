@@ -361,6 +361,9 @@ function populationIdentity(value: unknown): value is RecordedPopulationIdentity
     && !/[\u0000-\u001f\u007f]/.test(value[4]);
 }
 
+/** Reuse the same identity contract when collecting a candidate before execution. */
+export { populationIdentity as isRecordedPopulationIdentity };
+
 function comparePopulationIdentity(a: RecordedPopulationIdentity, b: RecordedPopulationIdentity): number {
   for (const index of [0, 1, 2, 4] as const) {
     if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
