@@ -10,8 +10,9 @@
  * before/after snapshot (a run whose tree moved is recorded worktree_dirty=true, never a
  * false clean).
  *
- * Fail-soft by contract: recording never changes the run's exit code, and a missing or
- * unreadable summary records nothing (unknown is not "zero tests").
+ * Recording is fail-soft and never throws. Callers decide whether incomplete ledger
+ * acknowledgement should keep a passing command green. A missing or unreadable summary
+ * records nothing (unknown is not "zero tests").
  */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -198,6 +199,18 @@ export interface NodeTestLedgerOutcome {
    * node:test mutant run is always `inconclusive` to mutation-probe, however it failed.
    */
   assertionFailures: Array<{ file: string; name: string; messages: string[] }>;
+}
+
+/** A passing node:test child is green only when every attempted ledger row was acknowledged. */
+export function nodeTestRunnerExitCode(
+  childExitCode: number | null,
+  outcome: Pick<NodeTestLedgerOutcome, 'recorded' | 'attempted'> | null,
+): number {
+  const testExitCode = childExitCode ?? 1;
+  if (testExitCode !== 0) return testExitCode;
+  if (!outcome || outcome.attempted === undefined || outcome.attempted <= 0 ||
+      outcome.recorded !== outcome.attempted) return 1;
+  return 0;
 }
 
 /** Summary -> the router's assertion-failure diagnostics. Pure; only body failures count. */

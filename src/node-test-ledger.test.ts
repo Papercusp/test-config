@@ -23,6 +23,7 @@ import {
   beginNodeTestLedger,
   buildNodeTestRunRows,
   nodeTestAssertionFailures,
+  nodeTestRunnerExitCode,
   parseNodeTestLedgerSummary,
 } from './node-test-ledger.ts';
 import type { NodeTestRowContext } from './node-test-ledger.ts';
@@ -161,6 +162,20 @@ describe('node:test ledger collector fold', () => {
     expect(oneLineMessage({ message: 'a\n\n b' })).toBe('a b');
     expect(oneLineMessage(undefined)).toBe('failed');
     expect(oneLineMessage({ message: 'x'.repeat(900) }).length).toBe(500);
+  });
+});
+
+describe('node:test runner exit status', () => {
+  it('requires complete ledger acknowledgement before a passing child exits green', () => {
+    expect(nodeTestRunnerExitCode(0, { recorded: 1, attempted: 1 })).toBe(0);
+    expect(nodeTestRunnerExitCode(0, { recorded: 0, attempted: 1 })).toBe(1);
+    expect(nodeTestRunnerExitCode(0, { recorded: 1, attempted: 2 })).toBe(1);
+    expect(nodeTestRunnerExitCode(0, { recorded: 1 })).toBe(1);
+    expect(nodeTestRunnerExitCode(0, null)).toBe(1);
+  });
+
+  it('preserves a failing child status when ledger acknowledgement is incomplete', () => {
+    expect(nodeTestRunnerExitCode(17, { recorded: 0, attempted: 1 })).toBe(17);
   });
 });
 
