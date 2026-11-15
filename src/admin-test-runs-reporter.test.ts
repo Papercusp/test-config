@@ -1778,6 +1778,38 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         expect(statements).toHaveLength(2);
       });
 
+      it.each([false, true])('recovers a complete three-phase readback without trusting an unseen competing row (overflow=%s)', async overflow => {
+        const cases = [{ caseIndex: 0, caseKey: 'suite > original', occurrence: 1,
+          status: 'pass' as const, durationMs: 1, errorTail: null }];
+        const original = { ...receipt, row: { ...receipt.row, cases },
+          caseInsertOutcome: { written: 0, unwritten: 1, reason: 'file_insert_timeout' } };
+        const population = [
+          { ...candidate, id: 'baseline', startedAt: new Date(at.getTime() - 2_000) },
+          { ...candidate, id: 'copy-baseline', startedAt: new Date(at.getTime() - 1_000) },
+          candidate,
+          ...(overflow ? [{ ...candidate, id: 'competing-match' }] : []),
+        ];
+        const statements: string[] = [];
+        const batches: Record<string, unknown>[][] = [];
+        const sql = Object.assign((first: unknown, ...parameters: unknown[]) => {
+          if (Array.isArray(first) && !('raw' in first)) {
+            if (typeof first[0] === 'object') batches.push(first as Record<string, unknown>[]);
+            return {};
+          }
+          const query = (first as TemplateStringsArray).join('?');
+          statements.push(query);
+          return Promise.resolve(query.includes('SELECT')
+            ? population.slice(0, Number(parameters.at(-1))) : []);
+        }, { end: async () => undefined }) as unknown as PgSql;
+        const recovered = await reconcileTimedOutTestRunReceiptsWithSql(sql, JSON.stringify(original), {
+          expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a', env: {},
+        });
+        expect(recovered.map(result => result.id)).toEqual(overflow ? [] : ['901']);
+        expect(batches).toHaveLength(overflow ? 0 : 1);
+        expect(statements.join('')).not.toContain('INSERT INTO harness_shared.test_runs');
+        if (!overflow) expect(recovered).toMatchObject([{ caseInsertOutcome: { written: 1, unwritten: 0 } }]);
+      });
+
       it.each(['foreign metadata', 'ambiguous row', 'different acknowledged id'])('never writes recovered cases for %s', async control => {
         const original = { ...base, outcome: 'inserted', id: '901', row: { ...base.row,
           cases: [{ caseIndex: 0, caseKey: 'original', occurrence: 1, status: 'pass', durationMs: 1, errorTail: null }] } };

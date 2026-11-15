@@ -2401,6 +2401,9 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
     const deadline = Date.now() + timeoutMs;
     const filePaths = [...new Set(readbackReceipts.map(receipt => receipt.row.filePath))];
     const maxRows = Math.min(TEST_RUN_RECEIPT_READBACK_MAX_ROWS, readbackReceipts.length * 2 + 1);
+    // Fetch an overflow row to distinguish a complete population at the limit
+    // from a truncated prefix without trusting a potentially unseen match.
+    const readbackLimit = maxRows + 1;
     let readbacks: unknown = [];
     let readbackFailed = false;
     const query = trackSharedPgOperation(Promise.resolve().then(async () => {
@@ -2429,7 +2432,7 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
         WHERE run_group_id = ${runGroupId}
           AND file_path IN ${sql(filePaths)}
         ORDER BY id
-        LIMIT ${maxRows}
+        LIMIT ${readbackLimit}
       `;
       if (Array.isArray(result)) readbacks = result;
       else readbackFailed = true;
@@ -2439,7 +2442,7 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
       ? readbacks.filter((row): row is TestRunReceiptReadbackCandidate =>
           Boolean(row && typeof row === 'object'))
       : [];
-    const truncated = candidates.length >= maxRows;
+    const truncated = candidates.length > maxRows;
     const recovered = recoverTimedOutTestRunReceipts(
       readbackReceipts.map(receipt => receipt.outcome === 'inserted'
         ? { ...receipt, outcome: 'timeout' as const, reason: 'case_recovery_readback', replayable: false }
