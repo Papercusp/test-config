@@ -175,8 +175,9 @@ it.each(['pending', 'drained', 'pre-client'] as const)('closes the parent cleanl
               env: { ...process.env, PAPERCUSP_TEST_STARTUP_TRACE: '1',
                 PAPERCUSP_TEST_RUNS_DB_URL: pg.getConnectionUri() } },
             (error, stdout, stderr) => error ? reject(Object.assign(error, { stdout, stderr })) : resolve({ stdout, stderr }));
-          child.stdout!.on('data', chunk => {
-            output += String(chunk);
+          child.stdout!.setEncoding('utf8');
+          child.stdout!.on('data', (chunk: string) => {
+            output += chunk;
             if (mode === 'drained' && !unlock && output.includes('"kind":"query-pending"')) {
               unlock = Promise.resolve(blocker.unsafe('SELECT pg_advisory_unlock(277023)'));
               void unlock.catch(reject);
