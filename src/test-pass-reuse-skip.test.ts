@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -31,10 +31,12 @@ it.each(['absent', 'legacy'])('loads with %s host runtime-proof support and runs
   mkdirSync(join(root, 'scripts/lib'), { recursive: true });
   writeFileSync(join(root, 'package.json'), '{"type":"module"}');
   if (support === 'legacy') writeFileSync(join(root, 'scripts/lib/runtime-compatibility.mjs'), 'export function measureRuntime() {}\n');
+  // Preserve the package's real self-reference exports and local dependency
+  // closure while varying only the host's runtime-proof API.
+  cpSync(new URL('../package.json', import.meta.url), join(root, 'libs/test-config/package.json'));
+  cpSync(new URL('./', import.meta.url), sourceDir, { recursive: true });
   writeFileSync(join(sourceDir, 'admin-test-runs-reporter.ts'), 'export function inferWorkspaceRoot() { return "/unused"; }\n');
   const consumer = join(sourceDir, 'test-pass-reuse-skip.ts');
-  writeFileSync(consumer, readFileSync(new URL('./test-pass-reuse-skip.ts', import.meta.url)));
-  writeFileSync(join(sourceDir, 'runtime-proof.ts'), readFileSync(new URL('./runtime-proof.ts', import.meta.url)));
   const list = join(root, 'skip.json');
   writeFileSync(list, JSON.stringify({ schema: REUSE_SKIP_LIST_SCHEMA, files: ['a.test.ts'],
     runContext: 'clean-local', runnerIdentity: 'old-runtime', judgedSha: 'a'.repeat(40) }));
