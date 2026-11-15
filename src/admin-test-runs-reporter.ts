@@ -2379,7 +2379,12 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
   const timedOutReceipts = latestReceipts.filter(receipt => {
     if (unsubmittedIds.has(receipt.receiptId)) return false;
     if (receipt.row.executionDetails?.runGroupId !== runGroupId) return false;
-    if (receipt.outcome !== 'timeout' && !(receipt.outcome === 'inserted'
+    // Losing the connection can lose RETURNING after PostgreSQL committed,
+    // without an earlier waiter timeout. This permits exact readback only:
+    // the failed packet remains intact and its file INSERT is never replayed.
+    const connectionAcknowledgementLost = receipt.outcome === 'failed'
+      && receipt.errorCode === 'CONNECTION_DESTROYED' && receipt.replayable === false;
+    if (receipt.outcome !== 'timeout' && !connectionAcknowledgementLost && !(receipt.outcome === 'inserted'
       && (receipt.row.cases?.length ?? 0) > 0
       && (!receipt.caseInsertOutcome || receipt.caseInsertOutcome.unwritten > 0))) return false;
     const expectedPath = testRunReceiptPathForRoot(receipt, options.expectedRoot);
@@ -2444,8 +2449,8 @@ export async function reconcileTimedOutTestRunReceiptsWithSql(
       : [];
     const truncated = candidates.length > maxRows;
     const recovered = recoverTimedOutTestRunReceipts(
-      readbackReceipts.map(receipt => receipt.outcome === 'inserted'
-        ? { ...receipt, outcome: 'timeout' as const, reason: 'case_recovery_readback', replayable: false }
+      readbackReceipts.map(receipt => receipt.outcome === 'inserted' || receipt.outcome === 'failed'
+        ? { ...receipt, outcome: 'timeout' as const, reason: 'unacknowledged_insert_readback', replayable: false }
         : receipt),
       candidates,
       runGroupId,

@@ -70,6 +70,7 @@ import AdminTestRunsReporter, {
   runGit,
   shouldRecordTestRunPath,
   TEST_RUN_INSERT_BATCH_SIZE,
+  TEST_CASE_INSERT_BATCH_SIZE,
   TEST_RUN_RECEIPT_ENV,
   TEST_RUN_RECOVERY_ENV,
   appendTestRunReceipts,
@@ -1743,6 +1744,122 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           ...base, outcome: 'inserted', id: '901',
         }]);
       });
+
+      it.each([15, TEST_CASE_INSERT_BATCH_SIZE - 1, TEST_CASE_INSERT_BATCH_SIZE,
+        TEST_CASE_INSERT_BATCH_SIZE + 1])(
+        'recovers the complete failed CONNECTION_DESTROYED packet through the consumer (%i cases)',
+        async count => {
+          const directory = mkdtempSync(join(tmpdir(), 'reporter-case-ack-recovery-'));
+          const packetPath = join(directory, 'recovery.ndjson');
+          const env = { [TEST_RUN_RECOVERY_ENV]: packetPath };
+          const cases = Array.from({ length: count }, (_, index) => ({
+            caseIndex: index, caseKey: `suite > original ${index}`, occurrence: 1,
+            status: 'pass' as const, durationMs: index, errorTail: null,
+          }));
+          const originalDetails = { ...details, passed: count };
+          const originalRow = { ...row('a.test.ts', 'pass'), executionDetails: originalDetails, cases };
+          const canonical = { ...candidate, executionDetails: originalDetails };
+          const caseLedger = new Map<number, Record<string, unknown>>();
+          let batch: Record<string, unknown>[] = [];
+          let fileWrites = 0;
+          let caseWrites = 0;
+          let loseSecondCaseAcknowledgement = count > TEST_CASE_INSERT_BATCH_SIZE;
+          const lostAcknowledgement = () => Object.assign(
+            new Error('write CONNECTION_DESTROYED 127.0.0.1:5432'), { code: 'CONNECTION_DESTROYED' },
+          );
+          const sql = Object.assign((first: unknown) => {
+            if (Array.isArray(first) && !('raw' in first)) {
+              if (typeof first[0] === 'object') batch = first as Record<string, unknown>[];
+              return {};
+            }
+            const query = (first as TemplateStringsArray).join('?');
+            if (query.includes('INSERT INTO harness_shared.test_runs')) {
+              fileWrites++;
+              // The file committed, but the producer never received its acknowledgement.
+              return Promise.reject(lostAcknowledgement());
+            }
+            if (query.includes('SELECT')) return Promise.resolve([canonical]);
+            expect(query).toContain('INSERT INTO harness_shared.test_case_runs');
+            expect(query).toContain('ON CONFLICT (test_run_id, case_index) DO NOTHING');
+            caseWrites++;
+            for (const value of batch) {
+              const index = Number(value.case_index);
+              if (!caseLedger.has(index)) caseLedger.set(index, value);
+            }
+            if (loseSecondCaseAcknowledgement && caseWrites === 2) {
+              loseSecondCaseAcknowledgement = false;
+              return Promise.reject(lostAcknowledgement());
+            }
+            return Promise.resolve([]);
+          }, { end: async () => undefined }) as unknown as PgSql;
+          try {
+            const failed = await insertTestRunRowsWithSql(sql, [originalRow], context,
+              undefined, () => undefined, env);
+            expect(failed).toMatchObject([{ outcome: 'failed', errorCode: 'CONNECTION_DESTROYED',
+              replayable: false, caseInsertOutcome: { written: 0, unwritten: count, reason: 'file_insert_failed' } }]);
+            appendTestRunReceipts(env, failed);
+            const originalPacket = readFileSync(packetPath, 'utf8');
+            expect(JSON.parse(originalPacket).row.cases).toEqual(cases);
+            const options = { expectedPaths: ['a.test.ts'], expectedRoot: details.root,
+              runGroupId: 'group-a', env };
+            expect(pendingTestRunRecoveryPaths(originalPacket, options.expectedPaths, options.expectedRoot))
+              .toEqual(['a.test.ts']);
+
+            const recovered = await reconcileTimedOutTestRunReceiptsWithSql(sql, originalPacket, options);
+            expect(recovered).toMatchObject([{ outcome: 'inserted', id: '901',
+              caseInsertOutcome: count > TEST_CASE_INSERT_BATCH_SIZE
+                ? { written: TEST_CASE_INSERT_BATCH_SIZE, unwritten: 1 }
+                : { written: count, unwritten: 0, reason: null } }]);
+            // Simulate a fresh consumer reading the durable packet after its predecessor exited.
+            const restartPacket = readFileSync(packetPath, 'utf8');
+            expect(restartPacket.startsWith(originalPacket)).toBe(true);
+            if (count > TEST_CASE_INSERT_BATCH_SIZE) {
+              expect(pendingTestRunRecoveryPaths(restartPacket, options.expectedPaths, options.expectedRoot))
+                .toEqual(['a.test.ts']);
+              expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, restartPacket, options))
+                .toMatchObject([{ id: '901', caseInsertOutcome: { written: count, unwritten: 0, reason: null } }]);
+            }
+            const completePacket = readFileSync(packetPath, 'utf8');
+            expect(pendingTestRunRecoveryPaths(completePacket, options.expectedPaths, options.expectedRoot)).toEqual([]);
+            expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, completePacket, options)).toEqual([]);
+            // Replaying the original failure is idempotent even after every case committed.
+            expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, originalPacket, options))
+              .toMatchObject([{ id: '901', caseInsertOutcome: { written: count, unwritten: 0 } }]);
+            expect(fileWrites).toBe(1);
+            expect(caseLedger.size).toBe(count);
+            expect([...caseLedger.values()]).toEqual(cases.map(value => ({
+              test_run_id: '901', case_index: value.caseIndex, case_key: value.caseKey,
+              occurrence: value.occurrence, status: value.status, duration_ms: value.durationMs,
+              error_tail: value.errorTail,
+            })));
+          } finally { rmSync(directory, { recursive: true, force: true }); }
+        },
+      );
+
+      it.each(['missing', 'foreign', 'ambiguous'])('preserves a failed CONNECTION_DESTROYED packet with %s canonical evidence',
+        async control => {
+          const original = { ...receipt, outcome: 'failed', errorCode: 'CONNECTION_DESTROYED',
+            reason: 'write CONNECTION_DESTROYED 127.0.0.1:5432',
+            row: { ...receipt.row, cases: [{ caseIndex: 0, caseKey: 'original', occurrence: 1,
+              status: 'pass', durationMs: 1, errorTail: null }] } };
+          const candidates = control === 'missing' ? [] : control === 'foreign'
+            ? [{ ...candidate, executionDetails: { ...details, passed: 2 } }]
+            : [candidate, { ...candidate, id: '902' }];
+          const statements: string[] = [];
+          const sql = Object.assign((first: unknown) => {
+            if (Array.isArray(first) && !('raw' in first)) return {};
+            statements.push((first as TemplateStringsArray).join('?'));
+            return Promise.resolve(candidates);
+          }, { end: async () => undefined }) as unknown as PgSql;
+          const packet = JSON.stringify(original);
+          expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, packet, {
+            expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a', env: {},
+          })).toEqual([]);
+          expect(statements).toHaveLength(1);
+          expect(statements[0]).toContain('SELECT');
+          expect(pendingTestRunRecoveryPaths(packet, ['a.test.ts'], details.root)).toEqual(['a.test.ts']);
+          expect(JSON.parse(packet)).toEqual(original);
+        });
 
       it.each(['timeout', 'inserted'] as const)('recovers omitted cases after a %s file receipt without another file INSERT', async outcome => {
         const cases = [{ caseIndex: 0, caseKey: 'suite > original', occurrence: 1,
