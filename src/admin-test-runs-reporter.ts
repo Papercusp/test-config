@@ -1249,6 +1249,8 @@ export interface TestCaseRecord {
 }
 
 export const TEST_CASE_ERROR_TAIL_MAX_CHARS = 1_000;
+/** Migration 1478's test_case_runs_case_key_check, in PostgreSQL characters.
+ * This is a storage validation boundary, never a collection/receipt limit. */
 export const TEST_CASE_KEY_MAX_CHARS = 2_000;
 
 /**
@@ -1269,7 +1271,7 @@ export function collectTestCases(testModule: TestModule): TestCaseRecord[] | nul
         : null;
       if (status === null) return null; // pending/unreadable: not a completed measurement
       const rawKey = typeof test.fullName === 'string' && test.fullName.trim() ? test.fullName : '(unnamed test)';
-      const caseKey = rawKey.slice(0, TEST_CASE_KEY_MAX_CHARS);
+      const caseKey = rawKey;
       const occurrence = (seen.get(caseKey) ?? 0) + 1;
       seen.set(caseKey, occurrence);
       let durationMs: number | null = null;
@@ -2650,7 +2652,7 @@ function replayRowFromPgSetupReceipt(receipt: PgSetupFailureReceipt): TestRunRow
   const caseStatuses: readonly string[] = ['pass', 'fail', 'skip'];
   const validCases = row.cases === undefined || row.cases === null || (Array.isArray(row.cases)
     && row.cases.every(testCase => Number.isSafeInteger(testCase.caseIndex) && testCase.caseIndex >= 0
-      && typeof testCase.caseKey === 'string' && testCase.caseKey.length <= TEST_CASE_KEY_MAX_CHARS
+      && typeof testCase.caseKey === 'string'
       && Number.isSafeInteger(testCase.occurrence) && testCase.occurrence > 0
       && caseStatuses.includes(testCase.status)
       && (testCase.durationMs === null || (typeof testCase.durationMs === 'number'
@@ -3124,10 +3126,11 @@ export async function insertTestCaseRowsWithSql(
   parents: ReadonlyArray<{ testRunId: string; cases: readonly TestCaseRecord[] }>,
   limits: { deadline: number; insertTimeoutMs: number },
 ): Promise<TestCaseInsertOutcome> {
-  const rows = parents.flatMap(({ testRunId, cases }) => cases.map((testCase) => escapeLedgerNul({
+  const rows = parents.flatMap(({ testRunId, cases }) => cases.map((testCase) => ({
     test_run_id: testRunId,
     case_index: testCase.caseIndex,
-    case_key: escapeLedgerNul(testCase.caseKey).slice(0, TEST_CASE_KEY_MAX_CHARS),
+    // Identity must remain exact. In particular NUL -> "\\0" is not injective.
+    case_key: testCase.caseKey,
     occurrence: testCase.occurrence,
     status: testCase.status,
     duration_ms: testCase.durationMs,
@@ -3138,6 +3141,18 @@ export async function insertTestCaseRowsWithSql(
     const remainingMs = limits.deadline - Date.now();
     if (remainingMs <= 0) return { written, unwritten: rows.length - offset, reason: 'flush_deadline' };
     const batch = rows.slice(offset, offset + TEST_CASE_INSERT_BATCH_SIZE);
+    // Reject the complete pending batch before submitting it. The original keys
+    // remain in receipt.row.cases and the recovery packet; the consumer reports
+    // the unwritten suffix rather than acknowledging altered identities. JSON
+    // receipts can retain NUL, but PostgreSQL text cannot (SQLSTATE 22021).
+    for (const row of batch) {
+      const characters = [...row.case_key].length;
+      const reason = row.case_key.includes('\0') ? 'case_key_contains_nul'
+        : characters < 1 ? 'case_key_empty'
+        : characters > TEST_CASE_KEY_MAX_CHARS ? 'case_key_exceeds_2000_characters'
+        : null;
+      if (reason) return { written, unwritten: rows.length - offset, reason };
+    }
     let failure: unknown = null;
     const query = trackSharedPgOperation(Promise.resolve(sql`
       INSERT INTO harness_shared.test_case_runs

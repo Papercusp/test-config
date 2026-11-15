@@ -32,6 +32,9 @@ import AdminTestRunsReporter, {
   captureSourceByteSnapshotInWorker,
   type SourceByteCensusWorkerFactory,
   collectModuleExecution,
+  collectTestCases,
+  insertTestCaseRowsWithSql,
+  TEST_CASE_KEY_MAX_CHARS,
   collectIsolatedRuntimeReceipts,
   collectBoundaryObservations,
   collectSqlCoverageObservations,
@@ -1615,7 +1618,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     expect(stored).toEqual(details);
   });
 
-  it('retains binary failure diagnostics in file, JSON and case inserts without PostgreSQL NULs', async () => {
+  it('retains binary diagnostics and rejects the intact NUL case identity without aliasing literal text', async () => {
     const batches: Record<string, unknown>[][] = [];
     let batch: Record<string, unknown>[] = [];
     const sql = Object.assign((first: unknown) => {
@@ -1636,11 +1639,12 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         status: 'fail', durationMs: 1, errorTail: diagnostic }],
     }], { branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: null,
       harnessSlug: null, workspaceId: null, loopLagP95Ms: null, rssMb: null });
-    expect(receipts).toMatchObject([{ outcome: 'inserted', id: '901' }]);
-    expect(batches).toHaveLength(2);
+    expect(receipts).toMatchObject([{ outcome: 'inserted', id: '901',
+      caseInsertOutcome: { written: 0, unwritten: 1, reason: 'case_key_contains_nul' } }]);
+    expect(batches).toHaveLength(1);
     expect(batches[0][0]).toMatchObject({ output_tail: 'raster\\0bytes',
       execution_details: { passedCaseTitles: ['raster\\0bytes'] } });
-    expect(batches[1][0]).toMatchObject({ case_key: 'raster\\0bytes', error_tail: 'raster\\0bytes' });
+    expect(JSON.parse(JSON.stringify(receipts))[0].row.cases[0].caseKey).toBe(diagnostic);
     expect(details.passedCaseTitles).toEqual([diagnostic]);
   });
 
@@ -1660,6 +1664,52 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         (first: unknown) => (Array.isArray(first) && !('raw' in (first as object)) ? {} : statement()),
         { end: async () => undefined },
       ) as unknown as PgSql;
+
+    describe('lossless case identity (EI-28880541891226078)', () => {
+      const collect = (names: string[]) => collectTestCases({ state: () => 'passed',
+        children: { allTests: () => names.map(fullName => ({ fullName,
+          result: () => ({ state: 'passed' }), diagnostic: () => ({ duration: 1 }) })) },
+      } as never)!;
+
+      it.each([TEST_CASE_KEY_MAX_CHARS - 1, TEST_CASE_KEY_MAX_CHARS, TEST_CASE_KEY_MAX_CHARS + 1])(
+        'collects the complete %i-character identity before storage validation', length => {
+          const name = 'x'.repeat(length);
+          expect(collect([name])[0]).toMatchObject({ caseKey: name, occurrence: 1 });
+        });
+
+      it.each([false, true])('counts full shared-prefix and binary identities independently (reversed=%s)', reversed => {
+        const prefix = 'x'.repeat(TEST_CASE_KEY_MAX_CHARS);
+        const names = [prefix + 'a', prefix + 'b', 'raster\0bytes', 'raster\\0bytes', prefix + 'a'];
+        if (reversed) names.reverse();
+        const seen = new Map<string, number>();
+        expect(collect(names).map(({ caseKey, occurrence }) => [caseKey, occurrence])).toEqual(names.map(name => {
+          const occurrence = (seen.get(name) ?? 0) + 1;
+          seen.set(name, occurrence);
+          return [name, occurrence];
+        }));
+      });
+
+      it.each([
+        ['x'.repeat(TEST_CASE_KEY_MAX_CHARS - 1), null],
+        ['x'.repeat(TEST_CASE_KEY_MAX_CHARS), null],
+        ['x'.repeat(TEST_CASE_KEY_MAX_CHARS + 1), 'case_key_exceeds_2000_characters'],
+        ['🌱'.repeat(TEST_CASE_KEY_MAX_CHARS), null],
+        ['x'.repeat(TEST_CASE_KEY_MAX_CHARS - 2) + '\0z', 'case_key_contains_nul'],
+        ['raster\\0bytes', null],
+      ])('stores or explicitly rejects identity boundary %# intact', async (name, reason) => {
+        const cases = collect([name!]);
+        const helpers: Record<string, unknown>[][] = [];
+        const sql = Object.assign((first: unknown) => {
+          if (Array.isArray(first) && !('raw' in first)) { helpers.push(first as Record<string, unknown>[]); return {}; }
+          return Promise.resolve([]);
+        }, { end: async () => undefined }) as unknown as PgSql;
+        const outcome = await insertTestCaseRowsWithSql(sql, [{ testRunId: '901', cases }],
+          { deadline: Date.now() + 10_000, insertTimeoutMs: 1_000 });
+        expect(outcome).toEqual({ written: reason ? 0 : 1, unwritten: reason ? 1 : 0, reason });
+        expect(helpers.flat().map(value => value.case_key)).toEqual(reason ? [] : [name]);
+        expect(cases[0].caseKey).toBe(name);
+      });
+    });
 
     it('uses a row framework override and keeps Vitest as the compatibility default', async () => {
       const insertedRows: Record<string, unknown>[] = [];
@@ -1746,14 +1796,14 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
       });
 
       it.each([15, TEST_CASE_INSERT_BATCH_SIZE - 1, TEST_CASE_INSERT_BATCH_SIZE,
-        TEST_CASE_INSERT_BATCH_SIZE + 1])(
+        TEST_CASE_INSERT_BATCH_SIZE + 1, TEST_CASE_INSERT_BATCH_SIZE * 2 + 1])(
         'recovers the complete failed CONNECTION_DESTROYED packet through the consumer (%i cases)',
         async count => {
           const directory = mkdtempSync(join(tmpdir(), 'reporter-case-ack-recovery-'));
           const packetPath = join(directory, 'recovery.ndjson');
           const env = { [TEST_RUN_RECOVERY_ENV]: packetPath };
           const cases = Array.from({ length: count }, (_, index) => ({
-            caseIndex: index, caseKey: `suite > original ${index}`, occurrence: 1,
+            caseIndex: index, caseKey: 'x'.repeat(TEST_CASE_KEY_MAX_CHARS - 8) + String(index).padStart(8, '0'), occurrence: 1,
             status: 'pass' as const, durationMs: index, errorTail: null,
           }));
           const originalDetails = { ...details, passed: count };
@@ -1808,7 +1858,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
             const recovered = await reconcileTimedOutTestRunReceiptsWithSql(sql, originalPacket, options);
             expect(recovered).toMatchObject([{ outcome: 'inserted', id: '901',
               caseInsertOutcome: count > TEST_CASE_INSERT_BATCH_SIZE
-                ? { written: TEST_CASE_INSERT_BATCH_SIZE, unwritten: 1 }
+                ? { written: TEST_CASE_INSERT_BATCH_SIZE, unwritten: count - TEST_CASE_INSERT_BATCH_SIZE }
                 : { written: count, unwritten: 0, reason: null } }]);
             // Simulate a fresh consumer reading the durable packet after its predecessor exited.
             const restartPacket = readFileSync(packetPath, 'utf8');
@@ -1835,6 +1885,42 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           } finally { rmSync(directory, { recursive: true, force: true }); }
         },
       );
+
+      it.each(['length', 'nul'] as const)('keeps the full rejected %s identity and unattempted suffix recoverable across restarts', async boundary => {
+        const directory = mkdtempSync(join(tmpdir(), 'case-identity-recovery-'));
+        const packetPath = join(directory, 'recovery.ndjson');
+        const names = Array.from({ length: TEST_CASE_INSERT_BATCH_SIZE + 2 }, (_, index) => `case ${index}`);
+        names[TEST_CASE_INSERT_BATCH_SIZE] = boundary === 'length'
+          ? 'x'.repeat(TEST_CASE_KEY_MAX_CHARS) + 'decisive'
+          : 'x'.repeat(TEST_CASE_KEY_MAX_CHARS - 1) + '\0';
+        const cases = names.map((caseKey, caseIndex) => ({ caseKey, caseIndex, occurrence: 1,
+          status: 'pass' as const, durationMs: 1, errorTail: null }));
+        const reason = boundary === 'length' ? 'case_key_exceeds_2000_characters' : 'case_key_contains_nul';
+        const batchKeys: unknown[][] = [];
+        const sql = Object.assign((first: unknown) => {
+          if (Array.isArray(first) && !('raw' in first)) {
+            if (typeof first[0] === 'object') batchKeys.push((first as Record<string, unknown>[]).map(value => value.case_key));
+            return {};
+          }
+          const query = (first as TemplateStringsArray).join('?');
+          return Promise.resolve(query.includes('SELECT') ? [candidate] : []);
+        }, { end: async () => undefined }) as unknown as PgSql;
+        const original = { ...receipt, row: { ...receipt.row, cases } };
+        const options = { expectedPaths: ['a.test.ts'], expectedRoot: details.root,
+          runGroupId: 'group-a', env: { [TEST_RUN_RECOVERY_ENV]: packetPath } };
+        try {
+          appendTestRunReceipts(options.env, [original]);
+          for (let restart = 0; restart < 3; restart++) {
+            const packet = readFileSync(packetPath, 'utf8');
+            expect(pendingTestRunRecoveryPaths(packet, options.expectedPaths, options.expectedRoot)).toEqual(['a.test.ts']);
+            expect(await reconcileTimedOutTestRunReceiptsWithSql(sql, packet, options))
+              .toMatchObject([{ id: '901', caseInsertOutcome: { written: TEST_CASE_INSERT_BATCH_SIZE, unwritten: 2, reason } }]);
+            const durable = latestTestRunReceipts(readFileSync(packetPath, 'utf8'));
+            expect(durable[0].row.cases).toEqual(cases);
+            expect(batchKeys.at(-1)).toEqual(names.slice(0, TEST_CASE_INSERT_BATCH_SIZE));
+          }
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
 
       it.each(['missing', 'foreign', 'ambiguous'])('preserves a failed CONNECTION_DESTROYED packet with %s canonical evidence',
         async control => {
