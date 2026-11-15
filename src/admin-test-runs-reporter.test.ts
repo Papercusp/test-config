@@ -9,7 +9,7 @@
  * onExit.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
@@ -93,6 +93,27 @@ import { captureConfigurationSnapshot } from './configuration-snapshot.ts';
 import { readVerifierSourceReceiptSync, verifierGitCheckoutSync, verifierSourceFiles } from './verifier-source.ts';
 
 const TEST_CONFIG_ROOT = fileURLToPath(new URL('../', import.meta.url));
+// Reporter fixtures must not append synthetic timeouts or acknowledgements to
+// the native runner's recovery sink. Keep evidence-mode budgets when requested,
+// but give every fixture the suite's private sink unless it selects its own.
+const fixtureReceiptDirectory = mkdtempSync(join(tmpdir(), 'reporter-fixture-receipts-'));
+const fixtureReceiptPath = join(fixtureReceiptDirectory, 'receipts.jsonl');
+const outerReceiptEnvironment = {
+  [TEST_RUN_RECEIPT_ENV]: process.env[TEST_RUN_RECEIPT_ENV],
+  [TEST_RUN_RECOVERY_ENV]: process.env[TEST_RUN_RECOVERY_ENV],
+};
+beforeEach(() => {
+  if (outerReceiptEnvironment[TEST_RUN_RECEIPT_ENV]?.trim()) process.env[TEST_RUN_RECEIPT_ENV] = fixtureReceiptPath;
+  else delete process.env[TEST_RUN_RECEIPT_ENV];
+  process.env[TEST_RUN_RECOVERY_ENV] = fixtureReceiptPath;
+});
+afterAll(() => {
+  for (const [key, value] of Object.entries(outerReceiptEnvironment)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(fixtureReceiptDirectory, { recursive: true, force: true });
+});
 describe('native Node TypeScript parser compatibility (EI-28690145575369014)', () => {
   it('parses the complete reporter with native type stripping', () => {
     const source = readFileSync(new URL('./admin-test-runs-reporter.ts', import.meta.url), 'utf8');
@@ -509,7 +530,7 @@ describe('receipt-backed native archive reporter', () => {
     // Run the real Vitest pool in an owned child. Only reporter-side Git is
     // slowed, identically in both modes; the passing test worker has no handles.
     writeFileSync(probePath, `
-      import { writeFileSync, mkdirSync, existsSync, unlinkSync, readFileSync } from 'node:fs';
+      import { appendFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, readFileSync } from 'node:fs';
       import { Writable } from 'node:stream';
       import { join } from 'node:path';
       const { createVitest, ForksPoolWorker } = await import(${JSON.stringify(pathToFileURL(require.resolve('vitest/node')).href)});
@@ -518,6 +539,9 @@ describe('receipt-backed native archive reporter', () => {
         reporterWriteBudget, appendTestRunReceipts, testRunReceiptBaseFor, TEST_RUN_RECEIPT_ENV
       } = await import(${JSON.stringify(new URL('./admin-test-runs-reporter.ts', import.meta.url).href)});
       const [root, receiptPath, mode, parent] = process.argv.slice(2);
+      const phaseFile = join(parent, mode + '.phases.jsonl');
+      const phase = event => appendFileSync(phaseFile, JSON.stringify({ event, at: Date.now() }) + '\\n');
+      phase('imports-ready');
       const events = [];
       const logs = [];
       const ordinary = mode === 'ordinary';
@@ -581,6 +605,7 @@ describe('receipt-backed native archive reporter', () => {
         'process.exit(result.status ?? 1);\\n', { mode: 0o755 });
       let snapshot;
       const stream = new Writable({ write(chunk, _encoding, done) { logs.push(String(chunk)); done(); } });
+      phase('create-vitest-start');
       const runner = await createVitest('test', { root, config: false, watch: false,
         globals: true, include: ['probe.test.ts'], maxWorkers: 1, teardownTimeout: 300,
         pool: { name: 'receipt-forks', createPoolWorker(options) {
@@ -635,13 +660,17 @@ describe('receipt-backed native archive reporter', () => {
           process.env.VERIFY_TAURI_SOURCE_REF = ${JSON.stringify(sourceCommit)};
           setRunRoot(root);
           try {
+            phase('snapshot-start');
             snapshot = mode === 'sync' ? { commit: readVerifierSourceReceiptSync(root).sourceCommit, porcelain: '' }
               : await captureWorktreeSnapshot();
+            phase('snapshot-end');
             events.push('snapshot-end');
           } finally { process.env.PATH = originalPath; setRunRoot(null); }
         } }],
       }, undefined, { stdout: stream, stderr: stream });
-      try { await runner.start(); } finally { await runner.close(); }
+      phase('create-vitest-end');
+      try { phase('run-start'); await runner.start(); phase('run-end'); }
+      finally { phase('close-start'); await runner.close(); phase('close-end'); }
       if (ordinary) process.exitCode = 0; // The nested assertion failure is this leg's required input.
       console.log(JSON.stringify({ mode, events, snapshot, osExitObserved: existsSync(exitedPath),
         ordinary: ordinary ? { afterSnapshot, aborted, writes, maxActiveWrites,
@@ -658,8 +687,10 @@ describe('receipt-backed native archive reporter', () => {
           { timeout: 20_000, maxBuffer: 1024 * 1024 }).catch(error => {
             writeFileSync(join(parent, mode + '.stdout.log'), error.stdout ?? '');
             writeFileSync(join(parent, mode + '.stderr.log'), error.stderr ?? '');
+            const phaseFile = join(parent, mode + '.phases.jsonl');
+            const phases = existsSync(phaseFile) ? readFileSync(phaseFile, 'utf8') : 'probe did not reach imports-ready';
             throw new Error(`fork-stop probe ${mode} failed: code=${error.code} signal=${error.signal}` +
-              ` killed=${error.killed}\nstdout:\n${error.stdout}\nstderr:\n${error.stderr}`, { cause: error });
+              ` killed=${error.killed}\nphases (${phaseFile}):\n${phases}\nstdout:\n${error.stdout}\nstderr:\n${error.stderr}`, { cause: error });
           });
         writeFileSync(join(parent, mode + '.stdout.log'), stdout);
         writeFileSync(join(parent, mode + '.stderr.log'), stderr);
@@ -1122,8 +1153,10 @@ describe('actual reporter population capture', () => {
   it.each([-1, 0, 1, 17])('persists every original collected outcome at diagnostic limit %+i, including duplicate occurrences', async offset => {
     const count = MAX_RECORDED_PASSED_CASES + offset;
     const execution = await record(count);
-    expect(execution.passedCaseTitlesTruncated).toBe(count > MAX_RECORDED_PASSED_CASES);
-    expect(execution.passedCaseTitles).toHaveLength(Math.min(count, MAX_RECORDED_PASSED_CASES));
+    // The diagnostic title list deduplicates the first two cases. The full
+    // population below must preserve both occurrences even below that limit.
+    expect(execution.passedCaseTitlesTruncated).toBe(true);
+    expect(execution.passedCaseTitles).toHaveLength(Math.min(count - 1, MAX_RECORDED_PASSED_CASES));
     const population = parseRecordedTestPopulation(execution.population)!;
     expect(population).toBeDefined();
     expect(population.cases).toHaveLength(count + 1);
