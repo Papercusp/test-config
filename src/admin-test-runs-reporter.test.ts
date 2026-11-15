@@ -1119,11 +1119,11 @@ describe('actual reporter population capture', () => {
     return rows[0].executionDetails!;
   }
 
-  it('persists every original collected outcome before diagnostic sampling, including duplicate occurrences', async () => {
-    const count = MAX_RECORDED_PASSED_CASES + 17;
+  it.each([-1, 0, 1, 17])('persists every original collected outcome at diagnostic limit %+i, including duplicate occurrences', async offset => {
+    const count = MAX_RECORDED_PASSED_CASES + offset;
     const execution = await record(count);
-    expect(execution.passedCaseTitlesTruncated).toBe(true);
-    expect(execution.passedCaseTitles).toHaveLength(MAX_RECORDED_PASSED_CASES);
+    expect(execution.passedCaseTitlesTruncated).toBe(count > MAX_RECORDED_PASSED_CASES);
+    expect(execution.passedCaseTitles).toHaveLength(Math.min(count, MAX_RECORDED_PASSED_CASES));
     const population = parseRecordedTestPopulation(execution.population)!;
     expect(population).toBeDefined();
     expect(population.cases).toHaveLength(count + 1);
@@ -1131,6 +1131,10 @@ describe('actual reporter population capture', () => {
       .toEqual([1, 2]);
     expect(population.cases.filter(row => row.selected)).toHaveLength(count);
     expect(population.executionOrder[0][2]).toBe(`suite > \u03bb-${count - 1}`);
+    expect(population.cases.find(row => row.identity[2] === `suite > \u03bb-${count - 1}`))
+      .toMatchObject({ selected: true, outcome: 'passed' });
+    expect(parseRecordedTestPopulation(JSON.parse(JSON.stringify(execution.population))))
+      .toEqual(population);
     expect(population.cases.find(row => !row.selected)?.outcome).toBe('skipped');
   });
 
