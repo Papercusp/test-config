@@ -2129,6 +2129,33 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         ], 'group-a')).toEqual([]);
       });
 
+      it.each(['x'.repeat(TEST_CASE_KEY_MAX_CHARS + 1), 'raster\0bytes'])(
+        'retains unsupported identity %# through pre-submit consumer replay instead of discarding its packet', async caseKey => {
+          const cases = [{ caseIndex: 0, caseKey, occurrence: 1,
+            status: 'pass' as const, durationMs: 1, errorTail: null }];
+          const runContext = { branch: 'staging', inferredCommit: 'abc123', declaredSource: 'mutation-probe' as const,
+            runGroupId: 'group-a', harnessSlug: 'papercusp', workspaceId: 'workspace-a',
+            loopLagP95Ms: 2, rssMb: 100, configurationSnapshot: captureConfigurationSnapshot({}) };
+          const original = { ...base, row: { ...base.row, cases }, outcome: 'failed' as const,
+            reason: 'pg_unavailable', replayable: true, runContext,
+            pgSetupFailure: { phase: 'client-construction' as const, code: 'ECONNREFUSED' } };
+          const sql = Object.assign((first: unknown) => {
+            if (Array.isArray(first) && !('raw' in first)) return {};
+            const query = (first as TemplateStringsArray).join('?');
+            return Promise.resolve(query.includes('INSERT INTO harness_shared.test_runs')
+              ? [{ id: '901', file_path: 'a.test.ts' }] : []);
+          }, { end: async () => undefined }) as unknown as PgSql;
+          const packet = JSON.stringify(original);
+          const recovered = await reconcileTimedOutTestRunReceiptsWithSql(sql, packet, {
+            expectedPaths: ['a.test.ts'], expectedRoot: details.root, runGroupId: 'group-a', env: {},
+          });
+          expect(recovered).toMatchObject([{ id: '901', attempt: 1, row: { cases },
+            caseInsertOutcome: { written: 0, unwritten: 1,
+              reason: caseKey.includes('\0') ? 'case_key_contains_nul' : 'case_key_exceeds_2000_characters' } }]);
+          expect(JSON.parse(packet).row.cases).toEqual(cases);
+          expect(pendingTestRunRecoveryPaths(JSON.stringify(recovered[0]), ['a.test.ts'], details.root)).toEqual(['a.test.ts']);
+        });
+
       it.each(['pg-setup', 'terminal-queue'] as const)(
         'recovers a first pre-submit %s receipt only after an exact empty readback', async phase => {
         const directory = mkdtempSync(join(tmpdir(), 'test-run-setup-replay-'));
