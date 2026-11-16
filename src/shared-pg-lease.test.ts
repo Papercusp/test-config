@@ -463,6 +463,21 @@ describe('shared PG lease (WI-10003715)', () => {
     try {
       await vi.advanceTimersByTimeAsync(SHARED_PG_DRAIN_TIMEOUT_MS);
       await closing;
+      // Reproduce the incident's timeout signature with only pre-client
+      // metadata pending. `inFlight: 1` cannot identify a PostgreSQL query.
+      const diagnostics: string[] = [];
+      const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => {
+        diagnostics.push(String(chunk));
+        return true;
+      });
+      try { new AdminTestRunsReporter().onProcessTimeout(); }
+      finally { sink.mockRestore(); }
+      expect(diagnostics).toHaveLength(1);
+      expect(JSON.parse(diagnostics[0].slice('TEST_FILE_FINALIZATION '.length))).toMatchObject({
+        phase: 'reporter-pg-timeout', holders: 0, inFlight: 1,
+        closeRequested: true, clientRequested: false, closing: false,
+      });
+      expect(construct).not.toHaveBeenCalled();
       start();
       await expect(operation).resolves.toBeNull();
       expect(construct).not.toHaveBeenCalled();
