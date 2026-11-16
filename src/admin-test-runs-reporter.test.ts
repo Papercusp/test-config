@@ -4958,9 +4958,10 @@ describe('completed Git reads across a delayed parent timer (EI-2683065978401391
     ].join('\n'));
     // Observe real kernel exit while the reporter loop is blocked, then keep
     // that loop blocked beyond its deadline. The reader must own its own clock.
+    const controller = new AbortController();
     const pending = runGit(
       `${quote(process.execPath)} ${quote(script)} ${quote(marker)} ${quote(output)}`,
-      root, 2_000, detail => failures.push(detail),
+      root, 2_000, detail => failures.push(detail), controller.signal,
     );
     try {
       const deadline = Date.now() + 5_000;
@@ -4989,6 +4990,9 @@ describe('completed Git reads across a delayed parent timer (EI-2683065978401391
       };
       expect(exited, `the independent producer must exit before timer delivery: ${JSON.stringify(precondition)}`).toBe(true);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_100);
+      // Caller cancellation can arrive before the parent dispatches the
+      // completed worker's buffered result. It must preserve that reading.
+      controller.abort();
       expect(await pending).toBe(output);
       expect(failures).toEqual([]);
     } finally {

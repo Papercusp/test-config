@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { readlinkSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
 
-const { cmd, cwd, timeoutMs } = workerData;
+const { cmd, cwd, timeoutMs, lifecycle } = workerData;
 // Distinguish the Node worker reaching its entry module from command spawn.
 // The parent owns the opt-in diagnostic sink and correlation id.
 parentPort.postMessage({ type: 'started' });
@@ -123,6 +123,9 @@ function finish(error, code = null, signal = null) {
   settled = true;
   if (timer) clearTimeout(timer);
   const failed = Boolean(error) || killed || code !== 0;
+  // Publish completion before queueing its message. The parent can be blocked
+  // past its own deadline and must still preserve this completed observation.
+  if (lifecycle) Atomics.store(lifecycle, 0, 2);
   parentPort.postMessage({ type: 'result', output: failed ? null : capturedOutput(),
     ...(failed ? { diagnostic: JSON.stringify({ command: cmd, timeoutMs,
       elapsedMs: Date.now() - startedAt, code: error?.code ?? code, signal, killed,
@@ -141,10 +144,18 @@ function stop(reason) {
   child?.stdout?.destroy();
   child?.stderr?.destroy();
   child?.stdio?.[3]?.destroy();
-  finish(undefined, child?.exitCode ?? null, child?.signalCode ?? 'SIGKILL');
+  // `close` acknowledges process exit and closed pipes. Do not settle a
+  // cancelled reader while it still owns a live command.
+  if (!child) finish(undefined, null, 'SIGKILL');
 }
 
-try {
+parentPort.on('message', message => {
+  if (message?.type === 'cancel') stop('git reader cancelled by caller');
+});
+
+if (lifecycle && Atomics.compareExchange(lifecycle, 0, 0, 1) !== 0) {
+  finish(new Error('git reader cancelled before command spawn'));
+} else try {
   child = spawn(cmd, { cwd, shell: true, detached: true,
     stdio: traceGit ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
     // Provenance reads must not refresh indexes in the root or its submodules.

@@ -680,7 +680,9 @@ let _gitCache: { value: GitContext; expiresAt: number } | null = null;
  */
 export function runGit(
   cmd: string, cwd: string, timeoutMs: number, onFailure?: (diagnostic: string) => void,
+  signal?: AbortSignal,
 ): Promise<string | null> {
+  if (signal?.aborted) return Promise.resolve(null);
   // Windows retains exec's native shell/timeout behavior. POSIX must own a
   // process group: killing exec's shell alone leaves Git and its helpers alive.
   const partitionedStatus = cmd.startsWith('git status --porcelain --untracked-files=all')
@@ -693,7 +695,7 @@ export function runGit(
   // still benefit from parallel refresh. Both paths read the complete tree.
   if (partitionedStatus && process.platform !== 'win32'
       && timeoutMs <= WORKTREE_SNAPSHOT_GIT_BUDGETS_MS[0]!)
-    return runGitProcessGroup(statusCommand, cwd, timeoutMs, onFailure);
+    return runGitProcessGroup(statusCommand, cwd, timeoutMs, onFailure, signal);
   if (partitionedStatus && process.platform !== 'win32') {
     let tempDir: string;
     try {
@@ -707,12 +709,12 @@ export function runGit(
       } catch { /* Diagnostics must obey the reporter's fail-soft contract too. */ }
       return Promise.resolve(null);
     }
-    return runGitProcessGroup(partitionedGitStatusScript(statusCommand, tempDir), cwd, timeoutMs, onFailure)
+    return runGitProcessGroup(partitionedGitStatusScript(statusCommand, tempDir), cwd, timeoutMs, onFailure, signal)
       .finally(() => { try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ } });
   }
   const actualCommand = statusCommand;
   if (process.platform !== 'win32')
-    return runGitProcessGroup(actualCommand, cwd, timeoutMs, onFailure);
+    return runGitProcessGroup(actualCommand, cwd, timeoutMs, onFailure, signal);
   return new Promise((resolveP) => {
     const startedAt = Date.now();
     let settled = false;
@@ -734,7 +736,7 @@ export function runGit(
       }
     };
     try {
-      const child = exec(actualCommand, { cwd, timeout: timeoutMs }, (err, stdout, stderr) => {
+      const child = exec(actualCommand, { cwd, timeout: timeoutMs, signal }, (err, stdout, stderr) => {
         finish(err, stdout, stderr, child);
       });
     } catch (error) {
@@ -815,6 +817,7 @@ function partitionedGitStatusScript(statusCommand: string, tempDir: string): str
 /** Built-ins-only bridge to the independent deadline and process-group owner. */
 function runGitProcessGroup(
   cmd: string, cwd: string, timeoutMs: number, onFailure?: (diagnostic: string) => void,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   return new Promise((resolveP) => {
     const startedAt = Date.now();
@@ -833,10 +836,20 @@ function runGitProcessGroup(
     };
     trace('requested');
     let settled = false;
+    let aborting = false;
     let groupPid: number | undefined;
+    let worker: Worker;
+    let result: { output: string | null; diagnostic?: string } | undefined;
+    // Atomic startup ownership prevents cancellation racing a command spawn.
+    // 0=before spawn, 1=command owned by worker, 2=result complete, 3=startup cancelled.
+    const lifecycle = new Int32Array(new SharedArrayBuffer(4));
+    const cancelledDiagnostic = () => JSON.stringify({ command: cmd, timeoutMs,
+      elapsedMs: Date.now() - startedAt, code: null, signal: null, killed: false,
+      message: 'git reader cancelled by caller', stderr: '' });
     const finish = (output: string | null, diagnostic?: string) => {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener('abort', onAbort);
       try { if (diagnostic) onFailure?.(diagnostic); }
       catch { /* Diagnostics obey the reporter's fail-soft contract too. */ }
       resolveP(output);
@@ -851,13 +864,29 @@ function runGitProcessGroup(
         message: `git reader worker: ${error instanceof Error ? error.message : String(error)}`.slice(0, 512),
         stderr: '' }));
     };
+    const onAbort = () => {
+      if (settled || aborting) return;
+      aborting = true;
+      trace('abort-requested');
+      const phase = Atomics.compareExchange(lifecycle, 0, 0, 3);
+      if (phase === 0) {
+        // The entry module has not acquired spawn ownership. Termination is
+        // safe even when a preload never reaches its message handler.
+        void worker.terminate().then(() => finish(null, cancelledDiagnostic()), failedWorker);
+      } else if (phase === 1) {
+        // This worker owns a live process group and must kill and reap it.
+        try { worker.postMessage({ type: 'cancel' }); } catch (error) { failedWorker(error); }
+      }
+      // A completed result may still be queued while the parent was blocked.
+      // Receive it intact; a late caller timer must not erase that observation.
+    };
     try {
       // Own the command deadline and pipe collection outside Vitest's event
       // loop. A synchronous reporter/import must not kill a child that already
       // completed, or turn unread stdout into a clean reading. The worker uses
       // the existing process-group, output-limit and null-on-failure contract.
-      const worker = new Worker(new URL('./git-read-worker.mjs', import.meta.url), {
-        workerData: { cmd, cwd, timeoutMs }, execArgv: [],
+      worker = new Worker(new URL('./git-read-worker.mjs', import.meta.url), {
+        workerData: { cmd, cwd, timeoutMs, lifecycle }, execArgv: [],
       });
       trace('created', { threadId: worker.threadId });
       worker.once('online', () => trace('online', { threadId: worker.threadId }));
@@ -868,32 +897,36 @@ function runGitProcessGroup(
           trace('spawned', { childPid: groupPid });
         } else if (message.type === 'result') {
           trace('result', { readable: typeof message.output === 'string' });
-          finish(typeof message.output === 'string' ? message.output : null, message.diagnostic);
+          result = { output: typeof message.output === 'string' ? message.output : null, diagnostic: message.diagnostic };
+          if (!aborting) finish(result.output, result.diagnostic);
         }
       });
       worker.once('error', failedWorker);
       worker.once('exit', code => {
         trace('exit', { code });
-        if (!settled) failedWorker(`exited ${code} without a complete reading`);
+        if (aborting) finish(result?.output ?? null, result?.diagnostic ?? (result ? undefined : cancelledDiagnostic()));
+        else if (!settled) failedWorker(`exited ${code} without a complete reading`);
       });
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
     } catch (error) { failedWorker(error); }
   });
 }
-async function resolveGitContext(): Promise<GitContext> {
+async function resolveGitContext(signal?: AbortSignal): Promise<GitContext> {
   const now = Date.now();
   if (_gitCache && _gitCache.expiresAt > now) return _gitCache.value;
   // WI-10000776: the branch/commit stamped on a row must describe the checkout the
   // tests came from, not whichever tree the process happened to start in.
   const root = resolveRecordRoot();
   const [branchRaw, commitRaw] = await Promise.all([
-    runGit('git rev-parse --abbrev-ref HEAD', root, 200),
-    runGit('git rev-parse HEAD', root, 200),
+    runGit('git rev-parse --abbrev-ref HEAD', root, 200, undefined, signal),
+    runGit('git rev-parse HEAD', root, 200, undefined, signal),
   ]);
   const value: GitContext = {
     branch: branchRaw && branchRaw !== 'HEAD' ? branchRaw : null,
     commit: commitRaw || null,
   };
-  _gitCache = { value, expiresAt: now + 30_000 };
+  if (!signal?.aborted) _gitCache = { value, expiresAt: now + 30_000 };
   return value;
 }
 
@@ -1537,7 +1570,7 @@ function writeFailureDetails(details: TestFailureDetail[]): void {
 
 export type WorktreeSnapshotReader = (phase?: WorktreeSnapshotPhase, signal?: AbortSignal) => Promise<WorktreeGitSnapshot>;
 export type TestRunRowWriter = (row: TestRunRow) => Promise<void>;
-export type TestRunRowsWriter = (rows: readonly TestRunRow[]) => Promise<void | readonly TestRunReceipt[]>;
+export type TestRunRowsWriter = (rows: readonly TestRunRow[], signal?: AbortSignal) => Promise<void | readonly TestRunReceipt[]>;
 
 /**
  * Resolve a host-level loop-lag value from the resource-governor snapshot.
@@ -3212,15 +3245,23 @@ export function nativeTestRunAttribution(env: NodeJS.ProcessEnv): Pick<TestRunEx
   return { attribution: { ownerId, workItemId } };
 }
 
-export async function insertRows(rows: readonly TestRunRow[]): Promise<TestRunReceipt[]> {
+export async function insertRows(rows: readonly TestRunRow[], signal?: AbortSignal): Promise<TestRunReceipt[]> {
   if (rows.length === 0) return [];
   let branch: string | null = null;
   let inferredCommit: string | null = null;
   try {
-    const ctx = await observeReporterStage('test-runs', 'git-context', resolveGitContext);
+    const ctx = await observeReporterStage('test-runs', 'git-context', () => resolveGitContext(signal));
     branch = ctx.branch;
     inferredCommit = ctx.commit;
   } catch { /* fail-soft */ }
+
+  if (signal?.aborted) {
+    // No client or INSERT has been requested. Preserve the observed rows with
+    // an explicit failure rather than starting database work after close.
+    const receipts = unwrittenReceipts(rows, 'failed', 'git_metadata_cancelled');
+    appendTestRunReceipts(process.env, receipts);
+    return receipts;
+  }
 
   const pg = await observeReporterStage('test-runs', 'pg-client', tryGetPg);
   if (!pg) {
@@ -3640,7 +3681,7 @@ export default class AdminTestRunsReporter implements Reporter {
         : insertRows);
     // Preserve the selected writer's identity before diagnostic wrapping.
     this.usesDefaultRowsWriter = rowsWriter === insertRows;
-    this.writeRows = rows => observeReporterStage('test-runs', 'write-rows', () => rowsWriter(rows));
+    this.writeRows = (rows, signal) => observeReporterStage('test-runs', 'write-rows', () => rowsWriter(rows, signal));
     const configuredReader = typeof readWorktreeSnapshotOrOptions === 'object'
       ? readWorktreeSnapshotOrOptions?.readRuntimeEnvironment : undefined;
     this.readRuntimeEnvironment = readRuntimeEnvironment ??
@@ -4071,7 +4112,10 @@ export default class AdminTestRunsReporter implements Reporter {
     // Retain the whole writer across the foreground timeout. Tracking individual
     // statements leaves a zero-in-flight gap between file and case INSERTs where
     // the final reporter release can close their shared client.
-    const write = trackSharedPgOperation(Promise.resolve().then(async () => { await this.writeRows(rows); }));
+    // Preparation can already have been aborted while retaining dirty fallback
+    // rows, so writing needs its own signal under the existing flush deadline.
+    const writeController = new AbortController();
+    const write = trackSharedPgOperation(Promise.resolve().then(async () => { await this.writeRows(rows, writeController.signal); }));
     this.pendingWrite = write;
     const settled = () => {
       if (this.pendingWrite === write) this.pendingWrite = null;
@@ -4084,7 +4128,7 @@ export default class AdminTestRunsReporter implements Reporter {
     const finished = await Promise.race([
       write.then(() => true),
       new Promise<false>((r) => {
-        flushTimer = setTimeout(() => r(false), remainingMs);
+        flushTimer = setTimeout(() => { writeController.abort(); r(false); }, remainingMs);
       }),
     ]);
     if (flushTimer) clearTimeout(flushTimer);

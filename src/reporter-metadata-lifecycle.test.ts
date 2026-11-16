@@ -15,7 +15,7 @@ const control = vi.hoisted(() => {
     hold: false,
     startupGate: null as Int32Array | null,
     startupWorkers: [] as import('node:worker_threads').Worker[],
-    workers: [] as Array<{ emit(event: string, value: unknown): boolean }>,
+    workers: [] as Array<{ emit(event: string, value: unknown): boolean; terminate: ReturnType<typeof vi.fn> }>,
     constructPg: vi.fn(() => { throw new Error('PostgreSQL must not be constructed in this fixture'); }),
   };
 });
@@ -38,7 +38,10 @@ vi.mock('node:worker_threads', async importOriginal => {
     }
     if (!control.hold || !String(args[0]).endsWith('/git-read-worker.mjs'))
       return new actual.Worker(...args);
-    const worker = new EventEmitter();
+    const worker = Object.assign(new EventEmitter(), {
+      terminate: vi.fn(async () => { worker.emit('exit', 1); return 1; }),
+      postMessage: vi.fn(),
+    });
     control.workers.push(worker);
     return worker;
   }) };
@@ -159,6 +162,82 @@ it.each(['before-spawn', 'after-spawn'] as const)(
     }
   },
 );
+
+it('cancels pre-client metadata at the existing flush deadline and drains its writer', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'reporter-metadata-cancellation-'));
+  const receiptFile = join(directory, 'receipts.jsonl');
+  const previousReceipt = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+  process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = receiptFile;
+  const writeRows = vi.fn(async (rows: readonly TestRunRow[], signal?: AbortSignal) => { await insertRows(rows, signal); });
+  const reporter = new AdminTestRunsReporter(async () => ({ commit: 'fixture-head', porcelain: '' }), undefined, writeRows);
+  let final: Promise<void> | undefined;
+  try {
+    await closeSharedPg();
+    await reporter.onInit({ config: { root: process.cwd() } } as never);
+    control.workers = [];
+    control.constructPg.mockClear();
+    control.hold = true;
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.setSystemTime(new Date('2031-01-01T00:00:00Z'));
+    reporter.onTestModuleEnd({ moduleId: fileURLToPath(import.meta.url), state: () => 'passed',
+      diagnostic: () => ({ duration: 1 }), children: { allTests: () => [] } } as unknown as TestModule);
+    final = reporter.onTestRunEnd();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(control.workers).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(control.workers.every(worker => worker.terminate.mock.calls.length === 1)).toBe(true);
+    await final;
+    expect(writeRows.mock.calls[0][1]?.aborted).toBe(true);
+    expect(control.constructPg).not.toHaveBeenCalled();
+    const receipts = readFileSync(receiptFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(receipts).toContainEqual(expect.objectContaining({ outcome: 'failed', reason: 'git_metadata_cancelled' }));
+    expect(vi.getTimerCount()).toBe(0);
+    const lines: string[] = [];
+    const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
+    try { reporter.onProcessTimeout(); } finally { sink.mockRestore(); }
+    expect(JSON.parse(lines[0].slice('TEST_FILE_FINALIZATION '.length))).toMatchObject({
+      holders: 0, inFlight: 0, closeRequested: false, clientRequested: false, closing: false,
+    });
+  } finally {
+    for (const worker of control.workers) worker.emit('message', { type: 'result', output: 'fixture-head' });
+    control.hold = false;
+    if (vi.isFakeTimers()) await vi.runAllTimersAsync();
+    await final;
+    await reporter.onExit();
+    await closeSharedPg();
+    vi.useRealTimers();
+    if (previousReceipt === undefined) delete process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
+    else process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = previousReceipt;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it.skipIf(process.platform === 'win32')('cancels and reaps a real worker held before its entry module', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'reporter-git-startup-cancel-'));
+  const gate = new Int32Array(new SharedArrayBuffer(8));
+  const controller = new AbortController();
+  control.startupGate = gate;
+  control.startupWorkers = [];
+  let pending: Promise<string | null> | undefined;
+  try {
+    let settled = false;
+    pending = runGit('printf must-not-spawn', directory, 20, undefined, controller.signal)
+      .then(output => { settled = true; return output; });
+    await vi.waitFor(() => expect(Atomics.load(gate, 0)).toBe(1), { timeout: 5_000 });
+    const exited = Promise.all(control.startupWorkers.map(worker => new Promise(resolve => worker.once('exit', resolve))));
+    controller.abort();
+    await vi.waitFor(() => expect(settled).toBe(true), { timeout: 1_000 });
+    expect(await pending).toBeNull();
+    await exited;
+  } finally {
+    Atomics.store(gate, 1, 1);
+    Atomics.notify(gate, 1);
+    await pending;
+    await Promise.all(control.startupWorkers.map(worker => worker.terminate()));
+    control.startupGate = null;
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 15_000);
 
 it.skipIf(process.platform === 'win32')('distinguishes a real worker preload stall from its command deadline', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'reporter-git-startup-'));
