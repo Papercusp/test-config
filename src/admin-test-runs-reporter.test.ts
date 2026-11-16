@@ -4979,7 +4979,15 @@ describe('completed Git reads across a delayed parent timer (EI-2683065978401391
         }
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
       }
-      expect(exited, 'the independent producer must exit before timer delivery').toBe(true);
+      // A missing exit marker can mean the command failed before it reached
+      // the fixture. Preserve that result instead of hiding it behind a
+      // precondition assertion and deleting the only useful evidence.
+      const precondition = exited ? null : {
+        reading: await pending,
+        failures,
+        markerExists: existsSync(marker),
+      };
+      expect(exited, `the independent producer must exit before timer delivery: ${JSON.stringify(precondition)}`).toBe(true);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_100);
       expect(await pending).toBe(output);
       expect(failures).toEqual([]);
