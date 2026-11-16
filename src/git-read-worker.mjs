@@ -7,6 +7,9 @@ import { readlinkSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
 
 const { cmd, cwd, timeoutMs } = workerData;
+// Distinguish the Node worker reaching its entry module from command spawn.
+// The parent owns the opt-in diagnostic sink and correlation id.
+parentPort.postMessage({ type: 'started' });
 const summarizeStatus = /^git status --porcelain --untracked-files=all(?: --ignore-submodules=none)?$/.test(cmd);
 const captureLimit = 1024 * 1024;
 // Trace2 gets its own pipe, so phase evidence never contaminates porcelain or
