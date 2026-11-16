@@ -13,6 +13,8 @@ const control = vi.hoisted(() => {
   vi.resetModules();
   return {
     hold: false,
+    startupGate: null as Int32Array | null,
+    startupWorkers: [] as import('node:worker_threads').Worker[],
     workers: [] as Array<{ emit(event: string, value: unknown): boolean }>,
     constructPg: vi.fn(() => { throw new Error('PostgreSQL must not be constructed in this fixture'); }),
   };
@@ -23,6 +25,17 @@ vi.mock('node:worker_threads', async importOriginal => {
   const actual = await importOriginal<typeof import('node:worker_threads')>();
   const { EventEmitter } = await import('node:events');
   return { ...actual, Worker: vi.fn(function (...args: ConstructorParameters<typeof actual.Worker>) {
+    if (control.startupGate && String(args[0]).endsWith('/git-read-worker.mjs')) {
+      const preload = 'import {workerData} from "node:worker_threads";'
+        + 'const gate=workerData.startupGate;Atomics.store(gate,0,1);'
+        + 'while(Atomics.load(gate,1)===0)Atomics.wait(gate,1,0);';
+      const worker = new actual.Worker(args[0], { ...args[1],
+        execArgv: [...(args[1]?.execArgv ?? []), '--import', 'data:text/javascript,' + encodeURIComponent(preload)],
+        workerData: { ...args[1]?.workerData, startupGate: control.startupGate },
+      });
+      control.startupWorkers.push(worker);
+      return worker;
+    }
     if (!control.hold || !String(args[0]).endsWith('/git-read-worker.mjs'))
       return new actual.Worker(...args);
     const worker = new EventEmitter();
@@ -32,7 +45,7 @@ vi.mock('node:worker_threads', async importOriginal => {
 });
 
 import AdminTestRunsReporter, {
-  closeSharedPg, insertRows, SHARED_PG_DRAIN_TIMEOUT_MS, type TestRunRow,
+  closeSharedPg, insertRows, runGit, SHARED_PG_DRAIN_TIMEOUT_MS, type TestRunRow,
 } from './admin-test-runs-reporter.ts';
 
 it.each(['before-spawn', 'after-spawn'] as const)(
@@ -146,3 +159,50 @@ it.each(['before-spawn', 'after-spawn'] as const)(
     }
   },
 );
+
+it.skipIf(process.platform === 'win32')('distinguishes a real worker preload stall from its command deadline', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'reporter-git-startup-'));
+  const gate = new Int32Array(new SharedArrayBuffer(8));
+  const previousTrace = process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE;
+  process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE = '1';
+  const lines: string[] = [];
+  const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
+  const events = () => lines.filter(line => line.startsWith('TEST_FILE_FINALIZATION '))
+    .map(line => JSON.parse(line.slice('TEST_FILE_FINALIZATION '.length)))
+    .filter(event => event.phase === 'reporter-git-reader');
+  control.startupGate = gate;
+  control.startupWorkers = [];
+  let pending: Promise<string | null> | undefined;
+  try {
+    let settled = false;
+    const failures: string[] = [];
+    pending = runGit('printf startup-released', directory, 20, failure => failures.push(failure))
+      .then(output => { settled = true; return output; });
+    await vi.waitFor(() => expect(Atomics.load(gate, 0)).toBe(1), { timeout: 5_000 });
+    await new Promise(resolve => setTimeout(resolve, 40));
+    expect(settled).toBe(false);
+    expect(events().map(event => event.event)).toEqual(['requested', 'created', 'online']);
+    expect(events().some(event => event.event === 'worker-started' || event.event === 'spawned')).toBe(false);
+
+    // This is a diagnostic discriminator, not a claim that the historical
+    // hang was in preload. Its command budget starts only after this gate.
+    Atomics.store(gate, 1, 1);
+    Atomics.notify(gate, 1);
+    expect(await pending).toBe('startup-released');
+    expect(failures).toEqual([]);
+    await vi.waitFor(() => expect(events().at(-1)).toMatchObject({ event: 'exit', code: 0 }), { timeout: 5_000 });
+    expect(events().map(event => event.event)).toEqual([
+      'requested', 'created', 'online', 'worker-started', 'spawned', 'result', 'exit',
+    ]);
+  } finally {
+    Atomics.store(gate, 1, 1);
+    Atomics.notify(gate, 1);
+    await pending;
+    await Promise.all(control.startupWorkers.map(worker => worker.terminate()));
+    control.startupGate = null;
+    sink.mockRestore();
+    if (previousTrace === undefined) delete process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE;
+    else process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE = previousTrace;
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 15_000);
