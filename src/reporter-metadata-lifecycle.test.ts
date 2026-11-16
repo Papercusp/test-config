@@ -1,10 +1,11 @@
 /** EI-28885010370277457: discriminate metadata work from PostgreSQL teardown.
  * These controlled stalls do not establish the historical incident's cause. */
 import { expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import type { TestModule } from 'vitest/node';
 
 const control = vi.hoisted(() => {
@@ -238,6 +239,67 @@ it.skipIf(process.platform === 'win32')('cancels and reaps a real worker held be
     rmSync(directory, { recursive: true, force: true });
   }
 }, 15_000);
+
+it('does not create a worker for an already-aborted Git read', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const failures = vi.fn();
+  const workersBefore = vi.mocked(Worker).mock.calls.length;
+  expect(await runGit('printf must-not-spawn', process.cwd(), 20, failures, controller.signal)).toBeNull();
+  expect(vi.mocked(Worker).mock.calls).toHaveLength(workersBefore);
+  expect(failures).not.toHaveBeenCalled();
+});
+
+it.skipIf(process.platform !== 'linux')('cancels a running command and waits for its worker and process group to stop', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'reporter-git-running-cancel-'));
+  const marker = join(directory, 'running.pid');
+  const script = join(directory, 'running.cjs');
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const controller = new AbortController();
+  const failures: string[] = [];
+  const running = (pid: number) => {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      return !stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z ');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  };
+  writeFileSync(script, [
+    'process.on("SIGTERM", () => {});',
+    'require("node:fs").writeFileSync(process.argv[2], String(process.pid));',
+    'setInterval(() => {}, 1000);',
+  ].join('\n'));
+  const pending = runGit(`${quote(process.execPath)} ${quote(script)} ${quote(marker)}`,
+    directory, 10_000, detail => failures.push(detail), controller.signal);
+  const worker = vi.mocked(Worker).mock.results.at(-1)!.value as Worker;
+  const exited = new Promise<number>(resolve => worker.once('exit', resolve));
+  let groupPid: number | undefined;
+  worker.on('message', message => { if (message.type === 'spawned') groupPid = message.pid; });
+  try {
+    await vi.waitFor(() => {
+      expect(existsSync(marker)).toBe(true);
+      expect(groupPid).toBeGreaterThan(0);
+    }, { timeout: 5_000 });
+    const descendant = Number(readFileSync(marker, 'utf8'));
+    expect(running(descendant)).toBe(true);
+    controller.abort();
+    expect(await pending).toBeNull();
+    expect(await exited).toBe(0);
+    expect(failures).toHaveLength(1);
+    expect(JSON.parse(failures[0])).toMatchObject({ killed: true, message: 'git reader cancelled by caller' });
+    // Resolution acknowledges worker exit and stopped commands, rather than
+    // merely queueing cancellation while a descendant remains running.
+    expect(running(descendant)).toBe(false);
+    expect(running(groupPid!)).toBe(false);
+  } finally {
+    controller.abort();
+    await pending;
+    await worker.terminate();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 20_000);
 
 it.skipIf(process.platform === 'win32')('distinguishes a real worker preload stall from its command deadline', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'reporter-git-startup-'));
