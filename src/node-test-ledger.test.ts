@@ -213,30 +213,35 @@ describe('buildNodeTestRunRows', () => {
     });
   });
 
-  it('resolves the native Node layer from the exact declared path only (EI-28821566028028635)', () => {
-    const declared = 'papercusp-desktop/test/native-workbench-gnome.test.mjs';
+  it.each([
+    'papercusp-desktop/test/native-workbench-gnome.test.mjs',
+    'papercusp-desktop/test/native-workbench-packaging.test.mjs',
+  ])('resolves the native Node layer from the exact declared path only: %s', declared => {
     expect(registeredNodeTestFileLayer(declared)).toBe('integration');
     expect(registeredNodeTestFileLayer(`./${declared}`)).toBe('integration');
     expect(registeredNodeTestFileLayer(declared.replaceAll('/', '\\'))).toBe('integration');
-    for (const undeclared of ['papercusp-desktop/test/guard.test.js', 'native-workbench-gnome.test.mjs',
-      declared.toUpperCase(), 'papercusp-desktop/test/native-workbench-gnome.integration.test.mjs', '']) {
+    for (const undeclared of ['papercusp-desktop/test/guard.test.js', declared.split('/').at(-1)!,
+      declared.toUpperCase(), declared.replace('.test.mjs', '.integration.test.mjs'), `other/${declared}`, '']) {
       expect(registeredNodeTestFileLayer(undeclared)).toBe('unit');
     }
   });
 
-  it('stamps each row with its own file layer; a lookalike name or forged collector/env layer never upgrades (EI-28821566028028635)', () => {
+  it.each([
+    'papercusp-desktop/test/native-workbench-gnome.test.mjs',
+    'papercusp-desktop/test/native-workbench-packaging.test.mjs',
+  ])('stamps each row from its declared path despite forged collector/env layers: %s', declared => {
     vi.stubEnv('PAPERCUSP_TEST_LAYER', 'integration');
     try {
       const forged = { ...result({ passed: 1 }), testLayer: 'integration', layer: 'llm' } as unknown as NodeTestLedgerSummary['files'][number];
       const rows = buildNodeTestRunRows(summary([
         forged,
-        result({ file: '/repo/papercusp-desktop/test/native-workbench-gnome.test.mjs', passed: 1 }),
-        result({ file: '/repo/papercusp-desktop/test/native-workbench-gnome.integration.test.mjs', passed: 1 }),
+        result({ file: `/repo/${declared}`, passed: 1 }),
+        { ...forged, file: `/repo/${declared.replace('.test.mjs', '.integration.test.mjs')}` },
       ]), ctx());
       expect(rows.map(row => [row.filePath, parseTestRunExecutionDetails(row.executionDetails)?.testLayer])).toEqual([
         ['papercusp-desktop/test/guard.test.js', 'unit'],
-        ['papercusp-desktop/test/native-workbench-gnome.test.mjs', 'integration'],
-        ['papercusp-desktop/test/native-workbench-gnome.integration.test.mjs', 'unit'],
+        [declared, 'integration'],
+        [declared.replace('.test.mjs', '.integration.test.mjs'), 'unit'],
       ]);
     } finally {
       vi.unstubAllEnvs();
@@ -385,8 +390,10 @@ describe('beginNodeTestLedger — a real node --test child', () => {
     testCommandSha256: 'c'.repeat(64),
   };
 
-  it('persists the declared native integration layer from a real child run (EI-28821566028028635)', async () => {
-    const rel = 'papercusp-desktop/test/native-workbench-gnome.test.mjs';
+  it.each([
+    'papercusp-desktop/test/native-workbench-gnome.test.mjs',
+    'papercusp-desktop/test/native-workbench-packaging.test.mjs',
+  ])('persists the declared native integration layer from a real child run: %s', async rel => {
     const { session, child, written } = await runChild(
       "import { test } from 'node:test'; test('declared integration stand-in', () => {});", undefined, 'inserted', rel);
     expect(child.status).toBe(0);

@@ -573,6 +573,12 @@ export const REGISTERED_NODE_TEST_FILE_LAYERS = [
     // quick-access-search-launcher-2026-10-26#D-029: the PREP-UBUNTU integration proof.
     reason: 'spawns real glib-compile-schemas and gjs processes against the GNOME extension source',
   },
+  {
+    file: 'papercusp-desktop/test/native-workbench-packaging.test.mjs',
+    layer: 'integration',
+    // EI-28728079516462053: the maintained PREP-PACKAGING integration boundary.
+    reason: 'spawns the real packaging CLI and checks payload bytes against the independent Inno installer manifest',
+  },
 ] as const satisfies readonly { file: string; layer: RecordedTestLayer; reason: string }[];
 
 /** The layer the native node:test route records for one repository-relative file. Exact,

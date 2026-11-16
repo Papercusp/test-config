@@ -14,7 +14,7 @@
  * Requires Docker (shared testcontainers PG).
  */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -25,8 +25,10 @@ import { createFreshTestDb, type MigratedTestDb } from './pg-migrate.ts';
 import type { TestProject } from 'vitest/node';
 import loadTimeoutHistory from './test-timeout-history-global-setup.ts';
 import { testTimingRuntimeIdentity, type TestTimeoutHistorySnapshot } from './test-timeout-runtime.ts';
-import { resolveTestRunWorkspaceId, resolveTestRunHarnessSlug, insertTestCaseRowsWithSql,
+import { resolveTestRunWorkspaceId, resolveTestRunHarnessSlug, insertTestCaseRowsWithSql, insertTestRunRowsWithSql,
   type PgSql, type TestCaseRecord } from './admin-test-runs-reporter.ts';
+import { beginNodeTestLedger } from './node-test-ledger.ts';
+import { parseTestRunExecutionDetails } from './execution-details.ts';
 import { historicalTestTimeout } from './test-timeout-history.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -232,6 +234,48 @@ describe('per-case results recorded by the real reporter (test_case_runs)', () =
     expect(historicalTestTimeout({ file, caseKey: 'suite > slow', occurrence: 1,
       layer: 'unit', runnerIdentity }, snapshot!.samples, Date.now()))
       .toMatchObject({ basis: 'case-history', timeoutMs: 365_000, sampleCount: 3 });
+  });
+
+  it('persists the exact packaging Node route in PostgreSQL without caller or lookalike escalation', async () => {
+    const root = join(workDir, 'native-node-route');
+    const paths = [
+      'papercusp-desktop/test/native-workbench-packaging.test.mjs',
+      'papercusp-desktop/test/native-workbench-packaging.integration.test.mjs',
+      'papercusp-desktop/test/unregistered.test.mjs',
+    ];
+    for (const path of paths) {
+      mkdirSync(dirname(join(root, path)), { recursive: true });
+      writeFileSync(join(root, path), "import { test } from 'node:test'; test('route classification fixture', () => {});");
+    }
+    // These fixtures test reporter persistence, not the packaging acceptance proof.
+    // Extra caller fields must not override the existing trusted per-file declaration.
+    const session = await beginNodeTestLedger({
+      ...{ testLayer: 'llm', layer: 'integration' },
+      repoRoot: root,
+      readSnapshot: async () => ({ commit: 'feedface00', porcelain: '' }),
+      writeRows: rows => insertTestRunRowsWithSql(sql as unknown as PgSql, rows, {
+        branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: null,
+        harnessSlug: resolveTestRunHarnessSlug(), workspaceId: resolveTestRunWorkspaceId(),
+        loopLagP95Ms: null, rssMb: null,
+      }),
+    });
+    const run = spawnSync(process.execPath, ['--test', ...session.reporterArgs, ...paths], {
+      cwd: root, encoding: 'utf8', timeout: CHILD_TIMEOUT_MS,
+      env: { ...process.env, NODE_OPTIONS: '', PAPERCUSP_TEST_LAYER: 'integration' },
+    });
+    const recorded = await session.record();
+    expect(run.error).toBeUndefined();
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
+    expect(recorded).toMatchObject({ attempted: 3, recorded: 3 });
+    const persisted = await sql<{ file_path: string; execution_details: unknown }[]>`
+      SELECT file_path, execution_details FROM harness_shared.test_runs
+       WHERE file_path = ANY(${paths}) ORDER BY file_path`;
+    expect(persisted.map(row => [row.file_path, parseTestRunExecutionDetails(row.execution_details)?.testLayer]))
+      .toEqual([
+        [paths[1], 'unit'],
+        [paths[0], 'integration'],
+        [paths[2], 'unit'],
+      ]);
   });
 
   it('prunes case rows with their file row (ON DELETE CASCADE)', async () => {
