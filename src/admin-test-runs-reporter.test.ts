@@ -1117,7 +1117,7 @@ describe('runtime environment recorded around execution', () => {
 });
 
 describe('actual reporter population capture', () => {
-  async function record(count: number, defect?: 'missing-ready' | 'missing-collection' | 'changed-collection' | 'unknown-ready' | 'terminal-at-collection' | 'long-title') {
+  async function record(count: number, defect?: 'missing-ready' | 'missing-collection' | 'changed-collection' | 'unknown-ready' | 'terminal-at-collection' | 'long-title', duplicateNames = true) {
     const rows: TestRunRow[] = [];
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }),
       async row => { rows.push(row); });
@@ -1125,7 +1125,7 @@ describe('actual reporter population capture', () => {
       configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } as never);
     let collected = true;
     const tests = Array.from({ length: count + 1 }, (_, index) => ({
-      id: `case-${index}`, fullName: index < 2 ? 'suite > duplicate' : `suite > \u03bb-${index}`,
+      id: `case-${index}`, fullName: duplicateNames && index < 2 ? 'suite > duplicate' : `suite > \u03bb-${index}`,
       options: { mode: index === count ? 'skip' : 'run' },
       get module() { return module; },
       result: () => ({ state: index === count ? 'skipped' : collected && defect !== 'terminal-at-collection' ? 'pending' : 'passed' }),
@@ -1150,8 +1150,8 @@ describe('actual reporter population capture', () => {
     return rows[0].executionDetails!;
   }
 
-  it.each([-1, 0, 1, 17])('persists every original collected outcome at diagnostic limit %+i, including duplicate occurrences', async offset => {
-    const count = MAX_RECORDED_PASSED_CASES + offset;
+  it('persists duplicate occurrences beyond the diagnostic title limit', async () => {
+    const count = MAX_RECORDED_PASSED_CASES + 17;
     const execution = await record(count);
     // The diagnostic title list deduplicates the first two cases. The full
     // population below must preserve both occurrences even below that limit.
@@ -1162,6 +1162,23 @@ describe('actual reporter population capture', () => {
     expect(population.cases).toHaveLength(count + 1);
     expect(population.cases.filter(row => row.identity[2] === 'suite > duplicate').map(row => row.identity[3]))
       .toEqual([1, 2]);
+    expect(population.cases.filter(row => row.selected)).toHaveLength(count);
+    expect(population.executionOrder[0][2]).toBe(`suite > \u03bb-${count - 1}`);
+    expect(population.cases.find(row => row.identity[2] === `suite > \u03bb-${count - 1}`))
+      .toMatchObject({ selected: true, outcome: 'passed' });
+    expect(parseRecordedTestPopulation(JSON.parse(JSON.stringify(execution.population))))
+      .toEqual(population);
+    expect(population.cases.find(row => !row.selected)?.outcome).toBe('skipped');
+  });
+
+  it.each([-1, 0, 1])('persists every unique original outcome at diagnostic limit %+i', async offset => {
+    const count = MAX_RECORDED_PASSED_CASES + offset;
+    const execution = await record(count, undefined, false);
+    expect(execution.passedCaseTitlesTruncated).toBe(count > MAX_RECORDED_PASSED_CASES ? true : undefined);
+    expect(execution.passedCaseTitles).toHaveLength(Math.min(count, MAX_RECORDED_PASSED_CASES));
+    const population = parseRecordedTestPopulation(execution.population)!;
+    expect(population).toBeDefined();
+    expect(population.cases).toHaveLength(count + 1);
     expect(population.cases.filter(row => row.selected)).toHaveLength(count);
     expect(population.executionOrder[0][2]).toBe(`suite > \u03bb-${count - 1}`);
     expect(population.cases.find(row => row.identity[2] === `suite > \u03bb-${count - 1}`))
