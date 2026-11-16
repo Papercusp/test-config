@@ -81,8 +81,18 @@ it.each(['before-spawn', 'after-spawn'] as const)(
       if (phase === 'after-spawn') {
         // Synthetic workers own no real process group. Zero is deliberately
         // inert in the bridge's failure cleanup; no PID can be signalled.
-        for (const worker of control.workers) worker.emit('message', { type: 'spawned', pid: 0 });
+        for (const worker of control.workers) {
+          worker.emit('online', undefined);
+          worker.emit('message', { type: 'started' });
+          worker.emit('message', { type: 'spawned', pid: 0 });
+        }
       }
+      const readerEvents = events().filter(event => event.phase === 'reporter-git-reader');
+      expect(readerEvents.filter(event => event.event === 'requested').map(event => event.commandKind).sort())
+        .toEqual(['branch', 'head']);
+      expect(readerEvents.filter(event => event.event === 'created')).toHaveLength(2);
+      for (const event of ['online', 'worker-started', 'spawned'])
+        expect(readerEvents.filter(row => row.event === event)).toHaveLength(phase === 'after-spawn' ? 2 : 0);
       await vi.advanceTimersByTimeAsync(25_000 + SHARED_PG_DRAIN_TIMEOUT_MS);
       await final;
       expect(finished).toBe(true);
@@ -106,6 +116,10 @@ it.each(['before-spawn', 'after-spawn'] as const)(
       expect(events()).toContainEqual(expect.objectContaining({
         operationId: metadataStart.operationId, event: 'end', outcome: 'returned',
       }));
+      for (const request of readerEvents.filter(event => event.event === 'requested'))
+        expect(events()).toContainEqual(expect.objectContaining({
+          phase: 'reporter-git-reader', operationId: request.operationId, event: 'result', readable: true,
+        }));
       expect(receipts()).toContainEqual(expect.objectContaining({ outcome: 'failed', reason: 'pg_unavailable' }));
       expect(control.constructPg).not.toHaveBeenCalled();
       reporter.onProcessTimeout();

@@ -818,6 +818,20 @@ function runGitProcessGroup(
 ): Promise<string | null> {
   return new Promise((resolveP) => {
     const startedAt = Date.now();
+    const operationId = randomUUID();
+    const trace = (event: string, detail: Record<string, unknown> = {}) => {
+      if (process.env.PAPERCUSP_TEST_REPORTER_STAGE_TRACE !== '1'
+          && process.env.PC_ISOLATED_RUNTIME_PROOF !== '1' && !process.env.VERIFY_TAURI_SOURCE_RECEIPT) return;
+      try {
+        process.stderr.write('TEST_FILE_FINALIZATION ' + JSON.stringify({ pid: process.pid,
+          phase: 'reporter-git-reader', operationId, event, elapsedMs: Date.now() - startedAt,
+          commandKind: cmd === 'git rev-parse HEAD' ? 'head'
+            : cmd === 'git rev-parse --abbrev-ref HEAD' ? 'branch'
+              : cmd.startsWith('git status ') ? 'status' : 'other',
+          timeoutMs, ...detail }) + '\n');
+      } catch { /* Diagnostics must never alter a Git reading. */ }
+    };
+    trace('requested');
     let settled = false;
     let groupPid: number | undefined;
     const finish = (output: string | null, diagnostic?: string) => {
@@ -829,6 +843,7 @@ function runGitProcessGroup(
     };
     const failedWorker = (error: unknown) => {
       if (settled) return;
+      trace('failed');
       try { if (groupPid) process.kill(-groupPid, 'SIGKILL'); }
       catch { /* The worker may already have reaped the command. */ }
       finish(null, JSON.stringify({ command: cmd, timeoutMs, elapsedMs: Date.now() - startedAt,
@@ -844,13 +859,21 @@ function runGitProcessGroup(
       const worker = new Worker(new URL('./git-read-worker.mjs', import.meta.url), {
         workerData: { cmd, cwd, timeoutMs }, execArgv: [],
       });
+      trace('created', { threadId: worker.threadId });
+      worker.once('online', () => trace('online', { threadId: worker.threadId }));
       worker.on('message', (message: { type: string; pid?: number; output?: string | null; diagnostic?: string }) => {
-        if (message.type === 'spawned' && Number.isSafeInteger(message.pid)) groupPid = message.pid;
-        else if (message.type === 'result') finish(typeof message.output === 'string' ? message.output : null,
-          message.diagnostic);
+        if (message.type === 'started') trace('worker-started');
+        else if (message.type === 'spawned' && Number.isSafeInteger(message.pid)) {
+          groupPid = message.pid;
+          trace('spawned', { childPid: groupPid });
+        } else if (message.type === 'result') {
+          trace('result', { readable: typeof message.output === 'string' });
+          finish(typeof message.output === 'string' ? message.output : null, message.diagnostic);
+        }
       });
       worker.once('error', failedWorker);
       worker.once('exit', code => {
+        trace('exit', { code });
         if (!settled) failedWorker(`exited ${code} without a complete reading`);
       });
     } catch (error) { failedWorker(error); }
