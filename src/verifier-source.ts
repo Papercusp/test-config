@@ -238,6 +238,11 @@ export function verifierSourceFiles(root: string, {
       const vadRuntimeAsset = /^apps\/operator\/public\/ort-wasm-[^/]+\.(?:wasm|mjs)$/.test(rel);
       if (runtimeArtifacts && (vitestResultCache || vadRuntimeAsset || [
         'apps/operator-vite/src/routeTree.gen.ts', '.papercusp-pinned-deps',
+        // bin/vite-build-singleflight tees every in-archive build into this exact
+        // log beside the admitted apps/operator-vite/dist (an assertion such as
+        // test:e2e:css-preload rebuilds after the preflight census). Diagnostic
+        // output only; a recorded log, a redirect, or any sibling stays fatal.
+        'apps/operator-vite/.vite-build.log',
         'apps/operator/public/silero_vad_v5.onnx',
         'apps/operator/public/silero_vad_legacy.onnx',
         'apps/operator/public/vad.worklet.bundle.min.js',
