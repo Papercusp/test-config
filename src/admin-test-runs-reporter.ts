@@ -1085,11 +1085,12 @@ export async function captureWorktreeSnapshot(
   if (existsSync(join(root, '.verifier-source.json'))) {
     try {
       const mutation = mutationSubjectForVerifierSource(root);
-      return { commit: (await readVerifierSourceReceipt(root, undefined, { mutation, signal,
+      const receipt = await readVerifierSourceReceipt(root, undefined, { mutation, signal,
         progress: record => process.stderr.write('TEST_FILE_FINALIZATION ' + JSON.stringify({
           pid: process.pid, phase: 'provenance-progress', origin: 'reporter-snapshot', ...record,
         }) + '\n'),
-      })).sourceCommit, porcelain: '' };
+      });
+      return withSubmodules({ commit: receipt.sourceCommit, porcelain: '' });
     } catch (error) {
       return { commit: null, porcelain: null,
         provenanceError: `verifier source: ${error instanceof Error ? error.message : String(error)}` };
