@@ -5115,6 +5115,11 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
       'const fs = require("node:fs");',
       'fs.writeSync(3, "invalid-json\\n" + "x".repeat(20_000) + "\\n");',
       'const parent = "private-diagnostic-parent", child = parent + "/blocked-helper";',
+      'const root = require("node:path").dirname(process.argv[2]);',
+      'for (const [sid,worktree] of [[parent,root], [child,root + "/nested-source"], [parent + "/external-helper",root + "-outside/private-path"]]) {',
+      '  fs.writeSync(3, JSON.stringify({event:"def_repo",sid,worktree}) + "\\n");',
+      '}',
+      'fs.writeSync(3, JSON.stringify({event:"region_enter",sid:parent + "/external-helper",thread:"main",nesting:1,category:"reporter-test",label:"external-helper"}) + "\\n");',
       'for (const [event, sid, label] of [["region_enter", parent, "completed-parent"], ["region_enter", child, "blocked-descendant"], ["region_leave", parent, "completed-parent"]]) {',
       '  fs.writeSync(3, JSON.stringify({event,sid,thread:"main",nesting:1,category:"reporter-test",label}) + "\\n");',
       '}',
@@ -5155,9 +5160,15 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
       expect(parent.processId).toMatch(/^[a-f0-9]{12}$/);
       expect(blocked.parentProcessId).toBe(parent.processId);
       expect(blocked.processId).not.toBe(parent.processId);
+      expect(blocked.repositoryPath).toBe('nested-source');
+      expect(parent.repositoryPath).toBe('.');
+      const external = failure.gitTrace.openRegions.find((phase: { label: string }) => phase.label === 'external-helper');
+      expect(external).not.toHaveProperty('repositoryPath');
       expect(failure.gitTrace.openRegions).not.toContainEqual(expect.objectContaining({ label: 'completed-parent' }));
       expect(failure.gitTrace.rootProcessId).toMatch(/^[a-f0-9]{12}$/);
       expect(failures[0]).not.toContain('private-diagnostic-parent');
+      expect(failures[0]).not.toContain(root);
+      expect(failures[0]).not.toContain('private-path');
       expect(failure.gitTrace.lastEvents.length).toBeLessThanOrEqual(12);
       expect(failure.gitTrace.openRegions.length).toBeLessThanOrEqual(12);
       expect(failures[0].length).toBeLessThan(8_000);

@@ -4,6 +4,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readlinkSync } from 'node:fs';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
 
 const { cmd, cwd, timeoutMs, lifecycle } = workerData;
@@ -14,7 +15,8 @@ const summarizeStatus = /^git status --porcelain --untracked-files=all(?: --igno
 const captureLimit = 1024 * 1024;
 // Trace2 gets its own pipe, so phase evidence never contaminates porcelain or
 // stderr. Respect an explicitly configured destination. Keep only bounded
-// phase metadata, not argv, paths, error messages, or an unbounded trace file.
+// phase metadata and repository-relative identity, not argv, absolute paths,
+// error messages, or an unbounded trace file.
 const traceGit = /^git(?:\s|$)/.test(cmd) && !process.env.GIT_TRACE2_EVENT;
 const traceLimit = 8192;
 let tracePending = '';
@@ -24,6 +26,7 @@ let traceDroppedLines = 0;
 let traceRootProcessId;
 const traceTail = [];
 const traceRegions = new Map();
+const traceRepositories = new Map();
 const statusDigest = summarizeStatus ? createHash('sha256') : null;
 const statusPrefix = [];
 let statusPrefixBytes = 0;
@@ -62,6 +65,18 @@ function captureTrace(chunk) {
         else if (typeof value === 'number' && Number.isFinite(value)) phase[key] = value;
       }
       if (typeof event.sid === 'string') {
+        // A process token identifies a stalled child but cannot name its
+        // submodule. Keep Git's declared repository only inside this source
+        // root; never retain the absolute worktree or an external helper path.
+        if (event.event === 'def_repo' && typeof event.worktree === 'string' && isAbsolute(event.worktree)) {
+          const repositoryPath = relative(resolve(cwd), event.worktree);
+          if (!isAbsolute(repositoryPath) && repositoryPath !== '..' && !repositoryPath.startsWith(`..${sep}`)
+              && repositoryPath.length <= 256) {
+            traceRepositories.set(event.sid, repositoryPath.split(sep).join('/') || '.');
+            if (traceRepositories.size > 128) traceRepositories.delete(traceRepositories.keys().next().value);
+          }
+        }
+        if (traceRepositories.has(event.sid)) phase.repositoryPath = traceRepositories.get(event.sid);
         // Correlate root/submodule phases without retaining raw session IDs.
         const token = sid => createHash('sha256').update(sid).digest('hex').slice(0, 12);
         phase.processId = token(event.sid);
