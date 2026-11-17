@@ -735,7 +735,7 @@ describe('receipt-backed native archive reporter', () => {
     }
   }, 45_000);
 
-  it('keeps worker-stop IPC responsive while validating an archive snapshot', async () => {
+  it.each([false, true])('keeps worker-stop IPC responsive while validating an archive snapshot (observations=%s)', async includeObservations => {
     const parent = mkdtempSync(join(tmpdir(), 'native-archive-responsive-'));
     const root = join(parent, 'source');
     mkdirSync(root);
@@ -760,13 +760,19 @@ describe('receipt-backed native archive reporter', () => {
     let heartbeat = false;
     const tick = new Promise<void>(resolve => setImmediate(() => { heartbeat = true; resolve(); }));
     try {
-      const snapshot = await captureWorktreeSnapshot();
-      expect(snapshot).toEqual({ commit: receipt.sourceCommit, porcelain: '' });
+      const snapshot = await captureWorktreeSnapshot(undefined, undefined, undefined, includeObservations);
+      if (includeObservations) {
+        expect(snapshot).toMatchObject({ commit: receipt.sourceCommit, porcelain: '', submodules: [],
+          sourceBytes: { schemaVersion: 'source-bytes-v1' } });
+        expect(snapshot.sourceBytes).toEqual(captureSourceByteSnapshot(root));
+      } else {
+        expect(snapshot).toEqual({ commit: receipt.sourceCommit, porcelain: '' });
+      }
       // Vitest fork termination can overlap reporter finalization. Its IPC
       // callbacks must run while census/Git work is pending, even on a tiny tree.
       expect(heartbeat).toBe(true);
       git(['checkout', '--detach', '--quiet', 'HEAD^']);
-      expect(await captureWorktreeSnapshot()).toMatchObject({ commit: null, porcelain: null,
+      expect(await captureWorktreeSnapshot(undefined, undefined, undefined, includeObservations)).toMatchObject({ commit: null, porcelain: null,
         provenanceError: expect.stringContaining('verification Git checkout differs') });
     } finally {
       await tick;
