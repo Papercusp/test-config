@@ -191,7 +191,13 @@ it('cancels pre-client metadata at the existing flush deadline and drains its wr
     expect(writeRows.mock.calls[0][1]?.aborted).toBe(true);
     expect(control.constructPg).not.toHaveBeenCalled();
     const receipts = readFileSync(receiptFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    expect(receipts).toContainEqual(expect.objectContaining({ outcome: 'failed', reason: 'git_metadata_cancelled' }));
+    expect(receipts).toContainEqual(expect.objectContaining({
+      outcome: 'failed', reason: 'git_metadata_cancelled', replayable: true,
+      runContext: expect.objectContaining({
+        configurationSnapshot: expect.objectContaining({ schemaVersion: 1, fingerprint: expect.any(String) }),
+      }),
+      row: expect.objectContaining({ commitSha: 'fixture-head', receiptAttempt: 0 }),
+    }));
     expect(vi.getTimerCount()).toBe(0);
     const lines: string[] = [];
     const sink = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { lines.push(String(chunk)); return true; });
@@ -329,8 +335,17 @@ it.skipIf(process.platform === 'win32')('distinguishes a real worker preload sta
     // hang was in preload. Its command budget starts only after this gate.
     Atomics.store(gate, 1, 1);
     Atomics.notify(gate, 1);
-    expect(await pending).toBe('startup-released');
-    expect(failures).toEqual([]);
+    const output = await pending;
+    // The assertion concerns the preload interval. Once released, a real
+    // command may legitimately exhaust its 20ms budget before its close event
+    // is delivered; require that exact post-spawn diagnosis in that case.
+    if (output === null) {
+      expect(failures).toHaveLength(1);
+      expect(JSON.parse(failures[0])).toMatchObject({ message: 'command timed out', killed: true, timeoutMs: 20 });
+    } else {
+      expect(output).toBe('startup-released');
+      expect(failures).toEqual([]);
+    }
     await vi.waitFor(() => expect(events().at(-1)).toMatchObject({ event: 'exit', code: 0 }), { timeout: 5_000 });
     expect(events().map(event => event.event)).toEqual([
       'requested', 'created', 'online', 'worker-started', 'spawned', 'result', 'exit',

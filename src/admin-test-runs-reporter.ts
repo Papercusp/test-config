@@ -2656,7 +2656,8 @@ function isPreSubmitPgSetupReceipt(
 ): receipt is PgSetupFailureReceipt {
   if (receipt.outcome !== 'failed'
     || !(receipt.reason === 'pg_unavailable' && isPreSubmitPgSetupFailure(receipt.pgSetupFailure)
-      || receipt.reason === 'terminal_queue_not_submitted' && receipt.replayable
+      || (receipt.reason === 'terminal_queue_not_submitted' && receipt.replayable
+        || receipt.reason === 'git_metadata_cancelled')
         && receipt.insertDiagnostics === undefined && receipt.pgSetupFailure === undefined)
     || receipt.row.receiptId !== receipt.receiptId || receipt.row.receiptAttempt !== receipt.attempt
     || receipt.row.filePath !== receipt.filePath || receipt.row.status !== receipt.status
@@ -3255,26 +3256,30 @@ export async function insertRows(rows: readonly TestRunRow[], signal?: AbortSign
     inferredCommit = ctx.commit;
   } catch { /* fail-soft */ }
 
+  // Retain the original process context even if metadata work exhausts the
+  // writer's deadline. Recovery must never substitute its own environment.
+  const context: TestRunInsertContext = {
+    branch,
+    inferredCommit,
+    declaredSource: resolveTestRunSource(),
+    runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
+    harnessSlug: resolveTestRunHarnessSlug(),
+    workspaceId: resolveTestRunWorkspaceId(),
+    ...captureReporterSaturationSnapshot(),
+    configurationSnapshot: captureConfigurationSnapshot(process.env),
+  };
   if (signal?.aborted) {
     // No client or INSERT has been requested. Preserve the observed rows with
-    // an explicit failure rather than starting database work after close.
-    const receipts = unwrittenReceipts(rows, 'failed', 'git_metadata_cancelled');
+    // a replayable pre-submit receipt; only the parent may start recovery.
+    const receipts = unwrittenReceipts(rows, 'failed', 'git_metadata_cancelled', {
+      replayable: true, runContext: context,
+    });
     appendTestRunReceipts(process.env, receipts);
     return receipts;
   }
 
   const pg = await observeReporterStage('test-runs', 'pg-client', tryGetPg);
   if (!pg) {
-    const context: TestRunInsertContext = {
-      branch,
-      inferredCommit,
-      declaredSource: resolveTestRunSource(),
-      runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
-      harnessSlug: resolveTestRunHarnessSlug(),
-      workspaceId: resolveTestRunWorkspaceId(),
-      ...captureReporterSaturationSnapshot(),
-      configurationSnapshot: captureConfigurationSnapshot(process.env),
-    };
     const setupFailure = sharedPg.setupFailure;
     const replayable = setupFailure?.phase === 'module-import' || setupFailure?.phase === 'client-construction';
     const receipts = unwrittenReceipts(rows, 'failed', 'pg_unavailable', {
@@ -3286,20 +3291,9 @@ export async function insertRows(rows: readonly TestRunRow[], signal?: AbortSign
     return receipts;
   }
 
-  const { loopLagP95Ms, rssMb } = captureReporterSaturationSnapshot();
   try {
     const receipts = await observeReporterStage('test-runs', 'ledger-insert', () =>
-      insertTestRunRowsWithSql(pg.sql, rows, {
-        branch,
-        inferredCommit,
-        declaredSource: resolveTestRunSource(),
-        runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
-        harnessSlug: resolveTestRunHarnessSlug(),
-        workspaceId: resolveTestRunWorkspaceId(),
-        loopLagP95Ms,
-        rssMb,
-        configurationSnapshot: captureConfigurationSnapshot(process.env),
-      }));
+      insertTestRunRowsWithSql(pg.sql, rows, context));
     appendTestRunReceipts(process.env, receipts);
     return receipts;
   } catch (error) {

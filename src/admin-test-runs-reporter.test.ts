@@ -2210,7 +2210,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           expect(pendingTestRunRecoveryPaths(JSON.stringify(recovered[0]), ['a.test.ts'], details.root)).toEqual(['a.test.ts']);
         });
 
-      it.each(['pg-setup', 'terminal-queue'] as const)(
+      it.each(['pg-setup', 'terminal-queue', 'git-metadata'] as const)(
         'recovers a first pre-submit %s receipt only after an exact empty readback', async phase => {
         const directory = mkdtempSync(join(tmpdir(), 'test-run-setup-replay-'));
         const receiptFile = join(directory, 'receipts.jsonl');
@@ -2223,7 +2223,7 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           ...base, outcome: 'failed', replayable: true, runContext,
           ...(phase === 'pg-setup'
             ? { reason: 'pg_unavailable', pgSetupFailure: { phase: 'client-construction' as const, code: 'ECONNREFUSED' } }
-            : { reason: 'terminal_queue_not_submitted' }),
+            : { reason: phase === 'git-metadata' ? 'git_metadata_cancelled' : 'terminal_queue_not_submitted' }),
         };
         const statements: string[] = [];
         const insertedRows: Record<string, unknown>[][] = [];
@@ -2266,13 +2266,13 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         }
       });
 
-      it.each(['pg-setup', 'terminal-queue'] as const)(
+      it.each(['pg-setup', 'terminal-queue', 'git-metadata'] as const)(
         'does not recover %s when a matching path has a pending insert or ambiguous ledger readback', async phase => {
         const setupFailure: TestRunReceipt = {
           ...base, outcome: 'failed', replayable: true,
           ...(phase === 'pg-setup'
             ? { reason: 'pg_unavailable', pgSetupFailure: { phase: 'module-import' as const } }
-            : { reason: 'terminal_queue_not_submitted' }),
+            : { reason: phase === 'git-metadata' ? 'git_metadata_cancelled' : 'terminal_queue_not_submitted' }),
           runContext: {
             branch: 'staging', inferredCommit: null, declaredSource: 'local', runGroupId: 'group-a',
             harnessSlug: 'papercusp', workspaceId: 'workspace-a', loopLagP95Ms: null, rssMb: null,
@@ -2292,6 +2292,8 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
           { log: JSON.stringify({ ...setupFailure, attempt: 1,
             row: { ...setupFailure.row, receiptAttempt: 1 } }), rows: [] },
           { log: JSON.stringify({ ...setupFailure, runContext: undefined }), rows: [] },
+          { log: JSON.stringify({ ...setupFailure,
+            runContext: { ...setupFailure.runContext, configurationSnapshot: null } }), rows: [] },
         ];
         for (const scenario of scenarios) {
           const statements: string[] = [];
