@@ -49,11 +49,11 @@ vi.mock('node:worker_threads', async importOriginal => {
 });
 
 import AdminTestRunsReporter, {
-  closeSharedPg, insertRows, runGit, SHARED_PG_DRAIN_TIMEOUT_MS, type TestRunRow,
+  closeSharedPg, insertRows, runGit, type TestRunRow,
 } from './admin-test-runs-reporter.ts';
 
-it.each(['before-spawn', 'after-spawn'] as const)(
-  'identifies an actual metadata writer held %s without blaming PostgreSQL teardown', async phase => {
+it.each(['without-signal', 'with-signal'] as const)(
+  'persists metadata independently of a held Worker startup (%s)', async phase => {
     const directory = mkdtempSync(join(tmpdir(), 'reporter-metadata-lifecycle-'));
     const receiptFile = join(directory, 'receipts.jsonl');
     const keys = ['PAPERCUSP_TEST_RUN_RECEIPT_FILE', 'PAPERCUSP_TEST_RUN_RECOVERY_FILE',
@@ -72,10 +72,11 @@ it.each(['before-spawn', 'after-spawn'] as const)(
     const releaseWorkers = () => {
       for (const worker of control.workers) worker.emit('message', { type: 'result', output: 'fixture-head' });
     };
-    // An injected snapshot avoids unrelated source discovery; the writer still
-    // calls the real insertRows -> resolveGitContext -> runGit worker path.
-    // Wrapping insertRows also bypasses the evidence-consumer PG preflight.
-    const writeRows = vi.fn(async (rows: readonly TestRunRow[]) => { await insertRows(rows); });
+    // Hold every Git Worker before its entry module. Optional branch/commit
+    // inference must still reach the real writer's pre-client failure receipt.
+    const writeRows = vi.fn(async (rows: readonly TestRunRow[], signal?: AbortSignal) => {
+      await insertRows(rows, phase === 'with-signal' ? signal : undefined);
+    });
     const reporter = new AdminTestRunsReporter(async () => ({ commit: 'fixture-head', porcelain: '' }),
       undefined, writeRows);
     let final: Promise<void> | undefined;
@@ -85,67 +86,37 @@ it.each(['before-spawn', 'after-spawn'] as const)(
       control.workers = [];
       control.constructPg.mockClear();
       control.hold = true;
-      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      vi.useFakeTimers({ toFake: ['Date'] });
       // Each case starts beyond the preceding case's metadata cache lifetime.
-      vi.setSystemTime(new Date(phase === 'before-spawn' ? '2030-01-01T00:00:00Z' : '2030-01-02T00:00:00Z'));
+      vi.setSystemTime(new Date(phase === 'without-signal' ? '2030-01-01T00:00:00Z' : '2030-01-02T00:00:00Z'));
       reporter.onTestModuleEnd({ moduleId: fileURLToPath(import.meta.url), state: () => 'passed',
         diagnostic: () => ({ duration: 1 }), children: { allTests: () => [] } } as unknown as TestModule);
       let finished = false;
       final = reporter.onTestRunEnd().then(() => { finished = true; });
-      await vi.advanceTimersByTimeAsync(0);
-      expect(writeRows).toHaveBeenCalledOnce();
-      expect(control.workers).toHaveLength(2);
-      if (phase === 'after-spawn') {
-        // Synthetic workers own no real process group. Zero is deliberately
-        // inert in the bridge's failure cleanup; no PID can be signalled.
-        for (const worker of control.workers) {
-          worker.emit('online', undefined);
-          worker.emit('message', { type: 'started' });
-          worker.emit('message', { type: 'spawned', pid: 0 });
-        }
-      }
-      const readerEvents = events().filter(event => event.phase === 'reporter-git-reader');
-      expect(readerEvents.filter(event => event.event === 'requested').map(event => event.commandKind).sort())
-        .toEqual(['branch', 'head']);
-      expect(readerEvents.filter(event => event.event === 'created')).toHaveLength(2);
-      for (const event of ['online', 'worker-started', 'spawned'])
-        expect(readerEvents.filter(row => row.event === event)).toHaveLength(phase === 'after-spawn' ? 2 : 0);
-      await vi.advanceTimersByTimeAsync(25_000 + SHARED_PG_DRAIN_TIMEOUT_MS);
+      await vi.waitFor(() => expect(control.constructPg).toHaveBeenCalledOnce(), { timeout: 2_000 });
       await final;
+      expect(writeRows).toHaveBeenCalledOnce();
+      expect(control.workers).toHaveLength(0);
+      const readerEvents = events().filter(event => event.phase === 'reporter-git-reader');
+      expect(readerEvents).toEqual([]);
       expect(finished).toBe(true);
       reporter.onProcessTimeout();
       expect(events()).toContainEqual(expect.objectContaining({
-        phase: 'reporter-pg-timeout', holders: 0, inFlight: 1,
-        closeRequested: true, clientRequested: false, closing: false,
+        phase: 'reporter-pg-timeout', holders: 0, inFlight: 0,
+        closeRequested: false, clientRequested: false, closing: false,
       }));
       const metadataStart = events().find(event => event.stage === 'git-context' && event.event === 'start');
       expect(metadataStart).toBeDefined();
-      expect(events().some(event => event.operationId === metadataStart.operationId && event.event === 'end')).toBe(false);
-      expect(events().some(event => event.stage === 'pg-client' || event.stage === 'ledger-insert')).toBe(false);
-      expect(events()).toContainEqual(expect.objectContaining({ stage: 'pg-release', event: 'end', outcome: 'returned' }));
-      expect(control.constructPg).not.toHaveBeenCalled();
-      const receipts = () => readFileSync(receiptFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      expect(receipts()).toMatchObject([{ outcome: 'timeout', reason: 'flush_budget_25000ms' }]);
-
-      releaseWorkers();
-      await vi.runAllTimersAsync();
-      await reporter.onExit();
       expect(events()).toContainEqual(expect.objectContaining({
         operationId: metadataStart.operationId, event: 'end', outcome: 'returned',
       }));
-      for (const request of readerEvents.filter(event => event.event === 'requested'))
-        expect(events()).toContainEqual(expect.objectContaining({
-          phase: 'reporter-git-reader', operationId: request.operationId, event: 'result', readable: true,
-        }));
-      expect(receipts()).toContainEqual(expect.objectContaining({ outcome: 'failed', reason: 'pg_unavailable' }));
-      expect(control.constructPg).not.toHaveBeenCalled();
-      reporter.onProcessTimeout();
-      expect(events().at(-1)).toMatchObject({
-        phase: 'reporter-pg-timeout', holders: 0, inFlight: 0,
-        closeRequested: false, clientRequested: false, closing: false,
-      });
-      expect(writeRows).toHaveBeenCalledOnce();
-      expect(vi.getTimerCount()).toBe(0);
+      expect(events()).toContainEqual(expect.objectContaining({ stage: 'pg-client', event: 'end' }));
+      expect(events().some(event => event.stage === 'ledger-insert')).toBe(false);
+      expect(events()).toContainEqual(expect.objectContaining({ stage: 'pg-release', event: 'end', outcome: 'returned' }));
+      const receipts = () => readFileSync(receiptFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(receipts()).toMatchObject([{ outcome: 'failed', reason: 'pg_unavailable', replayable: true,
+        runContext: expect.objectContaining({ configurationSnapshot: expect.any(Object) }),
+      }]);
     } finally {
       releaseWorkers();
       control.hold = false;
@@ -164,12 +135,14 @@ it.each(['before-spawn', 'after-spawn'] as const)(
   },
 );
 
-it('cancels pre-client metadata at the existing flush deadline and drains its writer', async () => {
+it('retains replayable results without starting Git or PG after metadata cancellation', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'reporter-metadata-cancellation-'));
   const receiptFile = join(directory, 'receipts.jsonl');
   const previousReceipt = process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE;
   process.env.PAPERCUSP_TEST_RUN_RECEIPT_FILE = receiptFile;
-  const writeRows = vi.fn(async (rows: readonly TestRunRow[], signal?: AbortSignal) => { await insertRows(rows, signal); });
+  const controller = new AbortController();
+  controller.abort();
+  const writeRows = vi.fn(async (rows: readonly TestRunRow[]) => { await insertRows(rows, controller.signal); });
   const reporter = new AdminTestRunsReporter(async () => ({ commit: 'fixture-head', porcelain: '' }), undefined, writeRows);
   let final: Promise<void> | undefined;
   try {
@@ -184,11 +157,9 @@ it('cancels pre-client metadata at the existing flush deadline and drains its wr
       diagnostic: () => ({ duration: 1 }), children: { allTests: () => [] } } as unknown as TestModule);
     final = reporter.onTestRunEnd();
     await vi.advanceTimersByTimeAsync(0);
-    expect(control.workers).toHaveLength(2);
-    await vi.advanceTimersByTimeAsync(25_000);
-    expect(control.workers.every(worker => worker.terminate.mock.calls.length === 1)).toBe(true);
+    expect(control.workers).toHaveLength(0);
     await final;
-    expect(writeRows.mock.calls[0][1]?.aborted).toBe(true);
+    expect(controller.signal.aborted).toBe(true);
     expect(control.constructPg).not.toHaveBeenCalled();
     const receipts = readFileSync(receiptFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(receipts).toContainEqual(expect.objectContaining({

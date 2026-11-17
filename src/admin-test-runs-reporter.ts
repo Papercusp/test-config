@@ -33,7 +33,7 @@
 
 import type { Reporter, TestCase, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
-import { exec, execFileSync } from 'node:child_process';
+import { exec, execFile, execFileSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { appendFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
@@ -918,9 +918,22 @@ async function resolveGitContext(signal?: AbortSignal): Promise<GitContext> {
   // WI-10000776: the branch/commit stamped on a row must describe the checkout the
   // tests came from, not whichever tree the process happened to start in.
   const root = resolveRecordRoot();
+  // These optional identifiers must not await a Worker preload before their
+  // command deadline even starts (EI-29028188542526166). Unlike source-status
+  // proof, a cancelled metadata reading may safely remain unknown. Invoke the
+  // two Git builtins directly, without a shell or Node/loader startup, and kill
+  // the actual process on timeout. Snapshot reads keep their independent worker.
+  const read = (args: string[]): Promise<string | null> => new Promise(resolveValue => {
+    if (signal?.aborted) { resolveValue(null); return; }
+    try {
+      const child = execFile('git', args, {
+        cwd: root, timeout: 200, killSignal: 'SIGKILL', signal, encoding: 'utf8',
+      }, (error, stdout) => resolveValue(error || child.killed ? null : stdout.trim()));
+    } catch { resolveValue(null); }
+  });
   const [branchRaw, commitRaw] = await Promise.all([
-    runGit('git rev-parse --abbrev-ref HEAD', root, 200, undefined, signal),
-    runGit('git rev-parse HEAD', root, 200, undefined, signal),
+    read(['rev-parse', '--abbrev-ref', 'HEAD']),
+    read(['rev-parse', 'HEAD']),
   ]);
   const value: GitContext = {
     branch: branchRaw && branchRaw !== 'HEAD' ? branchRaw : null,
