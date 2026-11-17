@@ -5167,7 +5167,7 @@ describe('runGit failure diagnostics (EI-25879692352233544)', () => {
       expect(failure.gitTrace.openRegions).not.toContainEqual(expect.objectContaining({ label: 'completed-parent' }));
       expect(failure.gitTrace.rootProcessId).toMatch(/^[a-f0-9]{12}$/);
       expect(failures[0]).not.toContain('private-diagnostic-parent');
-      expect(failures[0]).not.toContain(root);
+      expect(JSON.stringify(failure.gitTrace)).not.toContain(root);
       expect(failures[0]).not.toContain('private-path');
       expect(failure.gitTrace.lastEvents.length).toBeLessThanOrEqual(12);
       expect(failure.gitTrace.openRegions.length).toBeLessThanOrEqual(12);
