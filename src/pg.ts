@@ -27,6 +27,7 @@ export {
 export type { TestSchemaHandle } from './pg-container.ts';
 export { startDedicatedNativePg, resolveNativePgBinDir } from './dedicated-native-pg.ts';
 export type { DedicatedNativePg } from './dedicated-native-pg.ts';
+export { captureOwnedDatabaseSchema } from './owned-database-schema.ts';
 export { TESTCONTAINER_START_LOCK_TIMEOUT_MS } from './testcontainer-start-lock.ts';
 export {
   createFreshTestDb,
