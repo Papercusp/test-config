@@ -98,13 +98,15 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
             capabilities?: import('./runtime-proof.ts').RecordedWorkerRuntimeCapabilities };
           workerExecution?: { captureId: string; testFile: string };
           testConfiguration?: { schemaVersion: string; before: string | null; after: string | null };
+          moduleEvaluations?: import('./executed-inputs-capture.ts').ModuleEvaluationObservation;
         } | null } }> };
         rows: Array<{ inputsCaptured?: boolean; readPaths?: string[]; opaqueReasons?: string[];
           executedModules?: string[]; moduleEvaluations?: { basis: string; reasons: string[];
             entries: Array<{ id: string; sha256: string; byteLength: number; codeRef?: string }>;
             vmInputs?: Array<{ inputIndex: number; id: string; api: string; filename: string;
               sha256: string; byteLength: number; codeRef?: string }>;
-            externalCalls?: Array<{ id: string }> };
+            externalCalls?: Array<{ id: string }>;
+            settlements?: import('./executed-inputs-capture.ts').ModuleEvaluationObservation['settlements'] };
           sourceEvidence?: { status: string; reasons: string[];
             sources: Array<{ path: string; sha256: string; basis?: string }> } }>;
       };
@@ -161,6 +163,16 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       }));
       const evaluations = map.rows[0]?.moduleEvaluations;
       expect(evaluations?.basis).toBe('before-evaluator-call');
+      expect(evaluations?.settlements?.basis).toBe('v8-promise-hooks');
+      expect(evaluations?.settlements?.calls.map(call => call.inputIndex)).toEqual(
+        evaluations?.entries.map((_, inputIndex) => inputIndex),
+      );
+      const routeIndices = evaluations!.entries.flatMap((entry, index) =>
+        entry.id === join(FIXTURE, 'dynamic-route.fixture.ts') ? [index] : []);
+      expect(routeIndices.length).toBeGreaterThan(0);
+      for (const inputIndex of routeIndices)
+        expect(evaluations?.settlements?.calls[inputIndex]).toEqual({ inputIndex, status: 'settled' });
+      expect(map.nativeRun.files[0]?.proof.inputs?.moduleEvaluations?.settlements).toEqual(evaluations?.settlements);
       expect(evaluations?.reasons).not.toContain('evaluator-seam-unavailable');
       expect(evaluations?.externalCalls).toContainEqual({ id: 'node:querystring' });
       expect(evaluations?.reasons).toContain('external-loader-bytes-unobserved');

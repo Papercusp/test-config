@@ -153,6 +153,136 @@ describe('scoped module runner diagnostics', () => {
 });
 
 describe('prospective evaluator inputs', () => {
+  it('passively distinguishes pending and settled calls without replacing promises or errors', async () => {
+    const releases: Array<(value: string) => void> = [];
+    const rejects: Array<(error: Error) => void> = [];
+    const results: Promise<string>[] = [];
+    const evaluator = { runInlinedModule(..._args: unknown[]) {
+      const result = new Promise<string>((resolve, reject) => { releases.push(resolve); rejects.push(reject); });
+      results.push(result);
+      return result;
+    } };
+    const rec = beginFile();
+    installModuleEvaluationCapture({ moduleRunner: { evaluator } });
+    const first = evaluator.runInlinedModule({}, 'first', { id: '/repo/shared.ts' });
+    const second = evaluator.runInlinedModule({}, 'second', { id: '/repo/shared.ts' });
+    expect(first).toBe(results[0]); expect(second).toBe(results[1]);
+    expect(rec.moduleEvaluations?.settlements?.calls).toEqual([
+      { inputIndex: 0, status: 'pending' }, { inputIndex: 1, status: 'pending' },
+    ]);
+    const error = new Error('original rejection');
+    const rejection = expect(second).rejects.toBe(error);
+    rejects[1](error);
+    releases[0]('original value');
+    await rejection;
+    expect(await first).toBe('original value');
+    const observed = endFile('/repo/test.ts')?.moduleEvaluations;
+    expect(observed?.settlements).toEqual({ basis: 'v8-promise-hooks', calls: [
+      { inputIndex: 0, status: 'settled' }, { inputIndex: 1, status: 'settled' },
+    ] });
+    // Settlement is deliberately not a success verdict or compiler closure.
+    expect(observed?.reasons).toContain('runtime-inputs-outside-evaluator');
+  });
+
+  it('keeps an adopted pending promise pending until the outer evaluator promise settles', async () => {
+    let release!: (value: string) => void;
+    const evaluator = { runInlinedModule(..._args: unknown[]) {
+      return new Promise<string>(resolve => {
+        resolve(new Promise<string>(done => { release = done; }));
+      });
+    } };
+    const rec = beginFile();
+    installModuleEvaluationCapture({ moduleRunner: { evaluator } });
+    const result = evaluator.runInlinedModule({}, 'adopt', { id: '/repo/adopt.ts' });
+    await Promise.resolve();
+    expect(rec.moduleEvaluations?.settlements?.calls).toEqual([{ inputIndex: 0, status: 'pending' }]);
+    release('adopted value');
+    expect(await result).toBe('adopted value');
+    expect(endFile('/repo/test.ts')?.moduleEvaluations?.settlements?.calls).toEqual([
+      { inputIndex: 0, status: 'settled' },
+    ]);
+  });
+
+  it('retains separate call indices when several evaluations return the same pending promise', async () => {
+    let release!: () => void;
+    let result: Promise<void> | undefined;
+    const evaluator = { runInlinedModule(..._args: unknown[]) {
+      return result ??= new Promise<void>(resolve => { release = resolve; });
+    } };
+    const rec = beginFile(); installModuleEvaluationCapture({ moduleRunner: { evaluator } });
+    const first = evaluator.runInlinedModule({}, 'one', { id: '/repo/repeated.ts' });
+    expect(evaluator.runInlinedModule({}, 'two', { id: '/repo/repeated.ts' })).toBe(first);
+    expect(evaluator.runInlinedModule({}, 'three', { id: '/repo/repeated.ts' })).toBe(first);
+    expect(rec.moduleEvaluations?.settlements?.calls).toEqual([0, 1, 2].map(inputIndex => ({ inputIndex, status: 'pending' })));
+    release(); await first;
+    expect(endFile('/repo/test.ts')?.moduleEvaluations?.settlements?.calls).toEqual(
+      [0, 1, 2].map(inputIndex => ({ inputIndex, status: 'settled' })),
+    );
+  });
+
+  it('observes immediate native settlement and synchronous throws without reading then', () => {
+    const error = new Error('synchronous evaluator failure');
+    let thenReads = 0;
+    const evaluator = { runInlinedModule(_context: unknown, code: string, _module: unknown): unknown {
+      if (code === 'throw') throw error;
+      const result = code === 'native' ? Promise.resolve('value') : {};
+      Object.defineProperty(result, 'then', { get() { thenReads++; throw new Error('must not inspect then'); } });
+      return result;
+    } };
+    beginFile();
+    installModuleEvaluationCapture({ moduleRunner: { evaluator } });
+    const native = evaluator.runInlinedModule({}, 'native', { id: '/repo/one.ts' });
+    const thenable = evaluator.runInlinedModule({}, 'thenable', { id: '/repo/two.ts' });
+    expect(native).toBeInstanceOf(Promise); expect(typeof thenable).toBe('object');
+    expect(() => evaluator.runInlinedModule({}, 'throw', { id: '/repo/three.ts' })).toThrow(error);
+    expect(thenReads).toBe(0);
+    expect(endFile('/repo/test.ts')?.moduleEvaluations?.settlements?.calls).toEqual([
+      { inputIndex: 0, status: 'settled' }, { inputIndex: 1, status: 'returned' },
+      { inputIndex: 2, status: 'threw' },
+    ]);
+  });
+
+  it('keeps pre-observer promise state unknown until an actual settlement is observed', async () => {
+    const alreadySettled = Promise.resolve('before observation');
+    let release!: (value: string) => void;
+    const priorPending = new Promise<string>(resolve => { release = resolve; });
+    const evaluator = { runInlinedModule(_context: unknown, code: string, _module: unknown) {
+      return code === 'settled' ? alreadySettled : priorPending;
+    } };
+    const rec = beginFile();
+    installModuleEvaluationCapture({ moduleRunner: { evaluator } });
+    expect(evaluator.runInlinedModule({}, 'settled', { id: '/repo/a.ts' })).toBe(alreadySettled);
+    expect(evaluator.runInlinedModule({}, 'pending', { id: '/repo/b.ts' })).toBe(priorPending);
+    expect(evaluator.runInlinedModule({}, 'pending', { id: '/repo/c.ts' })).toBe(priorPending);
+    expect(rec.moduleEvaluations?.settlements?.calls.map(call => call.status)).toEqual(['unknown', 'unknown', 'unknown']);
+    release('later'); await priorPending;
+    expect(endFile('/repo/test.ts')?.moduleEvaluations?.settlements?.calls).toEqual([
+      { inputIndex: 0, status: 'unknown' }, { inputIndex: 1, status: 'settled' },
+      { inputIndex: 2, status: 'settled' },
+    ]);
+  });
+
+  it('does not upgrade a finished snapshot or confuse reused indices in another file', async () => {
+    const releases: Array<() => void> = [];
+    const evaluator = { runInlinedModule(..._args: unknown[]) {
+      return new Promise<void>(resolve => { releases.push(resolve); });
+    } };
+    beginFile(); installModuleEvaluationCapture({ moduleRunner: { evaluator } });
+    const first = evaluator.runInlinedModule({}, 'same', { id: '/repo/shared.ts' });
+    const prior = endFile('/repo/first.test.ts')!;
+    const saved = JSON.stringify(prior);
+    const rec = beginFile(); installModuleEvaluationCapture({ moduleRunner: { evaluator } });
+    const second = evaluator.runInlinedModule({}, 'same', { id: '/repo/shared.ts' });
+    releases[0](); await first;
+    expect(JSON.stringify(prior)).toBe(saved);
+    expect(rec.moduleEvaluations?.settlements?.calls).toEqual([{ inputIndex: 0, status: 'pending' }]);
+    releases[1](); await second;
+    expect(endFile('/repo/second.test.ts')?.moduleEvaluations?.settlements?.calls).toEqual([
+      { inputIndex: 0, status: 'settled' },
+    ]);
+    expect(prior.moduleEvaluations?.settlements?.calls).toEqual([{ inputIndex: 0, status: 'pending' }]);
+  });
+
   it('retains every supplied code version and delegates without changing identity or errors', async () => {
     const result = Promise.resolve('value');
     const error = new Error('evaluator failure');

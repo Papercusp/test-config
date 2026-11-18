@@ -23,6 +23,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { types } from 'node:util';
+import { promiseHooks } from 'node:v8';
 import vm from 'node:vm';
 import { pinModuleState } from '@papercusp/module-singleton';
 import { hashConfigurationValue } from './configuration-snapshot.ts';
@@ -105,7 +107,23 @@ export interface ModuleEvaluationObservation {
     sha256: string; byteLength: number; codeRef?: string }>;
   /** Evaluator calls only: Node may return cached exports or a Vitest stub. */
   externalCalls?: Array<{ id: string }>;
+  /** Passive native-promise evidence, indexed into entries. Settled includes
+   * rejection; returned describes only a synchronous return, never thenable completion.
+   * A pre-hook promise stays unknown until a settlement event is observed. */
+  settlements?: { basis: 'v8-promise-hooks'; calls: EvaluationCallSettlement[] };
   reasons: string[];
+}
+
+interface EvaluationCallSettlement {
+  inputIndex: number;
+  status: 'entered' | 'returned' | 'threw' | 'pending' | 'settled' | 'unknown';
+}
+
+interface EvaluationPromiseObservation {
+  createdIn: Recorder | null;
+  settledIn: Recorder | null;
+  settled: boolean;
+  calls: EvaluationCallSettlement[];
 }
 
 /** Summarize actual compiler calls. Artifact paths are transport, not inputs.
@@ -165,6 +183,7 @@ interface CaptureState {
   directoryIteratorUnobserved: boolean;
   repoRoot: string | null;
   evaluationContext: AsyncLocalStorage<{ recorder: Recorder; inputIndex: number; id: string; code: string }>;
+  evaluationPromises?: WeakMap<Promise<unknown>, EvaluationPromiseObservation>;
 }
 
 const state = pinModuleState<CaptureState>('@papercusp/test-config.executed-inputs-capture', () => ({
@@ -322,6 +341,33 @@ function wrap(target: Patchable, name: string | symbol, before: (args: unknown[]
   }
 }
 
+/** One optional worker-lifetime hook, with weak promise keys. Observing settlement
+ * must not attach then/catch handlers, assimilate thenables or suppress unhandled
+ * rejections. Only promises created inside an observed evaluator can prove pending. */
+function installEvaluationPromiseCapture(): void {
+  if (state.evaluationPromises) return;
+  const promises = new WeakMap<Promise<unknown>, EvaluationPromiseObservation>();
+  promiseHooks.createHook({
+    init(promise) {
+      try {
+        const active = state.evaluationContext.getStore();
+        if (active && active.recorder === state.current)
+          promises.set(promise, { createdIn: active.recorder, settledIn: null, settled: false, calls: [] });
+      } catch { /* observation cannot change promise behavior */ }
+    },
+    settled(promise) {
+      try {
+        const observed = promises.get(promise);
+        if (!observed) return;
+        observed.settled = true;
+        observed.settledIn = state.current;
+        for (const call of observed.calls) call.status = 'settled';
+      } catch { /* observation cannot change promise behavior */ }
+    },
+  });
+  state.evaluationPromises = promises;
+}
+
 /** Observe the code argument actually supplied to Vitest's worker evaluator. This
  * optional, version-sensitive seam does not inspect a later module cache or disk.
  * Calls retain their receiver, arguments, return identity and thrown errors. */
@@ -339,6 +385,12 @@ export function installModuleEvaluationCapture(mocker: unknown, artifactRoot?: s
       'evaluator-wrapper-unobserved', 'runtime-inputs-outside-evaluator',
       ...(!artifactRoot ? ['code-bytes-not-retained'] : [])],
   };
+  try {
+    installEvaluationPromiseCapture();
+    rec.moduleEvaluations.settlements = { basis: 'v8-promise-hooks', calls: [] };
+  } catch {
+    rec.moduleEvaluations.reasons.push('promise-settlement-seam-unavailable');
+  }
   try {
     const evaluator = (mocker as { moduleRunner?: { evaluator?: Patchable } } | null)?.moduleRunner?.evaluator;
     if (!evaluator || typeof evaluator.runInlinedModule !== 'function') throw new Error('unavailable');
@@ -360,7 +412,35 @@ export function installModuleEvaluationCapture(mocker: unknown, artifactRoot?: s
       } catch {
         if (observation && !observation.reasons.includes('invalid-evaluator-input')) observation.reasons.push('invalid-evaluator-input');
       }
-      return active ? state.evaluationContext.run(active, () => original.apply(receiver, args)) : original.apply(receiver, args);
+      if (!active) return original.apply(receiver, args);
+      const call: EvaluationCallSettlement = { inputIndex: active.inputIndex, status: 'entered' };
+      observation?.settlements?.calls.push(call);
+      let result: unknown;
+      try {
+        result = state.evaluationContext.run(active, () => original.apply(receiver, args));
+      } catch (error) {
+        call.status = 'threw';
+        throw error;
+      }
+      try {
+        if (!types.isPromise(result)) {
+          call.status = 'returned';
+        } else {
+          let observed = state.evaluationPromises?.get(result);
+          if (!observed) {
+            observed = { createdIn: null, settledIn: null, settled: false, calls: [] };
+            state.evaluationPromises?.set(result, observed);
+          }
+          call.status = observed.settledIn === active.recorder ? 'settled'
+            : !observed.settled && observed.createdIn === active.recorder ? 'pending' : 'unknown';
+          observed.calls.push(call);
+        }
+      } catch {
+        call.status = 'unknown';
+        if (observation && !observation.reasons.includes('promise-settlement-observation-failed'))
+          observation.reasons.push('promise-settlement-observation-failed');
+      }
+      return result;
     });
     if (!(evaluator.runInlinedModule as unknown as Record<symbol, unknown>)[WRAPPED]) throw new Error('unavailable');
     for (const api of ['runInThisContext', 'runInContext'] as const) {
@@ -645,7 +725,11 @@ export function endFile(testFile: string): InputsRecord | null {
   return { testFile: resolve(testFile), reads: [...rec.reads].sort(), opaque: [...rec.opaque].sort(),
     ...(rec.databaseReset ? { workerDatabaseReset: { ...structuredClone(rec.databaseReset),
       testFile: resolve(testFile), finishedAt: new Date().toISOString() } } : {}),
-    ...(rec.moduleEvaluations ? { moduleEvaluations: rec.moduleEvaluations } : {}) };
+    ...(evaluations ? { moduleEvaluations: { ...evaluations,
+      // A later settlement may update live weak-map rows, never a finished artifact.
+      ...(evaluations.settlements ? { settlements: { ...evaluations.settlements,
+        calls: evaluations.settlements.calls.map(call => ({ ...call })) } } : {}),
+    } } : {}) };
 }
 
 /** Test seam: the live recorder (null between files). */
