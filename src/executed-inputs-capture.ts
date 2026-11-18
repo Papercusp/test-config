@@ -33,6 +33,32 @@ const lstatInputPath = lstatSync;
 
 export const PC_EXECUTED_INPUTS_DIR_ENV = 'PC_EXECUTED_INPUTS_DIR';
 
+/** Scope optional Vite import diagnostics without changing an existing logger.
+ * Null means the version-sensitive runner seam was unavailable, not observed idle. */
+export function installModuleRunnerDebug(mocker: unknown,
+  observe: (...args: unknown[]) => void): (() => void) | null {
+  try {
+    const runner = (mocker as { moduleRunner?: object } | null)?.moduleRunner;
+    if (!runner) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(runner, 'debug');
+    if (!descriptor || !('value' in descriptor) ||
+      (descriptor.value !== undefined && typeof descriptor.value !== 'function')) return null;
+    const previous: unknown = descriptor.value;
+    const debug = function(this: unknown, ...args: unknown[]): unknown {
+      try { observe(...args); } catch { /* diagnostics cannot change the import result */ }
+      return typeof previous === 'function' ? Reflect.apply(previous, this, args) : undefined;
+    };
+    Object.defineProperty(runner, 'debug', { ...descriptor, value: debug });
+    return () => {
+      // A later installer owns its replacement; never overwrite it during teardown.
+      if (Object.getOwnPropertyDescriptor(runner, 'debug')?.value === debug)
+        Object.defineProperty(runner, 'debug', descriptor);
+    };
+  } catch {
+    return null;
+  }
+}
+
 export interface InputsRecord {
   compilerInputs?: import('./execution-details.ts').RecordedWorkerCompilerInputs;
   workerDatabaseReset?: import('./execution-details.ts').RecordedWorkerDatabaseReset;

@@ -20,6 +20,7 @@ import {
   endFile,
   installCapture,
   installModuleEvaluationCapture,
+  installModuleRunnerDebug,
   repoPathOf,
   recordRead,
   resetCaptureForTests,
@@ -90,6 +91,64 @@ describe('final worker module observation', () => {
     expect(captureModuleImports({ moduleExecutionInfo: new Map() })).toBeNull();
     expect(captureModuleImports({ moduleExecutionInfo: new Map([['/repo/route.ts', { external: 'invalid' }]]) })).toBeNull();
     expect(captureModuleImports({ get moduleExecutionInfo() { throw new Error('unavailable'); } })).toBeNull();
+  });
+});
+
+describe('scoped module runner diagnostics', () => {
+  it('preserves logger receiver, complete arguments, return identity and descriptor', () => {
+    const result = Promise.resolve('logged'), calls: unknown[][] = [], observed: unknown[][] = [];
+    const runner = { debug(this: unknown, ...args: unknown[]) {
+      calls.push([this, ...args]);
+      return result;
+    } };
+    const descriptor = Object.getOwnPropertyDescriptor(runner, 'debug');
+    const restore = installModuleRunnerDebug({ moduleRunner: runner }, (...args) => observed.push(args));
+    const message = `[module runner] module /repo/pending.ts takes over 2s to load.\n${'full-stack\n'.repeat(1000)}`;
+    const metadata = { pending: true };
+    expect(runner.debug(message, metadata)).toBe(result);
+    expect(calls).toEqual([[runner, message, metadata]]);
+    expect(observed).toEqual([[message, metadata]]);
+    restore?.();
+    restore?.();
+    expect(Object.getOwnPropertyDescriptor(runner, 'debug')).toEqual(descriptor);
+  });
+
+  it('traces an unset logger and restores its own undefined value', () => {
+    const observed: unknown[][] = [];
+    const runner = { debug: undefined as undefined | ((...args: unknown[]) => unknown) };
+    const restore = installModuleRunnerDebug({ moduleRunner: runner }, (...args) => observed.push(args));
+    expect(restore).toBeTypeOf('function');
+    expect(runner.debug?.('pending')).toBeUndefined();
+    expect(observed).toEqual([['pending']]);
+    restore?.();
+    expect(Object.hasOwn(runner, 'debug')).toBe(true);
+    expect(runner.debug).toBeUndefined();
+  });
+
+  it('keeps original thrown errors even when the diagnostic observer throws', () => {
+    const error = new Error('original logger error');
+    const runner = { debug() { throw error; } };
+    const restore = installModuleRunnerDebug({ moduleRunner: runner }, () => { throw new Error('observer'); });
+    expect(() => runner.debug()).toThrow(error);
+    restore?.();
+  });
+
+  it('reports absent, accessor and frozen seams as unavailable without running accessors', () => {
+    let accesses = 0;
+    const accessor = { get debug() { accesses++; return undefined; } };
+    for (const mocker of [undefined, {}, { moduleRunner: {} }, { moduleRunner: accessor },
+      { moduleRunner: Object.freeze({ debug: undefined }) }])
+      expect(installModuleRunnerDebug(mocker, () => {})).toBeNull();
+    expect(accesses).toBe(0);
+  });
+
+  it('leaves a later logger replacement intact during cleanup', () => {
+    const runner = { debug: undefined as undefined | ((...args: unknown[]) => unknown) };
+    const restore = installModuleRunnerDebug({ moduleRunner: runner }, () => {});
+    const replacement = () => 'later';
+    runner.debug = replacement;
+    restore?.();
+    expect(runner.debug).toBe(replacement);
   });
 });
 
