@@ -209,14 +209,14 @@ function listFilesystemFiles(cwd) {
     const { dir, prefix } = pending.pop();
     let entries;
     try {
-      entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+      entries = readdirSync(dir, { encoding: 'buffer' }).sort(Buffer.compare);
     } catch (error) {
       throw new Error(
         `filesystem fallback could not enumerate ${dir}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
 
-    for (const entry of entries) {
+    for (const nameBytes of entries) {
       inspected += 1;
       if (inspected > FALLBACK_MAX_ENTRIES) {
         throw new Error(
@@ -224,12 +224,17 @@ function listFilesystemFiles(cwd) {
             'refusing to return a partial scan',
         );
       }
-      if (entry.isSymbolicLink()) continue;
+      if (!isUtf8(nameBytes)) {
+        throw new Error(`Invalid UTF-8 in filesystem path record under ${dir} (hex: ${nameBytes.toString('hex')})`);
+      }
 
-      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const name = nameBytes.toString('utf8');
+      const path = join(dir, name);
+      const rel = prefix ? `${prefix}/${name}` : name;
+      const entry = lstatSync(path);
       if (entry.isDirectory()) {
-        if (!FALLBACK_SKIP_DIRS.has(entry.name)) pending.push({ dir: join(dir, entry.name), prefix: rel });
-      } else if (entry.isFile()) {
+        if (!FALLBACK_SKIP_DIRS.has(name)) pending.push({ dir: path, prefix: rel });
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
         files.push(rel.split(sep).join('/'));
       }
     }
