@@ -367,6 +367,10 @@ describe('ExecutedSourceMapReporter', () => {
   }
 
   beforeEach(() => {
+    // Most cases exercise source storage with an unavailable runtime. Runtime
+    // binding cases supply independent host and intended-worker measurements.
+    vi.spyOn(runtimeProof, 'captureVitestWorkerProofIdentity').mockImplementation(() =>
+      runtimeProof.captureCurrentRuntimeProofIdentity({ root: REPO_ROOT }));
     tmp = mkdtempSync(join(tmpdir(), 'esm-reporter-'));
     for (const k of [
       PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV,
@@ -440,6 +444,28 @@ describe('ExecutedSourceMapReporter', () => {
     const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
     expect(out).toMatchObject({ workspaceName: '@papercusp/test-config', recordedSha: clean.commit, worktreeDirty: false, skipped: 0 });
     expect(out.rows).toHaveLength(1);
+  });
+
+  it('keeps the host skip identity while validating a distinct intended worker invocation', async () => {
+    const host = { name: 'node', version: '25.1.0', executable: '/runtime/node',
+      binarySha256: 'a'.repeat(64), platform: 'linux', arch: 'x64',
+      nativeDependencyGeneration: 'b'.repeat(64), lockfileSha256: 'c'.repeat(64),
+      configurationSha256: 'd'.repeat(64) };
+    const worker = { ...host, configurationSha256: 'e'.repeat(64) };
+    vi.spyOn(runtimeProof, 'captureCurrentRuntimeProofIdentity').mockReturnValue(host);
+    vi.mocked(runtimeProof.captureVitestWorkerProofIdentity).mockReturnValue(worker);
+    const mod = fakeModule({ workerImports: true });
+    const path = inputsFilePath(tmp, TEST_FILE);
+    const inputs = JSON.parse(readFileSync(path, 'utf8'));
+    inputs.runtime = { before: worker, after: worker };
+    writeFileSync(path, JSON.stringify(inputs));
+    const { r, flushes } = reporter();
+    r.onInit({} as never);
+    await r.onTestModuleEnd(mod);
+    await r.onTestRunEnd();
+    expect(flushes[0]!.runnerIdentity).toBe(executedSourceRunnerIdentity());
+    expect(flushes[0]!.runnerIdentity).not.toBe(`proof-v3 ${runtimeProof.runtimeProofFingerprint(worker)}`);
+    expect(flushes[0]!.rows[0]!.opaqueReasons).not.toContain('worker-runtime-mismatch');
   });
 
   it('binds persisted passes and failed-file retirement to a stable actual worker runtime', async () => {

@@ -1,7 +1,56 @@
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { captureCurrentRuntimeCapabilities, parseRuntimeCapabilitySnapshot } from './runtime-proof.ts';
+import { captureCurrentRuntimeCapabilities, parseRuntimeCapabilitySnapshot, resolveVitestWorkerInvocation,
+  type VitestWorkerProject } from './runtime-proof.ts';
+
+describe('intended Vitest worker invocation', () => {
+  const project = (): VitestWorkerProject => ({
+    config: { pool: 'forks', execArgv: ['--stack-trace-limit=42', '--conditions', 'custom'] },
+    vitest: { config: { env: { NODE_OPTIONS: '--no-warnings' } } },
+    vite: { config: { isProduction: false, ssr: { resolve: {
+      conditions: ['node', 'development|production', 'production', 'node'],
+    } } } },
+  });
+
+  it('preserves the full launch order, condition resolution and root/project environment overrides', () => {
+    const saved = process.execArgv;
+    process.execArgv = [];
+    try {
+      const value = project();
+      value.config.env = { NODE_OPTIONS: '--trace-warnings', NODE_PATH: '/actual/modules' };
+      const require = createRequire(import.meta.url);
+      expect(resolveVitestWorkerInvocation(value)).toMatchObject({ execArgv: [
+        '--experimental-import-meta-resolve', '--require',
+        join(dirname(require.resolve('vitest/package.json')), 'suppress-warnings.cjs'),
+        '--conditions', 'node', '--conditions', 'development', ...value.config.execArgv,
+      ], environment: { NODE_OPTIONS: '--trace-warnings', NODE_PATH: '/actual/modules', TEST: 'true', VITEST: 'true' } });
+      value.vite.config.isProduction = true;
+      expect(resolveVitestWorkerInvocation(value)?.execArgv).toContain('production');
+      expect(resolveVitestWorkerInvocation(value)?.execArgv).not.toContain('development');
+      value.config.pool = 'vmForks';
+      expect(resolveVitestWorkerInvocation(value)?.execArgv.at(-1)).toBe('--experimental-vm-modules');
+    } finally { process.execArgv = saved; }
+  });
+
+  it('forwards profiling arguments intact and rejects unsupported or malformed profiles', () => {
+    const saved = process.execArgv;
+    process.execArgv = ['--cpu-prof', '--heap-prof-dir=/measure', '--diagnostic-dir=/diagnostics', '--trace-warnings'];
+    try {
+      expect(resolveVitestWorkerInvocation(project())?.execArgv.slice(0, 3)).toEqual(process.execArgv.slice(0, 3));
+      expect(resolveVitestWorkerInvocation(project())?.execArgv).not.toContain('--trace-warnings');
+      for (const pool of ['browser', 'custom', 'typescript']) {
+        const value = project(); value.config.pool = pool;
+        expect(resolveVitestWorkerInvocation(value)).toBeNull();
+      }
+      const browser = project(); browser.config.browser = { enabled: true };
+      expect(resolveVitestWorkerInvocation(browser)).toBeNull();
+      expect(resolveVitestWorkerInvocation({} as VitestWorkerProject)).toBeNull();
+    } finally { process.execArgv = saved; }
+  });
+});
 
 describe('original worker runtime surface', () => {
   it('captures an immutable bounded surface without claiming capability completeness', () => {

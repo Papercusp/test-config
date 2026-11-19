@@ -1,7 +1,8 @@
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { threadId } from 'node:worker_threads';
-import { isAbsolute } from 'node:path';
+import { isatty } from 'node:tty';
+import { dirname, isAbsolute, join } from 'node:path';
 import { hashConfigurationValue } from '@papercusp/test-config/configuration-snapshot';
 
 const CAPABILITY_GAPS = ['required-capability-population-unobserved', 'resource-permission-policy-unobserved',
@@ -155,6 +156,8 @@ export interface RuntimeProofIdentity {
 }
 type ProofModule = {
   captureCurrentRuntimeProofIdentity?: (options: { root: string; environment?: NodeJS.ProcessEnv }) => RuntimeProofIdentity | null;
+  captureRuntimeProofIdentity?: (options: { root: string; cwd?: string; environment?: NodeJS.ProcessEnv;
+    executable?: string; execArgv?: string[] }) => RuntimeProofIdentity | null;
   runtimeProofFingerprint?: (identity: unknown) => string | null;
 };
 const requireHost = createRequire(import.meta.url);
@@ -167,4 +170,56 @@ export function captureCurrentRuntimeProofIdentity(options: { root: string; envi
 }
 export function runtimeProofFingerprint(identity: unknown): string | null {
   return hostProof()?.runtimeProofFingerprint?.(identity) ?? null;
+}
+
+/** The resolved project inputs used by Vitest's built-in Node pool launcher. */
+export interface VitestWorkerProject {
+  config: { pool: string; execArgv: string[]; env?: NodeJS.ProcessEnv; browser?: { enabled?: boolean } };
+  vitest: { config: { env?: NodeJS.ProcessEnv; watch?: boolean } };
+  vite: { config: { isProduction: boolean; ssr: { resolve?: { conditions?: string[] } } } };
+}
+
+/** Version-bound adapter for Vitest resolveOptions/resolveConditions and VM pool
+ * constructors. Unknown launchers decline reuse. Never infer the intended argv
+ * from a worker's own observation: a wrong worker must fail the comparison. */
+export function resolveVitestWorkerInvocation(project: VitestWorkerProject):
+  { execArgv: string[]; environment: NodeJS.ProcessEnv } | null {
+  try {
+    const vitestPackage = requireHost.resolve('vitest/package.json');
+    const vitePackage = createRequire(vitestPackage).resolve('vite/package.json');
+    if (JSON.parse(readFileSync(vitestPackage, 'utf8')).version !== '4.1.8'
+      || JSON.parse(readFileSync(vitePackage, 'utf8')).version !== '7.3.5'
+      || process.versions.bun || process.versions.pnp || 'Deno' in globalThis) return null;
+    const { config, vite } = project;
+    if (config.browser?.enabled || !['forks', 'threads', 'vmForks', 'vmThreads'].includes(config.pool)
+      || !Array.isArray(config.execArgv) || !config.execArgv.every(arg => typeof arg === 'string')
+      || typeof vite.config.isProduction !== 'boolean') return null;
+    const conditions = vite.config.ssr.resolve?.conditions ?? [];
+    if (!Array.isArray(conditions) || !conditions.every(condition => typeof condition === 'string')) return null;
+    const execArgv = [
+      ...process.execArgv.filter(arg => arg.startsWith('--cpu-prof') || arg.startsWith('--heap-prof')
+        || arg.startsWith('--diagnostic-dir')),
+      '--experimental-import-meta-resolve', '--require', join(dirname(vitestPackage), 'suppress-warnings.cjs'),
+      ...[...new Set(conditions)].filter(condition => condition !== 'production' || vite.config.isProduction)
+        .filter(condition => condition !== 'development' || !vite.config.isProduction)
+        .map(condition => condition === 'development|production'
+          ? vite.config.isProduction ? 'production' : 'development' : condition)
+        .flatMap(condition => ['--conditions', condition]),
+      ...config.execArgv,
+      ...(config.pool.startsWith('vm') ? ['--experimental-vm-modules'] : []),
+    ];
+    const environment: NodeJS.ProcessEnv = { ...process.env, TEST: 'true', VITEST: 'true',
+      NODE_ENV: process.env.NODE_ENV || 'test', VITEST_MODE: project.vitest.config.watch ? 'WATCH' : 'RUN',
+      FORCE_TTY: isatty(1) ? 'true' : '',
+      ...project.vitest.config.env, ...config.env };
+    if (process.platform === 'win32') for (const name of Object.keys(environment))
+      environment[name.toUpperCase()] = environment[name];
+    return { execArgv, environment };
+  } catch { return null; }
+}
+
+export function captureVitestWorkerProofIdentity(options: { root: string; project: VitestWorkerProject }): RuntimeProofIdentity | null {
+  const invocation = resolveVitestWorkerInvocation(options.project);
+  return invocation ? hostProof()?.captureRuntimeProofIdentity?.({ root: options.root,
+    executable: process.execPath, ...invocation }) ?? null : null;
 }

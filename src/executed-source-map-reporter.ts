@@ -235,14 +235,14 @@ export function completeModuleImports(
 }
 
 /** Parent identity alone cannot establish the interpreter that executed a file. */
-export function completeWorkerRuntime(inputs: InputsRecord | null, reporterIdentity: string | null): string[] {
+export function completeWorkerRuntime(inputs: InputsRecord | null, intendedWorkerIdentity: string | null): string[] {
   const before = runtimeProof.runtimeProofFingerprint?.(inputs?.runtime?.before) ?? null;
   const after = runtimeProof.runtimeProofFingerprint?.(inputs?.runtime?.after) ?? null;
-  if (!before || !after || !reporterIdentity) return ['worker-runtime-unavailable'];
+  if (!before || !after || !intendedWorkerIdentity) return ['worker-runtime-unavailable'];
   const reasons: string[] = [];
   if (before !== after) reasons.push('worker-runtime-changed');
-  if (`${REUSE_PROOF_FORMAT} ${before}` !== reporterIdentity ||
-      `${REUSE_PROOF_FORMAT} ${after}` !== reporterIdentity) reasons.push('worker-runtime-mismatch');
+  if (`${REUSE_PROOF_FORMAT} ${before}` !== intendedWorkerIdentity ||
+      `${REUSE_PROOF_FORMAT} ${after}` !== intendedWorkerIdentity) reasons.push('worker-runtime-mismatch');
   return reasons;
 }
 
@@ -734,6 +734,14 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
   private checkpointWrites: Promise<void> = Promise.resolve();
   private acknowledgedCompletionIds = new Set<string>();
+  private workerIdentities = new Map<runtimeProof.VitestWorkerProject, string | null>();
+
+  private intendedWorkerIdentity(project: runtimeProof.VitestWorkerProject): string | null {
+    const fingerprint = runtimeProof.runtimeProofFingerprint(runtimeProof.captureVitestWorkerProofIdentity({
+      root: this.repoRoot, project,
+    }));
+    return fingerprint ? `${REUSE_PROOF_FORMAT} ${fingerprint}` : null;
+  }
   private readonly completionContext = {
     schemaVersion: 1,
     qualificationAttemptId: process.env.PAPERCUSP_CHECKPOINT_QUALIFICATION_ATTEMPT_ID?.trim() || null,
@@ -830,6 +838,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
     const reporterRunnerIdentity = executedSourceRunnerIdentity();
     this.completionContext.reporterRunnerIdentity = reporterRunnerIdentity;
     this.completionContext.runnerIdentity = reporterRunnerIdentity;
+    this.workerIdentities.clear();
+    for (const project of ctx.projects ?? []) this.workerIdentities.set(project, this.intendedWorkerIdentity(project));
     this.configDeps = resolveConfigDependencies(ctx);
     this.configEntries = resolveConfigEntries(ctx);
     this.configSourceCapture = this.armed.outPath
@@ -920,7 +930,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
           ...(viteTransformOptions ? { viteTransformOptions } : {}),
           ...(appliedCompilerInputs ? { appliedCompilerInputs } : {}) };
       const observed = completeModuleImports(collectionImports, inputs);
-      const runtimeReasons = completeWorkerRuntime(inputs, this.completionContext.reporterRunnerIdentity);
+      const project = testModule.project;
+      if (!this.workerIdentities.has(project)) this.workerIdentities.set(project, this.intendedWorkerIdentity(project));
+      const runtimeReasons = completeWorkerRuntime(inputs, this.workerIdentities.get(project) ?? null);
       // Worker evidence gates reuse and retirement. The reporter's independently
       // measured identity describes which process wrote the outcome.
       if (runtimeReasons.length) this.completionContext.runnerIdentity = null;
@@ -1104,6 +1116,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.discardCompletedInputs();
     await observeReporterStage('executed-source', 'completion-checkpoints', () => this.checkpointWrites);
     const rows = this.pending.splice(0);
+    for (const [project, identity] of this.workerIdentities) {
+      if (!identity || this.intendedWorkerIdentity(project) !== identity) this.completionContext.runnerIdentity = null;
+    }
     if (executedSourceRunnerIdentity() !== this.completionContext.reporterRunnerIdentity) {
       this.completionContext.reporterRunnerIdentity = null;
       this.completionContext.runnerIdentity = null;
