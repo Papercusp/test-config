@@ -469,6 +469,7 @@ describe('ExecutedSourceMapReporter', () => {
         }
         const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
         expect(out.completionCheckpoint.runnerIdentity).toBe(worker === node ? expected : null);
+        expect(out.completionCheckpoint.reporterRunnerIdentity).toBe(expected);
       }
     }
   });

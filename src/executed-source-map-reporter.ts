@@ -739,7 +739,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
     qualificationAttemptId: process.env.PAPERCUSP_CHECKPOINT_QUALIFICATION_ATTEMPT_ID?.trim() || null,
     runGroupId: process.env.PAPERCUSP_TEST_RUN_GROUP ?? null,
     runContext: executedSourceRunContext(),
-    runnerIdentity: executedSourceRunnerIdentity(),
+    runnerIdentity: null as string | null,
+    reporterRunnerIdentity: null as string | null,
   };
   private pending: ExecutedSourceRow[] = [];
   private retired: string[] = [];
@@ -826,7 +827,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   onInit(ctx: Vitest): void {
     if (!this.armed) return;
-    this.completionContext.runnerIdentity = executedSourceRunnerIdentity();
+    const reporterRunnerIdentity = executedSourceRunnerIdentity();
+    this.completionContext.reporterRunnerIdentity = reporterRunnerIdentity;
+    this.completionContext.runnerIdentity = reporterRunnerIdentity;
     this.configDeps = resolveConfigDependencies(ctx);
     this.configEntries = resolveConfigEntries(ctx);
     this.configSourceCapture = this.armed.outPath
@@ -917,9 +920,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
           ...(viteTransformOptions ? { viteTransformOptions } : {}),
           ...(appliedCompilerInputs ? { appliedCompilerInputs } : {}) };
       const observed = completeModuleImports(collectionImports, inputs);
-      const runtimeReasons = completeWorkerRuntime(inputs, this.completionContext.runnerIdentity);
-      // A mixed or unmeasured worker population cannot stamp a reusable checkpoint
-      // or retire the reporter runtime's proofs. Null scopes retirement to unknown rows.
+      const runtimeReasons = completeWorkerRuntime(inputs, this.completionContext.reporterRunnerIdentity);
+      // Worker evidence gates reuse and retirement. The reporter's independently
+      // measured identity describes which process wrote the outcome.
       if (runtimeReasons.length) this.completionContext.runnerIdentity = null;
       let sourceEvidence: ExecutedSourceEvidence | undefined;
       let nativeFile: NonNullable<ExecutedSourceMapReporter['nativeRun']>['files'][number] | undefined;
@@ -1101,8 +1104,10 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.discardCompletedInputs();
     await observeReporterStage('executed-source', 'completion-checkpoints', () => this.checkpointWrites);
     const rows = this.pending.splice(0);
-    if (executedSourceRunnerIdentity() !== this.completionContext.runnerIdentity)
+    if (executedSourceRunnerIdentity() !== this.completionContext.reporterRunnerIdentity) {
+      this.completionContext.reporterRunnerIdentity = null;
       this.completionContext.runnerIdentity = null;
+    }
     if (!this.completionContext.runnerIdentity) {
       for (const row of rows) row.opaqueReasons = [...new Set([
         ...(row.opaqueReasons ?? []), 'worker-runtime-unavailable',
