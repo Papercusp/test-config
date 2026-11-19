@@ -34,7 +34,7 @@
  */
 import { isUtf8 } from 'node:buffer';
 import { execSync } from 'node:child_process';
-import { lstatSync, readdirSync } from 'node:fs';
+import { lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 
 import { isRepositoryIndexFault, withGitIndexFaultRetry } from './git-index-fault-core.mjs';
@@ -240,7 +240,16 @@ function listFilesystemFiles(cwd) {
 
 /** Submodule paths declared in .gitmodules, superproject-relative, sorted. */
 export function declaredSubmodules(cwd = ROOT) {
-  const records = gitLinesNul("config -z -f .gitmodules --get-regexp '^submodule\\..*\\.path$'", cwd);
+  let output;
+  try {
+    output = runGitEnumeration("config -z -f .gitmodules --get-regexp '^submodule\\..*\\.path$'", cwd, null);
+  } catch (error) {
+    // Git exits 1 with no diagnostic when no key matches, including an absent
+    // file. Malformed or unreadable config cannot establish an empty list.
+    if (error?.status === 1 && !String(error.stderr ?? '').trim()) return [];
+    throw error;
+  }
+  const records = decodeGitRecords(output, cwd);
   // With -z, Git separates the key from its complete value with LF and ends
   // the record with NUL. Whitespace inside the value is part of the path.
   return records.map((record) => {
@@ -325,8 +334,8 @@ export function presentOnDisk(files, cwd = ROOT) {
  * So these guards could not adopt `listTrackedFiles()` without trading their
  * untracked coverage for submodule coverage — one blind spot for another. This
  * function buys both: the superproject keeps the untracked-inclusive flags, and
- * each submodule is enumerated with the SAME flags in its own working tree, with
- * results prefixed back to superproject-relative paths.
+ * each checked-out submodule is enumerated with the SAME flags in its own working
+ * tree. Its declarations are then followed with the accumulated parent prefix.
  *
  * A submodule git cannot descend into (no `.git` — the archive-extracted release
  * checkouts described under `describeUnscanned`) simply contributes nothing and
@@ -362,19 +371,38 @@ export function listFilesIncludingUntracked(cwd = ROOT) {
   }
   if (root.error) throw root.error;
 
-  const files = decodeGitRecords(root.output, cwd);
-  for (const path of declaredSubmodules(cwd)) {
-    const directory = join(cwd, path);
-    const submodule = runZ(directory);
-    // A root git worktree with an archive-extracted submodule intentionally keeps
-    // the existing unscanned coverage signal; only the root's non-git shape gets
-    // the filesystem fallback above.
-    if (submodule.error) continue;
-    for (const rel of decodeGitRecords(submodule.output, directory)) files.push(`${path}/${rel}`);
-  }
   // `--cached` carries the same index lag as listTrackedFiles (WI-10004173).
-  const present = presentOnDisk(files, cwd);
-  return { files: present, ...coverageOf(present, cwd) };
+  const files = presentOnDisk(decodeGitRecords(root.output, cwd), cwd);
+  const declared = new Set();
+  const scanned = [];
+  const pending = [{ directory: realpathSync(cwd), prefix: '' }];
+  while (pending.length) {
+    const { directory, prefix } = pending.pop();
+    for (const relative of declaredSubmodules(directory)) {
+      const path = prefix ? `${prefix}/${relative}` : relative;
+      if (relative.split('/').some(part => !part || part === '.' || part === '..')
+        || (sep === '\\' && relative.includes('\\')) || declared.has(path)) {
+        throw new Error(`Invalid or duplicate submodule path under ${cwd}: ${JSON.stringify(path)}`);
+      }
+      declared.add(path);
+      const child = join(directory, relative);
+      // Without its own metadata Git can find the parent and give an apparently
+      // successful parent listing. Keep that path in the unscanned partition.
+      if (!hasGitMetadataOnDisk(relative, directory)) continue;
+      try {
+        if (realpathSync(child) !== child) continue;
+      } catch {
+        continue;
+      }
+      const submodule = runZ(child);
+      if (submodule.error) continue;
+      const children = presentOnDisk(decodeGitRecords(submodule.output, child), child);
+      if (children.length) scanned.push(path);
+      for (const file of children) files.push(`${path}/${file}`);
+      pending.push({ directory: child, prefix: path });
+    }
+  }
+  return { files, ...partitionCoverage([...declared].sort(), scanned.sort(), cwd) };
 }
 
 /**
@@ -394,12 +422,13 @@ export function listFilesIncludingUntracked(cwd = ROOT) {
  */
 export function coverageOf(files, cwd = ROOT) {
   const declared = declaredSubmodules(cwd);
-  const scanned = [];
-  const unscanned = [];
-  for (const path of declared) {
-    if (files.some((f) => f.startsWith(`${path}/`))) scanned.push(path);
-    else unscanned.push(path);
-  }
+  const scanned = declared.filter(path => files.some(file => file.startsWith(`${path}/`)));
+  return partitionCoverage(declared, scanned, cwd);
+}
+
+function partitionCoverage(declared, scanned, cwd) {
+  const covered = new Set(scanned);
+  const unscanned = declared.filter(path => !covered.has(path));
   // The two gaps are NOT equally serious, and a caller that needs to ACT (rather than
   // just report) has to tell them apart:
   //
