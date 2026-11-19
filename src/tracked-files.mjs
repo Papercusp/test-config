@@ -32,6 +32,7 @@
  * Today that set is normally just libs/zero-harness, which is retired and
  * deliberately not initialized — a legitimate skip, but still a stated one.
  */
+import { isUtf8 } from 'node:buffer';
 import { execSync } from 'node:child_process';
 import { lstatSync, readdirSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
@@ -64,11 +65,11 @@ const ROOT = process.cwd();
  * already uses. Capturing it also keeps it OUT of guard output, preserving the quiet-probe
  * contract the old `'ignore'` was there for.
  */
-function runGitEnumeration(args, cwd) {
+function runGitEnumeration(args, cwd, encoding = 'utf8') {
   return withGitIndexFaultRetry(() =>
     execSync(`git ${args}`, {
       cwd,
-      encoding: 'utf8',
+      encoding,
       stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 256 * 1024 * 1024,
     }),
@@ -118,16 +119,35 @@ function gitLines(args, cwd) {
  * `listTrackedFiles` cannot drift back to the quoting form.
  */
 function gitLinesNul(args, cwd) {
+  let output;
   try {
     // Same quiet-probe contract as `gitLines`: an archive/checkpoint snapshot with no .git is an
     // expected shape and still yields []. An unreadable index is NOT that shape and throws —
     // this is the path `listTrackedFiles` uses, so it is where the measured 0-files-no-error
     // false green came from (see `runGitEnumeration`).
-    return runGitEnumeration(args, cwd).split('\0').filter(Boolean);
+    output = runGitEnumeration(args, cwd, null);
   } catch (error) {
     if (isUnreadableIndex(error)) throw error;
     return [];
   }
+  return decodeGitRecords(output, cwd);
+}
+
+function decodeGitRecords(output, cwd) {
+  if (!isUtf8(output)) {
+    // Keep the exact invalid identity. Decoding first would replace distinct
+    // path bytes with U+FFFD before presentOnDisk can resolve them.
+    for (let start = 0; start < output.length;) {
+      const separator = output.indexOf(0, start);
+      const end = separator === -1 ? output.length : separator;
+      const record = output.subarray(start, end);
+      if (!isUtf8(record)) {
+        throw new Error(`Invalid UTF-8 in Git path record under ${cwd} (hex: ${record.toString('hex')})`);
+      }
+      start = end + 1;
+    }
+  }
+  return output.toString('utf8').split('\0').filter(Boolean);
 }
 
 /** Maximum number of filesystem entries the non-git fallback will inspect. */
@@ -220,10 +240,16 @@ function listFilesystemFiles(cwd) {
 
 /** Submodule paths declared in .gitmodules, superproject-relative, sorted. */
 export function declaredSubmodules(cwd = ROOT) {
-  return gitLines('config -f .gitmodules --get-regexp path', cwd)
-    .map((line) => line.split(/\s+/)[1])
-    .filter(Boolean)
-    .sort();
+  const records = gitLinesNul("config -z -f .gitmodules --get-regexp '^submodule\\..*\\.path$'", cwd);
+  // With -z, Git separates the key from its complete value with LF and ends
+  // the record with NUL. Whitespace inside the value is part of the path.
+  return records.map((record) => {
+    const separator = record.indexOf('\n');
+    if (separator === -1 || separator === record.length - 1) {
+      throw new Error(`Missing submodule path value under ${cwd}: ${JSON.stringify(record)}`);
+    }
+    return record.slice(separator + 1);
+  }).sort();
 }
 
 /** Submodule paths registered in the superproject's local .git/config. */
@@ -312,20 +338,17 @@ export function listFilesIncludingUntracked(cwd = ROOT) {
   const runZ = (dir) => {
     try {
       return {
-        files: execSync(`git ${FLAGS.join(' ')}`, {
+        output: execSync(`git ${FLAGS.join(' ')}`, {
           cwd: dir,
-          encoding: 'utf8',
           // Preserve stderr for classification without leaking expected
           // "not a git repository" diagnostics into guard output.
           stdio: ['ignore', 'pipe', 'pipe'],
           maxBuffer: 256 * 1024 * 1024,
-        })
-          .split('\0')
-          .filter(Boolean),
+        }),
         error: null,
       };
     } catch (error) {
-      return { files: [], error };
+      return { output: null, error };
     }
   };
 
@@ -339,13 +362,15 @@ export function listFilesIncludingUntracked(cwd = ROOT) {
   }
   if (root.error) throw root.error;
 
-  const files = root.files;
+  const files = decodeGitRecords(root.output, cwd);
   for (const path of declaredSubmodules(cwd)) {
-    const submodule = runZ(join(cwd, path));
+    const directory = join(cwd, path);
+    const submodule = runZ(directory);
     // A root git worktree with an archive-extracted submodule intentionally keeps
     // the existing unscanned coverage signal; only the root's non-git shape gets
     // the filesystem fallback above.
-    for (const rel of submodule.files) files.push(`${path}/${rel}`);
+    if (submodule.error) continue;
+    for (const rel of decodeGitRecords(submodule.output, directory)) files.push(`${path}/${rel}`);
   }
   // `--cached` carries the same index lag as listTrackedFiles (WI-10004173).
   const present = presentOnDisk(files, cwd);
