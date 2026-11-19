@@ -153,7 +153,9 @@ function decodeGitRecords(output, cwd) {
 /** Maximum number of filesystem entries the non-git fallback will inspect. */
 const FALLBACK_MAX_ENTRIES = 100_000;
 
-/** Generated/runtime trees that Git's normal exclude-standard pass omits. */
+/** Generated/runtime trees that Git's normal exclude-standard pass omits.
+ * Keep build/ directories in archive scans because they can hold authored code.
+ */
 const FALLBACK_SKIP_DIRS = new Set([
   '.git',
   '.next',
@@ -166,7 +168,6 @@ const FALLBACK_SKIP_DIRS = new Set([
   '.vitest-tmpdir',
   '.vite',
   '.astro',
-  'build',
   'coverage',
   'dist',
   'dist-host',
