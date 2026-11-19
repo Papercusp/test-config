@@ -172,9 +172,29 @@ export function runtimeProofFingerprint(identity: unknown): string | null {
   return hostProof()?.runtimeProofFingerprint?.(identity) ?? null;
 }
 
-/** The resolved project inputs used by Vitest's built-in Node pool launcher. */
+export const PROGRESS_FORKS_POOL_NAME = 'papercusp-progress-forks';
+const FORKS_LAUNCHERS = Symbol.for('@papercusp/test-config.forks-launchers');
+type ForksLauncher = { name: string; createPoolWorker: unknown };
+function forksLaunchers(): WeakSet<object> {
+  // Config bundling and reporters can load separate copies in the same host.
+  const host = globalThis as typeof globalThis & { [FORKS_LAUNCHERS]?: WeakSet<object> };
+  return host[FORKS_LAUNCHERS] ??= new WeakSet();
+}
+
+/** Only the maintained progress pool registers its unchanged ForksPoolWorker
+ * launcher. The name alone cannot establish a custom pool's invocation. */
+export function registerProgressForksLauncher<T extends ForksLauncher>(pool: T): T {
+  if (pool.name !== PROGRESS_FORKS_POOL_NAME || typeof pool.createPoolWorker !== 'function')
+    throw new TypeError('Invalid progress forks launcher');
+  // Vitest clones the config object, preserving the original launch function.
+  forksLaunchers().add(pool.createPoolWorker);
+  return pool;
+}
+
+/** The resolved project inputs used by Vitest's Node pool launcher. */
 export interface VitestWorkerProject {
-  config: { pool: string; execArgv: string[]; env?: NodeJS.ProcessEnv; browser?: { enabled?: boolean } };
+  config: { pool: string; poolRunner?: ForksLauncher; execArgv: string[];
+    env?: NodeJS.ProcessEnv; browser?: { enabled?: boolean } };
   vitest: { config: { env?: NodeJS.ProcessEnv; watch?: boolean } };
   vite: { config: { isProduction: boolean; ssr: { resolve?: { conditions?: string[] } } } };
 }
@@ -191,7 +211,10 @@ export function resolveVitestWorkerInvocation(project: VitestWorkerProject):
       || JSON.parse(readFileSync(vitePackage, 'utf8')).version !== '7.3.5'
       || process.versions.bun || process.versions.pnp || 'Deno' in globalThis) return null;
     const { config, vite } = project;
-    if (config.browser?.enabled || !['forks', 'threads', 'vmForks', 'vmThreads'].includes(config.pool)
+    const progressForks = config.pool === PROGRESS_FORKS_POOL_NAME
+      && config.poolRunner?.name === config.pool && typeof config.poolRunner.createPoolWorker === 'function'
+      && forksLaunchers().has(config.poolRunner.createPoolWorker);
+    if (config.browser?.enabled || (!['forks', 'threads', 'vmForks', 'vmThreads'].includes(config.pool) && !progressForks)
       || !Array.isArray(config.execArgv) || !config.execArgv.every(arg => typeof arg === 'string')
       || typeof vite.config.isProduction !== 'boolean') return null;
     const conditions = vite.config.ssr.resolve?.conditions ?? [];

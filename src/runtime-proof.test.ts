@@ -1,10 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { captureCurrentRuntimeCapabilities, parseRuntimeCapabilitySnapshot, resolveVitestWorkerInvocation,
   type VitestWorkerProject } from './runtime-proof.ts';
+import { createProgressForksPool } from './worker-progress-pool.ts';
 
 describe('intended Vitest worker invocation', () => {
   const project = (): VitestWorkerProject => ({
@@ -35,6 +38,26 @@ describe('intended Vitest worker invocation', () => {
     } finally { process.execArgv = saved; }
   });
 
+  it('recognizes the maintained progress pool but rejects copied names and replaced launchers', () => {
+    const value = project();
+    const builtIn = resolveVitestWorkerInvocation(value);
+    expect(builtIn).not.toBeNull();
+    const pool = createProgressForksPool();
+    value.config.pool = pool.name;
+    value.config.poolRunner = pool;
+    expect(resolveVitestWorkerInvocation(value)).toEqual(builtIn);
+    value.config.poolRunner = { ...pool };
+    expect(resolveVitestWorkerInvocation(value)).toEqual(builtIn);
+    value.config.poolRunner = { name: pool.name,
+      createPoolWorker: () => { throw new Error('unregistered launcher'); } };
+    expect(resolveVitestWorkerInvocation(value)).toBeNull();
+    value.config.poolRunner = pool;
+    pool.createPoolWorker = () => { throw new Error('unsupported launcher'); };
+    expect(resolveVitestWorkerInvocation(value)).toBeNull();
+    delete value.config.poolRunner;
+    expect(resolveVitestWorkerInvocation(value)).toBeNull();
+  });
+
   it('forwards profiling arguments intact and rejects unsupported or malformed profiles', () => {
     const saved = process.execArgv;
     process.execArgv = ['--cpu-prof', '--heap-prof-dir=/measure', '--diagnostic-dir=/diagnostics', '--trace-warnings'];
@@ -49,6 +72,26 @@ describe('intended Vitest worker invocation', () => {
       expect(resolveVitestWorkerInvocation(browser)).toBeNull();
       expect(resolveVitestWorkerInvocation({} as VitestWorkerProject)).toBeNull();
     } finally { process.execArgv = saved; }
+  });
+
+  it('recognizes the maintained launcher after native Vitest config normalization', async () => {
+    const { createVitest } = await import('vitest/node');
+    const root = mkdtempSync(join(tmpdir(), 'worker-profile-config-'));
+    const pool = createProgressForksPool();
+    const runner = await createVitest('test', { root, config: false, watch: false,
+      pool, reporters: [], include: [] });
+    try {
+      const resolved = runner.projects[0]!;
+      expect(resolved.config.poolRunner).not.toBe(pool);
+      expect(resolved.config.poolRunner?.createPoolWorker).toBe(pool.createPoolWorker);
+      const builtIn = resolveVitestWorkerInvocation({ config: { ...resolved.config, pool: 'forks' },
+        vitest: resolved.vitest, vite: resolved.vite });
+      expect(builtIn).not.toBeNull();
+      expect(resolveVitestWorkerInvocation(resolved)).toEqual(builtIn);
+    } finally {
+      await runner.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

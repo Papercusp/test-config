@@ -4,6 +4,7 @@ import { ForksPoolWorker, type PoolOptions, type PoolRunnerInitializer, type Poo
   type Reporter, type TestCase, type TestModule, type TestProject } from 'vitest/node';
 import { historicalTestTimeout } from './test-timeout-history.ts';
 import type { TestTimeoutHistorySnapshot } from './test-timeout-runtime.ts';
+import { PROGRESS_FORKS_POOL_NAME, registerProgressForksLauncher } from './runtime-proof.ts';
 
 /** The config loader and reporter may evaluate separate copies of this module.
  * Keep the registry on Vitest's public project object, shared by both copies. */
@@ -56,9 +57,9 @@ function fileBudget(project: TestProject, file: string): number {
 /** Extend Vitest's maintained fork implementation, including its TERM/KILL
  * escalation. No private worker fields, custom IPC, or run-duration cap. */
 export function createProgressForksPool({ idleTimeoutMs }: { idleTimeoutMs?: number } = {}): PoolRunnerInitializer {
-  return {
+  return registerProgressForksLauncher({
     // Vitest dispatches built-in names before consulting a custom initializer.
-    name: 'papercusp-progress-forks',
+    name: PROGRESS_FORKS_POOL_NAME,
     createPoolWorker(options: PoolOptions): PoolWorker {
       const delegate = new ForksPoolWorker(options);
       const events = new EventEmitter();
@@ -109,7 +110,7 @@ export function createProgressForksPool({ idleTimeoutMs }: { idleTimeoutMs?: num
         stop,
       };
     },
-  };
+  });
 }
 
 function advance(module: TestModule, caseTimeout = 0): void {
