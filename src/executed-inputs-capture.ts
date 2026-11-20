@@ -180,6 +180,8 @@ export interface Recorder {
 interface CaptureState {
   current: Recorder | null;
   installed: boolean;
+  /** Synchronous archive I/O only; evaluated test code always restores observation. */
+  recorderFsDepth?: number;
   directoryIteratorUnobserved: boolean;
   repoRoot: string | null;
   evaluationContext: AsyncLocalStorage<{ recorder: Recorder; inputIndex: number; id: string; code: string }>;
@@ -243,7 +245,7 @@ export function repoPathOf(arg: unknown, repoRoot: string, cwd: CwdSource): stri
  * deliberately omit external paths and descriptor values from the handoff.
  */
 export function recordRead(rec: Recorder | null, arg: unknown, repoRoot: string, cwd: CwdSource): void {
-  if (!rec) return;
+  if (!rec || state.recorderFsDepth) return;
   let abs: string | null;
   try { abs = absoluteReadPathOf(arg, cwd, () => rec.opaque.add('fs-path-unobserved')); }
   catch { rec.opaque.add('fs-path-unobserved'); return; }
@@ -412,12 +414,20 @@ export function installModuleEvaluationCapture(mocker: unknown, artifactRoot?: s
       } catch {
         if (observation && !observation.reasons.includes('invalid-evaluator-input')) observation.reasons.push('invalid-evaluator-input');
       }
-      if (!active) return original.apply(receiver, args);
+      // A re-entrant evaluator can run during archive publication. Its real
+      // code is still a test input, even while the outer recorder is doing I/O.
+      const invoke = () => {
+        const archiveDepth = state.recorderFsDepth;
+        state.recorderFsDepth = 0;
+        try { return original.apply(receiver, args); }
+        finally { state.recorderFsDepth = archiveDepth; }
+      };
+      if (!active) return invoke();
       const call: EvaluationCallSettlement = { inputIndex: active.inputIndex, status: 'entered' };
       observation?.settlements?.calls.push(call);
       let result: unknown;
       try {
-        result = state.evaluationContext.run(active, () => original.apply(receiver, args));
+        result = state.evaluationContext.run(active, invoke);
       } catch (error) {
         call.status = 'threw';
         throw error;
@@ -507,6 +517,11 @@ function retainEvaluationCode(code: string, recorder: Recorder, observation: Mod
   let codeRef: string | undefined;
   const root = recorder.moduleCodeRoot;
   if (root) {
+    // The recorder's publication and validation touch external archive files
+    // and native fs descriptor helpers. They are not inputs read by the test.
+    // Keep the recorder itself active for nested evaluator observations.
+    const archiveDepth = state.recorderFsDepth;
+    state.recorderFsDepth = (archiveDepth ?? 0) + 1;
     try {
       mkdirSync(root, { recursive: true });
       if (!lstatSync(root).isDirectory() || lstatSync(root).isSymbolicLink()) throw new Error('invalid artifact root');
@@ -532,6 +547,8 @@ function retainEvaluationCode(code: string, recorder: Recorder, observation: Mod
       for (const reason of ['evaluator-code-archive-unavailable', 'code-bytes-not-retained']) {
         if (!observation.reasons.includes(reason)) observation.reasons.push(reason);
       }
+    } finally {
+      state.recorderFsDepth = archiveDepth;
     }
   }
   return { sha256, byteLength: Buffer.byteLength(code), ...(codeRef ? { codeRef } : {}) };

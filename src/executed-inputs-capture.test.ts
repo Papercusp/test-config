@@ -517,6 +517,61 @@ describe('prospective evaluator inputs', () => {
     }
   });
 
+  it('keeps native archive I/O out of test inputs while observing evaluator reads and descriptor reads', () => {
+    const archive = mkdtempSync(join(tmpdir(), 'pc-evaluator-native-'));
+    const file = join(archive, 'external.txt');
+    nativeFs.writeFileSync(file, 'external input');
+    const descriptors = Object.getOwnPropertyDescriptors(nativeFs);
+    const root = resolve(process.cwd());
+    resetCaptureForTests();
+    try {
+      installCapture({ fs: nativeFs as unknown as CaptureTargets['fs'], fsPromises: {},
+        childProcess: {}, syncBuiltinESMExports }, root);
+      const evaluator = { runInlinedModule(_context: unknown, _code: string, _module: { id: string }) {
+        return 'executed';
+      } };
+      beginFile();
+      installModuleEvaluationCapture({ moduleRunner: { evaluator } }, archive, {});
+      expect(evaluator.runInlinedModule({}, 'export const value = true;', { id: join(root, 'src/value.ts') }))
+        .toBe('executed');
+      const recorded = endFile(join(root, 'src/test.ts'))!;
+      expect(recorded.moduleEvaluations?.entries[0]?.codeRef).toBeDefined();
+      expect(recorded.moduleEvaluations?.reasons).not.toContain('evaluator-code-archive-unavailable');
+      expect(recorded.reads).toEqual([]);
+      expect(recorded.opaque).toEqual([]);
+
+      // Recorder suppression must end before the real evaluator is invoked.
+      const reads = { runInlinedModule(_context: unknown, _code: string, _module: { id: string }) {
+        return nativeFs.readFileSync(file, 'utf8');
+      } };
+      beginFile();
+      installModuleEvaluationCapture({ moduleRunner: { evaluator: reads } }, archive, {});
+      expect(reads.runInlinedModule({}, 'export const value = 1;', { id: join(root, 'src/reads.ts') }))
+        .toBe('external input');
+      expect(endFile(join(root, 'src/reads.test.ts'))?.opaque).toContain('outside-repo-read');
+      // An archive publication failure must also restore observation before
+      // evaluating the module, and retain the failure as explicit evidence.
+      beginFile();
+      installModuleEvaluationCapture({ moduleRunner: { evaluator: reads } }, file, {});
+      expect(reads.runInlinedModule({}, 'export const value = 2;', { id: join(root, 'src/failure.ts') }))
+        .toBe('external input');
+      const failedArchive = endFile(join(root, 'src/failure.test.ts'))!;
+      expect(failedArchive.moduleEvaluations?.reasons).toContain('evaluator-code-archive-unavailable');
+      expect(failedArchive.opaque).toContain('outside-repo-read');
+      const fd = nativeFs.openSync(file, 'r');
+      try {
+        beginFile();
+        expect(nativeFs.readSync(fd, Buffer.alloc(1), 0, 1, 0)).toBe(1);
+        expect(endFile(join(root, 'src/fd.test.ts'))?.opaque).toContain('fs-file-descriptor');
+      } finally { nativeFs.closeSync(fd); }
+    } finally {
+      resetCaptureForTests();
+      Object.defineProperties(nativeFs, descriptors);
+      syncBuiltinESMExports();
+      rmSync(archive, { recursive: true, force: true });
+    }
+  });
+
   it('retains both evaluator references when another writer arrives during an archive write', () => {
     const root = mkdtempSync(join(tmpdir(), 'pc-evaluator-overlap-'));
     const code = 'export const shared = "complete bytes";';
