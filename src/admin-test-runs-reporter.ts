@@ -35,17 +35,19 @@ import type { Reporter, TestCase, TestModule, TestRunEndReason, Vitest } from 'v
 import { pinModuleState } from '@papercusp/module-singleton';
 import { exec, execFile, execFileSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
 import { appendFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 // @papercusp/verification-harness is deliberately NOT imported statically — see loadEvidenceRootResolver.
 // This verifier is built-ins only; do not load operator stores in a reporter.
-import { findVerifierSourceRoot, readVerifierSourceReceipt, type VerifierSourceMutation } from './verifier-source.ts';
+import { findVerifierSourceRoot, readVerifierComparisonSources, readVerifierSourceReceipt, selectedVerifierDefinition,
+  type VerifiedComparisonSources, type VerifierSourceMutation, type VerifierSourceProgress } from './verifier-source.ts';
 import {
   TEST_RUN_EXECUTION_DETAILS_SCHEMA_VERSION, recordedTestLayer, isRecordedCaseTitle,
   MAX_RECORDED_PASSED_CASES, type TestRunExecutionDetails,
-  parseRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment, type RuntimeEnvironmentCaptureStatus,
+  parseRecordedRuntimeEnvironment, stableRecordedRuntimeEnvironment, type RecordedRuntimeEnvironment, type RuntimeEnvironmentCaptureStatus,
   parseIsolatedRuntimeReceipts, type IsolatedRuntimeReceipt,
   parseExecutionBoundaryReceipt, type TestBoundaryObservation,
   parseTestSqlCoverageObservations, type TestSqlCoverageObservation,
@@ -561,6 +563,7 @@ export interface WorktreeGitSnapshot {
   commit: string | null;
   porcelain: string | null;
   provenanceError?: string;
+  nativeComparison?: VerifiedComparisonSources;
   submodules?: RecordedSubmoduleCheckout[] | null;
   sourceBytes?: SourceByteSnapshot | null;
 }
@@ -596,39 +599,32 @@ export function captureSourceByteSnapshotInWorker(
     try { worker = workerFactory(root); }
     catch { resolvePromise(null); return; }
 
+    let snapshot: SourceByteSnapshot | null = null;
+    let failed = false;
     let settled = false;
-    let aborting = false;
-    const cleanup = () => signal?.removeEventListener('abort', onAbort);
-    const settle = (snapshot: SourceByteSnapshot | null) => {
-      if (settled || aborting) return;
-      settled = true;
-      cleanup();
-      resolvePromise(snapshot);
-    };
-    const settleAfterAbort = () => {
+    const finish = (code: number) => {
       if (settled) return;
       settled = true;
-      cleanup();
-      resolvePromise(null);
+      signal?.removeEventListener('abort', onAbort);
+      resolvePromise(code === 0 && !failed && !signal?.aborted ? snapshot : null);
     };
     const onAbort = () => {
-      if (settled || aborting) return;
-      aborting = true;
-      try { void worker.terminate().then(settleAfterAbort, settleAfterAbort); }
-      catch { settleAfterAbort(); }
+      // A rejected termination request does not establish exit. The exit
+      // listener retains ownership of the worker in that case.
+      try { void worker.terminate().then(finish, () => {}); }
+      catch { /* wait for the exit event */ }
     };
 
     worker.once('message', message => {
-      if (settled || aborting) return;
+      if (signal?.aborted) return;
       const result = message as { type?: unknown; manifest?: unknown } | null;
-      if (result?.type !== 'result') return;
-      if (!Array.isArray(result.manifest)) { settle(null); return; }
+      if (result?.type !== 'result' || !Array.isArray(result.manifest)) return;
       try {
-        settle(createSourceByteSnapshot(result.manifest as Array<{ path: string; sha256: string }>));
-      } catch { settle(null); }
+        snapshot = createSourceByteSnapshot(result.manifest as Array<{ path: string; sha256: string }>);
+      } catch { failed = true; }
     });
-    worker.once('error', () => settle(null));
-    worker.once('exit', () => settle(null));
+    worker.once('error', () => { failed = true; });
+    worker.once('exit', finish);
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
   });
@@ -645,6 +641,7 @@ export function describeWorktreeDirt(before: WorktreeGitSnapshot, after: Worktre
     if (errors.length) return [...new Set(errors)].join('; ');
     return `HEAD unreadable (before=${before.commit ?? 'null'} after=${after.commit ?? 'null'})`;
   }
+  if (before.nativeComparison?.digest !== after.nativeComparison?.digest) return 'native application or test definition changed during execution';
   if (before.commit !== after.commit) return `HEAD moved ${before.commit.slice(0, 12)} -> ${after.commit.slice(0, 12)}`;
   if (before.porcelain === null || after.porcelain === null) {
     const errors = [before, after]
@@ -1082,14 +1079,18 @@ export async function captureWorktreeSnapshot(
     signal?.throwIfAborted();
     return { ...snapshot, submodules: parseSubmoduleCheckoutStatus(observed), sourceBytes };
   };
-  if (existsSync(join(root, '.verifier-source.json'))) {
+  if (existsSync(join(root, '.verifier-source.json')) || process.env.VERIFY_TAURI_TEST_SOURCE_REF !== undefined
+    || process.env.VERIFY_TAURI_TEST_SOURCE_RECEIPT !== undefined) {
     try {
-      const mutation = mutationSubjectForVerifierSource(root);
-      const receipt = await readVerifierSourceReceipt(root, undefined, { mutation, signal,
-        progress: record => process.stderr.write('TEST_FILE_FINALIZATION ' + JSON.stringify({
-          pid: process.pid, phase: 'provenance-progress', origin: 'reporter-snapshot', ...record,
-        }) + '\n'),
-      });
+      const progress = (record: VerifierSourceProgress) => process.stderr.write('TEST_FILE_FINALIZATION ' + JSON.stringify({
+        pid: process.pid, phase: 'provenance-progress', origin: 'reporter-snapshot', ...record,
+      }) + '\n');
+      const definition = selectedVerifierDefinition();
+      if (definition) {
+        const nativeComparison = await readVerifierComparisonSources(root, definition, { progress, signal });
+        return withSubmodules({ commit: nativeComparison.definitionCommit, porcelain: '', nativeComparison });
+      }
+      const receipt = await readVerifierSourceReceipt(root, undefined, { mutation: mutationSubjectForVerifierSource(root), progress, signal });
       return withSubmodules({ commit: receipt.sourceCommit, porcelain: '' });
     } catch (error) {
       return { commit: null, porcelain: null,
@@ -3497,6 +3498,29 @@ type RuntimeEnvironmentCapture =
   | { status: 'captured'; witness: RecordedRuntimeEnvironment }
   | { status: Exclude<RuntimeEnvironmentCaptureStatus, 'captured'> };
 
+type RuntimeEnvironmentReader = () => Promise<RecordedRuntimeEnvironment | null>;
+interface RuntimeObserver { read: RuntimeEnvironmentReader; timeoutMs: number }
+
+function runtimeObserver(options: unknown, readOverride?: RuntimeEnvironmentReader, timeoutOverride?: number): RuntimeObserver | undefined {
+  const configured = options && typeof options === 'object' ? options as Record<string, unknown> : undefined;
+  const read = readOverride ?? configured?.readRuntimeEnvironment;
+  if (typeof read !== 'function') return undefined;
+  return { read: read as RuntimeEnvironmentReader,
+    timeoutMs: normalizeRuntimeEnvironmentCaptureTimeout(timeoutOverride ?? configured?.runtimeEnvironmentCaptureTimeoutMs) };
+}
+
+/** Vitest CLI reporters replace constructor options. The resolved Vite config
+ * retains the workspace's original tuple, including its actual reader function. */
+function workspaceRuntimeObserver(ctx: Vitest): RuntimeObserver | undefined {
+  const config = ctx?.vite?.config as { test?: { reporters?: unknown } } | undefined;
+  const reporters = config?.test?.reporters;
+  if (!Array.isArray(reporters)) return undefined;
+  const ownPath = realOrSelf(fileURLToPath(new URL('./admin-test-runs-reporter.ts', import.meta.url)));
+  const matches = reporters.filter(entry => Array.isArray(entry) && typeof entry[0] === 'string'
+    && isAbsolute(entry[0]) && realOrSelf(entry[0]) === ownPath);
+  return matches.length === 1 && Array.isArray(matches[0]) ? runtimeObserver(matches[0][1]) : undefined;
+}
+
 /**
  * The reporter's default runtime witness deadline. Remote readers may need a
  * longer producer-owned budget when they perform bounded control-plane reads.
@@ -3690,33 +3714,26 @@ export default class AdminTestRunsReporter implements Reporter {
     // Preserve the selected writer's identity before diagnostic wrapping.
     this.usesDefaultRowsWriter = rowsWriter === insertRows;
     this.writeRows = (rows, signal) => observeReporterStage('test-runs', 'write-rows', () => rowsWriter(rows, signal));
-    const configuredReader = typeof readWorktreeSnapshotOrOptions === 'object'
-      ? readWorktreeSnapshotOrOptions?.readRuntimeEnvironment : undefined;
-    this.readRuntimeEnvironment = readRuntimeEnvironment ??
-      (typeof configuredReader === 'function'
-        ? configuredReader as () => Promise<RecordedRuntimeEnvironment | null> : undefined);
-    const configuredTimeout = typeof readWorktreeSnapshotOrOptions === 'object'
-      ? readWorktreeSnapshotOrOptions?.runtimeEnvironmentCaptureTimeoutMs : undefined;
-    this.runtimeEnvironmentCaptureTimeoutMs = normalizeRuntimeEnvironmentCaptureTimeout(
-      runtimeEnvironmentCaptureTimeoutMs ?? configuredTimeout,
-    );
+    this.providedRuntimeObserver = runtimeObserver(readWorktreeSnapshotOrOptions,
+      readRuntimeEnvironment, runtimeEnvironmentCaptureTimeoutMs);
   }
 
   private readonly readWorktreeSnapshot: WorktreeSnapshotReader;
   private readonly writeRows: TestRunRowsWriter;
   private readonly usesDefaultRowsWriter: boolean;
-  private readonly readRuntimeEnvironment?: () => Promise<RecordedRuntimeEnvironment | null>;
-  private readonly runtimeEnvironmentCaptureTimeoutMs: number;
+  private readonly providedRuntimeObserver?: RuntimeObserver;
+  private runtimeObserverForRun?: RuntimeObserver;
 
   private async captureRuntimeEnvironment(): Promise<RuntimeEnvironmentCapture> {
-    if (!this.readRuntimeEnvironment) return { status: 'not-configured' };
+    const observer = this.runtimeObserverForRun;
+    if (!observer) return { status: 'not-configured' };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = Symbol('runtime-environment-capture-timeout');
     try {
       const result = await Promise.race([
-        Promise.resolve().then(() => this.readRuntimeEnvironment!()),
+        Promise.resolve().then(() => observer.read()),
         new Promise<typeof timedOut>(resolve => {
-          timer = setTimeout(() => resolve(timedOut), this.runtimeEnvironmentCaptureTimeoutMs);
+          timer = setTimeout(() => resolve(timedOut), observer.timeoutMs);
         }),
       ]);
       if (result === timedOut) return { status: 'timed-out' };
@@ -3734,6 +3751,7 @@ export default class AdminTestRunsReporter implements Reporter {
   private pgLease: (() => Promise<void>) | null = null;
 
   async onInit(ctx: Vitest): Promise<void> {
+    this.runtimeObserverForRun = this.providedRuntimeObserver ?? workspaceRuntimeObserver(ctx);
     // testing:run supplies its LOADED reader's envelope, including through
     // detached replay. Refuse before leases, snapshots or test-module imports;
     // running assertions cannot repair an incompatible evidence consumer.
@@ -4010,6 +4028,7 @@ export default class AdminTestRunsReporter implements Reporter {
     let worktreeDirty = true;
     let dirtReason: string | null = 'snapshot not taken';
     let commitSha: string | null = null;
+    let comparison: VerifiedComparisonSources | undefined;
     let sourceSubmodules: RecordedSourceSubmodules = { schemaVersion: 'submodule-checkouts-v1', before: null, after: null };
     let sourceBytes: RecordedSourceBytes = { schemaVersion: 'source-byte-observation-v1', before: null, after: null };
     try {
@@ -4017,6 +4036,10 @@ export default class AdminTestRunsReporter implements Reporter {
       signal.throwIfAborted();
       const after = await this.readWorktreeSnapshot('after', signal);
       dirtReason = describeWorktreeDirt(before, after);
+      comparison = before.nativeComparison ?? after.nativeComparison;
+      const selected = comparison?.inputs;
+      if (selected && !dirtReason && pendingRows.some(row => !selected.has(row.filePath)))
+        dirtReason = 'executed file is absent from the test definition receipt';
       worktreeDirty = dirtReason !== null;
       commitSha = after.commit;
       sourceSubmodules = { schemaVersion: 'submodule-checkouts-v1',
@@ -4040,6 +4063,16 @@ export default class AdminTestRunsReporter implements Reporter {
       commitSha = null;
       dirtReason = [dirtReason, ...verifierSourceReasons].filter(Boolean).join('; ').slice(0, 1_200);
     }
+    const runtimeEnvironmentAfter = await this.captureRuntimeEnvironment();
+    if (comparison) {
+      const runtime = stableRecordedRuntimeEnvironment(this.executionContext?.runtimeEnvironmentBefore,
+        runtimeEnvironmentAfter.status === 'captured' ? runtimeEnvironmentAfter.witness : undefined);
+      if (!runtime || runtime.units.length !== 1 || runtime.units[0] !== comparison.runtimeUnit) {
+        worktreeDirty = true;
+        dirtReason ??= 'native comparison runtime witness missing or changed';
+      }
+      if (worktreeDirty) commitSha = null;
+    }
     if (worktreeDirty && resolveTestRunSource() === 'ci') {
       // WI-10004076: the demotion erases every row of this invocation from source='ci'
       // triage, and the tree that caused it is gone by the next run — say why, once.
@@ -4048,9 +4081,11 @@ export default class AdminTestRunsReporter implements Reporter {
       );
     }
 
-    const runtimeEnvironmentAfter = await this.captureRuntimeEnvironment();
     return pendingRows.map((row) => ({
       ...row,
+      ...(comparison && !worktreeDirty ? { outputTail: [row.outputTail,
+        '[native sources] application=' + comparison.applicationCommit + ' verifier=' + comparison.definitionCommit]
+        .filter(Boolean).join('\n') } : {}),
       worktreeDirty,
       commitSha,
       executionDetails: row.executionDetails

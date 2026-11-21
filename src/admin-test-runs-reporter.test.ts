@@ -12,6 +12,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire, stripTypeScriptTypes } from 'node:module';
@@ -167,6 +168,32 @@ describe('actual source-byte census', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('hashes every path across worker partition boundaries and observes changes in the last partition', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-source-partitions-'));
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      const entries: { path: string; sha256: string }[] = [];
+      const snapshot = () => ({ schemaVersion: 'source-bytes-v1', fileCount: entries.length,
+        sha256: createHash('sha256').update(JSON.stringify(['source-bytes-v1', entries])).digest('hex') });
+      for (const size of [511, 512, 513, 2051]) {
+        while (entries.length < size) {
+          const path = String(entries.length).padStart(5, '0');
+          writeFileSync(join(root, path), path);
+          entries.push({ path, sha256: createHash('sha256').update(path).digest('hex') });
+        }
+        await expect(captureSourceByteSnapshotInWorker(root)).resolves.toEqual(snapshot());
+      }
+      const last = entries.at(-1)!;
+      writeFileSync(join(root, last.path), 'changed');
+      last.sha256 = createHash('sha256').update('changed').digest('hex');
+      await expect(captureSourceByteSnapshotInWorker(root)).resolves.toEqual(snapshot());
+      execFileSync('git', ['-C', root, 'add', '--', last.path]);
+      rmSync(join(root, last.path));
+      expect(captureSourceByteSnapshot(root)).toBeNull();
+      await expect(captureSourceByteSnapshotInWorker(root)).resolves.toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('keeps initialized nested gitlinks out of the file manifest without dropping their leaves', async () => {
     const root = mkdtempSync(join(tmpdir(), 'reporter-source-bytes-gitlinks-'));
     const outer = join(root, 'libs', 'outer');
@@ -211,6 +238,9 @@ describe('actual source-byte census', () => {
       expect(captureSourceByteSnapshot(root)).toBeNull();
       rmSync(entry, { recursive: true }); writeFileSync(entry, 'export const entry = 1;\n');
       expect(captureSourceByteSnapshot(root)?.fileCount).toBe(6);
+      rmSync(join(inner, 'inner.ts'));
+      await expect(captureSourceByteSnapshotInWorker(root)).resolves.toBeNull();
+      writeFileSync(join(inner, 'inner.ts'), 'export const inner = 2;\n');
       rmSync(join(inner, '.git'), { recursive: true, force: true });
       expect(captureSourceByteSnapshot(root)).toBeNull();
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -234,6 +264,23 @@ describe('actual source-byte census', () => {
     finishTermination?.(1);
     await expect(pending).resolves.toBeNull();
     expect(settled).toBe(true);
+  });
+
+  it('discards a posted manifest on cancellation and waits for exit if termination rejects', async () => {
+    const worker = Object.assign(new EventEmitter(), {
+      terminate: vi.fn(async () => { throw new Error('termination request failed'); }),
+    });
+    const controller = new AbortController();
+    let settled = false;
+    const pending = captureSourceByteSnapshotInWorker('/unused', controller.signal,
+      (() => worker) as unknown as SourceByteCensusWorkerFactory).then(value => { settled = true; return value; });
+    worker.emit('message', { type: 'result', manifest: [{ path: 'a', sha256: 'a'.repeat(64) }] });
+    controller.abort();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    expect(settled).toBe(false);
+    worker.emit('exit', 0);
+    await expect(pending).resolves.toBeNull();
   });
 });
 

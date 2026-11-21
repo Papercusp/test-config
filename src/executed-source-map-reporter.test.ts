@@ -954,6 +954,29 @@ describe('ExecutedSourceMapReporter', () => {
       }
     });
 
+    it('finishes the before census at initialization and remeasures at the partial and terminal boundaries', async () => {
+      const bytes = (digit: string) => ({ schemaVersion: 'source-bytes-v1' as const,
+        fileCount: 1, sha256: digit.repeat(64) });
+      let release!: () => void;
+      const before = new Promise<void>(resolve => { release = resolve; });
+      const read = vi.fn<() => Promise<WorktreeGitSnapshot>>()
+        .mockImplementationOnce(async () => { await before; return { ...clean, sourceBytes: bytes('1') }; })
+        .mockResolvedValueOnce({ ...clean, sourceBytes: bytes('2') })
+        .mockResolvedValueOnce({ ...clean, sourceBytes: bytes('3') });
+      const { r } = reporter(read);
+      let initialized = false;
+      const init = Promise.resolve(r.onInit({} as never)).then(() => { initialized = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(initialized).toBe(false);
+      release();
+      await init;
+      await r.onTestModuleEnd(nativeModule(['passed']));
+      expect(nativeOut().files[0].sourceBytes).toMatchObject({ before: bytes('1'), after: bytes('2') });
+      await r.onTestRunEnd();
+      expect(nativeOut().files[0].sourceBytes).toMatchObject({ before: bytes('1'), after: bytes('3') });
+      expect(read).toHaveBeenCalledTimes(3);
+    });
+
     it('awaits an asynchronous snapshot before acknowledging completion or finishing the run', async () => {
       const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
       let release!: () => void;

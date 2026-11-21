@@ -348,7 +348,7 @@ export function presentOnDisk(files, cwd = ROOT) {
  * falls out as `unscanned`, exactly like the recursing path. Coverage is computed
  * from the emitted paths, never from an exit code, so the two agree.
  */
-export function listFilesIncludingUntracked(cwd = ROOT) {
+export function listFilesIncludingUntracked(cwd = ROOT, { includeMissing = false } = {}) {
   const FLAGS = ['ls-files', '-z', '--cached', '--others', '--exclude-standard'];
   const runZ = (dir) => {
     try {
@@ -377,8 +377,13 @@ export function listFilesIncludingUntracked(cwd = ROOT) {
   }
   if (root.error) throw root.error;
 
-  // `--cached` carries the same index lag as listTrackedFiles (WI-10004173).
-  const files = presentOnDisk(decodeGitRecords(root.output, cwd), cwd);
+  // Guards scan present entries. A proof reader must also see missing index
+  // entries so an unreadable input invalidates its observation.
+  const entries = (output, directory) => {
+    const paths = decodeGitRecords(output, directory);
+    return includeMissing ? paths : presentOnDisk(paths, directory);
+  };
+  const files = entries(root.output, cwd);
   const declared = new Set();
   const scanned = [];
   const pending = [{ directory: realpathSync(cwd), prefix: '' }];
@@ -402,7 +407,7 @@ export function listFilesIncludingUntracked(cwd = ROOT) {
       }
       const submodule = runZ(child);
       if (submodule.error) continue;
-      const children = presentOnDisk(decodeGitRecords(submodule.output, child), child);
+      const children = entries(submodule.output, child);
       if (children.length) scanned.push(path);
       for (const file of children) files.push(`${path}/${file}`);
       pending.push({ directory: child, prefix: path });

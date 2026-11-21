@@ -32,7 +32,16 @@ function freshNode(source: string, env: NodeJS.ProcessEnv = {}) {
   expect(result.status, result.stderr).toBe(0);
   return JSON.parse(result.stdout.trim().split('\n').at(-1)!);
 }
-function manifest(directory: string, env: NodeJS.ProcessEnv = {}) {
+function manifest(directory: string, env: NodeJS.ProcessEnv = {}, worker = false) {
+  if (worker) {
+    const url = pathToFileURL(join(installed, 'src/source-byte-census-worker.mjs')).href;
+    return freshNode(
+      'import { Worker } from "node:worker_threads";'
+      + 'const worker = new Worker(new URL(' + JSON.stringify(url) + '),'
+      + '{execArgv:[],workerData:{root:' + JSON.stringify(directory) + '}});'
+      + 'worker.once("message", result => console.log(JSON.stringify(result.manifest)));', env,
+    ) as null | { path: string; sha256: string }[];
+  }
   const url = pathToFileURL(join(installed, 'src/source-byte-census.mjs')).href;
   return freshNode(
     'const {captureSourceByteManifest}=await import(' + JSON.stringify(url) + ');'
@@ -86,6 +95,30 @@ describe('standalone test-config consumer', () => {
     const index = join(directory, '.git/index');
     writeFileSync(index, '');
     expect(manifest(directory, { GIT_INDEX_FILE: index })).toBeNull();
+  });
+  it.each(['content', 'population'])('refuses a %s change between the two actual Git enumerations', change => {
+    const directory = subject('unstable-' + change);
+    execFileSync('git', ['init', '--quiet', directory]);
+    writeFileSync(join(directory, 'source.ts'), 'first');
+    const bin = subject('census-git-' + change);
+    // Change this private fixture when the second enumeration starts.
+    // Forward both enumerations to the real Git executable.
+    writeFileSync(join(bin, 'git'), [
+      '#!/bin/sh', 'set -eu', 'if [ "$1" = ls-files ]; then',
+      '  if [ -f "$CENSUS_MARKER" ]; then',
+      change === 'content' ? '    printf other > source.ts' : '    printf new > added.ts',
+      '  else', '    touch "$CENSUS_MARKER"', '  fi', 'fi',
+      'PATH="$CENSUS_ORIGINAL_PATH" exec git "$@"', '',
+    ].join('\n'), { mode: 0o755 });
+    for (const worker of [false, true]) {
+      const marker = join(bin, 'first-enumeration-' + worker);
+      writeFileSync(join(directory, 'source.ts'), 'first');
+      rmSync(join(directory, 'added.ts'), { force: true });
+      expect(manifest(directory, { PATH: bin + ':' + process.env.PATH,
+        CENSUS_ORIGINAL_PATH: process.env.PATH, CENSUS_MARKER: marker }, worker)).toBeNull();
+      expect(existsSync(marker)).toBe(true);
+      expect(manifest(directory, {}, worker)).toHaveLength(change === 'content' ? 1 : 2);
+    }
   });
   it('refuses declared but unscanned submodules', () => {
     const directory = subject('unscanned');

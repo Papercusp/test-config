@@ -833,7 +833,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private configEntries: string[] | null = null;
   private configSourceCapture: ConfigSourceCapture | undefined;
 
-  onInit(ctx: Vitest): void {
+  async onInit(ctx: Vitest): Promise<void> {
     if (!this.armed) return;
     const reporterRunnerIdentity = executedSourceRunnerIdentity();
     this.completionContext.reporterRunnerIdentity = reporterRunnerIdentity;
@@ -845,7 +845,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.configSourceCapture = this.armed.outPath
       ? captureConfigSources(this.configDeps, { repoRoot: this.repoRoot }) : undefined;
     this.pgLease ??= retainSharedPg();
-    this.worktreeBefore = this.readWorktreeSnapshot();
+    this.worktreeBefore = this.readWorktreeSnapshot().catch(() => ({ commit: null, porcelain: null }));
     this.checkpointWrites = Promise.resolve();
     this.acknowledgedCompletionIds.clear();
     this.completedInputs.clear();
@@ -864,6 +864,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
       reportedModulePaths: null, modulePopulationMatched: false, selectedPopulationMatched: false,
       selectedManifest: null, files: [], gaps: [],
     } : null;
+    // Vitest awaits this hook before discovery. The before observation must
+    // finish even when the executed-source reporter is the only one armed.
+    await this.worktreeBefore;
   }
 
   onTestRunStart(specifications: ReadonlyArray<TestSpecification>): void {
