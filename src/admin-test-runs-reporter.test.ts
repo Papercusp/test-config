@@ -1405,21 +1405,21 @@ describe('actual reporter population capture', () => {
     expect(population.cases.find(row => !row.selected)?.outcome).toBe('skipped');
   });
 
-  it.each([-1, 0, 1])('persists every unique original outcome at diagnostic limit %+i', async offset => {
-    const count = MAX_RECORDED_PASSED_CASES + offset;
+  const boundaryCounts = [MAX_RECORDED_PASSED_CASES - 1, MAX_RECORDED_PASSED_CASES, MAX_RECORDED_PASSED_CASES + 1];
+  it.each(boundaryCounts)('persists every unique original outcome at diagnostic limit with %i passing cases', async count => {
     const execution = await record(count, undefined, false);
     expect(execution.passedCaseTitlesTruncated).toBe(count > MAX_RECORDED_PASSED_CASES ? true : undefined);
     expect(execution.passedCaseTitles).toHaveLength(Math.min(count, MAX_RECORDED_PASSED_CASES));
     const population = parseRecordedTestPopulation(execution.population)!;
     expect(population).toBeDefined();
-    expect(population.cases).toHaveLength(count + 1);
-    expect(population.cases.filter(row => row.selected)).toHaveLength(count);
-    expect(population.executionOrder[0][2]).toBe(`suite > \u03bb-${count - 1}`);
-    expect(population.cases.find(row => row.identity[2] === `suite > \u03bb-${count - 1}`))
-      .toMatchObject({ selected: true, outcome: 'passed' });
+    const passingTitles = Array.from({ length: count }, (_, index) => `suite > λ-${index}`);
+    const skippedTitle = `suite > λ-${count}`;
+    const expectedOutcomes = [...passingTitles, skippedTitle].sort().map(title =>
+      title === skippedTitle ? [title, false, 'skipped'] : [title, true, 'passed']);
+    expect(population.cases.map(row => [row.identity[2], row.selected, row.outcome])).toEqual(expectedOutcomes);
+    expect(population.executionOrder.map(identity => identity[2])).toEqual(passingTitles.reverse());
     expect(parseRecordedTestPopulation(JSON.parse(JSON.stringify(execution.population))))
       .toEqual(population);
-    expect(population.cases.find(row => !row.selected)?.outcome).toBe('skipped');
   });
 
   it('uses original runner selection when a fast case is already terminal at collection delivery', async () => {
