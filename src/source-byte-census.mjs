@@ -9,7 +9,14 @@ export function captureSourceByteManifest(root) {
     const canonicalRoot = realpathSync(root);
     const census = listFilesIncludingUntracked(canonicalRoot);
     if (census.unscanned.length) return null;
-    const files = [...new Set(census.files)].sort();
+    // Git lists each gitlink directory as well as the recursively enumerated
+    // contents. Hash its leaves, retaining the coverage check above; arbitrary
+    // directories must still fail rather than being silently omitted.
+    const leafFiles = observation => {
+      const gitlinks = new Set(observation.scanned);
+      return [...new Set(observation.files)].filter(file => !gitlinks.has(file)).sort();
+    };
+    const files = leafFiles(census);
     const hashFile = file => {
       const absolute = realpathSync(resolve(canonicalRoot, file));
       if (!absolute.startsWith(canonicalRoot + sep)) throw new Error('source-path-escaped');
@@ -18,7 +25,7 @@ export function captureSourceByteManifest(root) {
     const manifest = files.map(file => ({ path: file, sha256: hashFile(file) }));
     const after = listFilesIncludingUntracked(canonicalRoot);
     if (after.unscanned.length ||
-      JSON.stringify(files) !== JSON.stringify([...new Set(after.files)].sort()) ||
+      JSON.stringify(files) !== JSON.stringify(leafFiles(after)) ||
       manifest.some(file => hashFile(file.path) !== file.sha256)) return null;
     return manifest;
   } catch {

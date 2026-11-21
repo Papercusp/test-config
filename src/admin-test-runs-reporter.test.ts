@@ -167,6 +167,55 @@ describe('actual source-byte census', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('keeps initialized nested gitlinks out of the file manifest without dropping their leaves', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'reporter-source-bytes-gitlinks-'));
+    const outer = join(root, 'libs', 'outer');
+    const inner = join(outer, 'libs', 'inner');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-C', cwd,
+      '-c', 'user.email=test@test', '-c', 'user.name=test', ...args], { stdio: 'pipe' }).toString().trim();
+    const register = (cwd: string, name: string, path: string, sha: string) => {
+      writeFileSync(join(cwd, '.gitmodules'), `[submodule "${name}"]\n\tpath = ${path}\n\turl = ./fixture\n`);
+      git(cwd, 'add', '.gitmodules');
+      git(cwd, 'update-index', '--add', '--cacheinfo', '160000', sha, path);
+      git(cwd, 'commit', '-qm', 'register submodule');
+      git(cwd, 'submodule', 'init');
+    };
+    try {
+      mkdirSync(inner, { recursive: true });
+      git(inner, 'init', '-q');
+      writeFileSync(join(inner, 'inner.ts'), 'export const inner = 1;\n');
+      git(inner, 'add', 'inner.ts'); git(inner, 'commit', '-qm', 'inner source');
+
+      git(outer, 'init', '-q');
+      writeFileSync(join(outer, 'outer.ts'), 'export const outer = 1;\n');
+      git(outer, 'add', 'outer.ts');
+      register(outer, 'inner', 'libs/inner', git(inner, 'rev-parse', 'HEAD'));
+
+      git(root, 'init', '-q');
+      const entry = join(root, 'entry.ts');
+      writeFileSync(entry, 'export const entry = 1;\n');
+      git(root, 'add', 'entry.ts');
+      register(root, 'outer', 'libs/outer', git(outer, 'rev-parse', 'HEAD'));
+
+      const before = captureSourceByteSnapshot(root);
+      expect(before).toMatchObject({ schemaVersion: 'source-bytes-v1', fileCount: 5 });
+      await expect(captureSourceByteSnapshotInWorker(root)).resolves.toEqual(before);
+      writeFileSync(join(inner, 'inner.ts'), 'export const inner = 2;\n');
+      expect(captureSourceByteSnapshot(root)?.sha256).not.toBe(before?.sha256);
+      writeFileSync(join(inner, 'untracked.ts'), 'export const extra = 1;\n');
+      expect(captureSourceByteSnapshot(root)?.fileCount).toBe(6);
+
+      // Only scanned gitlink roots may be excluded; an ordinary path changing
+      // from a file into a directory must still invalidate the census.
+      rmSync(entry); mkdirSync(entry);
+      expect(captureSourceByteSnapshot(root)).toBeNull();
+      rmSync(entry, { recursive: true }); writeFileSync(entry, 'export const entry = 1;\n');
+      expect(captureSourceByteSnapshot(root)?.fileCount).toBe(6);
+      rmSync(join(inner, '.git'), { recursive: true, force: true });
+      expect(captureSourceByteSnapshot(root)).toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('waits for an abandoned census worker to terminate before settling', async () => {
     let finishTermination: ((exitCode: number) => void) | undefined;
     const worker = {
