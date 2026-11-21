@@ -3675,6 +3675,7 @@ export default class AdminTestRunsReporter implements Reporter {
   private mutationInvocation: MutationInvocationDescriptor | null = null;
   /** Only a validated mutant with a proven initial source can supply terminal mutation proof. */
   private terminalMutationProvenance = false;
+  private verifiedNativeComparison = false;
   private populationCapture = new RecordedPopulationCapture(toWorkspaceRel);
 
   constructor(
@@ -3795,6 +3796,7 @@ export default class AdminTestRunsReporter implements Reporter {
     this.worktreeBefore = this.readWorktreeSnapshot('before');
     this.flushed = false;
     this.finalFlush = null;
+    this.finalizationDeadlineMs = null;
     this.failureDetails = [];
     this.failureDetailsFlushed = false;
     this.executionContext = {
@@ -3831,6 +3833,10 @@ export default class AdminTestRunsReporter implements Reporter {
     const before = await this.worktreeBefore;
     this.terminalMutationProvenance = this.mutationInvocation !== null &&
       this.executionContext.mutationPhase === 'mutant' && describeWorktreeDirt(before, before) === null;
+    this.verifiedNativeComparison = before.nativeComparison !== undefined &&
+      describeWorktreeDirt(before, before) === null && runtimeEnvironmentBefore.status === 'captured' &&
+      runtimeEnvironmentBefore.witness.units.length === 1 &&
+      runtimeEnvironmentBefore.witness.units[0] === before.nativeComparison.runtimeUnit;
     // After the bounded source read, for the same reason: module loading is synchronous work.
     this.evidenceRoot = await loadEvidenceRootResolver();
   }
@@ -3983,6 +3989,10 @@ export default class AdminTestRunsReporter implements Reporter {
     // The before census belongs to this run even when every failure was already
     // flushed. Drain it before the terminal hook releases process ownership.
     await this.worktreeBefore;
+    // A terminal hook can arrive during a native failure's archive census.
+    // Join that same operation before starting the queue's SQL deadline.
+    // persistRows still bounds the actual insert, including a stalled writer.
+    if (this.verifiedNativeComparison && this.interimFlush) await this.interimFlush;
     const { flushBudgetMs } = reporterWriteBudget(process.env);
     const deadlineMs = Date.now() + flushBudgetMs;
     this.finalizationDeadlineMs = deadlineMs;
@@ -4103,6 +4113,7 @@ export default class AdminTestRunsReporter implements Reporter {
     if (pendingRows.length === 0) return;
     const { flushBudgetMs, totalInsertMs } = reporterWriteBudget(process.env);
     const writeBudgetMs = finalProvenance ? Math.max(flushBudgetMs, totalInsertMs) : flushBudgetMs;
+    const awaitSourceProof = () => finalProvenance || (this.verifiedNativeComparison && this.flushed);
     let localDeadlineMs = finalProvenance ? Number.POSITIVE_INFINITY : Date.now() + flushBudgetMs;
     const deadlineMs = () => Math.min(
       localDeadlineMs,
@@ -4131,7 +4142,11 @@ export default class AdminTestRunsReporter implements Reporter {
       rows = finalProvenance ? await preparation : await Promise.race([
         preparation,
         new Promise<null>((resolve) => {
-          preparationTimer = setTimeout(() => resolve(null), Math.max(0, preparationDeadlineMs - Date.now()));
+          preparationTimer = setTimeout(() => {
+            // With no terminal hook the early failure must still reach the ledger.
+            // Once the hook has joined, its source reader owns the proof window.
+            if (!awaitSourceProof()) resolve(null);
+          }, Math.max(0, preparationDeadlineMs - Date.now()));
         }),
       ]);
     } catch (error) {
@@ -4146,7 +4161,7 @@ export default class AdminTestRunsReporter implements Reporter {
     // The outer timeout and SQL writer observe ONE write. Assign its identity
     // before they split, or two UUIDs make one late canonical row ambiguous.
     rows = receiptIdentifiedRows(rows);
-    if (finalProvenance) localDeadlineMs = Date.now() + writeBudgetMs;
+    if (awaitSourceProof()) localDeadlineMs = Date.now() + writeBudgetMs;
     const remainingMs = Math.max(0, deadlineMs() - Date.now());
     if (remainingMs === 0) {
       this.retainUnsubmittedTerminalRows(rows);

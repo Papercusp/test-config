@@ -604,7 +604,8 @@ describe('reporter ledger endpoint selection', () => {
 describe('receipt-backed native archive reporter', () => {
   it.each(['stable', 'failed test', 'changed application', 'changed definition', 'wrong definition commit',
     'same receipt', 'missing definition receipt', 'replaced receipt path', 'unselected test', 'runtime changed',
-    'other runtime', 'changed run group'])(
+    'other runtime', 'changed run group', 'slow failure', 'slow failure with changed source',
+    'slow failure with missing runtime', 'slow failure without final hook'])(
     'attributes the actual Vitest row for two independently frozen sources (%s)', async condition => {
       const parent = mkdtempSync(join(tmpdir(), 'vitest-comparison-'));
       function archive(name: string, file: string) {
@@ -626,6 +627,11 @@ describe('receipt-backed native archive reporter', () => {
         writeFileSync(join(root, '.verifier-source.json'), bytes);
         return { root, file, commit, receipt };
       }
+      const slow = condition.startsWith('slow failure');
+      let releaseAfter!: () => void;
+      const mayReadAfter = new Promise<void>(resolve => { releaseAfter = resolve; });
+      let afterStarted = false;
+      let finalHooks: Promise<void[]> | undefined;
       try {
         const app = archive('application', 'plans.ts');
         const driver = archive('definition', 'packages/operator-core/plan.e2e.test.ts');
@@ -643,8 +649,15 @@ describe('receipt-backed native archive reporter', () => {
           : condition === 'same receipt' ? app.receipt : driver.receipt);
         const rows: TestRunRow[] = [];
         let fingerprint = 'a'.repeat(64);
-        const reporter = new AdminTestRunsReporter(undefined, async row => { rows.push(row); }, undefined,
-          async () => ({ schemaVersion: 1, units: [condition === 'other runtime' ? 'shared' : 'verify-tauri-headless:1234'],
+        const reporter = new AdminTestRunsReporter(slow ? async (phase, signal) => {
+          if (phase === 'after') {
+            afterStarted = true;
+            await mayReadAfter;
+          }
+          return captureWorktreeSnapshot(undefined, phase, signal);
+        } : undefined, async row => { rows.push(row); }, undefined,
+          async () => afterStarted && condition === 'slow failure with missing runtime' ? null : ({
+            schemaVersion: 1, units: [condition === 'other runtime' ? 'shared' : 'verify-tauri-headless:1234'],
             fingerprint, observedAt: new Date().toISOString() }));
         const project = join(driver.root, 'packages/operator-core');
         await reporter.onInit({ config: { root: project, configFile: join(project, 'vitest.config.ts') } } as never);
@@ -658,14 +671,27 @@ describe('receipt-backed native archive reporter', () => {
         if (condition === 'runtime changed') fingerprint = 'b'.repeat(64);
         if (condition === 'changed run group') vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'other-run');
         const file = condition === 'unselected test' ? 'packages/operator-core/other.e2e.test.ts' : driver.file;
-        const state = condition === 'failed test' ? 'failed' : 'passed';
+        const state = condition === 'failed test' || slow ? 'failed' : 'passed';
+        if (slow) vi.useFakeTimers();
         reporter.onTestModuleEnd({ moduleId: join(driver.root, file), state: () => state,
           diagnostic: () => ({ duration: 1 }), errors: () => [],
           children: { allTests: () => [{ fullName: 'comparison case', result: () => ({ state }) }] } } as never);
-        await reporter.onTestRunEnd();
+        if (slow) {
+          await vi.advanceTimersByTimeAsync(0);
+          expect(afterStarted).toBe(true);
+          const noFinalHook = condition === 'slow failure without final hook';
+          if (!noFinalHook) finalHooks = Promise.all([reporter.onTestRunEnd(), reporter.onExit()]);
+          await vi.advanceTimersByTimeAsync(reporterWriteBudget(process.env).flushBudgetMs * 3);
+          expect(rows).toHaveLength(noFinalHook ? 1 : 0);
+          if (condition === 'slow failure with changed source') writeFileSync(join(app.root, app.file), 'modified');
+          vi.useRealTimers();
+          releaseAfter();
+        }
+        await (finalHooks ?? reporter.onTestRunEnd());
+        expect(rows).toHaveLength(1);
         const row = rows.at(-1)!;
         expect(row.status).toBe(state === 'failed' ? 'fail' : 'pass');
-        if (condition === 'stable' || condition === 'failed test') {
+        if (condition === 'stable' || condition === 'failed test' || condition === 'slow failure') {
           expect(row).toMatchObject({ filePath: file, worktreeDirty: false, commitSha: driver.commit });
           expect(row.outputTail).toContain('[native sources] application=' + app.commit + ' verifier=' + driver.commit);
           expect(row.executionDetails?.runtimeEnvironmentBefore?.fingerprint).toBe(fingerprint);
@@ -674,7 +700,14 @@ describe('receipt-backed native archive reporter', () => {
           expect(row).toMatchObject({ worktreeDirty: true, commitSha: null });
           expect(row.executionDetails?.worktreeDirtyReason).toBeTruthy();
         }
-      } finally { setRunRoot(null); vi.unstubAllEnvs(); rmSync(parent, { recursive: true, force: true }); }
+      } finally {
+        releaseAfter();
+        if (slow) vi.useRealTimers();
+        await finalHooks;
+        setRunRoot(null);
+        vi.unstubAllEnvs();
+        rmSync(parent, { recursive: true, force: true });
+      }
     });
 
   it('distinguishes real Vitest fork-stop callback starvation from worker handles, including ordinary Git interim provenance', async () => {
