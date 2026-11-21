@@ -155,6 +155,7 @@ export interface RuntimeProofIdentity {
   configurationSha256: string;
 }
 type ProofModule = {
+  prepareVerifierRuntimeProof?: (options: { root: string }) => Promise<void>;
   captureCurrentRuntimeProofIdentity?: (options: { root: string; environment?: NodeJS.ProcessEnv }) => RuntimeProofIdentity | null;
   captureRuntimeProofIdentity?: (options: { root: string; cwd?: string; environment?: NodeJS.ProcessEnv;
     executable?: string; execArgv?: string[] }) => RuntimeProofIdentity | null;
@@ -167,6 +168,10 @@ function hostProof(): ProofModule | null {
 }
 export function captureCurrentRuntimeProofIdentity(options: { root: string; environment?: NodeJS.ProcessEnv }): RuntimeProofIdentity | null {
   return hostProof()?.captureCurrentRuntimeProofIdentity?.(options) ?? null;
+}
+export async function prepareVerifierRuntimeProof(root: string): Promise<void> {
+  if (process.env.PAPERCUSP_VERIFIER_RUNTIME_HANDOFF_SHA256)
+    await hostProof()?.prepareVerifierRuntimeProof?.({ root });
 }
 export function runtimeProofFingerprint(identity: unknown): string | null {
   return hostProof()?.runtimeProofFingerprint?.(identity) ?? null;

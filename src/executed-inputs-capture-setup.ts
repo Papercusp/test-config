@@ -34,6 +34,8 @@ if (dir) {
     // Measure before installing fs capture: runtime hashing is recorder overhead,
     // not a test input. The final measurement follows endFile for the same reason.
     const root = inferWorkspaceRoot();
+    if (process.env.PAPERCUSP_VERIFIER_RUNTIME_HANDOFF_SHA256)
+      await runtimeProof.prepareVerifierRuntimeProof?.(root);
     const captureId = randomUUID();
     const processBefore = runtimeProof.captureCurrentWorkerProcessIdentity();
     const runtimeBefore = runtimeProof.captureCurrentRuntimeProofIdentity?.({ root }) ?? null;

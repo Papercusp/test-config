@@ -21,6 +21,15 @@ afterEach(() => {
 });
 
 describe('full verifier source census', () => {
+  it('exposes traversed empty directories for interval checks and leaves runtime trees to their own census', () => {
+    const root = archive();
+    const empty = join(root, 'src', 'empty');
+    mkdirSync(empty, { recursive: true });
+    mkdirSync(join(root, 'node_modules'));
+    const visited: string[] = [];
+    expect(verifierSourceFiles(root, { runtimeArtifacts: true, onDirectory: path => visited.push(path) })).toEqual([]);
+    expect(visited).toEqual([root, join(root, 'src'), empty]);
+  });
   it('refuses unrecorded dependencies before traversing them when runtime mode was omitted', () => {
     const root = archive();
     writeFileSync(join(root, 'source.ts'), 'export {};');

@@ -118,7 +118,8 @@ export function readVerifierComparisonSourcesSync(definitionRoot: string, defini
 
 /** Reuse the full source census, never a supplied SHA or the enclosing Git HEAD. */
 export function readVerifierSourceReceiptSync(root: string, receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT,
-  options: { progress?: (record: VerifierSourceProgress) => void; mutation?: VerifierSourceMutation } = {}): VerifierSourceReceipt {
+  options: { progress?: (record: VerifierSourceProgress) => void; mutation?: VerifierSourceMutation;
+    onDirectory?: (path: string) => void } = {}): VerifierSourceReceipt {
   if (!receiptPath) throw new VerifierSourceError('missing independent verifier source receipt');
   const receiptRel = relative(realpathSync(root), realpathSync(receiptPath));
   if (receiptRel !== '..' && !receiptRel.startsWith(`..${sep}`))
@@ -126,7 +127,7 @@ export function readVerifierSourceReceiptSync(root: string, receiptPath = proces
   const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
   if (process.env.VERIFY_TAURI_SOURCE_REF && receipt.sourceCommit !== process.env.VERIFY_TAURI_SOURCE_REF)
     throw new VerifierSourceError('verifier source receipt differs from selected source ref');
-  verifyVerifierSourceSync(root, receipt, { runtimeArtifacts: true, progress: options.progress, mutation: options.mutation });
+  verifyVerifierSourceSync(root, receipt, { ...options, runtimeArtifacts: true });
   return receipt;
 }
 
@@ -214,7 +215,7 @@ export function verifierGitCheckoutSync(root: string, sourceCommit: string,
 
 /** Never follow archive symlinks or exclude a recorded source path. */
 export function verifierSourceFiles(root: string, {
-  runtimeArtifacts = false, dependencyStaging = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root, includedPaths, progress,
+  runtimeArtifacts = false, dependencyStaging = false, recordedPaths = [], gitMetadataPaths = [], symlinkRoot = root, includedPaths, progress, onDirectory,
 }: { runtimeArtifacts?: boolean;
   /** Pre-copy preparation only; subsequent verification must reject leftover staging. */
   dependencyStaging?: boolean; recordedPaths?: string[]; gitMetadataPaths?: string[];
@@ -222,6 +223,8 @@ export function verifierSourceFiles(root: string, {
   symlinkRoot?: string;
   /** Explicit population from the maintained dependency-generation record writer. */
   includedPaths?: ReadonlySet<string>;
+  /** Report the directories actually traversed, including empty directories. */
+  onDirectory?: (path: string) => void;
   progress?: (record: VerifierSourceProgress) => void } = {}): VerifierSourceFile[] {
   const rows: VerifierSourceFile[] = [];
   // Runtime admission asks about the same recorded population for every entry.
@@ -249,6 +252,7 @@ export function verifierSourceFiles(root: string, {
     nextReportAt = Date.now() + 5_000;
   };
   function walk(dir: string): void {
+    onDirectory?.(dir);
     const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
     // Only dependency preparation may admit the copier's retained staging.
     // Recorded source stays attested; redirects and ambiguity remain fatal.
@@ -414,7 +418,7 @@ export function verifierSourceFiles(root: string, {
 /** Synchronous for Playwright's unawaited onBegin hook; unknown source fails closed. */
 export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: string, expected: T,
   options: { runtimeArtifacts?: boolean; dependencyStaging?: boolean; progress?: (record: VerifierSourceProgress) => void;
-    mutation?: VerifierSourceMutation } = {}): T {
+    mutation?: VerifierSourceMutation; onDirectory?: (path: string) => void } = {}): T {
   const phase = <V>(step: VerifierSourceProgress['step'], action: () => V): V => {
     options.progress?.({ step, event: 'start' });
     try {
@@ -441,7 +445,7 @@ export function verifyVerifierSourceSync<T extends VerifierSourceReceipt>(dest: 
   });
   phase('source-census', () => {
     const actual = verifierSourceFiles(dest, { runtimeArtifacts: options.runtimeArtifacts, dependencyStaging: options.dependencyStaging,
-      gitMetadataPaths, recordedPaths: expected.files.map(file => file.path), progress: options.progress });
+      gitMetadataPaths, recordedPaths: expected.files.map(file => file.path), progress: options.progress, onDirectory: options.onDirectory });
     if (JSON.stringify(actual) !== JSON.stringify(expected.files)) {
       const recorded = new Map(expected.files.map(file => [file.path, file]));
       const observed = new Map(actual.map(file => [file.path, file]));

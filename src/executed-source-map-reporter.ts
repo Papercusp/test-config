@@ -835,6 +835,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   async onInit(ctx: Vitest): Promise<void> {
     if (!this.armed) return;
+    if (process.env.PAPERCUSP_VERIFIER_RUNTIME_HANDOFF_SHA256)
+      await runtimeProof.prepareVerifierRuntimeProof?.(this.repoRoot);
     const reporterRunnerIdentity = executedSourceRunnerIdentity();
     this.completionContext.reporterRunnerIdentity = reporterRunnerIdentity;
     this.completionContext.runnerIdentity = reporterRunnerIdentity;
