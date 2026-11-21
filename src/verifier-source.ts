@@ -4,7 +4,7 @@
  */
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Worker } from 'node:worker_threads';
 
@@ -54,6 +54,68 @@ export interface VerifierSourceMutation {
   subjectPath: string;
 }
 
+export interface VerifierDefinitionSource { commit: string; receiptPath: string }
+
+export interface VerifiedComparisonSources {
+  applicationRoot: string;
+  applicationCommit: string;
+  definitionCommit: string;
+  runtimeUnit: string;
+  digest: string;
+  inputs: Set<string>;
+}
+
+export function selectedVerifierDefinition(env = process.env): VerifierDefinitionSource | null {
+  const commit = env.VERIFY_TAURI_TEST_SOURCE_REF;
+  const receiptPath = env.VERIFY_TAURI_TEST_SOURCE_RECEIPT;
+  if (commit === undefined && receiptPath === undefined) return null;
+  if (!commit || !/^[0-9a-f]{40}$/.test(commit) || !receiptPath)
+    throw new VerifierSourceError('incomplete native comparison definition selection');
+  return { commit, receiptPath };
+}
+
+/** Verify both independent archives against their original external receipts. */
+export function readVerifierComparisonSourcesSync(definitionRoot: string, definition: VerifierDefinitionSource,
+  progress?: (record: VerifierSourceProgress) => void): VerifiedComparisonSources {
+  const env = process.env;
+  const pid = Number(env.VERIFY_TAURI_PID);
+  if (!Number.isSafeInteger(pid) || pid <= 0 || env.VERIFY_TAURI_ISOLATED_DB !== '1' || !env.OPERATOR_SOURCE_ROOT || !env.VERIFY_TAURI_SOURCE_REF)
+    throw new VerifierSourceError('separate test definition requires the owned isolated native runner');
+  if (!env.VERIFY_TAURI_SOURCE_RECEIPT || !definition.receiptPath)
+    throw new VerifierSourceError('both external source receipts are required');
+  const roots = [realpathSync(env.OPERATOR_SOURCE_ROOT), realpathSync(definitionRoot)];
+  const within = (path: string, root: string) => {
+    const rel = relative(root, path);
+    return !isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep);
+  };
+  if (within(roots[0], roots[1]) || within(roots[1], roots[0]))
+    throw new VerifierSourceError('expected distinct, non-overlapping frozen source roots');
+  const paths = [realpathSync(env.VERIFY_TAURI_SOURCE_RECEIPT), realpathSync(definition.receiptPath)];
+  const stats = paths.map(path => statSync(path, { bigint: true }));
+  if (paths.some(path => roots.some(root => within(path, root))) || !stats.every(stat => stat.isFile())
+    || (stats[0].dev === stats[1].dev && stats[0].ino === stats[1].ino))
+    throw new VerifierSourceError('the two source receipts must be independent and outside both archives');
+  const refs = [env.VERIFY_TAURI_SOURCE_REF, definition.commit];
+  const ledger = [env.PAPERCUSP_TEST_RUN_GROUP, env.PAPERCUSP_TEST_RUN_WORKSPACE,
+    env.PAPERCUSP_TEST_RUN_HARNESS, env.PAPERCUSP_TEST_RUNS_DB_URL];
+  if (!ledger.every(value => value?.trim()))
+    throw new VerifierSourceError('native comparison requires a dedicated ledger, run group, harness and workspace');
+  const runtimeUnit = 'verify-tauri-headless:' + pid;
+  const digest = createHash('sha256').update(JSON.stringify([roots, paths, runtimeUnit, ledger]));
+  const verified = paths.map((path, i) => {
+    const bytes = readFileSync(path);
+    const manifest: VerifierSourceReceipt = JSON.parse(bytes.toString('utf8'));
+    if (!/^[0-9a-f]{40}$/.test(refs[i]) || manifest.sourceCommit !== refs[i])
+      throw new VerifierSourceError('source receipt differs from the selected commit');
+    if (!manifest.gitCheckout) throw new VerifierSourceError('native comparison requires Git custody in both source receipts');
+    digest.update('\0').update(bytes);
+    return verifyVerifierSourceSync(roots[i], manifest, { runtimeArtifacts: true, progress });
+  });
+  return { applicationRoot: roots[0], applicationCommit: verified[0].sourceCommit,
+    definitionCommit: verified[1].sourceCommit, runtimeUnit, digest: digest.digest('hex'),
+    inputs: new Set(verified[1].testedInputs.map(input => input.path)) };
+}
+
 /** Reuse the full source census, never a supplied SHA or the enclosing Git HEAD. */
 export function readVerifierSourceReceiptSync(root: string, receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT,
   options: { progress?: (record: VerifierSourceProgress) => void; mutation?: VerifierSourceMutation } = {}): VerifierSourceReceipt {
@@ -76,15 +138,24 @@ export function readVerifierSourceReceipt(root: string,
   receiptPath = process.env.VERIFY_TAURI_SOURCE_RECEIPT,
   options: { mutation?: VerifierSourceMutation; progress?: (record: VerifierSourceProgress) => void;
     signal?: AbortSignal } = {}): Promise<VerifierSourceReceipt> {
+  return runVerifierSourceWorker({ root, receiptPath, mutation: options.mutation }, options);
+}
+
+export function readVerifierComparisonSources(root: string, definition: VerifierDefinitionSource,
+  options: { progress?: (record: VerifierSourceProgress) => void; signal?: AbortSignal } = {}): Promise<VerifiedComparisonSources> {
+  return runVerifierSourceWorker({ root, definition }, options);
+}
+
+function runVerifierSourceWorker<T>(workerData: { root: string; receiptPath?: string; mutation?: VerifierSourceMutation }
+  | { root: string; definition: VerifierDefinitionSource },
+  options: { progress?: (record: VerifierSourceProgress) => void; signal?: AbortSignal }): Promise<T> {
   return new Promise((resolveReceipt, reject) => {
     if (options.signal?.aborted) {
       reject(new VerifierSourceError('verifier source read aborted'));
       return;
     }
-    const worker = new Worker(new URL('./verifier-source-worker.mjs', import.meta.url), {
-      workerData: { root, receiptPath, mutation: options.mutation },
-    });
-    let receipt: VerifierSourceReceipt | undefined;
+    const worker = new Worker(new URL('./verifier-source-worker.mjs', import.meta.url), { workerData });
+    let receipt: T | undefined;
     let failure: Error | undefined;
     const abort = () => {
       failure = new VerifierSourceError('verifier source read aborted');
@@ -93,7 +164,7 @@ export function readVerifierSourceReceipt(root: string,
       void worker.terminate().catch(error => { failure = error; });
     };
     options.signal?.addEventListener('abort', abort, { once: true });
-    worker.on('message', (result: { receipt?: VerifierSourceReceipt; error?: string; progress?: VerifierSourceProgress }) => {
+    worker.on('message', (result: { receipt?: T; error?: string; progress?: VerifierSourceProgress }) => {
       if (result.progress) {
         // Diagnostics must not change the full census or its terminal verdict.
         try { options.progress?.(result.progress); } catch { /* observer failure */ }

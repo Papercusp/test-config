@@ -555,6 +555,81 @@ describe('reporter ledger endpoint selection', () => {
 });
 
 describe('receipt-backed native archive reporter', () => {
+  it.each(['stable', 'failed test', 'changed application', 'changed definition', 'wrong definition commit',
+    'same receipt', 'missing definition receipt', 'replaced receipt path', 'unselected test', 'runtime changed',
+    'other runtime', 'changed run group'])(
+    'attributes the actual Vitest row for two independently frozen sources (%s)', async condition => {
+      const parent = mkdtempSync(join(tmpdir(), 'vitest-comparison-'));
+      function archive(name: string, file: string) {
+        const root = join(parent, name);
+        mkdirSync(join(root, 'packages/operator-core'), { recursive: true });
+        const git = (...args: string[]) => execFileSync('git', ['-C', root, '-c', 'user.name=Fixture',
+          '-c', 'user.email=fixture@example.invalid', ...args], { encoding: 'utf8' }).trim();
+        git('init', '--quiet');
+        git('commit', '--quiet', '--allow-empty', '-m', 'fixture parent');
+        writeFileSync(join(root, file), name);
+        git('add', file);
+        git('commit', '--quiet', '-m', 'fixture source');
+        const commit = git('rev-parse', 'HEAD');
+        const files = verifierSourceFiles(root, { gitMetadataPaths: ['.git'] });
+        const bytes = JSON.stringify({ schemaVersion: 'verifier-source-v1', sourceCommit: commit, files,
+          testedInputs: files.map(({ path, sha256 }) => ({ path, sha256 })), gitCheckout: verifierGitCheckoutSync(root, commit) });
+        const receipt = join(parent, name + '.json');
+        writeFileSync(receipt, bytes);
+        writeFileSync(join(root, '.verifier-source.json'), bytes);
+        return { root, file, commit, receipt };
+      }
+      try {
+        const app = archive('application', 'plans.ts');
+        const driver = archive('definition', 'packages/operator-core/plan.e2e.test.ts');
+        vi.stubEnv('VERIFY_TAURI_PID', '1234');
+        vi.stubEnv('VERIFY_TAURI_ISOLATED_DB', '1');
+        vi.stubEnv('OPERATOR_SOURCE_ROOT', app.root);
+        vi.stubEnv('VERIFY_TAURI_SOURCE_REF', app.commit);
+        vi.stubEnv('VERIFY_TAURI_SOURCE_RECEIPT', app.receipt);
+        vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'original-comparison');
+        vi.stubEnv('PAPERCUSP_TEST_RUN_WORKSPACE', 'ledger-workspace');
+        vi.stubEnv('PAPERCUSP_TEST_RUN_HARNESS', 'fixture');
+        vi.stubEnv('PAPERCUSP_TEST_RUNS_DB_URL', 'postgres://localhost:32190/fixture');
+        vi.stubEnv('VERIFY_TAURI_TEST_SOURCE_REF', condition === 'wrong definition commit' ? app.commit : driver.commit);
+        vi.stubEnv('VERIFY_TAURI_TEST_SOURCE_RECEIPT', condition === 'missing definition receipt' ? undefined
+          : condition === 'same receipt' ? app.receipt : driver.receipt);
+        const rows: TestRunRow[] = [];
+        let fingerprint = 'a'.repeat(64);
+        const reporter = new AdminTestRunsReporter(undefined, async row => { rows.push(row); }, undefined,
+          async () => ({ schemaVersion: 1, units: [condition === 'other runtime' ? 'shared' : 'verify-tauri-headless:1234'],
+            fingerprint, observedAt: new Date().toISOString() }));
+        const project = join(driver.root, 'packages/operator-core');
+        await reporter.onInit({ config: { root: project, configFile: join(project, 'vitest.config.ts') } } as never);
+        if (condition === 'changed application') writeFileSync(join(app.root, app.file), 'modified');
+        if (condition === 'changed definition') writeFileSync(join(driver.root, driver.file), 'modified');
+        if (condition === 'replaced receipt path') {
+          const other = join(parent, 'later.json');
+          writeFileSync(other, readFileSync(driver.receipt));
+          vi.stubEnv('VERIFY_TAURI_TEST_SOURCE_RECEIPT', other);
+        }
+        if (condition === 'runtime changed') fingerprint = 'b'.repeat(64);
+        if (condition === 'changed run group') vi.stubEnv('PAPERCUSP_TEST_RUN_GROUP', 'other-run');
+        const file = condition === 'unselected test' ? 'packages/operator-core/other.e2e.test.ts' : driver.file;
+        const state = condition === 'failed test' ? 'failed' : 'passed';
+        reporter.onTestModuleEnd({ moduleId: join(driver.root, file), state: () => state,
+          diagnostic: () => ({ duration: 1 }), errors: () => [],
+          children: { allTests: () => [{ fullName: 'comparison case', result: () => ({ state }) }] } } as never);
+        await reporter.onTestRunEnd();
+        const row = rows.at(-1)!;
+        expect(row.status).toBe(state === 'failed' ? 'fail' : 'pass');
+        if (condition === 'stable' || condition === 'failed test') {
+          expect(row).toMatchObject({ filePath: file, worktreeDirty: false, commitSha: driver.commit });
+          expect(row.outputTail).toContain('[native sources] application=' + app.commit + ' verifier=' + driver.commit);
+          expect(row.executionDetails?.runtimeEnvironmentBefore?.fingerprint).toBe(fingerprint);
+          expect(row.executionDetails?.runtimeEnvironmentAfter?.fingerprint).toBe(fingerprint);
+        } else {
+          expect(row).toMatchObject({ worktreeDirty: true, commitSha: null });
+          expect(row.executionDetails?.worktreeDirtyReason).toBeTruthy();
+        }
+      } finally { setRunRoot(null); vi.unstubAllEnvs(); rmSync(parent, { recursive: true, force: true }); }
+    });
+
   it('distinguishes real Vitest fork-stop callback starvation from worker handles, including ordinary Git interim provenance', async () => {
     const parent = mkdtempSync(join(tmpdir(), 'native-archive-stop-ipc-'));
     const root = join(parent, 'source');
@@ -1096,6 +1171,30 @@ describe('retained isolated runtime receipt custody', () => {
 });
 
 describe('runtime environment recorded around execution', () => {
+  it('uses the configured runtime observer when CLI reporters replace the workspace reporter tuple', async () => {
+    const { createVitest } = await import('vitest/node');
+    const root = mkdtempSync(join(tmpdir(), 'cli-reporter-options-'));
+    const rows: TestRunRow[] = [];
+    const reader = vi.fn(async () => ({ schemaVersion: 1 as const, units: ['fixture-runtime'],
+      fingerprint: 'a'.repeat(64), observedAt: new Date().toISOString() }));
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'fixture', porcelain: '' }),
+      async row => { rows.push(row); });
+    const path = fileURLToPath(new URL('./admin-test-runs-reporter.ts', import.meta.url));
+    try {
+      writeFileSync(join(root, 'probe.test.ts'), 'test("runs", () => {});\n');
+      const ctx = await createVitest('test', { root, config: false, watch: false, globals: true,
+        include: ['probe.test.ts'], maxWorkers: 1, reporters: [reporter] }, {
+        test: { reporters: [[path, { readRuntimeEnvironment: reader }]] },
+      });
+      try { await ctx.start(['probe.test.ts']); } finally { await ctx.close(); }
+      expect(rows).toHaveLength(1);
+      expect(rows[0].status).toBe('pass');
+      expect(reader).toHaveBeenCalledTimes(2);
+      expect(rows[0].executionDetails?.runtimeEnvironmentBefore?.fingerprint).toBe('a'.repeat(64));
+      expect(rows[0].executionDetails?.runtimeEnvironmentAfter?.fingerprint).toBe('a'.repeat(64));
+    } finally { setRunRoot(null); rmSync(root, { recursive: true, force: true }); }
+  });
+
   async function record(
     fingerprints: Array<string | null>,
     fault?: { call: number; kind: 'error' | 'timeout' },
