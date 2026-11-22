@@ -2083,6 +2083,69 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
         }]);
       });
 
+      it.each([[499, false], [500, false], [501, false], [1001, false], [1001, true]])(
+        'recovers a lost second acknowledgement and any unsent suffix (%i files, reverse=%s)',
+        async (count, reverse) => {
+          const paths = Array.from({ length: count }, (_, index) => `selected-${index}.test.ts`);
+          const selected = reverse ? [...paths].reverse() : paths;
+          const rows = selected.map(filePath => ({
+            ...row(filePath, 'pass'), executionDetails: { ...details, filePath },
+          }));
+          const runContext = { ...context, runGroupId: 'group-a', workspaceId: 'workspace-a',
+            configurationSnapshot: captureConfigurationSnapshot({}) };
+          const database = new Map<string, TestRunReceiptReadbackCandidate>();
+          const writes: string[][] = [];
+          const sql = Object.assign((first: unknown, ...parameters: unknown[]) => {
+            if (Array.isArray(first) && !('raw' in first)) return first;
+            const query = (first as TemplateStringsArray).join('?');
+            if (query.includes('SELECT')) {
+              const paths = parameters[1] as string[];
+              return Promise.resolve(paths.flatMap(path => database.get(path) ?? []));
+            }
+            const batch = parameters[0] as Array<{ file_path: string }>;
+            writes.push(batch.map(value => value.file_path));
+            const returning = batch.map(({ file_path: filePath }) => {
+              expect(database.has(filePath)).toBe(false);
+              const id = String(database.size + 1);
+              database.set(filePath, { ...candidate, id, filePath, detailsFilePath: filePath,
+                executionDetails: { ...details, filePath } });
+              return { id, file_path: filePath };
+            });
+            if (writes.length === 2) return Promise.reject(Object.assign(new Error('lost acknowledgement'),
+              { code: 'CONNECTION_DESTROYED' }));
+            return Promise.resolve(returning);
+          }, { end: async () => undefined }) as unknown as PgSql;
+          const original = await insertTestRunRowsWithSql(sql, rows, runContext,
+            { insertTimeoutMs: 1_000, totalInsertMs: 5_000 }, () => {}, {});
+          const originalLog = original.map(entry => JSON.stringify(entry)).join('\n');
+          const pending = pendingTestRunRecoveryPaths(originalLog, selected, details.root);
+          expect(pending).toEqual(selected.slice(TEST_RUN_INSERT_BATCH_SIZE));
+          if (count > 1000) expect(original.at(-1)).toMatchObject({ outcome: 'failed',
+            reason: 'file_insert_not_submitted', replayable: true, runContext });
+
+          const recovered: TestRunReceipt[] = [];
+          for (let offset = 0; offset < pending.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
+            recovered.push(...await reconcileTimedOutTestRunReceiptsWithSql(sql, originalLog, {
+              expectedPaths: pending.slice(offset, offset + TEST_RUN_INSERT_BATCH_SIZE), expectedRoot: details.root,
+              runGroupId: 'group-a', env: {},
+            }));
+          }
+          expect(recovered.map(value => value.filePath)).toEqual(pending);
+          expect(writes.flat()).toEqual(selected);
+          expect(database.size).toBe(count);
+          if (count > 1000) {
+            // Restart with the pre-recovery spool after the last INSERT committed.
+            const restart = await reconcileTimedOutTestRunReceiptsWithSql(sql, originalLog, {
+              expectedPaths: [selected.at(-1)!], expectedRoot: details.root, runGroupId: 'group-a', env: {},
+            });
+            expect(restart).toMatchObject([{ id: String(count), filePath: selected.at(-1) }]);
+            expect(writes).toHaveLength(3);
+          }
+          const complete = [originalLog, ...recovered.map(entry => JSON.stringify(entry))].join('\n');
+          expect(pendingTestRunRecoveryPaths(complete, selected, details.root)).toEqual([]);
+        },
+      );
+
       it.each([15, TEST_CASE_INSERT_BATCH_SIZE - 1, TEST_CASE_INSERT_BATCH_SIZE,
         TEST_CASE_INSERT_BATCH_SIZE + 1, TEST_CASE_INSERT_BATCH_SIZE * 2 + 1])(
         'recovers the complete failed CONNECTION_DESTROYED packet through the consumer (%i cases)',

@@ -31,7 +31,7 @@
  * onFinished/onTaskUpdate names from Vitest 1-3 are NOT called.
  */
 
-import type { Reporter, TestCase, TestModule, TestRunEndReason, Vitest } from 'vitest/node';
+import type { Reporter, TestCase, TestModule, TestRunEndReason, TestSpecification, Vitest } from 'vitest/node';
 import { pinModuleState } from '@papercusp/module-singleton';
 import { exec, execFile, execFileSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
@@ -2102,6 +2102,8 @@ export function isMissingConfigurationSnapshotColumn(error: unknown): boolean {
 export const TEST_RUN_RECEIPT_ENV = 'PAPERCUSP_TEST_RUN_RECEIPT_FILE';
 /** Capture ordinary runs without enabling proof admission or changing write budgets. */
 export const TEST_RUN_RECOVERY_ENV = 'PAPERCUSP_TEST_RUN_RECOVERY_FILE';
+export const TEST_RUN_SHARD_MANIFEST_ENV = 'PAPERCUSP_TEST_RUN_SHARD_MANIFEST';
+const NO_FILE_INSERT_SUBMITTED = 'file_insert_not_submitted';
 
 type ReceiptIdentifiedTestRunRow = TestRunRow & { receiptId: string; receiptAttempt: number };
 export type SerializedTestRunReceiptRow = Omit<ReceiptIdentifiedTestRunRow, 'startedAt' | 'finishedAt'> & {
@@ -2672,7 +2674,7 @@ function isPreSubmitPgSetupReceipt(
   if (receipt.outcome !== 'failed'
     || !(receipt.reason === 'pg_unavailable' && isPreSubmitPgSetupFailure(receipt.pgSetupFailure)
       || (receipt.reason === 'terminal_queue_not_submitted' && receipt.replayable
-        || receipt.reason === 'git_metadata_cancelled')
+        || receipt.reason === 'git_metadata_cancelled' || receipt.reason === NO_FILE_INSERT_SUBMITTED)
         && receipt.insertDiagnostics === undefined && receipt.pgSetupFailure === undefined)
     || receipt.row.receiptId !== receipt.receiptId || receipt.row.receiptAttempt !== receipt.attempt
     || receipt.row.filePath !== receipt.filePath || receipt.row.status !== receipt.status
@@ -2834,6 +2836,8 @@ export async function insertTestRunRowsWithSql(
   // even if another in-process runner changes its environment meanwhile.
   const capturedReceiptEnv = { [TEST_RUN_RECEIPT_ENV]: receiptEnv[TEST_RUN_RECEIPT_ENV],
     [TEST_RUN_RECOVERY_ENV]: receiptEnv[TEST_RUN_RECOVERY_ENV] };
+  const unsubmitted = (sourceRows: readonly TestRunRow[]) =>
+    unwrittenReceipts(sourceRows, 'failed', NO_FILE_INSERT_SUBMITTED, { replayable: true, runContext: context });
   const deadline = Date.now() + budget.totalInsertMs;
   let columns: readonly (typeof TEST_RUN_INSERT_COLUMNS)[number][] = TEST_RUN_INSERT_COLUMNS;
   // Case rows ride behind their file rows: collected per inserted batch, written once
@@ -2980,7 +2984,7 @@ export async function insertTestRunRowsWithSql(
   for (let offset = 0; offset < identifiedRows.length; offset += TEST_RUN_INSERT_BATCH_SIZE) {
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
-      receipts.push(...unwrittenReceipts(identifiedRows.slice(offset), 'timeout', `flush_deadline_${budget.totalInsertMs}ms`));
+      receipts.push(...unsubmitted(identifiedRows.slice(offset)));
       return finish();
     }
     let sourceRows = identifiedRows.slice(offset, offset + TEST_RUN_INSERT_BATCH_SIZE);
@@ -3028,14 +3032,10 @@ export async function insertTestRunRowsWithSql(
           ? unwrittenReceipts(sourceRows, 'failed', receiptReason(failure), {
               error: failure, replayable, insertDiagnostics,
             })
-          : unwrittenReceipts(sourceRows, 'timeout', `pg_insert_timeout_${timeoutMs}ms`, { insertDiagnostics })),
+          : query ? unwrittenReceipts(sourceRows, 'timeout', `pg_insert_timeout_${timeoutMs}ms`, { insertDiagnostics })
+            : unsubmitted(sourceRows)),
         // Later batches are never attempted once one has not completed.
-        ...unwrittenReceipts(
-          identifiedRows.slice(offset + TEST_RUN_INSERT_BATCH_SIZE),
-          'failed',
-          replayable ? 'not_attempted_after_pre_submit_failure' : 'not_attempted_after_failed_batch',
-          { replayable },
-        ),
+        ...unsubmitted(identifiedRows.slice(offset + TEST_RUN_INSERT_BATCH_SIZE)),
       );
       // A timed-out query may still be in flight; queueing case rows behind it would
       // break the one-in-flight-query invariant above. Account for omitted cases,
@@ -3643,6 +3643,7 @@ export class RecordedPopulationCapture {
 
 export default class AdminTestRunsReporter implements Reporter {
   private pending: PendingTestRunRow[] = [];
+  private shardManifest: { file: string; root: string; runGroupId: string; selected: string[] } | null = null;
   /** Captured in onInit, before Vitest starts executing test modules. */
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
   /** Vitest can call both onTestRunEnd and onExit; flush rows exactly once. */
@@ -3797,6 +3798,7 @@ export default class AdminTestRunsReporter implements Reporter {
     this.flushed = false;
     this.finalFlush = null;
     this.finalizationDeadlineMs = null;
+    this.shardManifest = null;
     this.failureDetails = [];
     this.failureDetailsFlushed = false;
     this.executionContext = {
@@ -4217,13 +4219,42 @@ export default class AdminTestRunsReporter implements Reporter {
     } catch { /* Diagnostics must not change the runner's timeout or exit. */ }
   }
 
+  onTestRunStart(specifications: ReadonlyArray<TestSpecification>): void {
+    const file = process.env[TEST_RUN_SHARD_MANIFEST_ENV];
+    const context = this.executionContext;
+    if (!file || !context?.runGroupId) return;
+    try {
+      const selected = [...new Set(specifications.map(specification => toWorkspaceRel(specification.moduleId)))]
+        .filter(shouldRecordTestRunPath);
+      this.shardManifest = { file, root: context.root, runGroupId: context.runGroupId, selected };
+      this.writeShardManifest(null);
+    } catch { /* The parent reports a missing manifest as incomplete. */ }
+  }
+
+  private writeShardManifest(modules: ReadonlyArray<TestModule> | null, reason?: TestRunEndReason): void {
+    if (!this.shardManifest) return;
+    const { file, ...manifest } = this.shardManifest;
+    const outcomes = modules?.flatMap(module => {
+      const path = toWorkspaceRel(module.moduleId);
+      if (!shouldRecordTestRunPath(path)) return [];
+      let state: string;
+      try { state = module.state(); } catch { state = 'unknown'; }
+      return [{ path, state }];
+    }) ?? null;
+    try {
+      writeFileSync(`${file}.tmp`, JSON.stringify({ version: 1, ...manifest, outcomes, reason: reason ?? null }), { mode: 0o600 });
+      renameSync(`${file}.tmp`, file);
+    } catch { /* Keep the last complete manifest for parent recovery. */ }
+  }
+
   async onTestRunEnd(
-    _testModules?: ReadonlyArray<TestModule>,
+    testModules?: ReadonlyArray<TestModule>,
     unhandledErrors: ReadonlyArray<unknown> = [],
     reason?: TestRunEndReason,
   ): Promise<void> {
     return observeReporterStage('test-runs', 'onTestRunEnd', async () => {
     try {
+      this.writeShardManifest(testModules ?? null, reason);
       // WI-6554700010008757: Vitest can pass every assertion yet fail the
       // invocation with an unhandled async/stream error. Module counts remain
       // measured assertion outcomes, but those rows cannot claim passing proof.
