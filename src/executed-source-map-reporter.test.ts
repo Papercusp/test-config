@@ -1014,9 +1014,13 @@ describe('ExecutedSourceMapReporter', () => {
 
     // WI-6554700010069314: a gate lane aborted at the 4 GB heap limit while each completion snapshot
     // was hundreds of MB. Cloning the cumulative payload when a completion was QUEUED kept one full
-    // copy per completion that arrived during a slow write. Bound: one copy per write in flight, and
-    // the completions that arrive meanwhile share one later write that carries and acknowledges them.
-    it.each([1, 2, 3])('holds one snapshot copy in flight and coalesces %i completions that arrive during it', async burst => {
+    // copy per completion that arrived during a slow write; the completions that arrive meanwhile
+    // share one later write that carries and acknowledges them.
+    // WI-6554700010069671: even ONE deep copy per write in flight duplicated the whole cumulative state
+    // (GBs on gate lanes) and was the allocation that killed the lane-stateful Vitest main process
+    // (gate run 87f675e2). A write freezes its population by copying containers only: no
+    // structuredClone of the payload, and a later write carries the SAME record objects.
+    it.each([1, 2, 3])('holds no snapshot copy in flight and coalesces %i completions that arrive during it', async burst => {
       const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
       const clones = vi.spyOn(globalThis, 'structuredClone');
       let release!: () => void;
@@ -1024,13 +1028,16 @@ describe('ExecutedSourceMapReporter', () => {
       let entered!: () => void;
       const started = new Promise<void>(resolve => { entered = resolve; });
       const written: string[][] = [];
+      const writtenProofs: unknown[][] = [];
       const checkpointCopies = () => clones.mock.calls.filter(([value]) =>
         typeof value === 'object' && value !== null && 'completionCheckpoint' in value).length;
       try {
         const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
           async (path, payload) => {
-            written.push((payload as { nativeRun: { files: Array<{ completionId: string }> } })
-              .nativeRun.files.map(file => file.completionId));
+            const files = (payload as { nativeRun: { files: Array<{ completionId: string; proof: unknown }> } })
+              .nativeRun.files;
+            written.push(files.map(file => file.completionId));
+            writtenProofs.push(files.map(file => file.proof));
             if (written.length === 1) { entered(); await gate; }
             await writeExecutedSourceMapSnapshotAsync(path, payload);
           // Per-completion mode pins the one-copy coalescing invariant; spacing is covered below.
@@ -1040,14 +1047,17 @@ describe('ExecutedSourceMapReporter', () => {
         await started;
         const during = Array.from({ length: burst }, () => recorder.onTestModuleEnd(nativeModule(['passed'])));
         await new Promise(resolve => setImmediate(resolve));
-        expect(checkpointCopies()).toBe(1);
+        expect(checkpointCopies()).toBe(0);
         expect(written).toHaveLength(1);
         release();
         await Promise.all([first, ...during]);
         const ids: string[] = nativeOut().files.map((file: { completionId: string }) => file.completionId);
         expect(ids).toHaveLength(burst + 1);
         expect(written).toEqual([ids.slice(0, 1), ids]);
-        expect(checkpointCopies()).toBe(2);
+        expect(checkpointCopies()).toBe(0);
+        // Structural sharing: the second write carries the first completion's own proof record.
+        expect(writtenProofs).toHaveLength(2);
+        expect(writtenProofs[1][0]).toBe(writtenProofs[0][0]);
         const acknowledged = writes.mock.calls
           .map(([line]) => /COMPLETION_ACK ids=(\[[^\]]*\])/.exec(String(line))?.[1])
           .filter((match): match is string => match !== undefined)
@@ -1250,16 +1260,24 @@ describe('ExecutedSourceMapReporter', () => {
           return sync(fd);
         };
         syncBuiltinESMExports();
+        // EI-29610214403068136: hold the async fsync until the fork has exited (capped), not for a fixed
+        // second. Under load a forked worker can take longer than any fixed window to exit, so the proof
+        // is the ORDER: the worker exits while this write is still pending, which only a free event loop
+        // allows. A writer that blocks the loop finishes first instead (and the sync arm warns).
+        let notifyExited;
+        const exited = new Promise(resolve => { notifyExited = resolve; });
         prototype.sync = async function() {
           events.push('fsync-start');
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 10_000))]);
           return originalSync.call(this);
         };
         let notifyStop;
         const stopped = new Promise(resolve => { notifyStop = resolve; });
         const stream = new Writable({ write(chunk, encoding, done) { logs.push(String(chunk)); done(); } });
         const runner = await createVitest('test', { root, config: false, watch: false,
-          globals: true, include: ['probe.test.ts'], maxWorkers: 1, teardownTimeout: 300,
+          globals: true, include: ['probe.test.ts'], maxWorkers: 1,
+          // The sync arm blocks the loop for 1000 ms, past a 300 ms teardown; the async arm must never warn.
+          teardownTimeout: mode === 'sync' ? 300 : 10_000,
           pool: { name: 'snapshot-forks', createPoolWorker(options) {
             events.push('pool-created');
             const worker = new ForksPoolWorker(options), send = worker.send.bind(worker), stop = worker.stop.bind(worker);
@@ -1267,7 +1285,7 @@ describe('ExecutedSourceMapReporter', () => {
               send(message);
               if (message.type === 'stop') { events.push('stop-request'); notifyStop(); }
             };
-            worker.stop = async () => { await stop(); events.push('worker-exited'); };
+            worker.stop = async () => { await stop(); events.push('worker-exited'); notifyExited(); };
             return worker;
           } },
           reporters: [{ async onTestRunEnd(modules, errors, reason) {
