@@ -1202,21 +1202,29 @@ export default class ExecutedSourceMapReporter implements Reporter {
     const nativeRunState = this.nativeRun;
     if (!armed.outPath || !nativeRunState) return;
     // Synchronous with the write start: every completion recorded so far is in this payload.
-    const payload = structuredClone({
+    // WI-6554700010069671: freeze the cumulative state STRUCTURALLY, never by deep copy. The
+    // reporter only appends to these arrays and rebinds nativeRun scalars; rows, diagnostics and
+    // file records are complete when pushed (onTestModuleEnd sets proof.sourceEvidence before it
+    // yields, and flushPending awaits checkpointWrites before it mutates rows). Copying the
+    // containers therefore fixes this write's population while the records stay shared. The
+    // former structuredClone duplicated the whole cumulative state once per write (GBs on gate
+    // lanes): it was the allocation that killed the lane-stateful Vitest main process at the
+    // 4 GB heap limit (gate run 87f675e2, stack ends in node::worker::Message::Deserialize).
+    const payload = {
       workspaceName: armed.workspaceName,
-      rows: this.pending,
-      diagnostics: this.diagnostics,
-      nativeRun: nativeRunState,
+      rows: [...this.pending],
+      diagnostics: [...this.diagnostics],
+      nativeRun: { ...nativeRunState, files: [...nativeRunState.files], gaps: [...nativeRunState.gaps] },
       skipped: this.skipped,
       configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
       configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
       mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot, this.configEntries),
       completionCheckpoint: {
         ...this.completionContext,
-        state: 'partial',
+        state: 'partial' as const,
         noPersist: armed.noPersist,
       },
-    });
+    };
     const before = this.worktreeBefore ? await this.worktreeBefore : null;
     const after = await this.readWorktreeSnapshot();
     const checkpoint = {
