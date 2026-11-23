@@ -19,6 +19,12 @@ import {
   createRecordedTestPopulation,
   parseRecordedTestPopulation,
   captureRecordedProofContext,
+  captureRecordedProofContextShared,
+  captureRecordedProofContextFile,
+  combineRecordedProofContext,
+  parseRecordedProofContextShared,
+  parseRecordedProofContextFile,
+  parseRecordedSourceBytes,
   parseRecordedWorkerRuntime,
   parseRecordedWorkerCompilerInputs,
   parseRecordedWorkerExecution,
@@ -33,8 +39,12 @@ import {
   type TestRunExecutionDetails,
 } from './execution-details.ts';
 import { createProofContextIdentity, proofContextImpact, PROOF_CONTEXT_COMPONENTS,
-  observeViteTransformOptions, readViteTransformOptions } from './configuration-snapshot.ts';
-import { captureCurrentWorkerProcessIdentity, captureCurrentRuntimeCapabilities } from './runtime-proof.ts';
+  observeViteTransformOptions, readViteTransformOptions, readWorkerTestConfiguration,
+  type ProofContextIdentity } from './configuration-snapshot.ts';
+import { captureCurrentWorkerProcessIdentity, captureCurrentRuntimeCapabilities,
+  runtimeProofFingerprint } from './runtime-proof.ts';
+import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { installAppliedCompilerInputCapture, readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 
 describe('original worker process custody', () => {
@@ -402,6 +412,144 @@ describe('original result proof-context capture', () => {
       .not.toBe(before.components.population);
     expect(captureRecordedProofContext({ ...input, commitSha: 'b'.repeat(40) }).components.source)
       .not.toBe(before.components.source);
+  });
+});
+
+describe('recorded proof-context halves (WI-6554700010069681)', () => {
+  // The pre-split implementation, verbatim: the oracle the halves must match digest for digest.
+  function legacyCaptureRecordedProofContext(input: {
+    commitSha: unknown; worktreeDirty: unknown; population?: unknown; workerRuntime?: unknown;
+    sourceSubmodules?: unknown; sourceBytes?: unknown; workerTestConfiguration?: unknown;
+  }): ProofContextIdentity {
+    const components = Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, null])) as
+      ProofContextIdentity['components'];
+    const digest = (kind: string, value: unknown) => createHash('sha256')
+      .update(JSON.stringify(['recorded-proof-context-v1', kind, value])).digest('hex');
+    if (input.worktreeDirty === false && typeof input.commitSha === 'string'
+      && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.commitSha)) {
+      if (input.sourceBytes === undefined) components.source = digest('source', input.commitSha);
+      else {
+        const bytes = parseRecordedSourceBytes(input.sourceBytes);
+        if (bytes?.before && bytes.after && bytes.before.sha256 === bytes.after.sha256
+          && bytes.before.fileCount === bytes.after.fileCount) components.source = bytes.before.sha256;
+      }
+    }
+    const submodules = parseRecordedSourceSubmodules(input.sourceSubmodules);
+    if (components.source && submodules?.before !== null && submodules?.before !== undefined
+      && submodules.after !== null && JSON.stringify(submodules.before) === JSON.stringify(submodules.after))
+      components.submodules = digest('submodules', submodules.before);
+    const population = parseRecordedTestPopulation(input.population);
+    if (population) components.population = digest('population', [population.populationHash,
+      population.selectionHash, population.executionOrderHash]);
+    const worker = parseRecordedWorkerRuntime(input.workerRuntime);
+    const before = runtimeProofFingerprint(worker?.before), after = runtimeProofFingerprint(worker?.after);
+    if (before && before === after && worker?.before)
+      components.dependencies = digest('dependencies', [worker.before.lockfileSha256,
+        worker.before.nativeDependencyGeneration]);
+    const configuration = readWorkerTestConfiguration(input.workerTestConfiguration);
+    if (configuration?.before && configuration.before === configuration.after)
+      components.testConfiguration = digest('testConfiguration', configuration.before);
+    return createProofContextIdentity(components)!;
+  }
+
+  const identity: RecordedPopulationIdentity = ['unit', 'libs/x/src/a.test.ts', 'case', 1, 'test'];
+  const passed = createRecordedTestPopulation([{ identity, selected: true, outcome: 'passed' }], [identity])!;
+  const runtime = { name: 'node', version: '25.1.0', executable: '/runtime/node', platform: 'linux', arch: 'x64',
+    binarySha256: '1'.repeat(64), lockfileSha256: '2'.repeat(64), nativeDependencyGeneration: '3'.repeat(64),
+    configurationSha256: '4'.repeat(64) };
+  const pin = (fill: string, fileCount = 3) => ({ schemaVersion: 'source-bytes-v1', fileCount, sha256: fill.repeat(64) });
+  const bytes = (before: unknown, after: unknown) => ({ schemaVersion: 'source-byte-observation-v1', before, after });
+  const checkouts = (before: unknown, after: unknown) => ({ schemaVersion: 'submodule-checkouts-v1', before, after });
+  const config = (before: unknown, after: unknown) => ({ schemaVersion: 'vitest-worker-configuration-v1', before, after });
+  // One option per branch of every input, measured and damaged alike.
+  const shared = {
+    commitSha: ['a'.repeat(40), 'b'.repeat(64), 'diagnostic-only', null],
+    worktreeDirty: [false, true, undefined],
+    sourceBytes: [undefined, null, bytes(pin('c'), pin('c')), bytes(pin('c'), pin('d')), bytes(pin('c'), pin('c', 4)),
+      bytes(null, pin('c')), { ...bytes(pin('c'), pin('c')), extra: true }],
+    sourceSubmodules: [undefined,
+      checkouts([['libs/z', '1'.repeat(40)], ['libs/a', '2'.repeat(40)]], [['libs/a', '2'.repeat(40)], ['libs/z', '1'.repeat(40)]]),
+      checkouts([['libs/a', '2'.repeat(40)]], [['libs/a', 'f'.repeat(40)]]), checkouts([], []), checkouts(null, []),
+      checkouts([['libs/a', 'short']], [])],
+  };
+  const file = {
+    population: [undefined, passed, createRecordedTestPopulation([{ identity, selected: false, outcome: 'skipped' }], []),
+      { ...passed, populationHash: 'f'.repeat(64) }],
+    workerRuntime: [undefined, { before: runtime, after: { ...runtime } },
+      { before: runtime, after: { ...runtime, binarySha256: 'f'.repeat(64) } }, { before: runtime, after: null },
+      { before: runtime, after: runtime, extra: true }],
+    workerTestConfiguration: [undefined, config('1'.repeat(64), '1'.repeat(64)), config('1'.repeat(64), '2'.repeat(64)),
+      config(null, '1'.repeat(64)), { ...config('1'.repeat(64), '1'.repeat(64)), extra: true }],
+  };
+  const product = (axes: Record<string, readonly unknown[]>) => Object.entries(axes).reduce<Record<string, unknown>[]>(
+    (rows, [key, values]) => rows.flatMap(row => values.map(value => ({ ...row, [key]: value }))), [{}]);
+  const sharedRows = product(shared), fileRows = product(file);
+  const sharedReps: Record<string, unknown>[] = [{ commitSha: null, worktreeDirty: true },
+    { commitSha: 'a'.repeat(40), worktreeDirty: false },
+    { commitSha: 'a'.repeat(40), worktreeDirty: false, sourceBytes: shared.sourceBytes[2], sourceSubmodules: shared.sourceSubmodules[1] },
+    { commitSha: 'b'.repeat(64), worktreeDirty: false, sourceBytes: shared.sourceBytes[3], sourceSubmodules: shared.sourceSubmodules[3] }];
+  const fileReps: Record<string, unknown>[] = [{},
+    { population: file.population[1], workerRuntime: file.workerRuntime[1], workerTestConfiguration: file.workerTestConfiguration[1] },
+    { population: file.population[3], workerRuntime: file.workerRuntime[2], workerTestConfiguration: file.workerTestConfiguration[2] },
+    { population: file.population[2], workerRuntime: file.workerRuntime[4], workerTestConfiguration: file.workerTestConfiguration[3] }];
+
+  it('matches the pre-split capture digest for digest, and each half reads only its own inputs', () => {
+    expect(sharedRows).toHaveLength(4 * 3 * 7 * 6);
+    expect(fileRows).toHaveLength(4 * 5 * 5);
+    const pairs = [...sharedRows.flatMap(run => fileReps.map(own => [run, own] as const)),
+      ...fileRows.flatMap(own => sharedReps.map(run => [run, own] as const))];
+    const mismatches: string[] = [];
+    const measured: Record<string, number> = {};
+    for (const [run, own] of pairs) {
+      const input = { ...run, ...own } as Parameters<typeof captureRecordedProofContext>[0];
+      const oracle = legacyCaptureRecordedProofContext(input);
+      const runHalf = captureRecordedProofContextShared(input), ownHalf = captureRecordedProofContextFile(input);
+      // A stored half travels as JSON: a module record and a later state record.
+      const recombined = combineRecordedProofContext(JSON.parse(JSON.stringify(runHalf)), JSON.parse(JSON.stringify(ownHalf)));
+      if (!isDeepStrictEqual(captureRecordedProofContext(input), oracle) || !isDeepStrictEqual(recombined, oracle)
+        || !isDeepStrictEqual(runHalf, captureRecordedProofContextShared(run as never))
+        || !isDeepStrictEqual(ownHalf, captureRecordedProofContextFile(own)))
+        mismatches.push(JSON.stringify(input));
+      for (const key of PROOF_CONTEXT_COMPONENTS)
+        if (oracle.components[key] !== null) measured[key] = (measured[key] ?? 0) + 1;
+    }
+    expect(mismatches).toEqual([]);
+    // Positive control: the corpus measures every component the capture can set, and only those.
+    expect(Object.keys(measured).sort()).toEqual(['dependencies', 'population', 'source', 'submodules', 'testConfiguration']);
+  });
+
+  it('rebuilds a file identity from its once-written half against an interrupted and a terminal source observation', () => {
+    const own = { population: passed, workerRuntime: { before: runtime, after: runtime },
+      workerTestConfiguration: config('1'.repeat(64), '1'.repeat(64)) };
+    const ownHalf = JSON.parse(JSON.stringify(captureRecordedProofContextFile(own)));
+    const interrupted = { commitSha: 'a'.repeat(40), worktreeDirty: false, sourceBytes: bytes(pin('c'), pin('d')),
+      sourceSubmodules: checkouts([], null) };
+    const terminal = { commitSha: 'a'.repeat(40), worktreeDirty: false, sourceBytes: bytes(pin('c'), pin('c')),
+      sourceSubmodules: checkouts([], []) };
+    for (const run of [interrupted, terminal])
+      expect(combineRecordedProofContext(captureRecordedProofContextShared(run), ownHalf))
+        .toEqual(legacyCaptureRecordedProofContext({ ...run, ...own }));
+    expect(combineRecordedProofContext(captureRecordedProofContextShared(interrupted), ownHalf)?.components)
+      .toMatchObject({ source: null, submodules: null });
+    expect(combineRecordedProofContext(captureRecordedProofContextShared(terminal), ownHalf)?.components.submodules)
+      .toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('refuses a malformed or inconsistent stored half instead of minting an identity', () => {
+    const runHalf = captureRecordedProofContextShared({ commitSha: 'a'.repeat(40), worktreeDirty: false,
+      sourceSubmodules: checkouts([], []) });
+    const ownHalf = captureRecordedProofContextFile({ workerRuntime: { before: runtime, after: runtime } });
+    expect(runHalf.submodules).toMatch(/^[a-f0-9]{64}$/);
+    expect(combineRecordedProofContext(runHalf, ownHalf)?.components).toMatchObject({ ...runHalf, ...ownHalf });
+    for (const damaged of [undefined, null, [], {}, { ...runHalf, extra: null }, { source: runHalf.source },
+      { ...runHalf, source: 'A'.repeat(64) }, { ...runHalf, source: 1 }, { source: null, submodules: runHalf.submodules }])
+      expect(combineRecordedProofContext(damaged, ownHalf), JSON.stringify(damaged)).toBeNull();
+    for (const damaged of [undefined, null, {}, { ...ownHalf, population: undefined }, { ...ownHalf, extra: null },
+      { ...ownHalf, dependencies: 'f'.repeat(63) }])
+      expect(combineRecordedProofContext(runHalf, damaged), JSON.stringify(damaged)).toBeNull();
+    expect(parseRecordedProofContextShared({ source: null, submodules: null })).toEqual({ source: null, submodules: null });
+    expect(parseRecordedProofContextFile({ population: null, dependencies: null, testConfiguration: null }))
+      .toEqual({ population: null, dependencies: null, testConfiguration: null });
   });
 });
 

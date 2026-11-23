@@ -269,6 +269,96 @@ export function parseRecordedWorkerRuntime(value: unknown): RecordedWorkerRuntim
   return value as unknown as RecordedWorkerRuntime;
 }
 
+// WI-6554700010069681: the recorded proof context factors into a run-wide half (the source
+// observation: commit, cleanliness, byte census and submodule census) and a per-file half (the
+// file's own population and worker measurements). A reporter can keep a durable module's three
+// per-file digests instead of its proof, and a reader can rebuild the identical identity against
+// whichever source observation a later state records.
+export const RECORDED_PROOF_CONTEXT_SHARED_COMPONENTS = ['source', 'submodules'] as const;
+export const RECORDED_PROOF_CONTEXT_FILE_COMPONENTS = ['population', 'dependencies', 'testConfiguration'] as const;
+export type RecordedProofContextSharedComponents =
+  Record<(typeof RECORDED_PROOF_CONTEXT_SHARED_COMPONENTS)[number], string | null>;
+export type RecordedProofContextFileComponents =
+  Record<(typeof RECORDED_PROOF_CONTEXT_FILE_COMPONENTS)[number], string | null>;
+
+function recordedProofDigest(kind: string, value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(['recorded-proof-context-v1', kind, value])).digest('hex');
+}
+
+/** The run-wide half. A submodule census only qualifies on top of a measured source. */
+export function captureRecordedProofContextShared(input: {
+  commitSha: unknown; worktreeDirty: unknown; sourceSubmodules?: unknown; sourceBytes?: unknown;
+}): RecordedProofContextSharedComponents {
+  let source: string | null = null;
+  if (input.worktreeDirty === false && typeof input.commitSha === 'string'
+    && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.commitSha)) {
+    // Legacy rows keep their old identity. New producers always supply the
+    // observation, including explicit nulls for an unavailable census.
+    if (input.sourceBytes === undefined) source = recordedProofDigest('source', input.commitSha);
+    else {
+      const bytes = parseRecordedSourceBytes(input.sourceBytes);
+      if (bytes?.before && bytes.after && bytes.before.sha256 === bytes.after.sha256
+        && bytes.before.fileCount === bytes.after.fileCount) source = bytes.before.sha256;
+    }
+  }
+  // Arrays (even empty ones) are measured censuses; null is an unavailable one.
+  const census = parseRecordedSourceSubmodules(input.sourceSubmodules);
+  const submodules = source && census?.before && census.after
+    && JSON.stringify(census.before) === JSON.stringify(census.after)
+    ? recordedProofDigest('submodules', census.before) : null;
+  return { source, submodules };
+}
+
+/** The per-file half: the file's own population, dependency and test-configuration pins. */
+export function captureRecordedProofContextFile(input: {
+  population?: unknown; workerRuntime?: unknown; workerTestConfiguration?: unknown;
+}): RecordedProofContextFileComponents {
+  const population = parseRecordedTestPopulation(input.population);
+  const worker = parseRecordedWorkerRuntime(input.workerRuntime);
+  const before = runtimeProofFingerprint(worker?.before), after = runtimeProofFingerprint(worker?.after);
+  const configuration = readWorkerTestConfiguration(input.workerTestConfiguration);
+  return {
+    population: population ? recordedProofDigest('population', [population.populationHash,
+      population.selectionHash, population.executionOrderHash]) : null,
+    dependencies: before && before === after && worker?.before ? recordedProofDigest('dependencies',
+      [worker.before.lockfileSha256, worker.before.nativeDependencyGeneration]) : null,
+    testConfiguration: configuration?.before && configuration.before === configuration.after
+      ? recordedProofDigest('testConfiguration', configuration.before) : null,
+  };
+}
+
+function parseRecordedProofContextHalf<K extends string>(value: unknown, keys: readonly K[]):
+  Record<K, string | null> | undefined {
+  if (!isRecord(value) || Object.keys(value).length !== keys.length) return undefined;
+  const half = {} as Record<K, string | null>;
+  for (const key of keys) {
+    const digest = value[key];
+    if (!Object.hasOwn(value, key)
+      || (digest !== null && (typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)))) return undefined;
+    half[key] = digest as string | null;
+  }
+  return half;
+}
+
+/** A stored half is evidence to recombine, never authority: exact keys and digests only. */
+export function parseRecordedProofContextShared(value: unknown): RecordedProofContextSharedComponents | undefined {
+  const half = parseRecordedProofContextHalf(value, RECORDED_PROOF_CONTEXT_SHARED_COMPONENTS);
+  return half && (half.source !== null || half.submodules === null) ? half : undefined;
+}
+
+export function parseRecordedProofContextFile(value: unknown): RecordedProofContextFileComponents | undefined {
+  return parseRecordedProofContextHalf(value, RECORDED_PROOF_CONTEXT_FILE_COMPONENTS);
+}
+
+/** The identity captureRecordedProofContext returns for these halves; null when either is malformed. */
+export function combineRecordedProofContext(shared: unknown, file: unknown): ProofContextIdentity | null {
+  const run = parseRecordedProofContextShared(shared), own = parseRecordedProofContextFile(file);
+  if (!run || !own) return null;
+  const components = Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, null])) as
+    ProofContextIdentity['components'];
+  return createProofContextIdentity({ ...components, ...run, ...own });
+}
+
 /** Inputs actually measured by both reporters today. Submodule materialization
  * needs its own stable recursive census. A commit does not measure capabilities, schemas,
  * fixtures, generated assets or the selection graph. Keep those unknown until
@@ -281,37 +371,7 @@ export function captureRecordedProofContext(input: {
   sourceBytes?: unknown;
   workerTestConfiguration?: unknown;
 }): ProofContextIdentity {
-  const components = Object.fromEntries(PROOF_CONTEXT_COMPONENTS.map(key => [key, null])) as
-    ProofContextIdentity['components'];
-  const digest = (kind: string, value: unknown) => createHash('sha256')
-    .update(JSON.stringify(['recorded-proof-context-v1', kind, value])).digest('hex');
-  if (input.worktreeDirty === false && typeof input.commitSha === 'string'
-    && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.commitSha)) {
-    // Legacy rows keep their old identity. New producers always supply the
-    // observation, including explicit nulls for an unavailable census.
-    if (input.sourceBytes === undefined) components.source = digest('source', input.commitSha);
-    else {
-      const bytes = parseRecordedSourceBytes(input.sourceBytes);
-      if (bytes?.before && bytes.after && bytes.before.sha256 === bytes.after.sha256
-        && bytes.before.fileCount === bytes.after.fileCount) components.source = bytes.before.sha256;
-    }
-  }
-  const submodules = parseRecordedSourceSubmodules(input.sourceSubmodules);
-  if (components.source && submodules?.before !== null && submodules?.before !== undefined
-    && submodules.after !== null && JSON.stringify(submodules.before) === JSON.stringify(submodules.after))
-    components.submodules = digest('submodules', submodules.before);
-  const population = parseRecordedTestPopulation(input.population);
-  if (population) components.population = digest('population', [population.populationHash,
-    population.selectionHash, population.executionOrderHash]);
-  const worker = parseRecordedWorkerRuntime(input.workerRuntime);
-  const before = runtimeProofFingerprint(worker?.before), after = runtimeProofFingerprint(worker?.after);
-  if (before && before === after && worker?.before)
-    components.dependencies = digest('dependencies', [worker.before.lockfileSha256,
-      worker.before.nativeDependencyGeneration]);
-  const configuration = readWorkerTestConfiguration(input.workerTestConfiguration);
-  if (configuration?.before && configuration.before === configuration.after)
-    components.testConfiguration = digest('testConfiguration', configuration.before);
-  return createProofContextIdentity(components)!;
+  return combineRecordedProofContext(captureRecordedProofContextShared(input), captureRecordedProofContextFile(input))!;
 }
 
 function recordedProofContextMatches(value: Record<string, unknown>): boolean {
