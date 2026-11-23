@@ -4,6 +4,7 @@ import { threadId } from 'node:worker_threads';
 import { isatty } from 'node:tty';
 import { dirname, isAbsolute, join } from 'node:path';
 import { hashConfigurationValue } from '@papercusp/test-config/configuration-snapshot';
+import { pinModuleState } from '@papercusp/module-singleton';
 
 const CAPABILITY_GAPS = ['required-capability-population-unobserved', 'resource-permission-policy-unobserved',
   'native-library-inputs-unobserved', 'runtime-input-closure-unobserved'] as const;
@@ -178,12 +179,13 @@ export function runtimeProofFingerprint(identity: unknown): string | null {
 }
 
 export const PROGRESS_FORKS_POOL_NAME = 'papercusp-progress-forks';
-const FORKS_LAUNCHERS = Symbol.for('@papercusp/test-config.forks-launchers');
 type ForksLauncher = { name: string; createPoolWorker: unknown };
+// Config bundling and reporters can load separate copies in the same host, so the
+// registry is pinned through the shared primitive (reported by listModuleDuplications).
+const forksLauncherState = pinModuleState('@papercusp/test-config.forks-launchers',
+  () => ({ launchers: new WeakSet<object>() }));
 function forksLaunchers(): WeakSet<object> {
-  // Config bundling and reporters can load separate copies in the same host.
-  const host = globalThis as typeof globalThis & { [FORKS_LAUNCHERS]?: WeakSet<object> };
-  return host[FORKS_LAUNCHERS] ??= new WeakSet();
+  return forksLauncherState.launchers;
 }
 
 /** Only the maintained progress pool registers its unchanged ForksPoolWorker
