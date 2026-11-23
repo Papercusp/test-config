@@ -33,6 +33,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { open, rename, rm } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import { inputsFilePath, readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { classifyReadPaths, normalizeExecutedKey } from './executed-read-paths';
@@ -724,6 +725,47 @@ export async function writeExecutedSourceMapSnapshotAsync(path: string, payload:
 
 type SnapshotWriter = (path: string, payload: unknown) => void | Promise<void>;
 
+/** How far apart partial completion checkpoint writes run (WI-6554700010069387). */
+export interface CompletionCheckpointSpacing {
+  /** Minimum time from the end of one partial write to the start of the next. */
+  readonly minIntervalMs: number;
+  /** The interval is also at least this multiple of the last partial write's measured duration. */
+  readonly durationMultiple: number;
+}
+
+/**
+ * WI-6554700010069387. A partial write re-serializes the WHOLE cumulative snapshot (proof inputs, rows
+ * and diagnostics for every file so far): 450-900 MB on gate lanes. Writing after every completion cost
+ * O(N^2) bytes, and Vitest awaits reporter hooks before a worker moves on, so workers also waited on
+ * those writes; gate lanes ran 6-10x over their estimates. So the first completion is written at once,
+ * and each later partial write starts no sooner than max(minIntervalMs, durationMultiple x the last
+ * write's duration) after the last one ended. Completions in between ride that write, and their hooks
+ * return without waiting for it. Checkpointing then costs at most about 1/(1 + durationMultiple) of the
+ * run. A kill can lose up to one interval of completions: they have no COMPLETION_ACK, so resume
+ * re-runs them. The final write at run end is never delayed, and it acknowledges what it carries.
+ */
+export const COMPLETION_CHECKPOINT_SPACING: CompletionCheckpointSpacing =
+  Object.freeze({ minIntervalMs: 30_000, durationMultiple: 10 });
+
+/** One partial write per completion, each awaited by that completion's hook: deterministic crash windows. */
+export const COMPLETION_CHECKPOINT_EVERY_COMPLETION: CompletionCheckpointSpacing =
+  Object.freeze({ minIntervalMs: 0, durationMultiple: 0 });
+
+/** Seams for partial completion checkpoint spacing; production uses the defaults. */
+export interface CompletionCheckpointOptions {
+  spacing?: CompletionCheckpointSpacing;
+  /** Monotonic clock in milliseconds (default: performance.now). */
+  now?: () => number;
+  /** Resolves once `ms` has elapsed (default: an unref'd timer). Run end cuts the wait short. */
+  wait?: (ms: number) => Promise<void>;
+}
+
+/** The queued partial write that later completions join until it fixes its payload. */
+interface QueuedCompletionCheckpoint {
+  /** What the queuing completion's hook awaits: the write, or nothing when spacing deferred it. */
+  hookWait: Promise<void>;
+}
+
 export default class ExecutedSourceMapReporter implements Reporter {
   private readonly armed = executedSourceMapArmed();
   private readonly repoRoot = inferWorkspaceRoot();
@@ -734,7 +776,17 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
   private checkpointWrites: Promise<void> = Promise.resolve();
   /** The not-yet-started completion write that later completions join (WI-6554700010069314). */
-  private queuedCheckpoint: Promise<void> | null = null;
+  private queuedCheckpoint: QueuedCompletionCheckpoint | null = null;
+  // Partial-write spacing (WI-6554700010069387): see COMPLETION_CHECKPOINT_SPACING.
+  private readonly checkpointSpacing: CompletionCheckpointSpacing;
+  private readonly checkpointNow: () => number;
+  private readonly checkpointWait: ((ms: number) => Promise<void>) | undefined;
+  private checkpointInFlight = false;
+  private lastCheckpointEndedAtMs: number | null = null;
+  private lastCheckpointDurationMs = 0;
+  /** Ends a spaced write's wait early: at run end the final write carries its completions instead. */
+  private releaseCheckpointWait: (() => void) | null = null;
+  private finalizingCheckpoints = false;
   private acknowledgedCompletionIds = new Set<string>();
   private workerIdentities = new Map<runtimeProof.VitestWorkerProject, string | null>();
 
@@ -812,6 +864,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     writeRows?: ExecutedSourceRowWriter,
     resolveGitDir?: (repoRoot: string) => string | null,
     writeSnapshot?: SnapshotWriter,
+    checkpointOptions: CompletionCheckpointOptions = {},
   ) {
     // Vitest constructs reporters with its options object; the unit suite injects seams.
     const snapshotReader =
@@ -824,6 +877,9 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.writeRows = flush => observeReporterStage('executed-source', 'write-rows', () => rowsWriter(flush));
     this.resolveGitDir = resolveGitDir ?? resolveRecordedGitDir;
     this.writeSnapshot = writeSnapshot ?? writeExecutedSourceMapSnapshotAsync;
+    this.checkpointSpacing = checkpointOptions.spacing ?? COMPLETION_CHECKPOINT_SPACING;
+    this.checkpointNow = checkpointOptions.now ?? (() => performance.now());
+    this.checkpointWait = checkpointOptions.wait;
   }
 
   /** WI-10003715: lease on the shared PG client, so the sibling test-runs reporter's concurrent
@@ -850,8 +906,13 @@ export default class ExecutedSourceMapReporter implements Reporter {
       ? captureConfigSources(this.configDeps, { repoRoot: this.repoRoot }) : undefined;
     this.pgLease ??= retainSharedPg();
     this.worktreeBefore = this.readWorktreeSnapshot().catch(() => ({ commit: null, porcelain: null }));
+    this.releaseCheckpointWait?.();
     this.checkpointWrites = Promise.resolve();
     this.queuedCheckpoint = null;
+    this.checkpointInFlight = false;
+    this.lastCheckpointEndedAtMs = null;
+    this.lastCheckpointDurationMs = 0;
+    this.finalizingCheckpoints = false;
     this.acknowledgedCompletionIds.clear();
     this.completedInputs.clear();
     this.pending = [];
@@ -1063,22 +1124,74 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   private checkpointCompletedModules(): Promise<void> {
     const armed = this.armed;
-    if (!armed?.outPath || !this.hasUnacknowledgedCompletion()) return this.checkpointWrites;
+    // The final write at run end carries every completion; no partial write may race it.
+    if (!armed?.outPath || this.finalizingCheckpoints) return Promise.resolve();
+    const spaced = this.checkpointSpacing.minIntervalMs > 0 || this.checkpointSpacing.durationMultiple > 0;
+    if (!this.hasUnacknowledgedCompletion()) return spaced ? Promise.resolve() : this.checkpointWrites;
     // WI-6554700010069314: copy the cumulative payload when a write STARTS, never when a completion
     // queues one. Completions that arrive while a write is in flight all join the single write queued
     // behind it, so one copy is held per write in flight however large the burst. Each copy reached
     // hundreds of MB on gate lanes, and one copy per queued completion exhausted the 4 GB heap.
-    if (this.queuedCheckpoint) return this.queuedCheckpoint;
-    const queued = this.checkpointWrites.then(() => {
+    if (this.queuedCheckpoint) return this.queuedCheckpoint.hookWait;
+    // WI-6554700010069387: Vitest awaits this hook before the worker moves on, so a hook waits only for
+    // a write that starts now. A write deferred by spacing (one is in flight, or the last one ended
+    // inside the interval) carries this completion later, and the hook returns at once.
+    const deferred = spaced && (this.checkpointInFlight || this.checkpointDueInMs() > 0);
+    const queued: QueuedCompletionCheckpoint = { hookWait: Promise.resolve() };
+    const write = this.checkpointWrites.then(async () => {
+      // The previous write has ended, so its measured duration sets this write's interval.
+      const waitMs = spaced ? this.checkpointDueInMs() : 0;
+      if (waitMs > 0 && !this.finalizingCheckpoints) {
+        log(`completion checkpoint spaced ${Math.ceil(waitMs)}ms after a ${Math.round(this.lastCheckpointDurationMs)}ms write`);
+        await this.waitForCheckpointInterval(waitMs);
+      }
       // From here on a new completion must queue another write: this one's payload is fixed now.
-      this.queuedCheckpoint = null;
-      return this.hasUnacknowledgedCompletion() ? this.writeCompletionCheckpoint(armed) : undefined;
+      if (this.queuedCheckpoint === queued) this.queuedCheckpoint = null;
+      if (this.finalizingCheckpoints || !this.hasUnacknowledgedCompletion()) return;
+      await this.timedCompletionCheckpoint(armed);
     }).catch(error => {
       log(`completion checkpoint failed (${error instanceof Error ? error.message : String(error)})`);
     });
+    if (!deferred) queued.hookWait = write;
     this.queuedCheckpoint = queued;
-    this.checkpointWrites = queued;
-    return queued;
+    this.checkpointWrites = write;
+    return queued.hookWait;
+  }
+
+  /** Milliseconds until the next partial write may start; zero or less means it may start now. */
+  private checkpointDueInMs(): number {
+    if (this.lastCheckpointEndedAtMs === null) return 0;
+    const { minIntervalMs, durationMultiple } = this.checkpointSpacing;
+    const intervalMs = Math.max(minIntervalMs, durationMultiple * this.lastCheckpointDurationMs);
+    return this.lastCheckpointEndedAtMs + intervalMs - this.checkpointNow();
+  }
+
+  private async waitForCheckpointInterval(ms: number): Promise<void> {
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    this.releaseCheckpointWait = release;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const elapsed = this.checkpointWait ? this.checkpointWait(ms)
+      : new Promise<void>(resolve => { timer = setTimeout(resolve, ms); timer.unref?.(); });
+    try {
+      await Promise.race([elapsed, released]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (this.releaseCheckpointWait === release) this.releaseCheckpointWait = null;
+    }
+  }
+
+  private async timedCompletionCheckpoint(armed: NonNullable<ReturnType<typeof executedSourceMapArmed>>): Promise<void> {
+    const startedAtMs = this.checkpointNow();
+    this.checkpointInFlight = true;
+    try {
+      await this.writeCompletionCheckpoint(armed);
+    } finally {
+      const endedAtMs = this.checkpointNow();
+      this.checkpointInFlight = false;
+      this.lastCheckpointEndedAtMs = endedAtMs;
+      this.lastCheckpointDurationMs = Math.max(0, endedAtMs - startedAtMs);
+    }
   }
 
   private hasUnacknowledgedCompletion(): boolean {
@@ -1130,17 +1243,25 @@ export default class ExecutedSourceMapReporter implements Reporter {
       await this.writeSnapshot(armed.outPath!, { ...checkpoint, nativeRun });
     });
     // Acknowledge only completions this payload carried; later ones ride the next write.
-    const completionIds = payload.nativeRun.files.map(file => file.completionId)
+    this.acknowledgeCarriedCompletions(payload.nativeRun.files, armed.outPath);
+  }
+
+  private acknowledgeCarriedCompletions(files: ReadonlyArray<{ completionId: string }>, outPath: string): void {
+    const completionIds = files.map(file => file.completionId)
       .filter(completionId => !this.acknowledgedCompletionIds.has(completionId));
     for (const completionId of completionIds) this.acknowledgedCompletionIds.add(completionId);
     if (completionIds.length)
-      log(`COMPLETION_ACK ids=${JSON.stringify(completionIds)} path=${JSON.stringify(armed.outPath)}`);
+      log(`COMPLETION_ACK ids=${JSON.stringify(completionIds)} path=${JSON.stringify(outPath)}`);
   }
 
   private async flushPending(): Promise<void> {
     if (!this.armed || this.flushed) return;
     this.flushed = true;
     this.discardCompletedInputs();
+    // The final write below carries every completion. A spaced partial write that has not started is
+    // skipped, never waited out; one already writing finishes first, so its rename cannot land after ours.
+    this.finalizingCheckpoints = true;
+    this.releaseCheckpointWait?.();
     await observeReporterStage('executed-source', 'completion-checkpoints', () => this.checkpointWrites);
     const rows = this.pending.splice(0);
     for (const [project, identity] of this.workerIdentities) {
@@ -1195,6 +1316,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
             configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
             mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot, this.configEntries) },
         );
+        // Completions a spaced partial write had not yet carried are durable now.
+        if (this.nativeRun) this.acknowledgeCarriedCompletions(this.nativeRun.files, this.armed.outPath);
       } catch (e) {
         log(`out-file write failed (${e instanceof Error ? e.message : String(e)}) ${summary}`);
       }

@@ -1,7 +1,8 @@
 import fs, { readFileSync, writeSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import type { TestModule, TestSpecification, Vitest } from 'vitest/node';
-import ExecutedSourceMapReporter, { writeExecutedSourceMapSnapshot } from '../../executed-source-map-reporter.ts';
+import ExecutedSourceMapReporter, { COMPLETION_CHECKPOINT_EVERY_COMPLETION, writeExecutedSourceMapSnapshot }
+  from '../../executed-source-map-reporter.ts';
 
 function interrupt(phase: string): void {
   const signal = process.env.PC_COMPLETION_CRASH_SIGNAL;
@@ -72,7 +73,9 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
         syncBuiltinESMExports();
       }
       if (checkpoint.nativeRun.files.length === 3 && phase === 'committed-before-ack') interrupt(phase);
-    });
+    // Each crash window targets one exact per-completion write (the first bank, the 3-file write), so this
+    // fixture writes after every completion. Production spaces partial writes (WI-6554700010069387).
+    }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
   }
 
   override async onTestModuleEnd(testModule: TestModule): Promise<void> {

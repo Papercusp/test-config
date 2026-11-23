@@ -21,6 +21,8 @@ import { observeViteTransformOptions, readViteTransformOptions } from './configu
 import { installAppliedCompilerInputCapture, readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 import { inputsFilePath, PC_EXECUTED_INPUTS_DIR_ENV } from './executed-inputs-capture';
 import ExecutedSourceMapReporter, {
+  COMPLETION_CHECKPOINT_EVERY_COMPLETION,
+  COMPLETION_CHECKPOINT_SPACING,
   EXECUTED_SOURCE_MAP_FLUSH_TIMEOUT_MS,
   appendExecutedSourceMapResult,
   captureConfigSources,
@@ -358,11 +360,12 @@ describe('ExecutedSourceMapReporter', () => {
     } as unknown as TestModule;
   }
 
-  function reporter(snap = snapshot(clean), gitDir: string | null = GIT_DIR) {
+  function reporter(snap = snapshot(clean), gitDir: string | null = GIT_DIR,
+    checkpointOptions?: ConstructorParameters<typeof ExecutedSourceMapReporter>[4]) {
     const flushes: ExecutedSourceFlush[] = [];
     const r = new ExecutedSourceMapReporter(snap, async (flush) => {
       flushes.push(flush);
-    }, () => gitDir);
+    }, () => gitDir, undefined, checkpointOptions);
     return { r, flushes };
   }
 
@@ -859,7 +862,8 @@ describe('ExecutedSourceMapReporter', () => {
       });
 
     it('saves passing, failing and infrastructure outcomes with their proofs before suite end', async () => {
-      const { r, flushes } = reporter();
+      // Per-completion mode: this pins what each partial write carries. Spaced writes are covered below.
+      const { r, flushes } = reporter(snapshot(clean), GIT_DIR, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
       r.onInit({} as never);
       for (const state of ['passed', 'failed', 'error']) {
         await r.onTestModuleEnd(nativeModule([state === 'passed' ? 'passed' : 'failed'], state));
@@ -915,7 +919,7 @@ describe('ExecutedSourceMapReporter', () => {
             writeExecutedSourceMapSnapshot(path, payload);
             const saved = JSON.parse(readFileSync(path, 'utf8'));
             savedIds.push(saved.nativeRun.files.at(-1).completionId);
-          });
+          }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
         recorder.onInit({} as never);
         await recorder.onTestModuleEnd(nativeModule(['passed']));
         await recorder.onTestModuleEnd(nativeModule(['failed'], 'failed'));
@@ -936,7 +940,7 @@ describe('ExecutedSourceMapReporter', () => {
           async (path, payload) => {
             if (failWrite) throw new Error('injected write failure');
             await writeExecutedSourceMapSnapshotAsync(path, payload);
-          });
+          }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
         recorder.onInit({} as never);
         await recorder.onTestModuleEnd(nativeModule(['passed']));
         const previous = readFileSync(join(tmp, 'out.json'), 'utf8');
@@ -1029,7 +1033,8 @@ describe('ExecutedSourceMapReporter', () => {
               .nativeRun.files.map(file => file.completionId));
             if (written.length === 1) { entered(); await gate; }
             await writeExecutedSourceMapSnapshotAsync(path, payload);
-          });
+          // Per-completion mode pins the one-copy coalescing invariant; spacing is covered below.
+          }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
         recorder.onInit({} as never);
         const first = recorder.onTestModuleEnd(nativeModule(['passed']));
         await started;
@@ -1053,6 +1058,173 @@ describe('ExecutedSourceMapReporter', () => {
         clones.mockRestore();
         writes.mockRestore();
       }
+    });
+
+    // WI-6554700010069387: a partial write re-serializes the whole cumulative snapshot (450-900 MB on gate
+    // lanes), and Vitest awaits this hook before a worker moves on. After the first completion, partial
+    // writes are spaced; completions in between ride the next one and their hooks do not wait for it.
+    describe('spaced completion checkpoints', () => {
+      const INTERVAL_MS = COMPLETION_CHECKPOINT_SPACING.minIntervalMs;
+
+      function spacedRecorder(options: { writeMs?: number; holdFirstWrite?: Promise<void> } = {}) {
+        let clock = 1_000;
+        let firstWriteStarted!: () => void;
+        const started = new Promise<void>(resolve => { firstWriteStarted = resolve; });
+        const waits: Array<{ ms: number; elapse: () => void }> = [];
+        const written: string[][] = [];
+        const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
+          async (path, payload) => {
+            written.push((payload as { nativeRun: { files: Array<{ completionId: string }> } })
+              .nativeRun.files.map(file => file.completionId));
+            if (written.length === 1) { firstWriteStarted(); await options.holdFirstWrite; }
+            clock += options.writeMs ?? 2_000; // the measured duration of this write
+            await writeExecutedSourceMapSnapshotAsync(path, payload);
+          },
+          { spacing: COMPLETION_CHECKPOINT_SPACING, now: () => clock,
+            wait: ms => new Promise<void>(resolve => { waits.push({ ms, elapse: resolve }); }) });
+        return { recorder, written, waits, started, advance: (ms: number) => { clock += ms; } };
+      }
+      const ackedIds = (writes: { mock: { calls: ReadonlyArray<ReadonlyArray<unknown>> } }) => writes.mock.calls
+        .map(([line]) => /COMPLETION_ACK ids=(\[[^\]]*\])/.exec(String(line))?.[1])
+        .filter((match): match is string => match !== undefined)
+        .map(match => JSON.parse(match) as string[]);
+      const completionIds = (): string[] => nativeOut().files.map((file: { completionId: string }) => file.completionId);
+      const settle = () => new Promise(resolve => setImmediate(resolve));
+
+      it('writes the first completion at once, and its hook waits for that write', async () => {
+        const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+        const { recorder, written, waits } = spacedRecorder();
+        await recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        expect(written).toEqual([completionIds()]);
+        expect(ackedIds(writes)).toEqual([completionIds()]);
+        expect(waits).toEqual([]);
+      });
+
+      it.each([
+        { offsetMs: -1, deferred: true },
+        { offsetMs: 0, deferred: false },
+        { offsetMs: 1, deferred: false },
+      ])('a completion $offsetMs ms past the interval end is deferred: $deferred', async ({ offsetMs, deferred }) => {
+        const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+        const { recorder, written, waits, advance } = spacedRecorder();
+        await recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        advance(INTERVAL_MS + offsetMs);
+        let returned = false;
+        const second = recorder.onTestModuleEnd(nativeModule(['failed'], 'failed')).then(() => { returned = true; });
+        await settle();
+        if (deferred) {
+          // The hook returned without waiting, nothing is written inside the interval, and the spaced
+          // write waits out exactly the rest of it.
+          expect(returned).toBe(true);
+          expect(written).toHaveLength(1);
+          expect(waits.map(wait => wait.ms)).toEqual([-offsetMs]);
+          waits[0]!.elapse();
+          await vi.waitFor(() => expect(ackedIds(writes)).toHaveLength(2));
+        }
+        await second;
+        const ids = completionIds();
+        expect(written).toEqual([ids.slice(0, 1), ids]);
+        expect(ackedIds(writes)).toEqual([ids.slice(0, 1), ids.slice(1)]);
+        if (!deferred) expect(waits).toEqual([]);
+      });
+
+      it.each([1, 2, 3])('%i completions inside one interval ride one spaced write', async count => {
+        const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+        const { recorder, written, waits, advance } = spacedRecorder();
+        await recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        advance(5_000);
+        for (let index = 0; index < count; index += 1) await recorder.onTestModuleEnd(nativeModule(['passed']));
+        await settle();
+        // Every hook returned with nothing written: ONE spaced write is queued, not one per completion.
+        expect(written).toHaveLength(1);
+        expect(waits.map(wait => wait.ms)).toEqual([INTERVAL_MS - 5_000]);
+        waits[0]!.elapse();
+        await vi.waitFor(() => expect(ackedIds(writes)).toHaveLength(2));
+        const ids = completionIds();
+        expect(ids).toHaveLength(count + 1);
+        expect(written).toEqual([ids.slice(0, 1), ids]);
+        expect(ackedIds(writes)).toEqual([ids.slice(0, 1), ids.slice(1)]);
+      });
+
+      it('scales the interval with the last write\'s duration', async () => {
+        const { recorder, waits, advance } = spacedRecorder({ writeMs: 7_000 });
+        await recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        advance(20_000);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        await settle();
+        // max(30 s, 10 x 7 s) = 70 s after the first write ended, of which 20 s have passed.
+        expect(waits.map(wait => wait.ms)).toEqual([50_000]);
+      });
+
+      it('completions during an in-flight write ride a spaced write after it, and wait for neither', async () => {
+        const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+        let release!: () => void;
+        const hold = new Promise<void>(resolve => { release = resolve; });
+        const { recorder, written, waits, started } = spacedRecorder({ holdFirstWrite: hold });
+        await recorder.onInit({} as never);
+        const first = recorder.onTestModuleEnd(nativeModule(['passed']));
+        await started;
+        await recorder.onTestModuleEnd(nativeModule(['failed'], 'failed'));
+        expect(written).toHaveLength(1);
+        release();
+        await first;
+        await settle();
+        expect(waits.map(wait => wait.ms)).toEqual([INTERVAL_MS]);
+        waits[0]!.elapse();
+        await vi.waitFor(() => expect(ackedIds(writes)).toHaveLength(2));
+        const ids = completionIds();
+        expect(written).toEqual([ids.slice(0, 1), ids]);
+        expect(ackedIds(writes)).toEqual([ids.slice(0, 1), ids.slice(1)]);
+      });
+
+      it('run end skips the spaced write: the final write carries and acknowledges every completion', async () => {
+        const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+        const { recorder, written, waits } = spacedRecorder();
+        await recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        await recorder.onTestModuleEnd(nativeModule(['failed'], 'failed'));
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        await settle();
+        expect(waits).toHaveLength(1);
+        await recorder.onTestRunEnd(); // never waits out the interval: the wait above is never elapsed
+        const final = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+        const ids: string[] = final.nativeRun.files.map((file: { completionId: string }) => file.completionId);
+        expect(ids).toHaveLength(3);
+        expect(final.completionCheckpoint.state).toBe('terminal');
+        // The first partial write and the final write only: no partial write raced the final one.
+        expect(written).toEqual([ids.slice(0, 1), ids]);
+        expect(ackedIds(writes)).toEqual([ids.slice(0, 1), ids.slice(1)]);
+      });
+
+      it('a kill inside the interval leaves the deferred completions off disk and unacknowledged', async () => {
+        const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+        const { recorder, waits } = spacedRecorder();
+        await recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        await recorder.onTestModuleEnd(nativeModule(['failed'], 'failed'));
+        await settle();
+        // The process dies here, before the spaced write: resume re-runs exactly the unacknowledged one.
+        expect(waits).toHaveLength(1);
+        const onDisk = completionIds();
+        expect(onDisk).toHaveLength(1);
+        expect(ackedIds(writes)).toEqual([onDisk]);
+      });
+
+      it('a new run writes its first completion at once, whatever the previous run last wrote', async () => {
+        const { recorder, written, waits } = spacedRecorder();
+        await recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        await recorder.onTestRunEnd();
+        await recorder.onInit({} as never);
+        await recorder.onTestModuleEnd(nativeModule(['passed']));
+        expect(waits).toEqual([]);
+        expect(written).toHaveLength(3);
+        expect(completionIds()).toHaveLength(1);
+      });
     });
 
     it('allows real Vitest fork shutdown during delayed snapshot fsync', async () => {
@@ -1167,7 +1339,7 @@ describe('ExecutedSourceMapReporter', () => {
     it.each(['SIGTERM', 'SIGKILL'] as const)('recovers exactly committed outcome/proof pairs after owned %s interruptions', signal => {
       const script = `
         import { readFileSync, writeFileSync, writeSync } from 'node:fs';
-        import Reporter, { writeExecutedSourceMapSnapshot } from ${JSON.stringify(new URL('./executed-source-map-reporter.ts', import.meta.url).href)};
+        import Reporter, { COMPLETION_CHECKPOINT_EVERY_COMPLETION, writeExecutedSourceMapSnapshot } from ${JSON.stringify(new URL('./executed-source-map-reporter.ts', import.meta.url).href)};
         const [phase, signal, outPath] = process.argv.slice(1);
         process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE = '@papercusp/test-config';
         process.env.PC_EXECUTED_SOURCE_MAP_OUT = outPath;
@@ -1181,7 +1353,7 @@ describe('ExecutedSourceMapReporter', () => {
             writeExecutedSourceMapSnapshot(path, payload);
             if (payload.nativeRun.files.length === 3 && phase === 'committed-before-ack')
               process.kill(process.pid, signal);
-          });
+          }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
         recorder.onInit({});
         recorder.onTestRunStart(['passed', 'failed', 'error'].map(state => ({
           moduleId: process.cwd() + '/fixtures/' + state + '.test.ts', project: {name: 'crash-window'}, pool: 'forks'
