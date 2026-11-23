@@ -1268,7 +1268,10 @@ describe('ExecutedSourceMapReporter', () => {
         const exited = new Promise(resolve => { notifyExited = resolve; });
         prototype.sync = async function() {
           events.push('fsync-start');
-          await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 10_000))]);
+          let cap;
+          await Promise.race([exited, new Promise(resolve => { cap = setTimeout(resolve, 10_000); })]);
+          // WI-6554700010069703: an uncleared cap holds this process open for the full 10 s after the race.
+          clearTimeout(cap);
           return originalSync.call(this);
         };
         let notifyStop;
@@ -1296,10 +1299,16 @@ describe('ExecutedSourceMapReporter', () => {
             events.push('snapshot-end');
           } }],
         }, undefined, { stdout: stream, stderr: stream });
+        // WI-6554700010069703: the fork pool pipes the child's stdio into this stream and ENDS it when the
+        // child closes stdio, so a teardown warning logged after that never reaches logs. Record logger.error.
+        const loggedErrors = [], logError = runner.logger.error.bind(runner.logger);
+        runner.logger.error = (...args) => { loggedErrors.push(args.map(String).join(' ')); return logError(...args); };
         try { await runner.start(); } finally { await runner.close(); }
         const { completionIntegrity, ...body } = JSON.parse(fs.readFileSync(join(root, mode + '.json'), 'utf8'));
-        console.log(JSON.stringify({ mode, events, body, completionIntegrity,
-          warning: logs.join('').includes('Timeout terminating snapshot-forks worker') }));
+        const timeoutWarning = 'Timeout terminating snapshot-forks worker';
+        console.log(JSON.stringify({ mode, events, body, completionIntegrity, loggedErrors,
+          streamWarning: logs.join('').includes(timeoutWarning),
+          warning: loggedErrors.some(message => message.includes(timeoutWarning)) }));
       `);
       const results = [];
       for (const mode of ['sync', 'async']) {
