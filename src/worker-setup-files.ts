@@ -16,6 +16,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const FAIL_ON_CONSOLE_SETUP = resolve(__dirname, 'setup-fail-on-console.ts');
 export const HERMETIC_ENV_SETUP = resolve(__dirname, 'setup-hermetic-env.ts');
+// WI-6554700010069310: withholds the runner's durable-evidence env from each test file and
+// restores it afterwards. See the file's own doc comment for why hooks, not a module-level delete.
+export const DURABLE_EVIDENCE_ENV_SETUP = resolve(__dirname, 'setup-durable-evidence-env.ts');
 // EI-19311807188719573: unit-layer-only rail forbidding a real Postgres connection.
 // See the file's own doc comment for why it guards the consequence (a live pool) rather
 // than the cause (an un-memoized dynamic import under concurrency).
@@ -40,6 +43,7 @@ export const EXECUTED_INPUTS_CAPTURE_SETUP = resolve(__dirname, 'executed-inputs
 export const WORKER_SETUP_FILE_PATHS: readonly string[] = [
   FAIL_ON_CONSOLE_SETUP,
   HERMETIC_ENV_SETUP,
+  DURABLE_EVIDENCE_ENV_SETUP,
   NO_REAL_PG_SETUP,
   NO_LIVE_PG_SETUP,
   TESTING_LIBRARY_TIMEOUT_SETUP,

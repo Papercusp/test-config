@@ -1008,6 +1008,53 @@ describe('ExecutedSourceMapReporter', () => {
       }
     });
 
+    // WI-6554700010069314: a gate lane aborted at the 4 GB heap limit while each completion snapshot
+    // was hundreds of MB. Cloning the cumulative payload when a completion was QUEUED kept one full
+    // copy per completion that arrived during a slow write. Bound: one copy per write in flight, and
+    // the completions that arrive meanwhile share one later write that carries and acknowledges them.
+    it.each([1, 2, 3])('holds one snapshot copy in flight and coalesces %i completions that arrive during it', async burst => {
+      const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const clones = vi.spyOn(globalThis, 'structuredClone');
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const written: string[][] = [];
+      const checkpointCopies = () => clones.mock.calls.filter(([value]) =>
+        typeof value === 'object' && value !== null && 'completionCheckpoint' in value).length;
+      try {
+        const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
+          async (path, payload) => {
+            written.push((payload as { nativeRun: { files: Array<{ completionId: string }> } })
+              .nativeRun.files.map(file => file.completionId));
+            if (written.length === 1) { entered(); await gate; }
+            await writeExecutedSourceMapSnapshotAsync(path, payload);
+          });
+        recorder.onInit({} as never);
+        const first = recorder.onTestModuleEnd(nativeModule(['passed']));
+        await started;
+        const during = Array.from({ length: burst }, () => recorder.onTestModuleEnd(nativeModule(['passed'])));
+        await new Promise(resolve => setImmediate(resolve));
+        expect(checkpointCopies()).toBe(1);
+        expect(written).toHaveLength(1);
+        release();
+        await Promise.all([first, ...during]);
+        const ids: string[] = nativeOut().files.map((file: { completionId: string }) => file.completionId);
+        expect(ids).toHaveLength(burst + 1);
+        expect(written).toEqual([ids.slice(0, 1), ids]);
+        expect(checkpointCopies()).toBe(2);
+        const acknowledged = writes.mock.calls
+          .map(([line]) => /COMPLETION_ACK ids=(\[[^\]]*\])/.exec(String(line))?.[1])
+          .filter((match): match is string => match !== undefined)
+          .map(match => JSON.parse(match) as string[]);
+        expect(acknowledged).toEqual([ids.slice(0, 1), ids.slice(1)]);
+      } finally {
+        release();
+        clones.mockRestore();
+        writes.mockRestore();
+      }
+    });
+
     it('allows real Vitest fork shutdown during delayed snapshot fsync', async () => {
       const require = createRequire(import.meta.url);
       writeFileSync(join(tmp, 'probe.test.ts'), 'test("tiny fork", () => expect(true).toBe(true));\n');

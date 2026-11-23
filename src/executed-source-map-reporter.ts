@@ -733,6 +733,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
   private readonly writeSnapshot: SnapshotWriter;
   private worktreeBefore: Promise<WorktreeGitSnapshot> | null = null;
   private checkpointWrites: Promise<void> = Promise.resolve();
+  /** The not-yet-started completion write that later completions join (WI-6554700010069314). */
+  private queuedCheckpoint: Promise<void> | null = null;
   private acknowledgedCompletionIds = new Set<string>();
   private workerIdentities = new Map<runtimeProof.VitestWorkerProject, string | null>();
 
@@ -849,6 +851,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     this.pgLease ??= retainSharedPg();
     this.worktreeBefore = this.readWorktreeSnapshot().catch(() => ({ commit: null, porcelain: null }));
     this.checkpointWrites = Promise.resolve();
+    this.queuedCheckpoint = null;
     this.acknowledgedCompletionIds.clear();
     this.completedInputs.clear();
     this.pending = [];
@@ -1060,14 +1063,37 @@ export default class ExecutedSourceMapReporter implements Reporter {
 
   private checkpointCompletedModules(): Promise<void> {
     const armed = this.armed;
-    if (!armed?.outPath || !this.nativeRun?.files.length ||
-      this.nativeRun.files.every(file => this.acknowledgedCompletionIds.has(file.completionId)))
-      return this.checkpointWrites;
+    if (!armed?.outPath || !this.hasUnacknowledgedCompletion()) return this.checkpointWrites;
+    // WI-6554700010069314: copy the cumulative payload when a write STARTS, never when a completion
+    // queues one. Completions that arrive while a write is in flight all join the single write queued
+    // behind it, so one copy is held per write in flight however large the burst. Each copy reached
+    // hundreds of MB on gate lanes, and one copy per queued completion exhausted the 4 GB heap.
+    if (this.queuedCheckpoint) return this.queuedCheckpoint;
+    const queued = this.checkpointWrites.then(() => {
+      // From here on a new completion must queue another write: this one's payload is fixed now.
+      this.queuedCheckpoint = null;
+      return this.hasUnacknowledgedCompletion() ? this.writeCompletionCheckpoint(armed) : undefined;
+    }).catch(error => {
+      log(`completion checkpoint failed (${error instanceof Error ? error.message : String(error)})`);
+    });
+    this.queuedCheckpoint = queued;
+    this.checkpointWrites = queued;
+    return queued;
+  }
+
+  private hasUnacknowledgedCompletion(): boolean {
+    return !!this.nativeRun?.files.some(file => !this.acknowledgedCompletionIds.has(file.completionId));
+  }
+
+  private async writeCompletionCheckpoint(armed: NonNullable<ReturnType<typeof executedSourceMapArmed>>): Promise<void> {
+    const nativeRunState = this.nativeRun;
+    if (!armed.outPath || !nativeRunState) return;
+    // Synchronous with the write start: every completion recorded so far is in this payload.
     const payload = structuredClone({
       workspaceName: armed.workspaceName,
       rows: this.pending,
       diagnostics: this.diagnostics,
-      nativeRun: this.nativeRun,
+      nativeRun: nativeRunState,
       skipped: this.skipped,
       configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
       configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
@@ -1078,41 +1104,37 @@ export default class ExecutedSourceMapReporter implements Reporter {
         noPersist: armed.noPersist,
       },
     });
-    this.checkpointWrites = this.checkpointWrites.then(async () => {
-      const before = this.worktreeBefore ? await this.worktreeBefore : null;
-      const after = await this.readWorktreeSnapshot();
-      const checkpoint = {
-        ...payload,
-        recordedSha: after.commit,
-        sourceSnapshot: before,
-        recordedGitDir: this.resolveGitDir(this.repoRoot),
-        worktreeDirty: before === null || computeWorktreeDirty(before, after),
-      };
-      const nativeRun = { ...checkpoint.nativeRun, files: checkpoint.nativeRun.files.map(file => ({ ...file,
-        sourceBytes: { schemaVersion: 'source-byte-observation-v1' as const,
+    const before = this.worktreeBefore ? await this.worktreeBefore : null;
+    const after = await this.readWorktreeSnapshot();
+    const checkpoint = {
+      ...payload,
+      recordedSha: after.commit,
+      sourceSnapshot: before,
+      recordedGitDir: this.resolveGitDir(this.repoRoot),
+      worktreeDirty: before === null || computeWorktreeDirty(before, after),
+    };
+    const nativeRun = { ...checkpoint.nativeRun, files: checkpoint.nativeRun.files.map(file => ({ ...file,
+      sourceBytes: { schemaVersion: 'source-byte-observation-v1' as const,
+        before: before?.sourceBytes ?? null, after: after.sourceBytes ?? null },
+      sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1' as const,
+        before: before?.submodules ?? null, after: after.submodules ?? null },
+      proofContext: captureRecordedProofContext({ commitSha: checkpoint.recordedSha,
+        worktreeDirty: checkpoint.worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime,
+        workerTestConfiguration: file.proof.inputs?.testConfiguration,
+        sourceBytes: { schemaVersion: 'source-byte-observation-v1',
           before: before?.sourceBytes ?? null, after: after.sourceBytes ?? null },
-        sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1' as const,
-          before: before?.submodules ?? null, after: after.submodules ?? null },
-        proofContext: captureRecordedProofContext({ commitSha: checkpoint.recordedSha,
-          worktreeDirty: checkpoint.worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime,
-          workerTestConfiguration: file.proof.inputs?.testConfiguration,
-          sourceBytes: { schemaVersion: 'source-byte-observation-v1',
-            before: before?.sourceBytes ?? null, after: after.sourceBytes ?? null },
-          sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1',
-            before: before?.submodules ?? null, after: after.submodules ?? null } }),
-      })) };
-      await observeReporterStage('executed-source', 'completion-snapshot', async () => {
-        await this.writeSnapshot(armed.outPath!, { ...checkpoint, nativeRun });
-      });
-      const completionIds = payload.nativeRun.files.map(file => file.completionId)
-        .filter(completionId => !this.acknowledgedCompletionIds.has(completionId));
-      for (const completionId of completionIds) this.acknowledgedCompletionIds.add(completionId);
-      if (completionIds.length)
-        log(`COMPLETION_ACK ids=${JSON.stringify(completionIds)} path=${JSON.stringify(armed.outPath)}`);
-    }).catch(error => {
-      log(`completion checkpoint failed (${error instanceof Error ? error.message : String(error)})`);
+        sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1',
+          before: before?.submodules ?? null, after: after.submodules ?? null } }),
+    })) };
+    await observeReporterStage('executed-source', 'completion-snapshot', async () => {
+      await this.writeSnapshot(armed.outPath!, { ...checkpoint, nativeRun });
     });
-    return this.checkpointWrites;
+    // Acknowledge only completions this payload carried; later ones ride the next write.
+    const completionIds = payload.nativeRun.files.map(file => file.completionId)
+      .filter(completionId => !this.acknowledgedCompletionIds.has(completionId));
+    for (const completionId of completionIds) this.acknowledgedCompletionIds.add(completionId);
+    if (completionIds.length)
+      log(`COMPLETION_ACK ids=${JSON.stringify(completionIds)} path=${JSON.stringify(armed.outPath)}`);
   }
 
   private async flushPending(): Promise<void> {

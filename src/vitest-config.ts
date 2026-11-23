@@ -26,6 +26,7 @@ import { installAppliedCompilerInputCapture } from './applied-compiler-inputs.ts
 import { createProgressForksPool } from './worker-progress-pool.ts';
 import type { PoolRunnerInitializer } from 'vitest/node';
 import {
+  DURABLE_EVIDENCE_ENV_SETUP,
   EXECUTED_INPUTS_CAPTURE_SETUP,
   FAIL_ON_CONSOLE_SETUP,
   HANDLE_LEAK_SETUP,
@@ -736,12 +737,14 @@ export function defineVitestConfig(opts: DefineVitestConfigOptions): UserConfig 
         }] as [string, Record<string, unknown>]
       : reporter);
   const finalSetup = allowConsoleNoise
-    ? [...inputsCaptureSetup, ...layerSetup, ...leakSetup, HERMETIC_ENV_SETUP, TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
+    ? [...inputsCaptureSetup, ...layerSetup, ...leakSetup, HERMETIC_ENV_SETUP, DURABLE_EVIDENCE_ENV_SETUP,
+        TESTING_LIBRARY_TIMEOUT_SETUP, ...setupFiles]
     : [
         ...inputsCaptureSetup,
         ...layerSetup,
         ...leakSetup,
         HERMETIC_ENV_SETUP,
+        DURABLE_EVIDENCE_ENV_SETUP,
         FAIL_ON_CONSOLE_SETUP,
         TESTING_LIBRARY_TIMEOUT_SETUP,
         ...setupFiles,
