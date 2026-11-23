@@ -120,9 +120,11 @@ describe('parent worker inactivity recovery', () => {
       try { await vitest(['--reporter=default', '--reporter=json'], join(root, 'dropped.json')); }
       catch (error) { failed = error as typeof failed; }
       const output = `${failed?.stdout}\n${failed?.stderr}`;
-      expect(failed?.code).toBe(1);
-      expect(output).toContain(missingWorkerProgressReporterMessage().slice(0, 60));
-      expect(output).not.toContain('Vitest worker made no test progress:');
+      // Vitest truncates a long `actual`, so every failure must name the child's own output.
+      const tail = `child exit=${failed?.code} output tail:\n${output.slice(-3000)}`;
+      expect(failed?.code, tail).toBe(1);
+      expect(output, tail).toContain(missingWorkerProgressReporterMessage().slice(0, 60));
+      expect(output, tail).not.toContain('Vitest worker made no test progress:');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 90_000);
 });
