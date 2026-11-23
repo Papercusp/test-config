@@ -5,7 +5,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createWorkerProgressLease } from './worker-progress-pool.ts';
+import WorkerProgressReporter, {
+  createWorkerProgressLease, hasWorkerProgressReporter, missingWorkerProgressReporterMessage,
+} from './worker-progress-pool.ts';
 
 const run = promisify(execFile);
 const source = fileURLToPath(new URL('./worker-progress-pool.ts', import.meta.url));
@@ -77,4 +79,50 @@ describe('parent worker inactivity recovery', () => {
       expect(healthy.assertionResults.every((test: { status: string }) => test.status === 'passed')).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 60_000);
+
+  it('recognises its reporter by path or inline instance, and nothing else', () => {
+    expect(hasWorkerProgressReporter([['default', {}], [source, {}]])).toBe(true);
+    expect(hasWorkerProgressReporter([['libs/test-config/src/worker-progress-pool.ts', {}]])).toBe(true);
+    expect(hasWorkerProgressReporter([new WorkerProgressReporter()])).toBe(true);
+    expect(hasWorkerProgressReporter([['json', {}], ['default', {}]])).toBe(false);
+    expect(hasWorkerProgressReporter([[source.replace(/\.ts$/, '.test.ts'), {}]])).toBe(false);
+    expect(hasWorkerProgressReporter([])).toBe(false);
+    expect(hasWorkerProgressReporter(undefined)).toBe(false);
+  });
+
+  // EI-29609516155497675: a CLI --reporter replaces the configured reporters but not the
+  // configured pool. The lease then measured elapsed time and reaped a healthy file.
+  it('fails fast, naming the fix, when a CLI reporter drops its partner reporter', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'worker-progress-cli-'));
+    try {
+      writeFileSync(join(root, 'healthy.test.ts'), `import { it } from 'vitest';
+        for (let i = 0; i < 8; i++) it('progress ' + i, async () => {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        });`);
+      const config = join(root, 'vitest.config.mjs');
+      writeFileSync(config, `
+        import { createProgressForksPool } from ${JSON.stringify(source)};
+        export default { test: { root: ${JSON.stringify(root)}, include: ['*.test.ts'],
+          pool: createProgressForksPool({ idleTimeoutMs: 2000 }), testTimeout: 20000,
+          reporters: ['default', ${JSON.stringify(source)}] } };`);
+      const vitest = (reporters: string[], outputFile: string) => run(process.execPath,
+        [cli, 'run', '--configLoader', 'native', '--config', config, ...reporters, `--outputFile=${outputFile}`],
+        { cwd: root, env: { ...process.env, GREEN_CHECKPOINT: '0' }, timeout: 45_000, maxBuffer: 200_000 });
+
+      // Control: with the partner reporter selected, 4s of tests outlive the 2s idle budget.
+      const kept = join(root, 'kept.json');
+      await vitest(['--reporter=default', '--reporter=json', `--reporter=${source}`], kept);
+      const result = JSON.parse(readFileSync(kept, 'utf8'));
+      expect(result.numPassedTests).toBe(8);
+
+      let failed: { code?: number; stdout?: string; stderr?: string } | undefined;
+      // The router's injected shape: human output plus a private JSON report, partner dropped.
+      try { await vitest(['--reporter=default', '--reporter=json'], join(root, 'dropped.json')); }
+      catch (error) { failed = error as typeof failed; }
+      const output = `${failed?.stdout}\n${failed?.stderr}`;
+      expect(failed?.code).toBe(1);
+      expect(output).toContain(missingWorkerProgressReporterMessage().slice(0, 60));
+      expect(output).not.toContain('Vitest worker made no test progress:');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 90_000);
 });

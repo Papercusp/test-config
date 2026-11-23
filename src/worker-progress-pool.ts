@@ -1,5 +1,6 @@
-import { relative } from 'node:path';
+import { basename, relative } from 'node:path';
 import { EventEmitter } from 'node:events';
+import { fileURLToPath } from 'node:url';
 import { ForksPoolWorker, type PoolOptions, type PoolRunnerInitializer, type PoolWorker,
   type Reporter, type TestCase, type TestModule, type TestProject } from 'vitest/node';
 import { historicalTestTimeout } from './test-timeout-history.ts';
@@ -16,6 +17,31 @@ interface WorkerProgress {
 function workers(project: TestProject): Set<WorkerProgress> {
   const target = project as TestProject & { [WORKERS]?: Set<WorkerProgress> };
   return target[WORKERS] ??= new Set();
+}
+
+const PROGRESS_REPORTER_PATH = fileURLToPath(import.meta.url);
+/** Marks a reporter instance passed inline (not by path); shared across module copies. */
+const PROGRESS_REPORTER: unique symbol = Symbol.for('@papercusp/test-config.worker-progress-reporter');
+
+/** Whether Vitest's resolved reporters include this module's reporter, the only
+ * thing that advances a worker's lease. A CLI `--reporter` REPLACES the configured
+ * reporters (vitest 4.1.8 resolveConfig) while the configured pool survives. A lease
+ * nothing can advance measures elapsed time, not inactivity, so it would reap a
+ * healthy file once its first budget elapsed (EI-29609516155497675). */
+export function hasWorkerProgressReporter(reporters: readonly unknown[] | undefined): boolean {
+  return (reporters ?? []).some((entry) => {
+    const reporter = Array.isArray(entry) ? entry[0] : entry;
+    if (typeof reporter === 'string') return basename(reporter) === basename(PROGRESS_REPORTER_PATH);
+    return typeof reporter === 'object' && reporter !== null && PROGRESS_REPORTER in reporter;
+  });
+}
+
+export function missingWorkerProgressReporterMessage(): string {
+  return `${PROGRESS_FORKS_POOL_NAME} cannot measure worker progress: its reporter `
+    + `(${PROGRESS_REPORTER_PATH}) is not among the active reporters. A CLI --reporter replaces `
+    + `the configured reporters, so add --reporter=${PROGRESS_REPORTER_PATH} `
+    + '(npm run test:file adds it under GREEN_CHECKPOINT=1) or run without GREEN_CHECKPOINT=1. '
+    + 'Refusing to arm a lease that would fail healthy tests by elapsed time.';
 }
 
 /** A parent-owned inactivity timer. Only this worker's lifecycle can reset it;
@@ -101,6 +127,13 @@ export function createProgressForksPool({ idleTimeoutMs }: { idleTimeoutMs?: num
         },
         send(message) {
           if (message.type === 'run' || message.type === 'collect') {
+            if (!hasWorkerProgressReporter(options.project.vitest.config.reporters)) {
+              // Fail closed now, naming the fix, rather than fail a healthy file later.
+              const error = new Error(missingWorkerProgressReporterMessage());
+              options.project.vitest.state.catchError(error, 'Worker progress reporter missing');
+              events.emit('error', error);
+              return;
+            }
             progress.files = new Set(message.context.files.map(file => file.filepath));
             workers(options.project).add(progress);
             progress.advance(Math.max(...[...progress.files].map(file => fileBudget(options.project, file)), 180_000));
@@ -124,6 +157,7 @@ function advance(module: TestModule, caseTimeout = 0): void {
 }
 
 export default class WorkerProgressReporter implements Reporter {
+  readonly [PROGRESS_REPORTER] = true;
   onTestModuleQueued(module: TestModule): void { advance(module); }
   onTestModuleCollected(module: TestModule): void { advance(module); }
   onTestModuleStart(module: TestModule): void { advance(module); }
