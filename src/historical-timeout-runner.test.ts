@@ -88,4 +88,44 @@ describe('history-derived native Vitest execution', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it('measures a case on the real clock: advancing fake timers past the budget is not a timeout', async () => {
+    // Gate red 2026-11-23: compaction-compliance-watchdog advanced default fake timers
+    // by an hour and restored them in afterEach. The runner's post-return elapsed
+    // check read the FAKED global performance clock and reported "timed out in
+    // 180000ms" for a case that ran in milliseconds. The fixture mirrors that shape:
+    // the fake clock is still installed when the case returns.
+    const root = mkdtempSync(join(tmpdir(), 'historical-vitest-fake-clock-'));
+    try {
+      writeFileSync(join(root, 'fixture.test.ts'), `
+        import { it, expect, vi, afterEach } from 'vitest';
+        afterEach(() => { vi.useRealTimers(); });
+        it('advances fake time by an hour', () => {
+          vi.useFakeTimers();
+          const start = performance.now();
+          vi.advanceTimersByTime(60 * 60_000);
+          // Positive control: default fake timers really move the global performance clock.
+          expect(performance.now() - start).toBeGreaterThanOrEqual(60 * 60_000);
+        });
+      `);
+      const outputFile = join(root, 'result.json');
+      writeFileSync(join(root, 'vitest.config.mjs'), `export default { test: {
+        root: ${JSON.stringify(root)}, include: ['fixture.test.ts'],
+        runner: ${JSON.stringify(runner)}, pool: 'forks', maxWorkers: 1,
+        testTimeout: 1, hookTimeout: 1000,
+        provide: { papercuspTestLayer: 'unit' },
+        reporters: ['default', 'json'], outputFile: ${JSON.stringify(outputFile)}
+      } };`);
+      await run(process.execPath, [cli, 'run', '--configLoader', 'native', '--config', join(root, 'vitest.config.mjs')], {
+        cwd: root, env: { ...process.env, GREEN_CHECKPOINT: '0' }, maxBuffer: 200_000,
+      }).catch(() => undefined); // the verdict is read from the JSON report, not the exit code
+      const result = JSON.parse(readFileSync(outputFile, 'utf8'));
+      const failures = result.testResults[0].assertionResults.flatMap((test: { failureMessages: string[] }) => test.failureMessages);
+      // Joined so a regression prints the runner's message (e.g. "Test timed out in 180000ms").
+      expect(failures.join('\n')).toBe('');
+      expect(result.numPassedTests).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

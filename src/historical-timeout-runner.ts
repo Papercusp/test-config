@@ -1,4 +1,5 @@
 import { relative } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { setTimeout, clearTimeout } from 'node:timers';
 import { VitestTestRunner } from 'vitest/runners';
 import type { RunnerTestCase, RunnerTestFile, TestContext } from 'vitest';
@@ -11,6 +12,15 @@ import { testTimingRuntimeIdentity, type TestTimeoutHistorySnapshot } from './te
  * and the SAME cancellation signal consumed by Vitest's fixture/assertion wrapper.
  * Explicit author-supplied timeouts still apply. No run-level timer is installed.
  */
+/**
+ * This runner's clock for a case's elapsed time, bound when the runner loads, before any
+ * test can install fake timers. Vitest's default `vi.useFakeTimers()` replaces the global
+ * `performance`, so reading it after a case that advanced fake time (and restores real
+ * timers only in afterEach) reported "timed out" for a case that ran in milliseconds
+ * (gate red 2026-11-23, compaction-compliance-watchdog: an hour of fake time > 180s).
+ */
+const realNow = performance.now.bind(performance);
+
 export default class HistoricalTimeoutRunner extends VitestTestRunner {
   private readonly controllers = new WeakMap<RunnerTestCase, AbortController>();
   private readonly budgets = new WeakMap<RunnerTestCase, HistoricalTestTimeout>();
@@ -79,7 +89,7 @@ export default class HistoricalTimeoutRunner extends VitestTestRunner {
     // explicit author limit, so history must not silently shorten it.
     const timeoutMs = test.timeout || budget.timeoutMs;
     const controller = this.controllers.get(test)!;
-    const started = performance.now();
+    const started = realNow();
     const timeout = () => controller.abort(new Error(
       `Test timed out in ${timeoutMs}ms (${budget.basis}): ${test.fullTestName}`,
     ));
@@ -88,7 +98,7 @@ export default class HistoricalTimeoutRunner extends VitestTestRunner {
     try {
       await VitestTestRunner.getTestFn(test)();
       // A microtask-only loop can starve timers and still eventually return.
-      if (performance.now() - started >= timeoutMs) {
+      if (realNow() - started >= timeoutMs) {
         timeout();
         throw controller.signal.reason;
       }
