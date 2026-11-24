@@ -7,8 +7,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   appendCompletionCheckpoint, appendCompletionCheckpointSync, closeCompletionJournal, closeCompletionJournalSync,
-  completionFileProofInputs, createCompletionJournal, createCompletionJournalSync, readCompletionSnapshotSync,
-  type CompletionJournalView,
+  completionFileProofInputs, completionPayloadFromBytes, createCompletionJournal, createCompletionJournalSync,
+  readCompletionSnapshotSync, type CompletionJournalView,
 } from '../../../scripts/lib/completion-journal.mjs';
 import { completionSnapshotChunks } from '../../../scripts/lib/completion-snapshot.mjs';
 import { captureRecordedProofContext, createRecordedTestPopulation } from './execution-details.ts';
@@ -219,6 +219,35 @@ describe('completion journal (WI-6554700010069681)', () => {
     expect(readJournal(cut).integrity.acceptedBytes).toBe(commits.at(-2));
   });
 
+  it('parses captured OUT bytes of either format exactly as the file reader does (custody and native receipts)', () => {
+    const path = join(dir, 'bytes.json'), cut = join(dir, 'bytes-cut.json');
+    const journal = createCompletionJournalSync(path, { run: 'run-bytes', pid: 7, startedAtMs: 1 });
+    const views = [makeView(2), makeView(5, { skipped: 1 }), makeView(7, { skipped: 2, terminal: true })];
+    const commits = views.map((view, index) =>
+      appendCompletionCheckpointSync(journal, view, { final: index === views.length - 1 }).acceptedBytes);
+    closeCompletionJournalSync(journal);
+    const bytes = readFileSync(path);
+    const expected = readJournal(path).snapshot;
+    expect(completionPayloadFromBytes(bytes)).toStrictEqual(expected);
+    expect(completionPayloadFromBytes(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength))).toStrictEqual(expected);
+    for (const size of [1, 2, 63, 64, 65]) expect(completionPayloadFromBytes(bytes, size), `chunk ${size}`).toStrictEqual(expected);
+    // A torn tail folds to the acknowledged prefix, as the file reader folds it.
+    for (const end of [commits[0]! + 1, commits[1]!, bytes.length - 1]) {
+      writeFileSync(cut, bytes.subarray(0, end));
+      expect(completionPayloadFromBytes(bytes.subarray(0, end)), `cut at ${end}`).toStrictEqual(readJournal(cut).snapshot);
+    }
+    // v1 bytes stay one JSON document.
+    const v1 = Buffer.from([...completionSnapshotChunks(v1Snapshot(views[2]!, true))].join(''));
+    expect(completionPayloadFromBytes(v1)).toStrictEqual(JSON.parse(v1.toString('utf8')));
+    // No committed batch, damage before the tail, bytes that are no OUT, and a non-byte argument all throw.
+    expect(() => completionPayloadFromBytes(bytes.subarray(0, commits[0]! - 1))).toThrow(/no committed batch/);
+    const damaged = Buffer.from(bytes), offset = lineStarts(bytes)[1]! + 40;
+    damaged[offset] = damaged[offset]! ^ 0x01;
+    expect(() => completionPayloadFromBytes(damaged)).toThrow(/corrupt/);
+    expect(() => completionPayloadFromBytes(Buffer.from('{'))).toThrow(SyntaxError);
+    expect(() => completionPayloadFromBytes('{}' as unknown as Uint8Array)).toThrow(TypeError);
+  });
+
   it('replaces a journal atomically on restart: the old writer stops, mixed runs are refused, other formats stay explicit', async () => {
     const path = join(dir, 'restart.json');
     expect(readCompletionSnapshotSync(path)).toEqual({ format: 'absent' });
@@ -228,10 +257,11 @@ describe('completion journal (WI-6554700010069681)', () => {
     appendCompletionCheckpointSync(first, makeView(2));
     const firstBytes = readFileSync(path);
     const second = await createCompletionJournal(path, { run: 'run-b', pid: 22, startedAtMs: 2 });
-    expect(readJournal(path).snapshot).toBeNull();
+    // Unpublished until its first commit: the first run's journal still answers at the path.
+    expect(readJournal(path).integrity.run).toBe('run-a');
+    await appendCompletionCheckpoint(second, makeView(1));
     expect(() => appendCompletionCheckpointSync(first, makeView(3))).toThrow(/replaced/);
     expect(first.poisoned).toBeInstanceOf(Error);
-    await appendCompletionCheckpoint(second, makeView(1));
     const read = readJournal(path);
     expect(read.integrity.run).toBe('run-b');
     expect(read.stats.pid).toBe(22);
@@ -243,6 +273,65 @@ describe('completion journal (WI-6554700010069681)', () => {
     expect(() => readCompletionSnapshotSync(path)).toThrow(/mixed run ids/);
     writeFileSync(path, [...completionSnapshotChunks(v1Snapshot(makeView(2), false))].join(''));
     expect(readCompletionSnapshotSync(path).format).toBe('v1');
+  });
+
+  it('publishes the journal only with its first commit, so a crash or failure before it leaves the path absent', async () => {
+    const temporaries = () => fs.readdirSync(dir).filter(name => name.endsWith('.journal-tmp'));
+    const abandoned = join(dir, 'abandoned.json');
+    const never = createCompletionJournalSync(abandoned, { run: 'run-7', pid: 1, startedAtMs: 1 });
+    expect(readCompletionSnapshotSync(abandoned)).toEqual({ format: 'absent' });
+    expect(never.unpublished).toMatch(/\.journal-tmp$/);
+    expect(temporaries()).toHaveLength(1);
+    closeCompletionJournalSync(never);
+    expect(temporaries()).toEqual([]);
+    expect(readCompletionSnapshotSync(abandoned)).toEqual({ format: 'absent' });
+
+    // A first batch that fails to write, or to rename into place, is cut back and stays unpublished.
+    const path = join(dir, 'first.json');
+    const journal = createCompletionJournalSync(path, { run: 'run-8', pid: 1, startedAtMs: 1 });
+    const headerBytes = journal.bytes;
+    const originalWrite = fs.writeSync, originalRename = fs.renameSync;
+    try {
+      fs.writeSync = ((descriptor: number, ...rest: unknown[]) => {
+        if (descriptor === journal.fd) throw new Error('disk full');
+        return (originalWrite as (...a: unknown[]) => number)(descriptor, ...rest);
+      }) as typeof fs.writeSync;
+      syncBuiltinESMExports();
+      expect(() => appendCompletionCheckpointSync(journal, makeView(2))).toThrow(/disk full/);
+      fs.writeSync = originalWrite;
+      fs.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+        if (from === journal.unpublished) throw new Error('rename refused');
+        originalRename(from, to);
+      }) as typeof fs.renameSync;
+      syncBuiltinESMExports();
+      expect(() => appendCompletionCheckpointSync(journal, makeView(2))).toThrow(/rename refused/);
+    } finally {
+      fs.writeSync = originalWrite;
+      fs.renameSync = originalRename;
+      syncBuiltinESMExports();
+    }
+    expect(readCompletionSnapshotSync(path)).toEqual({ format: 'absent' });
+    expect(statSync(journal.unpublished!).size).toBe(headerBytes);
+    expect(journal.poisoned).toBeNull();
+    expect(journal.commits).toBe(0);
+    appendCompletionCheckpointSync(journal, makeView(2));
+    expect(journal.unpublished).toBeNull();
+    expect(temporaries()).toEqual([]);
+    expect(withoutIntegrity(readJournal(path).snapshot)).toStrictEqual(v1ReadBack(makeView(2), false));
+    appendCompletionCheckpointSync(journal, makeView(3, { terminal: true }), { final: true });
+    closeCompletionJournalSync(journal);
+    expect(withoutIntegrity(readJournal(path).snapshot)).toStrictEqual(v1ReadBack(makeView(3, { terminal: true }), true));
+
+    const later = join(dir, 'async.json');
+    const asyncJournal = await createCompletionJournal(later, { run: 'run-9', pid: 1, startedAtMs: 1 });
+    expect(readCompletionSnapshotSync(later)).toEqual({ format: 'absent' });
+    await appendCompletionCheckpoint(asyncJournal, makeView(1));
+    expect(readJournal(later).integrity.run).toBe('run-9');
+    await closeCompletionJournal(asyncJournal);
+    const asyncAbandoned = join(dir, 'async-abandoned.json');
+    await closeCompletionJournal(await createCompletionJournal(asyncAbandoned, { run: 'run-10', pid: 1, startedAtMs: 1 }));
+    expect(readCompletionSnapshotSync(asyncAbandoned)).toEqual({ format: 'absent' });
+    expect(temporaries()).toEqual([]);
   });
 
   it('cuts a failed batch back off, so the next batch continues a clean chain', () => {
