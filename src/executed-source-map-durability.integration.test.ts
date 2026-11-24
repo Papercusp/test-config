@@ -1,10 +1,10 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import * as runtimeProof from '../../../scripts/lib/runtime-compatibility.mjs';
 
@@ -14,8 +14,10 @@ const vitest = join(dirname(createRequire(import.meta.url).resolve('vitest/packa
 const directories: string[] = [];
 const expectedFiles = ['armed-capture/sample.armed-fixture.ts', 'case-ledger/cases.case-fixture.ts',
   'durable-completion/collection-error.fixture.ts'];
-const crashWindows = ['before-commit', 'file-synced-before-rename', 'committed-before-ack',
+// WI-6554700010069681: windows of the completion journal's append (crash-reporter.fixture.ts).
+const crashWindows = ['batch-partially-written', 'written-before-fsync', 'committed-before-ack',
   'acknowledged-before-kill'];
+const completionJournalModule = pathToFileURL(join(repoRoot, 'scripts/lib/completion-journal.mjs')).href;
 
 async function runFixture(env: NodeJS.ProcessEnv) {
   const child = spawn(process.execPath, [vitest, 'run', '--root', fixture,
@@ -92,14 +94,20 @@ describe('atomic completion through the real Vitest lifecycle', () => {
       expect(child.signal, output).toBe(signal);
       expect(output).toContain(`REAL_COMPLETION_WRITE_INTERRUPTED phase=${phase} signal=${signal}`);
       expect(existsSync(resultPath), output).toBe(false);
+      // A fresh process reads what reached the file: the crashed writer's memory cannot help it.
       const recovery = spawnSync(process.execPath, ['--input-type=module', '-e',
-        "import {readFileSync} from 'node:fs'; process.stdout.write(readFileSync(process.argv[1], 'utf8'));", outPath],
+        `import {readCompletionSnapshotSync} from ${JSON.stringify(completionJournalModule)};`
+          + ' process.stdout.write(JSON.stringify(readCompletionSnapshotSync(process.argv[1])));', outPath],
       { encoding: 'utf8', timeout: 10_000 });
       expect(recovery.status, recovery.stderr).toBe(0);
-      const checkpoint = JSON.parse(recovery.stdout);
-      const { completionIntegrity, ...body } = checkpoint;
-      expect(completionIntegrity).toEqual({ schemaVersion: 1,
-        sha256: createHash('sha256').update(JSON.stringify(body)).digest('hex') });
+      const read = JSON.parse(recovery.stdout);
+      expect(read.format).toBe('journal');
+      const checkpoint = read.snapshot;
+      const { completionIntegrity } = checkpoint;
+      expect(completionIntegrity).toMatchObject({ schemaVersion: 2, journal: 'completion-journal-v1', final: false });
+      expect(completionIntegrity).toEqual(read.integrity);
+      // Only the torn batch leaves bytes past the last commit; the reader drops and reports them.
+      expect(completionIntegrity.tailBytes > 0).toBe(phase === 'batch-partially-written');
       const files = checkpoint.nativeRun.files as Array<{ testFile: string; completionId: string;
         observedAtMs: number; state: string;
         proof: { inputs: { testFile: string; reads: string[]; opaque: string[];
@@ -118,14 +126,11 @@ describe('atomic completion through the real Vitest lifecycle', () => {
         expect(specification).toMatchObject({ testNamePattern: null, testLines: null, testIds: null,
           testTagsFilter: null });
       }
-      const beforeRename = phase === 'before-commit' || phase === 'file-synced-before-rename';
-      expect(files).toHaveLength(beforeRename ? 2 : 3);
-      const temporaries = readdirSync(directory).filter(file => file.startsWith('out.json.') && file.endsWith('.tmp'));
-      expect(temporaries).toHaveLength(beforeRename ? 1 : 0);
-      if (phase === 'before-commit')
-        expect(readFileSync(join(directory, temporaries[0]!), 'utf8')).toBe('{"nativeRun":');
-      if (phase === 'file-synced-before-rename')
-        expect(JSON.parse(readFileSync(join(directory, temporaries[0]!), 'utf8')).nativeRun.files).toHaveLength(3);
+      // Bytes written before the kill are in the file even unsynced (a process crash keeps the page cache),
+      // so only the torn batch loses the third completion.
+      expect(files).toHaveLength(phase === 'batch-partially-written' ? 2 : 3);
+      // The journal renames its header into place once; no crash window leaves a temporary behind.
+      expect(readdirSync(directory).filter(file => file.endsWith('.journal-tmp') || file.endsWith('.tmp'))).toEqual([]);
       const acknowledgmentIds = [...output.matchAll(/COMPLETION_ACK ids=(\[[^\n]+?\]) path=/g)]
         .flatMap(match => JSON.parse(match[1]!) as string[]);
       expect(acknowledgmentIds).toHaveLength(phase === 'acknowledged-before-kill' ? 3 : 2);
@@ -133,7 +138,7 @@ describe('atomic completion through the real Vitest lifecycle', () => {
         expect(files.filter(file => file.completionId === completionId)).toHaveLength(1);
       expect(new Set(files.map(file => file.completionId)).size).toBe(files.length);
       const unacknowledged = files.filter(file => !acknowledgmentIds.includes(file.completionId));
-      expect(unacknowledged).toHaveLength(phase === 'committed-before-ack' ? 1 : 0);
+      expect(unacknowledged).toHaveLength(phase === 'committed-before-ack' || phase === 'written-before-fsync' ? 1 : 0);
       expect(files.filter(file => file.proof.inputs !== null).length).toBeGreaterThan(0);
       for (const file of files) {
         expect(selected.some(specification => specification.testFile === file.testFile)).toBe(true);
@@ -189,7 +194,7 @@ describe('atomic completion through the real Vitest lifecycle', () => {
           else expect(source.sha256).toMatch(/^[a-f0-9]{64}$/);
         }
       }
-      if (!beforeRename) {
+      if (phase !== 'batch-partially-written') {
         expect(files.filter(file => file.state === 'passed')).toHaveLength(1);
         expect(files.filter(file => file.testFile.endsWith('cases.case-fixture.ts') && file.state !== 'passed')).toHaveLength(1);
         expect(files.filter(file => file.testFile.endsWith('collection-error.fixture.ts') && file.state !== 'passed')).toHaveLength(1);

@@ -1,8 +1,11 @@
-import fs, { readFileSync, writeSync } from 'node:fs';
+import fs, { writeSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import type { TestModule, TestSpecification, Vitest } from 'vitest/node';
-import ExecutedSourceMapReporter, { COMPLETION_CHECKPOINT_EVERY_COMPLETION, writeExecutedSourceMapSnapshot }
-  from '../../executed-source-map-reporter.ts';
+import ExecutedSourceMapReporter, { COMPLETION_CHECKPOINT_EVERY_COMPLETION } from '../../executed-source-map-reporter.ts';
+import {
+  appendCompletionCheckpointSync, closeCompletionJournalSync, createCompletionJournalSync, readCompletionSnapshotSync,
+  type CompletionJournal,
+} from '../../../../../scripts/lib/completion-journal.mjs';
 
 function interrupt(phase: string): void {
   const signal = process.env.PC_COMPLETION_CRASH_SIGNAL;
@@ -10,6 +13,12 @@ function interrupt(phase: string): void {
   writeSync(2, `REAL_COMPLETION_WRITE_INTERRUPTED phase=${phase} signal=${signal}\n`);
   process.removeAllListeners(signal);
   process.kill(process.pid, signal);
+}
+
+/** The folded completion snapshot at the armed out path, or null before its first commit. */
+function durableSnapshot(): { nativeRun: { files: unknown[] } } | null {
+  const read = readCompletionSnapshotSync(process.env.PC_EXECUTED_SOURCE_MAP_OUT!);
+  return read.format === 'journal' || read.format === 'v1' ? read.snapshot : null;
 }
 
 export default class CrashReporter extends ExecutedSourceMapReporter {
@@ -44,35 +53,48 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
   }
 
   constructor() {
-    super(undefined, undefined, undefined, (path, payload) => {
-      const checkpoint = payload as { nativeRun: { files: unknown[] } };
+    // The production journal format through its synchronous primitives, so each crash window can stop the
+    // process at an exact point of the real append (WI-6554700010069681). No substitute file is written.
+    const journals = new Map<string, CompletionJournal>();
+    super(undefined, undefined, undefined, (path, view, { final }) => {
       const phase = process.env.PC_COMPLETION_CRASH_WINDOW;
-      const originalWrite = fs.writeFileSync;
+      let journal = journals.get(path);
+      if (!journal) {
+        journal = createCompletionJournalSync(path);
+        journals.set(path, journal);
+      }
+      const fd = journal.fd;
+      const originalWrite = fs.writeSync;
       const originalSync = fs.fsyncSync;
-      if (checkpoint.nativeRun.files.length === 3) {
-        // Intercept the real writer's descriptor, after its exclusive temporary
-        // file has opened. No substitute writer or unrelated scratch file is used.
-        fs.writeFileSync = (file, data, options) => {
-          if (typeof file === 'number' && phase === 'before-commit') {
-            originalWrite(file, '{"nativeRun":');
+      if (view.nativeRun.files.length === 3) {
+        // Intercept the real journal's descriptor during the batch that commits the third completion.
+        let writes = 0;
+        fs.writeSync = ((descriptor: number, buffer: NodeJS.ArrayBufferView, offset?: number, length?: number) => {
+          if (descriptor === fd && phase === 'batch-partially-written' && ++writes === 2) {
+            // One whole record of the batch, then half of the next: an uncommitted batch with a torn tail.
+            originalWrite(descriptor, buffer, offset ?? 0, Math.max(1, Math.floor((length ?? buffer.byteLength) / 2)));
             interrupt(phase);
           }
-          originalWrite(file, data, options);
-        };
+          return originalWrite(descriptor, buffer, offset, length);
+        }) as typeof fs.writeSync;
         fs.fsyncSync = descriptor => {
+          if (descriptor === fd && phase === 'written-before-fsync') interrupt(phase);
           originalSync(descriptor);
-          if (phase === 'file-synced-before-rename') interrupt(phase);
         };
         syncBuiltinESMExports();
       }
       try {
-        writeExecutedSourceMapSnapshot(path, payload);
+        appendCompletionCheckpointSync(journal, view, { final });
       } finally {
-        fs.writeFileSync = originalWrite;
+        fs.writeSync = originalWrite;
         fs.fsyncSync = originalSync;
         syncBuiltinESMExports();
+        if (final) {
+          journals.delete(path);
+          closeCompletionJournalSync(journal);
+        }
       }
-      if (checkpoint.nativeRun.files.length === 3 && phase === 'committed-before-ack') interrupt(phase);
+      if (view.nativeRun.files.length === 3 && phase === 'committed-before-ack') interrupt(phase);
     // Each crash window targets one exact per-completion write (the first bank, the 3-file write), so this
     // fixture writes after every completion. Production spaces partial writes (WI-6554700010069387).
     }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
@@ -81,8 +103,7 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
   override async onTestModuleEnd(testModule: TestModule): Promise<void> {
     await super.onTestModuleEnd(testModule);
     if (process.env.PC_COMPLETION_CRASH_WINDOW === 'primary-yield') {
-      const checkpoint = JSON.parse(readFileSync(process.env.PC_EXECUTED_SOURCE_MAP_OUT!, 'utf8'));
-      if (checkpoint.nativeRun.files.length === 1) {
+      if (durableSnapshot()?.nativeRun.files.length === 1) {
         if (!process.connected || !process.send) throw new Error('primary yield fixture requires parent IPC');
         process.send({ kind: 'native-first-bank-ready', pid: process.pid });
         // Keep the unfinished selection pending while the real parent boundary
@@ -91,11 +112,9 @@ export default class CrashReporter extends ExecutedSourceMapReporter {
       }
     }
     if (process.env.PC_COMPLETION_CRASH_WINDOW === 'after-first-bank') {
-      const checkpoint = JSON.parse(readFileSync(process.env.PC_EXECUTED_SOURCE_MAP_OUT!, 'utf8'));
-      if (checkpoint.nativeRun.files.length === 1) interrupt('after-first-bank');
+      if (durableSnapshot()?.nativeRun.files.length === 1) interrupt('after-first-bank');
     }
     if (process.env.PC_COMPLETION_CRASH_WINDOW !== 'acknowledged-before-kill') return;
-    const checkpoint = JSON.parse(readFileSync(process.env.PC_EXECUTED_SOURCE_MAP_OUT!, 'utf8'));
-    if (checkpoint.nativeRun.files.length === 3) interrupt('acknowledged-before-kill');
+    if (durableSnapshot()?.nativeRun.files.length === 3) interrupt('acknowledged-before-kill');
   }
 }

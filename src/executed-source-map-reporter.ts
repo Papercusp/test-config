@@ -32,7 +32,6 @@ import type { Reporter, TestCase, TestModule, TestRunEndReason, TestSpecificatio
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { open, rename, rm } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { inputsFilePath, readInputsRecord, PC_EXECUTED_INPUTS_DIR_ENV, type InputsRecord } from './executed-inputs-capture';
 import { dirname, isAbsolute, resolve } from 'node:path';
@@ -40,6 +39,8 @@ import { classifyReadPaths, normalizeExecutedKey } from './executed-read-paths';
 export { classifyReadPaths, normalizeExecutedKey } from './executed-read-paths';
 import * as runtimeProof from './runtime-proof.ts';
 import { completionSnapshotChunks } from '../../../scripts/lib/completion-snapshot.mjs';
+import { appendCompletionCheckpoint, closeCompletionJournal, createCompletionJournal,
+  type CompletionJournal, type CompletionJournalView } from '../../../scripts/lib/completion-journal.mjs';
 
 import {
   captureWorktreeSnapshot,
@@ -58,7 +59,6 @@ import {
   type WorktreeGitSnapshot,
 } from './admin-test-runs-reporter';
 import type { RecordedTestPopulation, PopulationCaptureStatus, RecordedSourceSubmodules, RecordedSourceBytes } from './execution-details';
-import { captureRecordedProofContext } from './execution-details';
 import { readViteTransformOptions } from './configuration-snapshot.ts';
 import { readAppliedCompilerInputs } from './applied-compiler-inputs.ts';
 import { executedSourceMapArmed, PC_EXECUTED_SOURCE_ORIGINAL_META, readExecutedSourceOriginals,
@@ -690,6 +690,11 @@ export function appendExecutedSourceMapResult(resultPath: string | null, result:
   }
 }
 
+/**
+ * Writes one v1 snapshot document (temporary file, fsync, rename). The reporter no longer writes v1: it
+ * appends completion-journal-v1 (WI-6554700010069681). Readers still accept v1, and tests build v1
+ * documents with this.
+ */
 export function writeExecutedSourceMapSnapshot(path: string, payload: unknown): void {
   const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
   let descriptor: number | undefined;
@@ -706,24 +711,30 @@ export function writeExecutedSourceMapSnapshot(path: string, payload: unknown): 
   }
 }
 
-/** Keep disk synchronization off the controller's fork-stop callback path. */
-export async function writeExecutedSourceMapSnapshotAsync(path: string, payload: unknown): Promise<void> {
-  const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
-  let descriptor: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    descriptor = await open(temporary, 'wx', 0o600);
-    for (const chunk of completionSnapshotChunks(payload)) await descriptor.writeFile(chunk);
-    await descriptor.sync();
-    await descriptor.close();
-    descriptor = undefined;
-    await rename(temporary, path);
-  } finally {
-    try { if (descriptor !== undefined) await descriptor.close(); }
-    finally { await rm(temporary, { force: true }); }
-  }
-}
+/** WI-6554700010069681: completion checkpoints append to one journal per out path; the final append closes it. */
+type SnapshotWriter = (path: string, view: CompletionJournalView, options: { final: boolean }) => void | Promise<void>;
 
-type SnapshotWriter = (path: string, payload: unknown) => void | Promise<void>;
+/** The default writer: one append-only completion journal (completion-journal-v1) per out path. */
+export function createCompletionJournalWriter(): SnapshotWriter {
+  const journals = new Map<string, Promise<CompletionJournal>>();
+  return async (path, view, { final }) => {
+    let journal = journals.get(path);
+    if (!journal) {
+      journal = createCompletionJournal(path);
+      journals.set(path, journal);
+      journal.catch(() => journals.delete(path));
+    }
+    const handle = await journal;
+    try {
+      await appendCompletionCheckpoint(handle, view, { final });
+    } finally {
+      if (final) {
+        journals.delete(path);
+        await closeCompletionJournal(handle);
+      }
+    }
+  };
+}
 
 /** How far apart partial completion checkpoint writes run (WI-6554700010069387). */
 export interface CompletionCheckpointSpacing {
@@ -759,6 +770,25 @@ export interface CompletionCheckpointOptions {
   /** Resolves once `ms` has elapsed (default: an unref'd timer). Run end cuts the wait short. */
   wait?: (ms: number) => Promise<void>;
 }
+
+/** One completed module, as onTestModuleEnd records it. */
+type NativeRunFileRecord = { testFile: string; state: string; observedAtMs: number;
+  completionId: string;
+  projectName: string | null;
+  populationCaptureStatus: PopulationCaptureStatus;
+  population?: RecordedTestPopulation;
+  firstAttemptVerdict: 'pass' | 'fail' | 'unknown';
+  proof: { inputs: InputsRecord | null; sourceEvidence: ExecutedSourceEvidence | null };
+  execution: ReturnType<typeof collectModuleExecution>; cases: ReturnType<typeof collectTestCases> };
+
+/**
+ * WI-6554700010069681: what a module record keeps once a journal append made it durable. Only the
+ * acknowledgement and the end-of-run population checks read it again; the proof, execution and cases
+ * live in the journal. The journal never re-reads a record it already holds (it appends files past
+ * its own count), so these never reach it.
+ */
+type DurableNativeRunFile = Pick<NativeRunFileRecord,
+  'completionId' | 'testFile' | 'projectName' | 'populationCaptureStatus'> & { durable: true; hasPopulation: boolean };
 
 /** The queued partial write that later completions join until it fixes its payload. */
 interface QueuedCompletionCheckpoint {
@@ -831,16 +861,12 @@ export default class ExecutedSourceMapReporter implements Reporter {
       testFile: string | null; projectName: string | null; pool: string;
       testNamePattern: string | null; testLines: number[] | null; testIds: string[] | null; testTagsFilter: string[] | null;
     }> } | null;
-    files: Array<{ testFile: string; state: string; observedAtMs: number;
-      completionId: string;
-      projectName: string | null;
-      populationCaptureStatus: PopulationCaptureStatus;
-      population?: RecordedTestPopulation;
-      firstAttemptVerdict: 'pass' | 'fail' | 'unknown';
-      proof: { inputs: InputsRecord | null; sourceEvidence: ExecutedSourceEvidence | null };
-      execution: ReturnType<typeof collectModuleExecution>; cases: ReturnType<typeof collectTestCases> }>;
+    files: Array<NativeRunFileRecord | DurableNativeRunFile>;
     gaps: string[];
   } | null = null;
+
+  /** WI-6554700010069681: nativeRun.files[0, durableFileCount) are DurableNativeRunFile records. */
+  private durableFileCount = 0;
 
   private completedInputs = new Set<string>();
 
@@ -876,7 +902,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
     const rowsWriter = writeRows ?? ((flush: ExecutedSourceFlush) => trackSharedPgOperation(writeExecutedSourceRows(flush)));
     this.writeRows = flush => observeReporterStage('executed-source', 'write-rows', () => rowsWriter(flush));
     this.resolveGitDir = resolveGitDir ?? resolveRecordedGitDir;
-    this.writeSnapshot = writeSnapshot ?? writeExecutedSourceMapSnapshotAsync;
+    this.writeSnapshot = writeSnapshot ?? createCompletionJournalWriter();
     this.checkpointSpacing = checkpointOptions.spacing ?? COMPLETION_CHECKPOINT_SPACING;
     this.checkpointNow = checkpointOptions.now ?? (() => performance.now());
     this.checkpointWait = checkpointOptions.wait;
@@ -1006,7 +1032,7 @@ export default class ExecutedSourceMapReporter implements Reporter {
       // measured identity describes which process wrote the outcome.
       if (runtimeReasons.length) this.completionContext.runnerIdentity = null;
       let sourceEvidence: ExecutedSourceEvidence | undefined;
-      let nativeFile: NonNullable<ExecutedSourceMapReporter['nativeRun']>['files'][number] | undefined;
+      let nativeFile: NativeRunFileRecord | undefined;
       let state = 'error';
       try {
         state = testModule.state();
@@ -1227,31 +1253,45 @@ export default class ExecutedSourceMapReporter implements Reporter {
     };
     const before = this.worktreeBefore ? await this.worktreeBefore : null;
     const after = await this.readWorktreeSnapshot();
-    const checkpoint = {
+    // WI-6554700010069681: the journal stores each file once, with its per-file proof-context half,
+    // and derives per-file sourceBytes, sourceSubmodules and the shared half from these fields on read.
+    const view: CompletionJournalView = {
       ...payload,
       recordedSha: after.commit,
       sourceSnapshot: before,
       recordedGitDir: this.resolveGitDir(this.repoRoot),
       worktreeDirty: before === null || computeWorktreeDirty(before, after),
-    };
-    const nativeRun = { ...checkpoint.nativeRun, files: checkpoint.nativeRun.files.map(file => ({ ...file,
-      sourceBytes: { schemaVersion: 'source-byte-observation-v1' as const,
+      sourceBytes: { schemaVersion: 'source-byte-observation-v1',
         before: before?.sourceBytes ?? null, after: after.sourceBytes ?? null },
-      sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1' as const,
+      sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1',
         before: before?.submodules ?? null, after: after.submodules ?? null },
-      proofContext: captureRecordedProofContext({ commitSha: checkpoint.recordedSha,
-        worktreeDirty: checkpoint.worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime,
-        workerTestConfiguration: file.proof.inputs?.testConfiguration,
-        sourceBytes: { schemaVersion: 'source-byte-observation-v1',
-          before: before?.sourceBytes ?? null, after: after.sourceBytes ?? null },
-        sourceSubmodules: { schemaVersion: 'submodule-checkouts-v1',
-          before: before?.submodules ?? null, after: after.submodules ?? null } }),
-    })) };
+    };
     await observeReporterStage('executed-source', 'completion-snapshot', async () => {
-      await this.writeSnapshot(armed.outPath!, { ...checkpoint, nativeRun });
+      await this.writeSnapshot(armed.outPath!, view, { final: false });
     });
     // Acknowledge only completions this payload carried; later ones ride the next write.
     this.acknowledgeCarriedCompletions(payload.nativeRun.files, armed.outPath);
+    this.retainDurableFiles(payload.nativeRun.files.length);
+  }
+
+  /**
+   * WI-6554700010069681: the append above made files[0, count) durable, so the main process stops
+   * holding their proof, execution and cases (the lane-stateful run held ~900 MB of them). Elements are
+   * REPLACED, never removed or mutated: the journal counts files by position, and a write still in
+   * flight serializes the full records through its own container copy.
+   */
+  private retainDurableFiles(count: number): void {
+    const files = this.nativeRun?.files;
+    if (!files) return;
+    const end = Math.min(count, files.length);
+    for (let index = this.durableFileCount; index < end; index += 1) {
+      const file = files[index]!;
+      if ('durable' in file) continue;
+      files[index] = { durable: true, completionId: file.completionId, testFile: file.testFile,
+        projectName: file.projectName, populationCaptureStatus: file.populationCaptureStatus,
+        hasPopulation: !!file.population };
+    }
+    this.durableFileCount = Math.max(this.durableFileCount, end);
   }
 
   private acknowledgeCarriedCompletions(files: ReadonlyArray<{ completionId: string }>, outPath: string): void {
@@ -1301,31 +1341,28 @@ export default class ExecutedSourceMapReporter implements Reporter {
       worktreeDirty = true; // no proof of stability is dirty, never a false clean
     }
     const summary = `ws=${this.armed.workspaceName} rows=${rows.length} skipped=${this.skipped} sha=${recordedSha ?? 'unknown'} dirty=${worktreeDirty}`;
-    if (this.armed.outPath) {
+    // nativeRun exists exactly when outPath does (onTestRunStart); the journal needs it.
+    if (this.armed.outPath && this.nativeRun) {
       try {
+        // WI-6554700010069681: the terminal append; files a partial append already made durable are not rewritten.
         await this.writeSnapshot(
           this.armed.outPath,
           { workspaceName: this.armed.workspaceName, recordedSha, worktreeDirty,
             recordedGitDir: this.resolveGitDir(this.repoRoot),
             completionCheckpoint: {
               ...this.completionContext,
-              state: this.nativeRun?.terminalHook === 'onTestRunEnd' ? 'terminal' : 'partial',
+              state: this.nativeRun.terminalHook === 'onTestRunEnd' ? 'terminal' : 'partial',
               noPersist: this.armed.noPersist,
             },
             skipped: this.skipped, rows, diagnostics: this.diagnostics,
-            ...(this.nativeRun ? { nativeRun: { ...this.nativeRun,
-              files: this.nativeRun.files.map(file => ({ ...file,
-                sourceSubmodules, sourceBytes,
-                proofContext: captureRecordedProofContext({ commitSha: recordedSha,
-                  worktreeDirty, population: file.population, workerRuntime: file.proof.inputs?.runtime, sourceSubmodules, sourceBytes,
-                  workerTestConfiguration: file.proof.inputs?.testConfiguration }),
-              })) } } : {}),
+            nativeRun: this.nativeRun, sourceSubmodules, sourceBytes,
             configSources: qualifyConfigSources(this.configSourceCapture, { repoRoot: this.repoRoot }),
             configLoadedSources: qualifyLoadedConfigSources(this.configDeps, this.repoRoot, this.configEntries),
             mainProcessLoadedSources: qualifyLoadedMainProcessSources(this.configDeps, this.repoRoot, this.configEntries) },
+          { final: true },
         );
         // Completions a spaced partial write had not yet carried are durable now.
-        if (this.nativeRun) this.acknowledgeCarriedCompletions(this.nativeRun.files, this.armed.outPath);
+        this.acknowledgeCarriedCompletions(this.nativeRun.files, this.armed.outPath);
       } catch (e) {
         log(`out-file write failed (${e instanceof Error ? e.message : String(e)}) ${summary}`);
       }
@@ -1452,7 +1489,8 @@ export default class ExecutedSourceMapReporter implements Reporter {
         this.nativeRun.selectedPopulationMatched = !!selected?.length
           && selected.every(spec => spec.testFile !== null && spec.projectName !== null)
           && this.nativeRun.modulePopulationMatched
-          && this.nativeRun.files.every(file => file.populationCaptureStatus === 'captured' && !!file.population)
+          && this.nativeRun.files.every(file => file.populationCaptureStatus === 'captured'
+            && ('durable' in file ? file.hasPopulation : !!file.population))
           && JSON.stringify(selected.map(spec => JSON.stringify([spec.projectName, spec.testFile])).sort())
             === JSON.stringify(this.nativeRun.files.map(file => JSON.stringify([file.projectName, file.testFile])).sort());
         if (!this.nativeRun.modulePopulationMatched) this.nativeRun.gaps.push('terminal-module-population-unmatched');

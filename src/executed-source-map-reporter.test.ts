@@ -39,10 +39,22 @@ import ExecutedSourceMapReporter, {
   resolveRecordedGitDir,
   shouldRecordModule,
   writeExecutedSourceMapSnapshot,
-  writeExecutedSourceMapSnapshotAsync,
+  createCompletionJournalWriter,
   type ExecutedSourceFlush,
   type ExecutedSourceMapResult,
 } from './executed-source-map-reporter';
+import { readCompletionSnapshotSync } from '../../../scripts/lib/completion-journal.mjs';
+
+/** WI-6554700010069681: the reporter's out file is a completion journal; this is its folded snapshot. */
+function readOutSnapshot(path: string) {
+  const read = readCompletionSnapshotSync(path);
+  if (read.format !== 'journal' || read.snapshot === null)
+    throw new Error(`no committed completion journal at ${path} (format ${read.format})`);
+  return read.snapshot;
+}
+
+/** The production journal writer, for tests that wrap it. One journal per path; each test has its own tmp dir. */
+const writeJournal = createCompletionJournalWriter();
 
 describe('bounded completion JSON', () => {
   it('matches JSON serialization and digest semantics across chunk and UTF-8 boundaries', () => {
@@ -65,7 +77,7 @@ describe('bounded completion JSON', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it.each([writeExecutedSourceMapSnapshot, writeExecutedSourceMapSnapshotAsync])(
+  it.each([writeExecutedSourceMapSnapshot])(
     'round-trips a large completion population without serializing its aggregate (%#)', async writer => {
       const dir = mkdtempSync(join(tmpdir(), 'completion-population-'));
       const payload = { rows: Array.from({ length: 1000 }, (_, i) => ({
@@ -444,7 +456,7 @@ describe('ExecutedSourceMapReporter', () => {
         },
       ],
     });
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out).toMatchObject({ workspaceName: '@papercusp/test-config', recordedSha: clean.commit, worktreeDirty: false, skipped: 0 });
     expect(out.rows).toHaveLength(1);
   });
@@ -496,7 +508,7 @@ describe('ExecutedSourceMapReporter', () => {
           expect(flushes[0]!.rows[0]!.opaqueReasons).toContain(
             worker ? 'worker-runtime-mismatch' : 'worker-runtime-unavailable');
         }
-        const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+        const out = readOutSnapshot(join(tmp, 'out.json'));
         expect(out.completionCheckpoint.runnerIdentity).toBe(worker === node ? expected : null);
         expect(out.completionCheckpoint.reporterRunnerIdentity).toBe(expected);
       }
@@ -527,7 +539,7 @@ describe('ExecutedSourceMapReporter', () => {
         rows: [],
       },
     ]);
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.rows).toEqual([]);
     expect(out.skipped).toBe(5);
   });
@@ -538,7 +550,7 @@ describe('ExecutedSourceMapReporter', () => {
     dirty.r.onTestModuleEnd(fakeModule({}));
     await dirty.r.onTestRunEnd();
     expect(dirty.flushes).toEqual([]);
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out).toMatchObject({ worktreeDirty: true });
     expect(out.rows).toHaveLength(1); // the artifact still says what WOULD have been recorded
 
@@ -584,7 +596,7 @@ describe('ExecutedSourceMapReporter', () => {
     r.onTestModuleEnd(mod);
     await r.onTestRunEnd();
     expect(flushes).toEqual([]);
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.worktreeDirty).toBe(true);
     expect(out.rows[0].sourceEvidence).toMatchObject({
       status: 'stable', scope: 'repository-worker-vite-original-sources', reasons: [],
@@ -629,7 +641,7 @@ describe('ExecutedSourceMapReporter', () => {
     Object.defineProperty(environment, 'moduleGraph', { get: () => { throw new Error('final graph is mutable'); } });
     r.onTestModuleEnd(mod);
     await r.onTestRunEnd();
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.rows[0].sourceEvidence).toMatchObject({ status: 'stable', reasons: [],
       sources: expect.arrayContaining([expect.objectContaining({
         path: 'libs/test-config/src/executed-source-fingerprints.test.ts', basis: 'vite-pre-transform',
@@ -648,7 +660,7 @@ describe('ExecutedSourceMapReporter', () => {
     r.onInit({ vite: { config: { configFileDependencies: [config] } } } as never);
     r.onTestModuleEnd(fakeModule({}));
     await r.onTestRunEnd();
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.configSources).toEqual({
       schemaVersion: 'vitest-config-disk-snapshots-v1', scope: 'repository-vite-config-dependencies',
       basis: 'reporter-init-disk', status: 'unchanged', reasons: [],
@@ -663,7 +675,7 @@ describe('ExecutedSourceMapReporter', () => {
     r.onInit({ vite: { config: { configFile: '/unobserved/config.mjs', configFileDependencies: [] } } } as never);
     r.onTestModuleEnd(fakeModule({}));
     await r.onTestRunEnd();
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.configLoadedSources).toMatchObject({ status: 'unknown',
       importPopulation: { basis: 'node-resolve-and-load-observations', status: 'unknown', paths: [] } });
     expect(out.configLoadedSources.importPopulation.unresolved).toContain('config-import-outside-repository');
@@ -682,7 +694,7 @@ describe('ExecutedSourceMapReporter', () => {
     }
 
     function nativeOut() {
-      return JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8')).nativeRun;
+      return readOutSnapshot(join(tmp, 'out.json')).nativeRun;
     }
 
     function populationModule(count = 3) {
@@ -810,7 +822,7 @@ describe('ExecutedSourceMapReporter', () => {
       }
       ledger.onTestModuleEnd(mod);
       await r.onTestModuleEnd(mod);
-      const checkpoint = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+      const checkpoint = readOutSnapshot(join(tmp, 'out.json'));
       const original = checkpoint.nativeRun.files[0];
       expect(original.populationCaptureStatus).toBe('captured');
       expect(original.population).toBeDefined();
@@ -867,7 +879,7 @@ describe('ExecutedSourceMapReporter', () => {
       r.onInit({} as never);
       for (const state of ['passed', 'failed', 'error']) {
         await r.onTestModuleEnd(nativeModule([state === 'passed' ? 'passed' : 'failed'], state));
-        const checkpoint = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+        const checkpoint = readOutSnapshot(join(tmp, 'out.json'));
         expect(checkpoint).toMatchObject({ recordedSha: clean.commit, worktreeDirty: false,
           recordedGitDir: GIT_DIR, completionCheckpoint: { schemaVersion: 1, state: 'partial',
             runGroupId: 'grp-1', runnerIdentity: executedSourceRunnerIdentity(),
@@ -895,7 +907,7 @@ describe('ExecutedSourceMapReporter', () => {
       selected[0]!.testIds!.push('late-change');
       process.env.PAPERCUSP_TEST_RUN_GROUP = 'different-group-after-start';
       await r.onTestModuleEnd(nativeModule(['passed']));
-      const saved = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+      const saved = readOutSnapshot(join(tmp, 'out.json'));
       const manifest = saved.nativeRun.selectedManifest;
       expect(manifest.specifications).toHaveLength(2);
       expect(manifest.specifications).toContainEqual(expect.objectContaining({ projectName: 'one',
@@ -913,11 +925,11 @@ describe('ExecutedSourceMapReporter', () => {
       try {
         const savedIds: string[] = [];
         const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
-          (path, payload) => {
+          async (path, payload, writeOptions) => {
             const acknowledged = writes.mock.calls.filter(([line]) => String(line).includes('COMPLETION_ACK')).length;
             expect(acknowledged).toBe(savedIds.length);
-            writeExecutedSourceMapSnapshot(path, payload);
-            const saved = JSON.parse(readFileSync(path, 'utf8'));
+            await writeJournal(path, payload, writeOptions);
+            const saved = readOutSnapshot(path);
             savedIds.push(saved.nativeRun.files.at(-1).completionId);
           }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
         recorder.onInit({} as never);
@@ -937,9 +949,9 @@ describe('ExecutedSourceMapReporter', () => {
       try {
         let failWrite = false;
         const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
-          async (path, payload) => {
+          async (path, payload, writeOptions) => {
             if (failWrite) throw new Error('injected write failure');
-            await writeExecutedSourceMapSnapshotAsync(path, payload);
+            await writeJournal(path, payload, writeOptions);
           }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
         recorder.onInit({} as never);
         await recorder.onTestModuleEnd(nativeModule(['passed']));
@@ -989,10 +1001,10 @@ describe('ExecutedSourceMapReporter', () => {
       const started = new Promise<void>(resolve => { entered = resolve; });
       try {
         const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
-          async (path, payload) => {
+          async (path, payload, writeOptions) => {
             entered();
             await ready;
-            await writeExecutedSourceMapSnapshotAsync(path, payload);
+            await writeJournal(path, payload, writeOptions);
           });
         recorder.onInit({} as never);
         let completed = false;
@@ -1005,7 +1017,7 @@ describe('ExecutedSourceMapReporter', () => {
         await pending;
         expect(writes.mock.calls.filter(([line]) => String(line).includes('COMPLETION_ACK'))).toHaveLength(1);
         await recorder.onTestRunEnd();
-        expect(JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8')).completionCheckpoint.state).toBe('terminal');
+        expect(readOutSnapshot(join(tmp, 'out.json')).completionCheckpoint.state).toBe('terminal');
       } finally {
         release();
         writes.mockRestore();
@@ -1033,13 +1045,13 @@ describe('ExecutedSourceMapReporter', () => {
         typeof value === 'object' && value !== null && 'completionCheckpoint' in value).length;
       try {
         const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
-          async (path, payload) => {
-            const files = (payload as { nativeRun: { files: Array<{ completionId: string; proof: unknown }> } })
+          async (path, payload, writeOptions) => {
+            const files = (payload as { nativeRun: { files: ReadonlyArray<{ completionId: string; proof?: unknown }> } })
               .nativeRun.files;
             written.push(files.map(file => file.completionId));
             writtenProofs.push(files.map(file => file.proof));
             if (written.length === 1) { entered(); await gate; }
-            await writeExecutedSourceMapSnapshotAsync(path, payload);
+            await writeJournal(path, payload, writeOptions);
           // Per-completion mode pins the one-copy coalescing invariant; spacing is covered below.
           }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
         recorder.onInit({} as never);
@@ -1055,9 +1067,12 @@ describe('ExecutedSourceMapReporter', () => {
         expect(ids).toHaveLength(burst + 1);
         expect(written).toEqual([ids.slice(0, 1), ids]);
         expect(checkpointCopies()).toBe(0);
-        // Structural sharing: the second write carries the first completion's own proof record.
+        // WI-6554700010069681: the first append made completion 0 durable, so the reporter dropped its proof
+        // from memory: the second write carries only its light record, and the journal alone keeps the proof.
         expect(writtenProofs).toHaveLength(2);
-        expect(writtenProofs[1][0]).toBe(writtenProofs[0][0]);
+        expect(writtenProofs[0][0]).toBeTruthy();
+        expect(writtenProofs[1][0]).toBeUndefined();
+        expect(nativeOut().files[0].proof).toEqual(writtenProofs[0][0]);
         const acknowledged = writes.mock.calls
           .map(([line]) => /COMPLETION_ACK ids=(\[[^\]]*\])/.exec(String(line))?.[1])
           .filter((match): match is string => match !== undefined)
@@ -1083,12 +1098,12 @@ describe('ExecutedSourceMapReporter', () => {
         const waits: Array<{ ms: number; elapse: () => void }> = [];
         const written: string[][] = [];
         const recorder = new ExecutedSourceMapReporter(snapshot(clean), async () => {}, () => GIT_DIR,
-          async (path, payload) => {
-            written.push((payload as { nativeRun: { files: Array<{ completionId: string }> } })
+          async (path, payload, writeOptions) => {
+            written.push((payload as { nativeRun: { files: ReadonlyArray<{ completionId: string }> } })
               .nativeRun.files.map(file => file.completionId));
             if (written.length === 1) { firstWriteStarted(); await options.holdFirstWrite; }
             clock += options.writeMs ?? 2_000; // the measured duration of this write
-            await writeExecutedSourceMapSnapshotAsync(path, payload);
+            await writeJournal(path, payload, writeOptions);
           },
           { spacing: COMPLETION_CHECKPOINT_SPACING, now: () => clock,
             wait: ms => new Promise<void>(resolve => { waits.push({ ms, elapse: resolve }); }) });
@@ -1201,7 +1216,7 @@ describe('ExecutedSourceMapReporter', () => {
         await settle();
         expect(waits).toHaveLength(1);
         await recorder.onTestRunEnd(); // never waits out the interval: the wait above is never elapsed
-        const final = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+        const final = readOutSnapshot(join(tmp, 'out.json'));
         const ids: string[] = final.nativeRun.files.map((file: { completionId: string }) => file.completionId);
         expect(ids).toHaveLength(3);
         expect(final.completionCheckpoint.state).toBe('terminal');
@@ -1248,7 +1263,15 @@ describe('ExecutedSourceMapReporter', () => {
         import { Writable } from 'node:stream';
         import { join } from 'node:path';
         const { createVitest, ForksPoolWorker } = await import(${JSON.stringify(pathToFileURL(require.resolve('vitest/node')).href)});
-        const { writeExecutedSourceMapSnapshot, writeExecutedSourceMapSnapshotAsync } = await import(${JSON.stringify(new URL('./executed-source-map-reporter.ts', import.meta.url).href)});
+        // WI-6554700010069681: the production writer is the async completion journal; its sync primitives are the
+        // loop-blocking contrast.
+        const { createCompletionJournalWriter } = await import(${JSON.stringify(new URL('./executed-source-map-reporter.ts', import.meta.url).href)});
+        const { appendCompletionCheckpointSync, closeCompletionJournalSync, createCompletionJournalSync,
+          readCompletionSnapshotSync } = await import(${JSON.stringify(new URL('../../../scripts/lib/completion-journal.mjs', import.meta.url).href)});
+        const view = { workspaceName: 'snapshot-stop', rows: [{ outcome: 'pass', proof: 'same payload' }], diagnostics: [],
+          nativeRun: { files: [], selectedManifest: null }, skipped: 0, configSources: null, configLoadedSources: null,
+          mainProcessLoadedSources: null, completionCheckpoint: { state: 'terminal' }, recordedSha: null,
+          recordedGitDir: null, worktreeDirty: true, sourceBytes: null, sourceSubmodules: null };
         const [root, mode] = process.argv.slice(2), events = [], logs = [];
         const handle = await open(join(root, 'handle-' + mode), 'wx');
         const prototype = Object.getPrototypeOf(handle), originalSync = prototype.sync;
@@ -1294,8 +1317,12 @@ describe('ExecutedSourceMapReporter', () => {
           reporters: [{ async onTestRunEnd(modules, errors, reason) {
             if (reason !== 'passed' || errors.length || modules.length !== 1) throw new Error('tiny test did not pass');
             await stopped;
-            await (mode === 'sync' ? writeExecutedSourceMapSnapshot : writeExecutedSourceMapSnapshotAsync)(
-              join(root, mode + '.json'), { outcome: 'pass', proof: 'same payload' });
+            const path = join(root, mode + '.json');
+            if (mode === 'sync') {
+              const journal = createCompletionJournalSync(path);
+              try { appendCompletionCheckpointSync(journal, view, { final: true }); }
+              finally { closeCompletionJournalSync(journal); }
+            } else await createCompletionJournalWriter()(path, view, { final: true });
             events.push('snapshot-end');
           } }],
         }, undefined, { stdout: stream, stderr: stream });
@@ -1304,9 +1331,10 @@ describe('ExecutedSourceMapReporter', () => {
         const loggedErrors = [], logError = runner.logger.error.bind(runner.logger);
         runner.logger.error = (...args) => { loggedErrors.push(args.map(String).join(' ')); return logError(...args); };
         try { await runner.start(); } finally { await runner.close(); }
-        const { completionIntegrity, ...body } = JSON.parse(fs.readFileSync(join(root, mode + '.json'), 'utf8'));
+        const read = readCompletionSnapshotSync(join(root, mode + '.json'));
         const timeoutWarning = 'Timeout terminating snapshot-forks worker';
-        console.log(JSON.stringify({ mode, events, body, completionIntegrity, loggedErrors,
+        console.log(JSON.stringify({ mode, events, format: read.format, rows: read.snapshot?.rows ?? null,
+          integrity: read.integrity ?? null, loggedErrors,
           streamWarning: logs.join('').includes(timeoutWarning),
           warning: loggedErrors.some(message => message.includes(timeoutWarning)) }));
       `);
@@ -1321,9 +1349,12 @@ describe('ExecutedSourceMapReporter', () => {
       for (const result of results) {
         expect(result.events, JSON.stringify(result)).toContain('pool-created');
         expect(result.events, JSON.stringify(result)).toContain('fsync-start');
-        expect(result.body).toEqual({ outcome: 'pass', proof: 'same payload' });
-        expect(result.completionIntegrity).toEqual({ schemaVersion: 1,
-          sha256: createHash('sha256').update(JSON.stringify(result.body)).digest('hex') });
+        expect(result.format, JSON.stringify(result)).toBe('journal');
+        // The probe's view records no runner identity, so the final fold marks the row opaque, as flushPending does.
+        expect(result.rows).toEqual([{ outcome: 'pass', proof: 'same payload',
+          opaqueReasons: ['worker-runtime-unavailable'] }]);
+        expect(result.integrity).toMatchObject({ schemaVersion: 2, journal: 'completion-journal-v1', tailBytes: 0,
+          final: true });
       }
       expect(sync.warning, JSON.stringify(sync)).toBe(true);
       expect(sync.events.indexOf('snapshot-end'), JSON.stringify(sync)).toBeLessThan(sync.events.indexOf('worker-exited'));
@@ -1331,7 +1362,7 @@ describe('ExecutedSourceMapReporter', () => {
       expect(async.events.indexOf('worker-exited'), JSON.stringify(async)).toBeLessThan(async.events.indexOf('snapshot-end'));
     }, 45_000);
 
-    it.each([writeExecutedSourceMapSnapshot, writeExecutedSourceMapSnapshotAsync])(
+    it.each([writeExecutedSourceMapSnapshot])(
       'preserves the previous snapshot and removes the temporary file on serialization failure (%#)', async writer => {
       const path = join(tmp, 'atomic.json');
       await writer(path, { outcome: 'pass', proof: { candidate: clean.commit } });
@@ -1355,7 +1386,7 @@ describe('ExecutedSourceMapReporter', () => {
       await r.onTestModuleEnd(module);
       const completed = nativeOut().files[0];
       await r.onTestRunEnd([module], [new Error('late run-level failure')], 'failed');
-      const final = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+      const final = readOutSnapshot(join(tmp, 'out.json'));
       expect(final.nativeRun).toMatchObject({ terminalHook: 'onTestRunEnd', reason: 'failed', unhandledErrorCount: 1 });
       expect(final.nativeRun.files[0]).toEqual(completed);
       expect(final).toMatchObject({ recordedGitDir: GIT_DIR,
@@ -1366,18 +1397,17 @@ describe('ExecutedSourceMapReporter', () => {
     it.each(['SIGTERM', 'SIGKILL'] as const)('recovers exactly committed outcome/proof pairs after owned %s interruptions', signal => {
       const script = `
         import { readFileSync, writeFileSync, writeSync } from 'node:fs';
-        import Reporter, { COMPLETION_CHECKPOINT_EVERY_COMPLETION, writeExecutedSourceMapSnapshot } from ${JSON.stringify(new URL('./executed-source-map-reporter.ts', import.meta.url).href)};
+        import Reporter, { COMPLETION_CHECKPOINT_EVERY_COMPLETION, createCompletionJournalWriter } from ${JSON.stringify(new URL('./executed-source-map-reporter.ts', import.meta.url).href)};
+        const journal = createCompletionJournalWriter();
         const [phase, signal, outPath] = process.argv.slice(1);
         process.env.PC_EXECUTED_SOURCE_MAP_WORKSPACE = '@papercusp/test-config';
         process.env.PC_EXECUTED_SOURCE_MAP_OUT = outPath;
         process.env.PAPERCUSP_TEST_RUN_GROUP = 'crash-window-frozen-group';
         const recorder = new Reporter(async () => ({commit: 'frozen-candidate', porcelain: ''}),
-          async () => {}, () => '/frozen/.git', (path, payload) => {
-            if (payload.nativeRun.files.length === 3 && phase === 'before-commit') {
-              writeFileSync(path + '.incomplete.tmp', '{"nativeRun":');
-              process.kill(process.pid, signal);
-            }
-            writeExecutedSourceMapSnapshot(path, payload);
+          async () => {}, () => '/frozen/.git', async (path, payload, options) => {
+            // WI-6554700010069681: the production journal writer; before-commit stops ahead of the third append.
+            if (payload.nativeRun.files.length === 3 && phase === 'before-commit') process.kill(process.pid, signal);
+            await journal(path, payload, options);
             if (payload.nativeRun.files.length === 3 && phase === 'committed-before-ack')
               process.kill(process.pid, signal);
           }, { spacing: COMPLETION_CHECKPOINT_EVERY_COMPLETION });
@@ -1403,10 +1433,13 @@ describe('ExecutedSourceMapReporter', () => {
         expect(child.error, child.stderr).toBeUndefined();
         expect(child.signal, child.stderr).toBe(signal);
         const recovery = spawnSync(process.execPath, ['--input-type=module', '-e',
-          "import {readFileSync} from 'node:fs'; process.stdout.write(readFileSync(process.argv[1], 'utf8'));", outPath],
+          `import {readCompletionSnapshotSync} from ${JSON.stringify(new URL('../../../scripts/lib/completion-journal.mjs', import.meta.url).href)};`
+            + ' process.stdout.write(JSON.stringify(readCompletionSnapshotSync(process.argv[1])));', outPath],
         { encoding: 'utf8', timeout: 10_000 });
         expect(recovery.status, recovery.stderr).toBe(0);
-        const recovered = JSON.parse(recovery.stdout);
+        const read = JSON.parse(recovery.stdout);
+        expect(read.format).toBe('journal');
+        const recovered = read.snapshot;
         const expectedStates = phase === 'before-commit' ? ['passed', 'failed'] : ['passed', 'failed', 'error'];
         expect(recovered.nativeRun.files.map((file: { state: string }) => file.state)).toEqual(expectedStates);
         expect(recovered).toMatchObject({ recordedSha: 'frozen-candidate', worktreeDirty: false,
@@ -1548,7 +1581,7 @@ describe('ExecutedSourceMapReporter', () => {
       expect(nativeOut()).toMatchObject({ reason: 'passed', modulePopulationMatched: true,
         files: [{ firstAttemptVerdict: 'pass' }],
       });
-      expect(JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8')).worktreeDirty).toBe(true);
+      expect(readOutSnapshot(join(tmp, 'out.json')).worktreeDirty).toBe(true);
     });
   });
 
@@ -1566,7 +1599,7 @@ describe('ExecutedSourceMapReporter', () => {
     r.onTestModuleCollected(mod);
     r.onTestModuleEnd(mod);
     await r.onTestRunEnd();
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.diagnostics).toEqual([expect.objectContaining({
       testFile: 'libs/test-config/src/executed-source-map-reporter.test.ts', state: 'failed',
       sourceEvidence: expect.objectContaining({ status: 'stable', sources: expect.arrayContaining([
@@ -1603,7 +1636,7 @@ describe('ExecutedSourceMapReporter', () => {
     }
     expect(paths).toEqual([join(tmp, 'out.json'), join(tmp, 'out.1.json'), join(tmp, 'out.2.json')]);
     for (const [index, path] of paths.entries()) {
-      const out = JSON.parse(readFileSync(path, 'utf8'));
+      const out = readOutSnapshot(path);
       const evidence = index === 1 ? out.diagnostics[0].sourceEvidence : out.rows[0].sourceEvidence;
       expect(evidence).toMatchObject({ status: 'stable', sources: expect.arrayContaining([
         expect.objectContaining({ path: 'libs/test-config/src/executed-source-map-reporter.ts',
@@ -1641,7 +1674,7 @@ describe('ExecutedSourceMapReporter', () => {
     r.onTestModuleEnd(mod);
     await r.onTestRunEnd();
     await r.onExit();
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.rows).toEqual([]);
     expect(out.diagnostics).toEqual([{
       testFile: 'libs/test-config/src/executed-source-map-reporter.test.ts', state,
@@ -1671,7 +1704,7 @@ describe('ExecutedSourceMapReporter', () => {
     r.onTestModuleCollected(mod);
     r.onTestModuleEnd(mod);
     await r.onTestRunEnd();
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.rows).toEqual([]);
     expect(out.diagnostics).toEqual([expect.objectContaining({
       sourceEvidence: expect.objectContaining({ status: 'unknown', reasons: expect.arrayContaining([
@@ -1698,7 +1731,7 @@ describe('ExecutedSourceMapReporter', () => {
     imports[late] = {};
     r.onTestModuleEnd(mod);
     await r.onTestRunEnd();
-    const out = JSON.parse(readFileSync(join(tmp, 'out.json'), 'utf8'));
+    const out = readOutSnapshot(join(tmp, 'out.json'));
     expect(out.rows[0].sourceEvidence).toMatchObject({
       status: 'unknown',
       reasons: ['module-not-captured-at-collection:libs/test-config/src/executed-source-fingerprints.test.ts'],
