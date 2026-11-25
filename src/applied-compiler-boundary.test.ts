@@ -172,7 +172,7 @@ describe('maintained Vite applied compiler boundary', () => {
   function nativeUseRun(runtime: ReturnType<typeof implementationRuntime>, mode: string, native = '', decoy = '') {
     const script = `
       import { pathToFileURL } from 'node:url';
-      import { readFileSync, writeFileSync } from 'node:fs';
+      import { readFileSync, renameSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       import { createRequire } from 'node:module';
       import { channel } from 'node:diagnostics_channel';
@@ -265,7 +265,11 @@ describe('maintained Vite applied compiler boundary', () => {
           const bytes = readFileSync(binary);
           for (const suffix of ['', '\\nPAPERCUSP_NATIVE_USE_CONTROL\\n', '']) {
             await stop();
-            writeFileSync(binary, Buffer.concat([bytes, Buffer.from(suffix)]), { mode: 0o755 });
+            // Each restart opens a fresh inode. Linux can still hold the prior
+            // executable mapped after the service stop has resolved.
+            const nextImage = binary + '.next';
+            writeFileSync(nextImage, Buffer.concat([bytes, Buffer.from(suffix)]), { mode: 0o755 });
+            renameSync(nextImage, binary);
             await esbuild.transform('export const warm: number = 0;', { loader: 'ts' });
             await compile(['input.ts']);
           }
