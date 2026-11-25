@@ -38,6 +38,10 @@ import {
 import * as runtimeProof from './runtime-proof.ts';
 
 const EXECUTED_SOURCE_MAP_REPORTER = /executed-source-map-reporter\.ts$/;
+const expectedExcludes = [
+  ...configDefaults.exclude,
+  '**/node_modules/**', '**/dist/**', '**/dist-verify/**', '**/.next/**', '**/.papercusp/**', '**/_retired/**',
+];
 const INPUTS_CAPTURE_SETUP = /executed-inputs-capture-setup\.ts$/;
 
 let scratch: string;
@@ -98,7 +102,7 @@ describe('gateParticipationConfig — what a hand-rolled unit config spreads in'
       reporters: ['default', ADMIN_TEST_RUNS_REPORTER_PATH],
       setupFiles: ['./src/test-setup.ts'],
       globalSetup: [HOST_PREFLIGHT_GLOBAL_SETUP],
-      exclude: [...configDefaults.exclude, 'src/**/*.integration.test.ts'],
+      exclude: [...expectedExcludes, 'src/**/*.integration.test.ts'],
     });
   });
 
@@ -137,7 +141,7 @@ describe('gateParticipationConfig — what a hand-rolled unit config spreads in'
 
   it('keeps vitest default excludes even with no caller excludes — setting exclude replaces them', () => {
     const { exclude } = gateParticipationConfig({}, {});
-    expect(exclude).toEqual([...configDefaults.exclude]);
+    expect(exclude).toEqual(expectedExcludes);
     expect(exclude).toContain('**/node_modules/**');
   });
 
@@ -166,7 +170,7 @@ describe('gateParticipationConfig — what a hand-rolled unit config spreads in'
   it('applies a valid reuse skip list as literal (glob-escaped, sorted) excludes, after the caller excludes', () => {
     const env = { [PC_TEST_REUSE_SKIP_LIST_ENV]: writeSkipList(['src/a.test.ts', 'src/(g)/b.test.ts']) };
     expect(gateParticipationConfig({ exclude: ['x/**'] }, env).exclude).toEqual([
-      ...configDefaults.exclude,
+      ...expectedExcludes,
       'x/**',
       'src/\\(g\\)/b.test.ts',
       'src/a.test.ts',
@@ -175,12 +179,12 @@ describe('gateParticipationConfig — what a hand-rolled unit config spreads in'
 
   it('a skip list for another runner identity is declined, so every file runs', () => {
     const env = { [PC_TEST_REUSE_SKIP_LIST_ENV]: writeSkipList(['src/a.test.ts'], 'v0.0.0 plan9 mips') };
-    expect(gateParticipationConfig({}, env).exclude).toEqual([...configDefaults.exclude]);
+    expect(gateParticipationConfig({}, env).exclude).toEqual(expectedExcludes);
   });
 
   it('applies the partial skip channel only to integration configs', () => {
     const env = { AFFECTED_PARTIAL_RESUME: '1', [PC_TEST_PARTIAL_SKIP_LIST_ENV]: writePartialSkipList(['src/a.integration.test.ts']) };
-    expect(gateParticipationConfig({}, env).exclude).toEqual([...configDefaults.exclude]);
+    expect(gateParticipationConfig({}, env).exclude).toEqual(expectedExcludes);
     vi.stubEnv('AFFECTED_PARTIAL_RESUME', env.AFFECTED_PARTIAL_RESUME);
     vi.stubEnv(PC_TEST_PARTIAL_SKIP_LIST_ENV, env[PC_TEST_PARTIAL_SKIP_LIST_ENV]);
     const integration = defineVitestConfig({ layer: 'integration', exclude: ['caller/**'] }).test!;
@@ -214,6 +218,7 @@ describe('defineVitestConfig and gateParticipationConfig carry the same gate-own
 
   it('unarmed, neither carries the proof reporter, the capture or the raised limit', () => {
     vi.stubEnv('CI', '');
+    vi.stubEnv('GREEN_CHECKPOINT', undefined);
     vi.stubEnv(PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV, undefined);
     vi.stubEnv(PC_TEST_REUSE_SKIP_LIST_ENV, undefined);
     vi.stubEnv('PAPERCUSP_DISABLE_TEST_RUNS_REPORTER', undefined);

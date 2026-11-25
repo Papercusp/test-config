@@ -26,6 +26,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { completionPayloadFromBytes } from '../../../scripts/lib/completion-journal.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(here, '__fixtures__/armed-capture');
@@ -89,7 +90,7 @@ describe('executed-inputs capture, armed inside a real vitest run', () => {
       // The out file is written on every flush, before the clean-checkout rail decides whether to
       // persist, so it shows what the capture produced even on a dirty tree.
       expect(existsSync(run.mapPath), run.output.slice(-4000)).toBe(true);
-      const map = JSON.parse(readFileSync(run.mapPath, 'utf8')) as {
+      const map = completionPayloadFromBytes(readFileSync(run.mapPath)) as {
         workspaceName: string;
         completionCheckpoint: { runnerIdentity: string | null };
         nativeRun: { files: Array<{ proof: { inputs: {

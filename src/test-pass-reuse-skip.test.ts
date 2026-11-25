@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,6 +35,7 @@ it.each(['absent', 'legacy'])('loads with %s host runtime-proof support and runs
   // closure while varying only the host's runtime-proof API.
   cpSync(new URL('../package.json', import.meta.url), join(root, 'libs/test-config/package.json'));
   cpSync(new URL('./', import.meta.url), sourceDir, { recursive: true });
+  symlinkSync(new URL('../../../node_modules/', import.meta.url), join(root, 'node_modules'), 'dir');
   writeFileSync(join(sourceDir, 'admin-test-runs-reporter.ts'), 'export function inferWorkspaceRoot() { return "/unused"; }\n');
   const consumer = join(sourceDir, 'test-pass-reuse-skip.ts');
   const list = join(root, 'skip.json');
