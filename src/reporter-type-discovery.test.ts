@@ -1,6 +1,6 @@
-/** EI-26154571958613818: postgres.js leaves its startup array-type probe
- * unobserved when shutdown interrupts it. Exercise the real driver over a tiny
- * protocol peer; no product/test Postgres or arbitrary timing race is involved.
+/** EI-26154571958613818: the patched driver handles interrupted type discovery.
+ * Exercise both discovery and the reporter's direct statement over a local
+ * protocol peer that holds the first query until the client shuts down.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -57,14 +57,18 @@ const child = String.raw`
   const sql = postgres({ host: process.argv[2] || '127.0.0.1', port: server.address().port,
     database: 'fixture', username: 'fixture', max: 1, connect_timeout: stallDns ? 1 : 5,
     fetch_types: JSON.parse(process.argv[1]), onnotice() {} });
-  const statement = sql.unsafe('select 1').catch(error => { if (stallDns) resolveQuery(error.code); });
+  let statementError = null;
+  const statement = sql.unsafe('select 1').catch(error => {
+    statementError = error.code;
+    if (stallDns) resolveQuery(error.code);
+  });
   const timer = setTimeout(() => { throw new Error('protocol fixture saw no query'); }, 7000);
   const query = await seen; clearTimeout(timer);
   await sql.end({ timeout: 0 }); await statement;
   await new Promise(resolve => setImmediate(() => setImmediate(resolve)));
   for (const socket of sockets) socket.destroy();
   await new Promise(resolve => server.close(resolve));
-  console.log(JSON.stringify({ query, unhandled, lookups }));
+  console.log(JSON.stringify({ query, unhandled, lookups, statementError }));
 `;
 
 async function interrupt(fetchTypes: boolean, host = '127.0.0.1', stallDns = false) {
@@ -78,10 +82,11 @@ async function interrupt(fetchTypes: boolean, host = '127.0.0.1', stallDns = fal
 afterEach(async () => { await closeSharedPg(); vi.unstubAllEnvs(); });
 
 describe('reporter shutdown during postgres startup', () => {
-  it('CONTROL: interrupting driver array discovery causes the observed unhandled rejection', async () => {
+  it('interrupting driver array discovery rejects the caller without an unhandled rejection', async () => {
     const result = await interrupt(true);
     expect(result.query).toContain('pg_catalog.pg_type');
-    expect(result.unhandled).toEqual([expect.objectContaining({ code: 'CONNECTION_DESTROYED' })]);
+    expect(result.statementError).toBe('CONNECTION_DESTROYED');
+    expect(result.unhandled).toEqual([]);
   }, 15_000);
 
   it('the real reporter client submits its statement without the unsafe startup probe', async () => {
@@ -108,7 +113,7 @@ describe('reporter connection before TCP', () => {
     expect(handle).not.toBeNull();
     const sql = handle!.sql as unknown as { options: { host: string[]; fetch_types: boolean } };
     const result = await interrupt(sql.options.fetch_types, sql.options.host[0], true);
-    expect(result).toEqual({ query: 'select 1', lookups: 0, unhandled: [] });
+    expect(result).toEqual({ query: 'select 1', lookups: 0, unhandled: [], statementError: 'CONNECTION_DESTROYED' });
   });
 
   it.each([
