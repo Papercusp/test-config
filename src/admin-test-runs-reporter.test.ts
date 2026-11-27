@@ -87,6 +87,7 @@ import AdminTestRunsReporter, {
   type TestRunReceipt,
   type TestRunReceiptReadbackCandidate,
   type TestRunRow,
+  type TestFailureDetail,
   type WorktreeGitRunner,
 } from './admin-test-runs-reporter';
 import { parseTestRunExecutionDetails } from './execution-details.ts';
@@ -3247,6 +3248,37 @@ describe('AdminTestRunsReporter fail-soft contract', () => {
     } as unknown as Parameters<typeof buildOutputTail>[0];
     const tail = buildOutputTail(fakeModule, 'fail');
     expect(tail).toBe('suite > fails: expected 1 to be 2');
+  });
+
+  it('writes a coded sidecar entry only for one complete error from the same case', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'papercusp-reporter-coded-errors-'));
+    const path = join(dir, 'details.json');
+    const previous = process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+    process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = path;
+    const reporter = new AdminTestRunsReporter(async () => ({ commit: 'abc', porcelain: '' }), async () => undefined);
+    const coded = { code: 'invoice_total_mismatch', message: 'Invoice exceeds the posted balance', actual: '41' };
+    try {
+      await reporter.onInit({ vite: { config: { configFile: join(TEST_CONFIG_ROOT, 'vitest.config.ts') } } } as never);
+      const cases = [
+        { fullName: 'single', errors: [coded] }, { fullName: 'multiple', errors: [coded, { message: 'Second error' }] },
+        { fullName: 'no code', errors: [{ message: coded.message, actual: '41' }] },
+        { fullName: 'redacted', errors: [{ ...coded, message: '[redacted] invoice' }] },
+        { fullName: 'clipped', errors: [{ ...coded, message: coded.message.repeat(120) }] },
+      ];
+      reporter.onTestModuleEnd({ moduleId: join(TEST_CONFIG_ROOT, 'src/coded-error.test.ts'),
+        state: () => 'failed', diagnostic: () => ({ duration: 1 }), errors: () => [],
+        children: { allTests: () => cases.map(c => ({ fullName: c.fullName,
+          result: () => ({ state: 'failed', errors: c.errors }) })) } } as never);
+      await reporter.onTestRunEnd();
+      const rows = JSON.parse(readFileSync(path, 'utf8')).failures as TestFailureDetail[];
+      expect(rows.map(row => row.test)).toEqual(cases.map(c => c.fullName));
+      expect(rows[0]?.codedError).toMatchObject({ code: coded.code, message: coded.message });
+      expect(rows.slice(1).every(row => row.codedError === undefined)).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH;
+      else process.env.PAPERCUSP_TEST_FAILURE_DETAILS_PATH = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('redacts inherited credential values before reporter tail and sidecar clipping', async () => {

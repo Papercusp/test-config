@@ -1443,6 +1443,7 @@ export interface TestFailureDetail {
   message?: string;
   actual?: string;
   expected?: string;
+  codedError?: { code: string; message: string; reportSha256: string };
 }
 
 /**
@@ -1466,6 +1467,25 @@ function boundFailureText(value: string, maxChars = FAILURE_DETAIL_VALUE_MAX_CHA
   if (maxChars <= 0) return '';
   const sanitized = redactSensitiveText(value);
   return sanitized.length <= maxChars ? sanitized : `${sanitized.slice(0, maxChars - 1)}…`;
+}
+
+/** The digest joins this one structured error to the exact text Vitest reported. */
+export function readCodedTestError(value: unknown): TestFailureDetail['codedError'] {
+  if (!value || typeof value !== 'object') return;
+  const { code, message, reportSha256 } = value as Record<string, unknown>;
+  if (typeof reportSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(reportSha256)
+    || typeof code !== 'string' || !code.trim() || typeof message !== 'string' || !message.trim()
+    || [code, message].some(text => text !== boundFailureText(text) || /\[redacted/i.test(text))) return;
+  return { code, message, reportSha256 };
+}
+
+function singleCodedTestError(errors: readonly unknown[], collection = false): TestFailureDetail['codedError'] {
+  if (errors.length !== 1) return;
+  const code = errorField(errors[0], 'code');
+  const message = errorField(errors[0], 'message');
+  const reported = collection ? message : errorField(errors[0], 'stack') || message;
+  if (typeof code !== 'string' || typeof reported !== 'string' || reported !== boundFailureText(reported)) return;
+  return readCodedTestError({ code, message, reportSha256: createHash('sha256').update(reported).digest('hex') });
 }
 
 function stringifyFailureValue(value: unknown): string {
@@ -1542,7 +1562,7 @@ function readFailureDetailsFile(file: string): TestFailureDetail[] {
         if (!entry || typeof entry !== 'object') return null;
         const value = entry as Record<string, unknown>;
         if (typeof value.file !== 'string' || !value.file || typeof value.test !== 'string' || !value.test) return null;
-        const detail: TestFailureDetail = { file: value.file, test: value.test };
+        const detail: TestFailureDetail = { file: value.file, test: value.test, codedError: readCodedTestError(value.codedError) };
         for (const field of ['message', 'actual', 'expected'] as const) {
           if (value[field] !== undefined) detail[field] = boundFailureText(stringifyFailureValue(value[field]));
         }
@@ -1567,6 +1587,7 @@ function writeFailureDetails(details: TestFailureDetail[]): void {
     merged.set(key, {
       ...(previous ?? {}),
       ...detail,
+      codedError: detail.codedError,
       ...(previous?.message && !detail.message ? { message: previous.message } : {}),
       ...(previous?.actual !== undefined && detail.actual === undefined ? { actual: previous.actual } : {}),
       ...(previous?.expected !== undefined && detail.expected === undefined ? { expected: previous.expected } : {}),
@@ -3392,14 +3413,10 @@ function collectModuleErrors(testModule: TestModule): unknown[] {
 
 function collectTestFailureDetails(testModule: TestModule, file: string): TestFailureDetail[] {
   const details: TestFailureDetail[] = [];
-  // Tracks "did collection get far enough to discover at least one failing
-  // test case", independently of `details` — the loop below only PUSHES a
-  // detail when the error carries a structured actual/expected diff (this
-  // sidecar exists to recover values Vitest's own JSON reporter elides), so a
-  // plain-message test failure leaves `details` empty despite collection
-  // having succeeded. Conflating the two would misclassify that case as a
-  // collection crash below (EI-22137062583459326 test 2 caught exactly this).
+  // A failing case without assertion values or a complete coded error can
+  // leave details empty. It must still prevent the collection-failure fallback.
   let sawFailingTestCase = false;
+  const moduleErrors = moduleStatus(testModule) === 'fail' ? collectModuleErrors(testModule) : [];
   try {
     const collection = (testModule as unknown as {
       children?: { allTests?: () => Iterable<unknown> };
@@ -3425,7 +3442,8 @@ function collectTestFailureDetails(testModule: TestModule, file: string): TestFa
         if (message !== undefined) detail.message = boundFailureText(stringifyFailureValue(message));
         if (actual !== undefined) detail.actual = boundFailureText(stringifyFailureValue(actual));
         if (expected !== undefined) detail.expected = boundFailureText(stringifyFailureValue(expected));
-        if (detail.actual !== undefined || detail.expected !== undefined) details.push(detail);
+        if (!moduleErrors.length) detail.codedError = singleCodedTestError(result.errors ?? []);
+        if (detail.actual !== undefined || detail.expected !== undefined || detail.codedError) details.push(detail);
         break;
       }
       if (details.length >= 20) break;
@@ -3452,11 +3470,12 @@ function collectTestFailureDetails(testModule: TestModule, file: string): TestFa
   if (!sawFailingTestCase) {
     try {
       if (moduleStatus(testModule) === 'fail') {
-        const errs = collectModuleErrors(testModule);
+        const errs = moduleErrors;
         if (errs.length > 0) {
           const message = formatTestCaseError(errs[0], { includeStack: true });
           if (message) {
-            details.push({ file, test: COLLECTION_FAILURE_TEST, message: boundFailureText(message) });
+            details.push({ file, test: COLLECTION_FAILURE_TEST, message: boundFailureText(message),
+              codedError: singleCodedTestError(errs, true) });
           }
         }
       }
