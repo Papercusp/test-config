@@ -41,9 +41,21 @@ const armed = Boolean(process.env[PC_EXECUTED_INPUTS_DIR_ENV]?.trim()) && curren
 
 // Unit tests below reset and re-install capture against fakes. Restore the setup file's real
 // recorder after each one, or an armed worker loses it (and this file's inputs record).
-let restoreCapture: () => void = () => {};
-beforeEach(() => { restoreCapture = snapshotCaptureForTests(); });
-afterEach(() => restoreCapture());
+let restoreWorkerCapture: () => void = () => {};
+beforeEach(() => { restoreWorkerCapture = snapshotCaptureForTests(); });
+afterEach(() => restoreWorkerCapture());
+
+function readFixtureFileSync(path: fs.PathOrFileDescriptor, encoding: BufferEncoding): string {
+  // The fake target has already recorded the read against its fixture repo. An armed worker's
+  // real fs wrapper must record the delegated I/O against its own repo and recorder.
+  const restoreFixtureCapture = snapshotCaptureForTests();
+  restoreWorkerCapture();
+  try {
+    return nativeFs.readFileSync(path, encoding);
+  } finally {
+    restoreFixtureCapture();
+  }
+}
 
 describe('original file database reset capture', () => {
   const identity = { captureId: '12345678-9abc-def0-1234-56789abcdef0',
@@ -692,8 +704,7 @@ describe('unmeasured filesystem input custody', () => {
     const file = join(root, 'fixture.txt');
     const testFile = 'src/external-input.test.ts';
     resetCaptureForTests();
-    const targets = { readFileSync: (path: fs.PathOrFileDescriptor, encoding: BufferEncoding) =>
-      nativeFs.readFileSync(path, encoding) };
+    const targets = { readFileSync: readFixtureFileSync };
     installCapture({ fs: targets, fsPromises: {}, childProcess: {} }, resolve(process.cwd()));
     try {
       nativeFs.writeFileSync(file, 'first');
@@ -1237,8 +1248,7 @@ describe('unmeasured filesystem input custody', () => {
     const traversed = `${repo}/bridge/../fixture.txt`;
     const testFile = 'src/parent-input.test.ts';
     resetCaptureForTests();
-    const targets = { readFileSync: (file: fs.PathOrFileDescriptor, encoding: BufferEncoding) =>
-      nativeFs.readFileSync(file, encoding) };
+    const targets = { readFileSync: readFixtureFileSync };
     installCapture({ fs: targets, fsPromises: {}, childProcess: {} }, repo);
     try {
       for (const file of [traversed, Buffer.from(traversed)]) {
@@ -1271,8 +1281,7 @@ describe('unmeasured filesystem input custody', () => {
     nativeFs.symlinkSync(join(external, 'missing.txt'), join(repo, 'dangling.txt'));
     const testFile = 'src/linked-input.test.ts';
     resetCaptureForTests();
-    const targets = { readFileSync: (path: fs.PathOrFileDescriptor, encoding: BufferEncoding) =>
-      nativeFs.readFileSync(path, encoding) };
+    const targets = { readFileSync: readFixtureFileSync };
     installCapture({ fs: targets, fsPromises: {}, childProcess: {} }, repo);
     try {
       for (const [path, expected] of [['file.txt', 'first'], ['directory/fixture.txt', 'first'],
@@ -1305,7 +1314,9 @@ describe('unmeasured filesystem input custody', () => {
       expect(targets.readFileSync(join(repo, 'local.txt'), 'utf8')).toBe('local');
       expect(() => targets.readFileSync(join(repo, 'missing.txt'), 'utf8')).toThrow(
         expect.objectContaining({ code: 'ENOENT' }));
-      expect(endFile(join(repo, testFile))?.opaque).toEqual([]);
+      const ordinary = endFile(join(repo, testFile))!;
+      expect(ordinary.reads).toEqual([join(repo, 'local.txt'), join(repo, 'missing.txt')]);
+      expect(ordinary.opaque).toEqual([]);
     } finally { resetCaptureForTests(); rmSync(root, { recursive: true, force: true }); }
   });
 });
