@@ -27,6 +27,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { TestProject } from 'vitest/node';
+import { protectVitestModuleCaches } from './hermetic-tmpdir.ts';
 
 export const HOST_PREFLIGHT_MODULE = 'scripts/lib/vitest-host-preflight.mjs';
 
@@ -95,7 +96,8 @@ export async function runHostPreflight(opts: {
   }
 }
 
-export default async function setup(project: TestProject): Promise<void> {
+export default async function setup(project: TestProject): Promise<() => void> {
   await runHostPreflight({ projectRoot: project.config.root, files: project.vitest.state.getPaths(), env: process.env,
     testNamePattern: project.vitest.config.testNamePattern });
+  return protectVitestModuleCaches([project.tmpDir, project.vitest.getRootProject().tmpDir]);
 }

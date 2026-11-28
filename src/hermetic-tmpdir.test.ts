@@ -34,7 +34,7 @@ import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseExplicitFiles } from '../../../scripts/lib/tsc-baseline-gate.mjs';
 
 import {
@@ -42,6 +42,7 @@ import {
   createHermeticDir,
   creatorIsAlive,
   prepareCloudTutorialNetlog,
+  protectVitestModuleCaches,
   sweepCloudTutorialNetlogs,
   CLOUD_TUTORIAL_NETLOG_MAX_AGE_MS,
   CLOUD_TUTORIAL_NETLOG_MAX_BYTES,
@@ -307,6 +308,81 @@ describe('cloud tutorial Chromium netlog retention', () => {
 });
 
 describe('sweepStaleTestScratch', () => {
+  it('renews the directory timestamp used by older cleaners and stops on project teardown', () => {
+    vi.useFakeTimers();
+    const cache = join(root, 'h'.repeat(21));
+    const stop = protectVitestModuleCaches([cache, cache]);
+    try {
+      const old = (Date.now() - GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 2) / 1000;
+      utimesSync(cache, old, old);
+      vi.advanceTimersByTime(GENERIC_SCRATCH_SWEEP_MAX_AGE_MS / 2);
+      expect(naiveAgeOnlySweep(root, GENERIC_SCRATCH_SWEEP_MAX_AGE_MS)).toBe(0);
+      const refreshed = statSync(cache).mtimeMs;
+      stop();
+      vi.advanceTimersByTime(GENERIC_SCRATCH_SWEEP_MAX_AGE_MS);
+      expect(statSync(cache).mtimeMs).toBe(refreshed);
+    } finally {
+      stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps readable Vitest module copies for both live projects and reclaims them after the coordinator exits', async () => {
+    const projectCache = join(root, 'p'.repeat(21));
+    const rootCache = join(root, 'r'.repeat(21));
+    const setupUrl = new URL('./host-preflight-global-setup.ts', import.meta.url).href;
+    const runner = spawn(process.execPath, ['--input-type=module', '-e', `
+      const [setupUrl, root, tmpDir, rootTmpDir] = process.argv.slice(1);
+      const { default: setup } = await import(setupUrl);
+      await setup({ tmpDir, config: { root }, vitest: {
+        state: { getPaths: () => [] }, config: {}, getRootProject: () => ({ tmpDir: rootTmpDir })
+      } });
+      process.stdout.write('ready');
+      process.stdin.resume();
+    `, setupUrl, root, projectCache, rootCache], {
+      env: { ...process.env, NODE_OPTIONS: '', TMPDIR: root },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    const exited = once(runner, 'exit');
+    const created = Math.floor(Date.now() / 1000) * 1000;
+    const cutoff = created + GENERIC_SCRATCH_SWEEP_MAX_AGE_MS;
+    const caches = [projectCache, rootCache];
+    const modulePath = join('ssr', 'a'.repeat(40));
+    try {
+      await Promise.race([
+        once(runner.stdout, 'data'),
+        exited.then(([code]) => { throw new Error(`cache owner exited before setup completed (${code})`); }),
+      ]);
+      for (const cache of caches) {
+        mkdirSync(join(cache, 'ssr'), { recursive: true });
+        writeFileSync(join(cache, modulePath), 'transformed module');
+        utimesSync(cache, created / 1000, created / 1000);
+      }
+      for (const now of [cutoff - 1, cutoff, cutoff + 1, cutoff + GENERIC_SCRATCH_SWEEP_MAX_AGE_MS]) {
+        sweepStaleTestScratch(root, { now, startAt: 0 });
+        for (const cache of caches) expect(readFileSync(join(cache, modulePath), 'utf8')).toBe('transformed module');
+      }
+    } finally {
+      runner.stdin.end();
+      await exited;
+    }
+    expect(sweepStaleTestScratch(root, { now: cutoff + 1, startAt: 0 }).removed).toBe(caches.length);
+    for (const cache of caches) expect(existsSync(cache)).toBe(false);
+  });
+
+  it('preserves unmarked Vitest caches from earlier runners while still collecting ordinary scratch', () => {
+    const cache = join(root, 'mfEi3yPSOF1N3c4bgcvaU');
+    mkdirSync(join(cache, 'ssr'), { recursive: true });
+    const modulePath = join(cache, 'ssr', 'b'.repeat(40));
+    writeFileSync(modulePath, 'legacy module');
+    const ordinary = seedNamed('expired-unowned-dir', GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 2);
+    const old = (Date.now() - GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 2) / 1000;
+    utimesSync(cache, old, old);
+    sweepStaleTestScratch(root, { startAt: 0 });
+    expect(readFileSync(modulePath, 'utf8')).toBe('legacy module');
+    expect(existsSync(ordinary)).toBe(false);
+  });
+
   it('preserves a live affected run’s inputs across the age cutoff and reclaims them after exit', async () => {
     const scratch = join(root, 'papercusp-affected-tests');
     mkdirSync(scratch);

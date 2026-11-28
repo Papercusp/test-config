@@ -132,9 +132,9 @@
  *     that collects it anyway. A recycled pid can never cause an early delete.
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, utimesSync, writeFileSync, type Dirent, type Stats } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, uptime } from 'node:os';
 // This source package is also imported by native Node CLI entry points.
 import { PAPERCUSP_TMPDIR_CANDIDATES } from './tmpdir-guard.ts';
 
@@ -162,6 +162,46 @@ export const HERMETIC_SWEEP_SCAN_CAP = 400;
  * directory has separate process/path evidence and can outlive a full test run.
  */
 export const GENERIC_SCRATCH_SWEEP_MAX_AGE_MS = 4 * 60 * 60 * 1_000;
+const VITEST_CACHE_OWNER = '.papercusp-vitest-owner';
+
+/** Vitest's coordinator owns these directories until its projects close. */
+export function protectVitestModuleCaches(paths: readonly string[]): () => void {
+  const caches = new Set(paths);
+  for (const path of caches) {
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, VITEST_CACHE_OWNER), String(process.pid));
+  }
+  // Older runners may still sweep the same TMPDIR by top-level mtime alone.
+  // Module writes inside ssr/ and client/ don't update their parent's mtime.
+  const heartbeat = setInterval(() => {
+    const now = new Date();
+    for (const path of caches) {
+      try {
+        utimesSync(path, now, now);
+      } catch {
+        // A project can close before its siblings. Never recreate a removed cache.
+      }
+    }
+  }, GENERIC_SCRATCH_SWEEP_MAX_AGE_MS / 2);
+  heartbeat.unref();
+  return () => clearInterval(heartbeat);
+}
+
+function vitestCacheInUse(path: string, name: string, entry: Stats): boolean {
+  try {
+    const owner = Number(readFileSync(join(path, VITEST_CACHE_OWNER), 'utf8'));
+    // A partial marker or recycled live PID can safely delay collection.
+    return !Number.isSafeInteger(owner) || owner <= 0 || creatorIsAlive(owner);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return true;
+  }
+  // Vitest 4 creates <nanoid(21)>/<environment>. Older producers didn't
+  // record a PID. Their normal teardown owns these caches within this boot.
+  if (!/^[A-Za-z0-9_-]{21}$/.test(name) ||
+      (!existsSync(join(path, 'ssr')) && !existsSync(join(path, 'client')))) return false;
+  const bootTime = Date.now() - uptime() * 1000;
+  return entry.birthtimeMs <= 0 || Math.max(entry.birthtimeMs, entry.ctimeMs, entry.mtimeMs) >= bootTime;
+}
 /**
  * Known /tmp/pcv top-level entries that are LONG-LIVED lock directories, not
  * per-run scratch — a root-level age sweep must never reap these regardless of age.
@@ -321,7 +361,7 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
     result.scanned += 1;
     const path = join(root, name);
     let ageMs: number;
-    let isDirectory: boolean;
+    let entry: Stats;
     try {
       // lstat, NOT stat: stat FOLLOWS a symlink, so a link whose target this
       // sweep already removed throws ENOENT here and takes the `continue` below —
@@ -329,14 +369,18 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
       // stat-able again. See "dangling symlinks" in the module doc. lstat is also
       // the right question regardless: we want the age of the ENTRY we may remove,
       // never the age of whatever it points at.
-      const entry = lstatSync(path);
+      entry = lstatSync(path);
       ageMs = now - entry.mtimeMs;
-      isDirectory = entry.isDirectory();
     } catch {
       continue; // vanished under us — a peer swept it first
     }
     if (ageMs < minAgeMs) {
       result.keptYoung += 1;
+      continue;
+    }
+    const isDirectory = entry.isDirectory();
+    if (ageOnly && isDirectory && ageMs > maxAgeMs && vitestCacheInUse(path, name, entry)) {
+      result.keptAlive += 1;
       continue;
     }
     // Affected runs mint a PID and nonce before scheduling their guards. A peer
