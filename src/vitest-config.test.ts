@@ -21,7 +21,11 @@ import { availableParallelism } from 'node:os';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defineVitestConfig, gateParticipationConfig, isWritableDir } from './vitest-config.ts';
+import {
+  defineVitestConfig, gateParticipationConfig, isWritableDir,
+  PC_EXECUTED_INPUTS_DIR_ENV, PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV,
+} from './vitest-config.ts';
+import { EXECUTED_INPUTS_CAPTURE_SETUP, NO_REAL_PG_SETUP } from './worker-setup-files.ts';
 import { recordedTestLayer } from './execution-details.ts';
 import { createServer, type Plugin } from 'vite';
 
@@ -150,10 +154,22 @@ describe('defineVitestConfig unit-layer integration-path guard (§A5)', () => {
 
   it('unit setup prevents background context-door refreshes as well as real PG connections', () => {
     withArgv();
-    const setupFiles = defineVitestConfig({ layer: 'unit' }).test?.setupFiles as string[];
-    expect(setupFiles[0]).toMatch(/setup-no-real-pg\.ts$/);
-    expect(process.env.PAPERCUSP_FORBID_REAL_PG).toBe('1');
-    expect(process.env.PAPERCUSP_DOORS_CONFIG_OFF).toBe('1');
+    const inputsDir = mkdtempSync(join(tmpdir(), 'unit-setup-inputs-'));
+    try {
+      vi.stubEnv(PC_EXECUTED_INPUTS_DIR_ENV, inputsDir);
+      vi.stubEnv(PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV, undefined);
+      const unarmed = defineVitestConfig({ layer: 'unit' }).test?.setupFiles as string[];
+      expect(unarmed[0]).toBe(NO_REAL_PG_SETUP);
+
+      vi.stubEnv(PC_EXECUTED_SOURCE_MAP_WORKSPACE_ENV, '@papercusp/test-config');
+      const armed = defineVitestConfig({ layer: 'unit' }).test?.setupFiles as string[];
+      expect(armed.slice(0, 2)).toEqual([EXECUTED_INPUTS_CAPTURE_SETUP, NO_REAL_PG_SETUP]);
+      expect(process.env.PAPERCUSP_FORBID_REAL_PG).toBe('1');
+      expect(process.env.PAPERCUSP_DOORS_CONFIG_OFF).toBe('1');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(inputsDir, { recursive: true, force: true });
+    }
   });
 
   it('routes an *.integration.test.ts remediation through the repository test router', () => {
