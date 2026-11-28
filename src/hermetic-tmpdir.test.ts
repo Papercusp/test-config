@@ -35,6 +35,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { parseExplicitFiles } from '../../../scripts/lib/tsc-baseline-gate.mjs';
 
 import {
   affectedTestRunLogPath,
@@ -306,6 +307,35 @@ describe('cloud tutorial Chromium netlog retention', () => {
 });
 
 describe('sweepStaleTestScratch', () => {
+  it('preserves a live affected run’s inputs across the age cutoff and reclaims them after exit', async () => {
+    const scratch = join(root, 'papercusp-affected-tests');
+    mkdirSync(scratch);
+    const runner = spawn(process.execPath, ['-e', "process.stdout.write('ready'); process.stdin.resume()"],
+      { stdio: ['pipe', 'pipe', 'pipe'] });
+    const exited = once(runner, 'exit');
+    const token = `${runner.pid}-0123abcd`;
+    const response = join(scratch, `${token}-files-2.json`);
+    const result = join(scratch, `executed-map-result-${token}-workspace.jsonl.failures.json`);
+    const paths = ['src/first.ts', 'src/with,comma.ts', 'src/last.ts'];
+    const created = Math.floor(Date.now() / 1_000) * 1_000;
+    const cutoff = created + GENERIC_SCRATCH_SWEEP_MAX_AGE_MS;
+    try {
+      await once(runner.stdout, 'data');
+      writeFileSync(response, JSON.stringify(paths));
+      writeFileSync(result, 'first attempt');
+      for (const file of [response, result]) utimesSync(file, created / 1_000, created / 1_000);
+      for (const now of [cutoff - 1, cutoff, cutoff + 1, cutoff + GENERIC_SCRATCH_SWEEP_MAX_AGE_MS]) {
+        sweepStaleTestScratch(scratch, { now, startAt: 0 });
+        expect(parseExplicitFiles([`--files-from=${response}`])).toEqual(new Set(paths));
+        expect(readFileSync(result, 'utf8')).toBe('first attempt');
+      }
+    } finally {
+      runner.stdin.end();
+      await exited;
+    }
+    expect(sweepStaleTestScratch(scratch, { now: cutoff + 1, startAt: 0 }).removed).toBe(2);
+  });
+
   it.skipIf(process.platform !== 'linux')('retains an aged live postmaster, while rejecting dead and recycled ownership', async () => {
     const age = GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 3;
     const live = seedNamed('papercusp-test-pg-live', age);

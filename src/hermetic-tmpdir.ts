@@ -133,7 +133,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, type Dirent } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 // This source package is also imported by native Node CLI entry points.
 import { PAPERCUSP_TMPDIR_CANDIDATES } from './tmpdir-guard.ts';
@@ -234,8 +234,8 @@ export interface SweepOptions {
    */
   exclude?: ReadonlySet<string>;
   /**
-   * Decide solely by age — never call `isAlive`. Required whenever entries under
-   * `root` are NOT pid-stamped (`<pid>-<suffix>`): an unparseable name makes
+   * Decide by age unless the namespace supplies explicit live ownership. Required
+   * whenever entries under `root` are not all pid-stamped: an unparseable name makes
    * `isAlive` return false immediately, so the liveness path would reap a live
    * process's dir the moment it crosses `minAgeMs` (60s) instead of `maxAgeMs`.
    * See `sweepStaleTestScratch`, the only intended caller.
@@ -295,6 +295,7 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
   const isAlive = opts.isAlive ?? ((pid: number) => creatorIsAlive(pid));
   const exclude = opts.exclude;
   const ageOnly = opts.ageOnly ?? false;
+  const affectedRunScratch = ageOnly && basename(root) === 'papercusp-affected-tests';
   const result: SweepResult = { scanned: 0, removed: 0, keptAlive: 0, keptYoung: 0 };
 
   let entries: string[];
@@ -337,6 +338,16 @@ export function sweepAbandonedHermeticDirs(root: string, opts: SweepOptions = {}
     if (ageMs < minAgeMs) {
       result.keptYoung += 1;
       continue;
+    }
+    // Affected runs mint a PID and nonce before scheduling their guards. A peer
+    // starting hours later must leave the original response files and results
+    // available for late tasks and retries. A recycled PID only delays cleanup.
+    if (affectedRunScratch && ageMs > maxAgeMs) {
+      const owner = /^(?:executed-map-result-)?(\d+)-[a-f0-9]{8}-/.exec(name);
+      if (owner && isAlive(Number(owner[1]))) {
+        result.keptAlive += 1;
+        continue;
+      }
     }
     // A long R6 run can hold a private database beyond the generic four-hour
     // cutoff. Its postmaster, rather than directory mtime, owns that lifetime.
