@@ -195,12 +195,18 @@ function vitestCacheInUse(path: string, name: string, entry: Stats): boolean {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return true;
   }
-  // Vitest 4 creates <nanoid(21)>/<environment>. Older producers didn't
-  // record a PID. Their normal teardown owns these caches within this boot.
-  if (!/^[A-Za-z0-9_-]{21}$/.test(name) ||
-      (!existsSync(join(path, 'ssr')) && !existsSync(join(path, 'client')))) return false;
+  // Earlier Vitest coordinators leave no PID. Their module copies live in
+  // <nanoid(21)>/<environment.name>/, including custom Vite environments.
+  if (!/^[A-Za-z0-9_-]{21}$/.test(name)) return false;
   const bootTime = Date.now() - uptime() * 1000;
-  return entry.birthtimeMs <= 0 || Math.max(entry.birthtimeMs, entry.ctimeMs, entry.mtimeMs) >= bootTime;
+  if (entry.birthtimeMs > 0 && Math.max(entry.birthtimeMs, entry.ctimeMs, entry.mtimeMs) < bootTime) {
+    return false;
+  }
+  try {
+    return readdirSync(path, { withFileTypes: true }).some(child => child.isDirectory());
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
 }
 /**
  * Known /tmp/pcv top-level entries that are LONG-LIVED lock directories, not

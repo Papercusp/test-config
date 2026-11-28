@@ -29,7 +29,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, uptime } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
@@ -370,10 +370,10 @@ describe('sweepStaleTestScratch', () => {
     for (const cache of caches) expect(existsSync(cache)).toBe(false);
   });
 
-  it('preserves unmarked Vitest caches from earlier runners while still collecting ordinary scratch', () => {
+  it.each(['ssr', 'client', 'edge-runtime'])('keeps an unmarked %s cache until the next boot', (environment) => {
     const cache = join(root, 'mfEi3yPSOF1N3c4bgcvaU');
-    mkdirSync(join(cache, 'ssr'), { recursive: true });
-    const modulePath = join(cache, 'ssr', 'b'.repeat(40));
+    mkdirSync(join(cache, environment), { recursive: true });
+    const modulePath = join(cache, environment, 'b'.repeat(40));
     writeFileSync(modulePath, 'legacy module');
     const ordinary = seedNamed('expired-unowned-dir', GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 2);
     const old = (Date.now() - GENERIC_SCRATCH_SWEEP_MAX_AGE_MS * 2) / 1000;
@@ -381,6 +381,16 @@ describe('sweepStaleTestScratch', () => {
     sweepStaleTestScratch(root, { startAt: 0 });
     expect(readFileSync(modulePath, 'utf8')).toBe('legacy module');
     expect(existsSync(ordinary)).toBe(false);
+
+    // Move the calculated boot time beyond the last change to this directory.
+    const afterReboot = Date.now() + Math.ceil(uptime()) * 1_000 + GENERIC_SCRATCH_SWEEP_MAX_AGE_MS;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(afterReboot);
+    try {
+      expect(sweepStaleTestScratch(root, { startAt: 0 }).removed).toBe(1);
+      expect(existsSync(cache)).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('preserves a live affected run’s inputs across the age cutoff and reclaims them after exit', async () => {
